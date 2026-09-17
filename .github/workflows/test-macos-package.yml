@@ -44,7 +44,9 @@ jobs:
           npm ci
 
       - name: Build application bundle
-        run: npx tauri build --verbose --bundles app
+        run: >-
+          npx tauri build --verbose --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Ad-hoc sign application
         run: |
