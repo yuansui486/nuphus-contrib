@@ -21,6 +21,8 @@ jobs:
         run: test "$(uname -m)" = arm64
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -30,14 +32,15 @@ jobs:
         run: |
           npm ci
           cd frontend && npm ci
+      # The application build prepares OCR models used by desktop contract tests.
+      - name: Build release application
+        run: npx tauri build --verbose --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Test macOS desktop contracts
         run: |
           cargo test -p nuphus --lib desktop_automation::
           cargo test -p nuphus --lib tools::semantic_desktop::
           cargo test -p nuphus --lib desktop::
           cargo test -p desktop-api --lib
-      - name: Build release application
-        run: npx tauri build --verbose --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - name: Sign and verify application
         run: |
           codesign --force --deep --sign - target/release/bundle/macos/Nuphus.app
