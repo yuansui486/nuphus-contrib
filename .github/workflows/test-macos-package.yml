@@ -1,0 +1,98 @@
+name: Test macOS package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NUPHUS_SOURCE_SHA: 8ab087856973fe34c53aa6527a8a24e88ce427ba
+
+concurrency:
+  group: test-macos-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build and verify macOS ARM64 DMG
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.NUPHUS_SOURCE_SHA }}
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = arm64
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: |
+          npm ci
+          cd frontend && npm ci
+      # The application build prepares OCR models used by desktop contract tests.
+      - name: Build release application
+        run: npx tauri build --verbose --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Test macOS desktop contracts
+        run: |
+          cargo test -p nuphus --lib desktop_automation::
+          cargo test -p nuphus --lib tools::semantic_desktop::
+          cargo test -p nuphus --lib desktop::
+          cargo test -p desktop-api --lib
+      - name: Sign and verify application
+        run: |
+          codesign --force --deep --sign - target/release/bundle/macos/Nuphus.app
+          codesign --verify --deep --strict target/release/bundle/macos/Nuphus.app
+          lipo target/release/bundle/macos/Nuphus.app/Contents/MacOS/nuphus -verify_arch arm64
+      - name: Verify bundled vision runtime and launch
+        run: |
+          cargo build -p desktop-api --example macos_runtime_smoke
+          env -u ORT_DYLIB_PATH target/debug/examples/macos_runtime_smoke "$PWD/target/release/bundle/macos/Nuphus.app"
+          target/release/bundle/macos/Nuphus.app/Contents/MacOS/nuphus > /tmp/nuphus-package-launch.log 2>&1 &
+          app_pid=$!
+          sleep 12
+          if kill -0 "$app_pid" 2>/dev/null; then
+            kill "$app_pid" || true
+          else
+            tail -50 /tmp/nuphus-package-launch.log
+            exit 1
+          fi
+      - name: Package and verify DMG
+        run: |
+          stage_dir=$(mktemp -d)
+          ditto target/release/bundle/macos/Nuphus.app "$stage_dir/Nuphus.app"
+          ln -s /Applications "$stage_dir/Applications"
+          hdiutil create -volname Nuphus -srcfolder "$stage_dir" -format UDZO nuphus-macos-arm64-rpa.dmg
+          hdiutil verify nuphus-macos-arm64-rpa.dmg
+          mount_dir=$(mktemp -d)
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" nuphus-macos-arm64-rpa.dmg
+          trap 'hdiutil detach "$mount_dir" || true' EXIT
+          codesign --verify --deep --strict "$mount_dir/Nuphus.app"
+          lipo "$mount_dir/Nuphus.app/Contents/MacOS/nuphus" -verify_arch arm64
+          test "$(readlink "$mount_dir/Applications")" = /Applications
+          env -u ORT_DYLIB_PATH target/debug/examples/macos_runtime_smoke "$mount_dir/Nuphus.app"
+          shasum -a 256 nuphus-macos-arm64-rpa.dmg > nuphus-macos-arm64-rpa.dmg.sha256
+          printf 'Source commit: %s\nArchitecture: arm64\nSigning: ad-hoc (not notarized)\n' "$NUPHUS_SOURCE_SHA" > build-info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuphus-macos-arm64-rpa-dmg-${{ env.NUPHUS_SOURCE_SHA }}
+          path: |
+            nuphus-macos-arm64-rpa.dmg
+            nuphus-macos-arm64-rpa.dmg.sha256
+            build-info.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-rpa-launch-log
+          path: /tmp/nuphus-package-launch.log
+          retention-days: 14
