@@ -1,7 +1,12 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
+  define: {
+    'import.meta.env.VITE_NUPHUS_EDITION': JSON.stringify(
+      mode === 'workbench' ? 'workbench' : 'standard',
+    ),
+  },
   plugins: [react()],
   base: './',
   server: {
@@ -42,4 +47,4 @@ export default defineConfig({
       },
     },
   },
-})
+}))

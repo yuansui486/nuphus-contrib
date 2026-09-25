@@ -270,7 +270,7 @@ fn get_json(
 /// 产出目录：~/.nuphus/generated/（自动创建）
 fn generated_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "无法定位用户主目录".to_string())?;
-    let dir = home.join(".nuphus").join("generated");
+    let dir = home.join(crate::profile::home_name()).join("generated");
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("创建产出目录失败 {}: {e}", dir.display()))?;
     Ok(dir)

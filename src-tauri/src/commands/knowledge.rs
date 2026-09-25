@@ -41,7 +41,7 @@ fn ensure_knowledge_engine(
         let index_dir = docs_root
             .parent()
             .and_then(|p| p.parent())
-            .map(|p| p.join(".nuphus").join("index"))
+            .map(|p| p.join(nuphus::profile::home_name()).join("index"))
             .unwrap_or_else(|| {
                 let mut p = std::env::current_dir().unwrap_or_default();
                 p.push(".nuphus");

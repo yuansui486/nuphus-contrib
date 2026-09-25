@@ -522,6 +522,9 @@ fn load_persisted_from(path: &Path) -> PersistedSchedules {
 }
 
 fn resolve_persist_path() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        return crate::profile::workbench_data_dir().join("schedules.json");
+    }
     std::env::current_dir()
         .unwrap_or_default()
         .join(".nuphus")
@@ -529,6 +532,9 @@ fn resolve_persist_path() -> PathBuf {
 }
 
 fn resolve_history_path() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        return crate::profile::workbench_data_dir().join("schedule_runs.json");
+    }
     std::env::current_dir()
         .unwrap_or_default()
         .join(".nuphus")

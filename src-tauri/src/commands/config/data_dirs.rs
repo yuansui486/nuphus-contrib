@@ -39,13 +39,13 @@ const DATA_DIR_KEYS: [&str; 5] = ["data", "runtime", "generated", "plugin", "con
 /// 主数据目录：与 `dict_ocr` / `models::bootstrap` / `store::db` 的路径拼法同源
 /// （`dirs::data_dir()/{Nuphus|nuphus}`，Windows 大小写不敏感，实为同一目录）。
 fn data_dir() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|base| base.join("Nuphus"))
+    dirs::data_dir().map(|base| base.join(nuphus::profile::data_name()))
 }
 
 /// 生成产物目录：`~/.nuphus/generated`（`tools/builtin/generation.rs::generated_dir` 同源）。
 /// 这里不调用 `generated_dir()` —— 那个函数会 `create_dir_all`，列举页面不应有写副作用。
 fn generated_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|home| home.join(".nuphus").join("generated"))
+    dirs::home_dir().map(|home| home.join(nuphus::profile::home_name()).join("generated"))
 }
 
 /// 配置文件所在目录：`get_config_path()` 返回的是文件路径，取父目录。

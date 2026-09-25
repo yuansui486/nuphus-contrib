@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 import type { WorkflowItem } from '../../core/types'
-import { listWorkflows } from '../lib/api'
+import { useCanvasBackend } from './CanvasBackend'
 import { useLanguage } from '../../locales'
 
 /**
@@ -23,6 +23,7 @@ export function WorkflowSwitcher({
   disabledHint?: string
 }) {
   const { lang } = useLanguage()
+  const { listWorkflows } = useCanvasBackend()
   const ui = (zh: string, en: string) => (lang === 'zh' ? zh : en)
   const [open, setOpen] = useState(false)
   const [list, setList] = useState<WorkflowItem[] | null>(null)

@@ -1,0 +1,80 @@
+name: Workbench CI
+
+on:
+  push:
+    branches: [edition/workflow-workbench]
+  pull_request:
+    branches: [edition/workflow-workbench]
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Workbench frontend and original editor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - run: npx tsc --noEmit
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npx prettier --check "src/workbench/**/*.{ts,tsx,css}" src/main-window/workflow-canvas/CanvasBackend.ts
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build:workbench
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+  native:
+    name: Workbench native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: workbench-${{ matrix.os }}
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libpipewire-0.3-dev libasound2-dev libgbm-dev libxdo-dev
+      - name: Verify Apple Silicon runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = arm64
+      - run: cargo fmt --all -- --check
+      - run: cargo test -p nuphus-workbench --features gateway
+      - run: cargo clippy -p nuphus-workbench --features gateway --all-targets -- -D warnings
+      - run: cargo test -p nuphus --lib workflow --features workbench
+      - run: cargo check -p nuphus-desktop --features workbench
+      - run: cargo check -p nuphus-desktop
+      - name: macOS desktop contracts
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p nuphus --lib desktop_automation:: --features workbench
+          cargo test -p nuphus --lib tools::semantic_desktop:: --features workbench
+          cargo test -p desktop-api --lib

@@ -30,6 +30,12 @@ pub fn set_config_override(path: PathBuf) {
 /// load_registry 与 toml_ops 共享此列表，确保路径探测逻辑唯一。
 /// 优先级: override(桌面端) > exe_dir > cwd > ~/.config/nuphus > ~/.nuphus > AppData
 pub fn config_search_paths() -> Vec<PathBuf> {
+    if crate::profile::WORKBENCH {
+        return vec![CONFIG_OVERRIDE
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::profile::config_dir().join("providers.toml"))];
+    }
     let mut paths: Vec<PathBuf> = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
 

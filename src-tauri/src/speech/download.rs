@@ -112,7 +112,10 @@ fn emit(app: &AppHandle, ev: DownloadEvent) {
 /// files without a restart of the path resolution logic.
 fn target_dir() -> Result<PathBuf, String> {
     let data_dir = dirs::data_dir().ok_or_else(|| "cannot resolve user data dir".to_string())?;
-    Ok(data_dir.join("Nuphus").join("models").join("stt"))
+    Ok(data_dir
+        .join(nuphus::profile::data_name())
+        .join("models")
+        .join("stt"))
 }
 
 /// One HTTP attempt: stream `url` to `path`, reporting progress.

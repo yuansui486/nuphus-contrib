@@ -177,6 +177,9 @@ fn expand_env_vars(path: &str) -> String {
 
 /// Get the Nuphus browser Profile directory
 pub fn get_profile_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("NUPHUS_BROWSER_PROFILE_DIR").filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
     let base = dirs::data_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     base.join("Nuphus").join("browser_profile_v2")
 }

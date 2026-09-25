@@ -6,6 +6,8 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
+    "dev:workbench": "vite --mode workbench --port 5176 --strictPort",
+    "build:workbench": "tsc && vite build --mode workbench --outDir dist-workbench",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "lint": "eslint . --ext .ts,.tsx",

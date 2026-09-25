@@ -63,6 +63,12 @@ pub async fn finish_startup(app: AppHandle) -> Result<(), String> {
         None => tracing::debug!("[Startup] finish_startup 重复调用（splash 已关闭）"),
     }
     // Show main window
+    if nuphus::profile::WORKBENCH && std::env::args().any(|arg| arg == "--background") {
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.hide();
+        }
+        return Ok(());
+    }
     match app.get_webview_window("main") {
         Some(main) => {
             if let Err(e) = main.show() {

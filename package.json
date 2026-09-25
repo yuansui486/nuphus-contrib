@@ -4,6 +4,8 @@
     "predev": "node -e \"try { fetch('http://localhost:5174').then(r => r.text()).catch(() => {}); } catch(e) {}\"",
     "dev": "cd frontend && npm run dev",
     "build": "cd frontend && npm run build",
+    "dev:workbench": "cd frontend && npm run dev:workbench",
+    "build:workbench": "cd frontend && npm run build:workbench",
     "publish:npm": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& 'npm-desktop/publish.ps1' @args\""
   },
   "devDependencies": {

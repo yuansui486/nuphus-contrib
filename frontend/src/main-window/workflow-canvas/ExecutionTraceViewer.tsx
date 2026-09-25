@@ -1,11 +1,7 @@
 import { useContext, useEffect, useId, useMemo, useRef, useState } from 'react'
-import {
-  wfTraceList,
-  wfTraceRead,
-  type WorkflowInvocationTrace,
-  type WorkflowRunTrace,
-} from '../lib/api'
+import { type WorkflowInvocationTrace, type WorkflowRunTrace } from '../lib/api'
 import { WorkflowTraceContext } from './WorkflowTraceContext'
+import { useCanvasBackend } from './CanvasBackend'
 import {
   runtimeChildren,
   runtimeChildCount,
@@ -132,6 +128,7 @@ type Tab = (typeof tabs)[number]
 
 export function ExecutionTraceViewer(props: ExecutionTraceViewerProps) {
   const context = useContext(WorkflowTraceContext)
+  const { wfTraceList, wfTraceRead } = useCanvasBackend()
   const workflowId = props.workflowId ?? context?.workflowId
   const refreshKey = props.refreshKey ?? context?.refreshKey
   const text = useTraceText()

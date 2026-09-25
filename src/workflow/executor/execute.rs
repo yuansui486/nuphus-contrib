@@ -61,6 +61,10 @@ impl Executor {
                     workflow_id.to_string(),
                     crate::workflow::debug::current()
                         .map(|session| session.cancelled.clone())
+                        .or_else(|| {
+                            crate::workflow::run_context::current()
+                                .map(|context| context.cancelled.clone())
+                        })
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
                 );
             }
@@ -159,6 +163,9 @@ impl Executor {
         let mut run_record = RunRecord {
             run_id: crate::workflow::debug::current()
                 .map(|session| session.run_id.clone())
+                .or_else(|| {
+                    crate::workflow::run_context::current().map(|context| context.run_id.clone())
+                })
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             started_at: chrono::Utc::now(),
             finished_at: None,

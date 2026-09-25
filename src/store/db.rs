@@ -40,6 +40,9 @@ fn db_path() -> &'static PathBuf {
 
 /// 默认数据库路径：~/.nuphus/nuphus.db
 fn default_db_path() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        return crate::profile::workbench_data_dir().join("nuphus.db");
+    }
     dirs::data_dir()
         .map(|d| d.join("nuphus").join("nuphus.db"))
         .unwrap_or_else(|| PathBuf::from(".").join(".nuphus").join("nuphus.db"))

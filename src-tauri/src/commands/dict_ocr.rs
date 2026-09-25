@@ -12,7 +12,7 @@ fn dict_dir() -> PathBuf {
                 .unwrap_or_else(|| {
                     dirs::data_dir()
                         .unwrap_or_else(|| PathBuf::from("."))
-                        .join("Nuphus")
+                        .join(nuphus::profile::data_name())
                 });
             base.join("dicts")
         })

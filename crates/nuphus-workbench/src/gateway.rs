@@ -19,8 +19,9 @@ use axum::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -269,7 +270,7 @@ impl<H: Host> Mcp<H> {
 }
 
 pub fn server_info() -> ServerConfig {
-    ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
         .with_instructions("Nuphus Workbench: native project/workflow service, not an Agent proxy. Read a canvas revision before editing. Publish then run with a unique request_id; reuse that ID for retries. Use run_events cursors to follow durable progress. Closing the client does not cancel a run.")
 }
 
@@ -311,6 +312,41 @@ pub fn tool_response(result: Result<Value>) -> CallToolResponse {
 impl<H: Host> ServerHandler for Mcp<H> {
     fn get_info(&self) -> ServerConfig {
         server_info()
+    }
+    async fn list_resources(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourcesResult, McpError> {
+        self.principal(&context)?
+            .authorize("read", None)
+            .map_err(|e| McpError::invalid_request(e.message, None))?;
+        Ok(crate::resources::list())
+    }
+    async fn list_resource_templates(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourceTemplatesResult, McpError> {
+        self.principal(&context)?
+            .authorize("read", None)
+            .map_err(|e| McpError::invalid_request(e.message, None))?;
+        Ok(crate::resources::templates())
+    }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ReadResourceResponse, McpError> {
+        let principal = self.principal(&context)?;
+        let (operation, args) = crate::resources::resolve(&request.uri)
+            .map_err(|e| McpError::invalid_params(e.message, None))?;
+        let value = self
+            .service
+            .dispatch(&principal, operation, args)
+            .await
+            .map_err(|e| McpError::invalid_request(e.message, None))?;
+        Ok(crate::resources::response(&request.uri, value))
     }
     async fn list_tools(
         &self,

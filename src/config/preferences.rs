@@ -200,6 +200,9 @@ impl UserPreferences {
     }
 
     fn path() -> PathBuf {
+        if crate::profile::WORKBENCH {
+            return crate::profile::config_dir().join("preferences.json");
+        }
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());

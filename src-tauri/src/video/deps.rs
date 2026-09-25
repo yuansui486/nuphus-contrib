@@ -62,7 +62,7 @@ impl BinTool {
 /// `<data_dir>/Nuphus/tools` — auto-download target & third probe candidate.
 pub fn tools_dir() -> Result<PathBuf, String> {
     let data_dir = dirs::data_dir().ok_or_else(|| "cannot resolve user data dir".to_string())?;
-    Ok(data_dir.join("Nuphus").join("tools"))
+    Ok(data_dir.join(nuphus::profile::data_name()).join("tools"))
 }
 
 fn on_path(tool: BinTool) -> bool {

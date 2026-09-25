@@ -116,8 +116,12 @@ fn find_step<'a>(steps: &'a [Step], id: &str) -> Option<&'a Step> {
 impl WorkflowEngine {
     /// Validate and freeze before spawn, making malformed drafts a synchronous API error.
     pub async fn prepare_debug(&self, request: DebugRequest) -> Result<Arc<DebugSession>, String> {
-        let mut draft = self
-            .store
+        let context = super::run_context::current();
+        let base_store = context
+            .as_ref()
+            .map(|context| &context.store)
+            .unwrap_or(&self.store);
+        let mut draft = base_store
             .get(&request.workflow_id)
             .await
             .ok_or("workflow_not_found")?;
@@ -192,7 +196,7 @@ impl WorkflowEngine {
             if !visited.insert(id.clone()) {
                 continue;
             }
-            if let Some(mut wf) = self.store.get(&id).await {
+            if let Some(mut wf) = base_store.get(&id).await {
                 wf.run_history.clear();
                 calls(&wf.steps, &mut pending);
                 definitions.push(wf);
@@ -210,7 +214,7 @@ impl WorkflowEngine {
             }
         }
         let snapshots = serde_json::to_value(&definitions).map_err(|error| error.to_string())?;
-        let store = WorkflowStore::frozen(self.store.root().to_path_buf(), definitions);
+        let store = WorkflowStore::frozen(base_store.root().to_path_buf(), definitions);
         let schemas = self.tools().map(|tools| tools.get_schemas());
         let report = match schemas.as_deref() {
             Some(schemas) => {
@@ -223,9 +227,12 @@ impl WorkflowEngine {
         if !errors.is_empty() {
             return Err(errors.join("; "));
         }
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = context
+            .as_ref()
+            .map(|context| context.run_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let recorder = TraceRecorder::create(
-            self.store.root(),
+            base_store.root(),
             &frozen_definition,
             &run_id,
             true,
@@ -244,7 +251,7 @@ impl WorkflowEngine {
         let mut variables = request.variables;
         if !variables.contains_key("params") {
             if let Ok(data) =
-                tokio::fs::read(self.store.workflow_dir(&draft.id).join("params.json")).await
+                tokio::fs::read(base_store.workflow_dir(&draft.id).join("params.json")).await
             {
                 if let Ok(params) = serde_json::from_slice::<Value>(&data) {
                     variables.insert("params".into(), params);
@@ -261,7 +268,10 @@ impl WorkflowEngine {
             selected_step_id: request.selected_step_id,
             mode: request.mode,
             use_retry_policy: request.use_retry_policy,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: context
+                .as_ref()
+                .map(|context| context.cancelled.clone())
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             cancel_notify: tokio::sync::Notify::new(),
             breakpoint_consumed: AtomicBool::new(false),
             ticks: AtomicU64::new(0),

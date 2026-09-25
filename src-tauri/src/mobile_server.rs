@@ -109,10 +109,7 @@ impl Default for MobileServerConfig {
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("nuphus")
-        .join("mobile_server.json")
+    nuphus::profile::config_dir().join("mobile_server.json")
 }
 
 /// 剥离 UTF-8 BOM：外部编辑器（记事本等）保存配置常带 BOM，

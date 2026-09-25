@@ -1790,7 +1790,7 @@ impl DesktopClient {
         }
         dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("Nuphus")
+            .join(crate::profile::data_name())
             .join("dicts")
     }
 }
@@ -1808,5 +1808,7 @@ pub fn captures_dir_path() -> std::io::Result<PathBuf> {
             return Ok(p);
         }
     }
-    Ok(std::env::temp_dir().join("nuphus").join("captures"))
+    Ok(std::env::temp_dir()
+        .join(crate::profile::config_name())
+        .join("captures"))
 }

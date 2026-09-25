@@ -14,9 +14,57 @@ struct Bridge {
     token: String,
 }
 
+impl Bridge {
+    async fn operation(&self, operation: &str, args: Value) -> Result<Value, ErrorData> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/{operation}", self.base))
+            .bearer_auth(&self.token)
+            .json(&args)
+            .send()
+            .await
+            .map_err(|_| ErrorData::internal_error("Workbench is not reachable", None))?;
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|_| ErrorData::internal_error("Invalid response", None))?;
+        body.get("result").cloned().ok_or_else(|| {
+            ErrorData::invalid_request("Workbench request rejected", body.get("error").cloned())
+        })
+    }
+}
+
 impl ServerHandler for Bridge {
     fn get_info(&self) -> ServerConfig {
         gateway::server_info()
+    }
+    async fn list_resources(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        self.operation("project.list", serde_json::json!({}))
+            .await?;
+        Ok(nuphus_workbench::resources::list())
+    }
+    async fn list_resource_templates(
+        &self,
+        _: Option<PaginatedRequestParams>,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        self.operation("project.list", serde_json::json!({}))
+            .await?;
+        Ok(nuphus_workbench::resources::templates())
+    }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let (op, args) = nuphus_workbench::resources::resolve(&request.uri)
+            .map_err(|e| ErrorData::invalid_params(e.message, None))?;
+        let value = self.operation(op, args).await?;
+        Ok(nuphus_workbench::resources::response(&request.uri, value))
     }
     async fn list_tools(
         &self,

@@ -66,11 +66,11 @@ const READ_TEMPLATE: &str = r#"# {agent_name} 对接协议
 pub fn handoff_root() -> PathBuf {
     crate::plugin_apps::find_plugin_dir()
         .parent()
-        .map(|root| root.join(".nuphus").join("handoff"))
+        .map(|root| root.join(nuphus::profile::home_name()).join("handoff"))
         .unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap_or_default()
-                .join(".nuphus")
+                .join(nuphus::profile::home_name())
                 .join("handoff")
         })
 }

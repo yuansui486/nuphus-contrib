@@ -279,6 +279,179 @@ fn refuses_future_schema_without_downgrading_it() {
 }
 
 #[test]
+fn project_identity_survives_registration_in_a_fresh_app_registry() {
+    let (dir, service, project, _) = fixture();
+    let draft = service
+        .store
+        .create(&project.project_id, "Keep", AuthoringMode::External)
+        .unwrap();
+    let other = WorkbenchStore::open(dir.path().join("another-app")).unwrap();
+    let registered = other.register_project(dir.path(), "Reopened").unwrap();
+    assert_eq!(project.project_id, registered.project_id);
+    assert_eq!(
+        other
+            .draft(&registered.project_id, &draft.workflow_id)
+            .unwrap(),
+        draft
+    );
+    // Simulate an earlier schema which stored identity only inside documents.
+    let conn =
+        rusqlite::Connection::open(dir.path().join(".nuphus-workbench/workbench.sqlite")).unwrap();
+    conn.execute("DELETE FROM metadata", []).unwrap();
+    let third = WorkbenchStore::open(dir.path().join("third-app")).unwrap();
+    assert_eq!(
+        third
+            .register_project(dir.path(), "Legacy")
+            .unwrap()
+            .project_id,
+        project.project_id
+    );
+}
+
+#[test]
+fn unavailable_project_does_not_block_other_project_recovery() {
+    let (dir, service, project, _) = fixture();
+    let detached = dir.path().join("detached");
+    std::fs::create_dir(&detached).unwrap();
+    let unavailable = service
+        .store
+        .register_project(&detached, "Detached")
+        .unwrap();
+    std::fs::rename(&detached, dir.path().join("detached-moved")).unwrap();
+    let draft = service
+        .store
+        .create(&project.project_id, "Recover", AuthoringMode::External)
+        .unwrap();
+    let version = service
+        .store
+        .publish_validated(&project.project_id, &draft.workflow_id, 1)
+        .unwrap();
+    let (run, _) = service
+        .store
+        .register_run(
+            &project.project_id,
+            "test",
+            "recovery",
+            "hash",
+            &version,
+            json!({}),
+            json!([]),
+        )
+        .unwrap();
+    let (count, errors) = service.store.recover_available().unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(errors[0].0, unavailable.project_id);
+    assert_eq!(errors[0].1.code, "project_unavailable");
+    assert_eq!(
+        service
+            .store
+            .run(&project.project_id, &run.run_id)
+            .unwrap()
+            .status,
+        RunStatus::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn direct_actions_are_scoped_durable_idempotent_and_do_not_create_drafts() {
+    let (_dir, service, p, token) = fixture();
+    let restricted = service.store.authenticate(&token).unwrap();
+    let args = json!({"project_id":p.project_id,"request_id":"action","tool":"desktop_test","parameters":{}});
+    assert_eq!(
+        service
+            .dispatch(&restricted, "automation.execute", args.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "permission_denied"
+    );
+    let (_, token) = service
+        .store
+        .create_client(
+            "Automation",
+            vec![p.project_id.clone()],
+            vec!["automation".into()],
+        )
+        .unwrap();
+    let client = service.store.authenticate(&token).unwrap();
+    let first = service
+        .dispatch(&client, "automation.execute", args.clone())
+        .await
+        .unwrap();
+    let second = service
+        .dispatch(&client, "automation.execute", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["run_id"], second["run_id"]);
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
+    assert!(service.store.drafts(&p.project_id).unwrap().is_empty());
+    let run = service
+        .store
+        .run(&p.project_id, first["run_id"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(run.snapshots[0]["steps"][0]["do"]["tool"], "desktop_test");
+    assert_eq!(
+        service
+            .dispatch(&client, "automation.observe", args)
+            .await
+            .unwrap_err()
+            .code,
+        "idempotency_conflict"
+    );
+}
+
+#[tokio::test]
+async fn debug_replay_keeps_its_snapshot_and_does_not_persist_test_values() {
+    let (_dir, service, p, token) = fixture();
+    let client = service.store.authenticate(&token).unwrap();
+    let draft = service
+        .store
+        .create(&p.project_id, "Debug", AuthoringMode::External)
+        .unwrap();
+    let mut args = json!({"project_id":p.project_id,"workflow_id":draft.workflow_id,"revision":1,"request_id":"debug","mode":"node","selected_step_id":"a","steps":[{"id":"a","name":"Wait","do":{"sleep":0.01}}],"runtime_inputs":{"token":"do-not-persist-me"}});
+    args["revision"] = json!(2);
+    assert_eq!(
+        service
+            .dispatch(&client, "workflow.debug", args.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "revision_conflict"
+    );
+    args["revision"] = json!(1);
+    let first = service
+        .dispatch(&client, "workflow.debug", args.clone())
+        .await
+        .unwrap();
+    service
+        .store
+        .update(
+            &p.project_id,
+            &draft.workflow_id,
+            1,
+            &[edit::Edit::Rename {
+                name: "Edited".into(),
+            }],
+        )
+        .unwrap();
+    let second = service
+        .dispatch(&client, "workflow.debug", args)
+        .await
+        .unwrap();
+    assert_eq!(first["run_id"], second["run_id"]);
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
+    let run = service
+        .store
+        .run(&p.project_id, first["run_id"].as_str().unwrap())
+        .unwrap();
+    assert!(!serde_json::to_string(&run)
+        .unwrap()
+        .contains("do-not-persist-me"));
+    assert_eq!(run.snapshots[0]["name"], "Debug");
+    assert_eq!(run.debug.unwrap()["selected_step_id"], "a");
+}
+
+#[test]
 fn stale_human_replies_cannot_resume_the_next_wait() {
     let (_dir, service, p, _) = fixture();
     let draft = service
@@ -403,6 +576,12 @@ async fn mcp_discovery_and_calls_use_per_request_auth_and_session_ownership() {
         .unwrap()
         .iter()
         .any(|t| t["name"] == "canvas_create"));
+    let (_, _, resources) = rpc(&http, &url, &token, Some(&session), json!({"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"workbench://projects"}})).await;
+    let projects: Value =
+        serde_json::from_str(resources["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(projects.as_array().unwrap().len(), 1);
+    let (_, _, denied) = rpc(&http, &url, &token, Some(&session), json!({"jsonrpc":"2.0","id":21,"method":"resources/read","params":{"uri":"workbench://projects/unauthorized-project"}})).await;
+    assert!(denied.get("error").is_some());
     let (_,_,body)=rpc(&http,&url,&token,Some(&session),json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"canvas_create","arguments":{"project_id":p.project_id,"name":"MCP"}}})).await;
     assert_eq!(
         body["result"]["structuredContent"]["result"]["authoring_mode"], "external",

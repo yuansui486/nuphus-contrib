@@ -53,7 +53,23 @@ impl Executor {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        if let Some(ref dir) = script.cwd {
+        if let Some(context) = crate::workflow::run_context::current() {
+            let directory = script
+                .cwd
+                .as_ref()
+                .map(|dir| {
+                    std::path::PathBuf::from(super::variables::resolve_vars_str(dir, variables))
+                })
+                .map(|dir| {
+                    if dir.is_absolute() {
+                        dir
+                    } else {
+                        context.project_dir.join(dir)
+                    }
+                })
+                .unwrap_or_else(|| context.project_dir.clone());
+            cmd.current_dir(directory);
+        } else if let Some(ref dir) = script.cwd {
             cmd.current_dir(super::variables::resolve_vars_str(dir, variables));
         }
 

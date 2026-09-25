@@ -1,4 +1,5 @@
 import { editorText } from './editorText'
+import { useCanvasBackend } from './CanvasBackend'
 /**
  * CanvasPage.tsx — 工作流画布页面壳（设计文档 2.2）
  *
@@ -53,17 +54,7 @@ import {
 } from 'lucide-react'
 
 import type { RunRecord, WorkflowStep, ToolSchema } from '../../core/types'
-import {
-  wfGetRaw,
-  wfSave,
-  wfValidate,
-  wfRun,
-  wfLayoutGet,
-  wfLayoutSave,
-  wfScheduleHistoryGet,
-  type ScheduleRunRecord,
-  type ValidationReport,
-} from '../lib/api'
+import { wfScheduleHistoryGet, type ScheduleRunRecord, type ValidationReport } from '../lib/api'
 import { useWorkflowGate } from '../lib/useWorkflowGate'
 import type {
   WorkflowIR,
@@ -127,6 +118,8 @@ interface CanvasPageProps {
   /** 切换到另一个工作流画布（工作台注入：换 id 即整页换成目标工作流） */
   onSwitchWorkflow?: (id: string) => void
   registerLeaveGuard?: (guard: CanvasLeaveGuard | null) => void
+  onEditorState?: (state: { dirty: boolean; selection: string[]; layerId: string; problems: Problem[]; validation: ValidationReport | null }) => void
+  onGenerateIntent?: (text: string) => void
 }
 
 /**
@@ -203,7 +196,11 @@ function CanvasInner({
   onClose,
   onSwitchWorkflow,
   registerLeaveGuard,
+  onEditorState,
+  onGenerateIntent,
 }: CanvasPageProps) {
+  const backend = useCanvasBackend()
+  const { wfGetRaw, wfSave, wfValidate, wfRun, wfLayoutGet, wfLayoutSave } = backend
   const { t, lang } = useLanguage()
   const ui = (zh: string, en: string) => (lang === 'zh' ? zh : en)
   const rf = useReactFlow()
@@ -423,7 +420,9 @@ function CanvasInner({
         () => null,
       )) as unknown as CanvasLayoutSidecar | null
       if (alive) setSidecar(layout)
-    })()
+    })().catch(error => {
+      if (alive) setNotice(String(error))
+    })
     return () => {
       alive = false
     }
@@ -503,7 +502,11 @@ function CanvasInner({
   }, [steps, variableIndex])
 
   // ── 只读判定：运行中锁（1.6）+ 旧格式整树只读（V13/R1）──
-  const readOnly = snapshot.running || !!projection?.index.hasCustomNodes || !!replayRunId
+  const readOnly =
+    (!backend.versioned && snapshot.running) || !!projection?.index.hasCustomNodes || !!replayRunId
+  useEffect(() => {
+    onEditorState?.({ dirty, selection: selectedIds, layerId, problems, validation: backendReport })
+  }, [dirty, selectedIds, layerId, problems, backendReport, onEditorState])
   // 只读翻转（运行开始等）时自动收起残留的连线插入菜单
   useEffect(() => {
     if (readOnly) setEdgeInsert(null)
@@ -983,7 +986,7 @@ function CanvasInner({
         // 实际执行的 IR。故不改「只落内存」：内存改动本来就在画布上，落盘才是危险动作。
         // 判定与「运行」入口同源（useWorkflowGate → wf_gate_status），后端 wf_save 兜底。
         const gateNow = await gateRefresh()
-        if (gateNow.locked) {
+        if (gateNow.locked && !backend.versioned) {
           setNotice(
             gateNow.reason === 'workflow'
               ? editorText(
@@ -1037,7 +1040,7 @@ function CanvasInner({
         saving.current = false
       }
     },
-    [gateRefresh, flushDrafts, draftStore],
+    [gateRefresh, flushDrafts, draftStore, backend.versioned, wfSave],
   )
 
   const runCheck = useCallback(async () => {
@@ -1138,7 +1141,7 @@ function CanvasInner({
       sidecarSaveTimer.current = setTimeout(() => {
         const layers = projection?.layers
         const cleaned = layers ? pruneSidecar(next, layers) : next
-        void wfLayoutSave(workflowId, cleaned).catch(() => {})
+        void wfLayoutSave(workflowId, cleaned).catch(error => setNotice(String(error)))
       }, 600)
     },
     [workflowId, projection],
@@ -1559,8 +1562,12 @@ function CanvasInner({
       const saved = await save()
       if (!saved) return false
       setIntentFormOpen(false)
-      onClose()
       const text = buildIntentTextTemplate(form, workflowId, ir?.name)
+      if (onGenerateIntent) {
+        onGenerateIntent(text)
+        return true
+      }
+      onClose()
       window.dispatchEvent(
         new CustomEvent('nuphus:append-to-chat', {
           detail: { text, mode: 'workflow' },
@@ -1568,7 +1575,7 @@ function CanvasInner({
       )
       return true
     },
-    [save, onClose, workflowId, ir?.name],
+    [save, onClose, workflowId, ir?.name, onGenerateIntent],
   )
 
   // ── 工具面板拖拽入画布（HTML5 DnD）──
@@ -1925,7 +1932,7 @@ function CanvasInner({
               type="button"
               className="wfc-btn"
               onClick={() => void save()}
-              disabled={!dirty || snapshot.running}
+              disabled={!dirty || (!backend.versioned && snapshot.running)}
               title={editorText('保存（Ctrl+S，保存前强制校验）', t)}
             >
               <Save size={13} /> {editorText('保存', t)}
@@ -1983,7 +1990,10 @@ function CanvasInner({
             <button
               className="wfc-btn"
               disabled={
-                (!selectedStep && !debugTarget) || !!replayRunId || (readOnly && !debugRunId)
+                !backend.debugging ||
+                (!selectedStep && !debugTarget) ||
+                !!replayRunId ||
+                (readOnly && !debugRunId)
               }
               onClick={() => {
                 if (debugRunId) {
@@ -2009,7 +2019,7 @@ function CanvasInner({
                 <button
                   key="ai"
                   className="wfc-btn"
-                  disabled={!selectedStep || readOnly || gateLocked}
+                  disabled={!backend.generation || !selectedStep || readOnly || gateLocked}
                   title={ui(
                     '按住 Shift 多选节点；仅修改所选范围',
                     'Shift-click to select nodes; edits stay in the selected scope',
@@ -2100,6 +2110,7 @@ function CanvasInner({
                 type="button"
                 className="wfc-btn"
                 onClick={() => setScheduleOpen(true)}
+                disabled={!backend.scheduling}
                 title={
                   ir.schedule?.enabled
                     ? editorText('定时运行已启用', t)
@@ -2119,7 +2130,7 @@ function CanvasInner({
                   playUiSound('switch')
                   setIntentFormOpen(true)
                 }}
-                disabled={readOnly}
+                disabled={readOnly || !backend.generation}
                 title={
                   readOnly
                     ? snapshot.running

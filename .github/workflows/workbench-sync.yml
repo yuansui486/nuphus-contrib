@@ -1,0 +1,108 @@
+name: Workbench upstream synchronization
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: workbench-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'yuansui486/nuphus-contrib'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      candidate: ${{ steps.merge.outputs.candidate }}
+      base: ${{ steps.merge.outputs.base }}
+      pr: ${{ steps.merge.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: edition/workflow-workbench
+          fetch-depth: 0
+      - name: Merge latest upstream into a candidate, never directly into product
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch https://github.com/mrpulor-gh/nuphus.git main
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          base_sha=$(git rev-parse HEAD)
+          echo "base=$base_sha" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Workbench already contains upstream main.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          sync_branch="sync/workbench-${upstream_sha:0:12}-${base_sha:0:8}"
+          if git ls-remote --exit-code --heads origin "$sync_branch" >/dev/null; then
+            git fetch origin "$sync_branch"
+            git checkout --detach FETCH_HEAD
+          else
+            git switch -c "$sync_branch"
+            if ! git merge --no-ff --no-edit --signoff -m "chore: 同步上游主分支 ${upstream_sha:0:12}" "$upstream_sha"; then
+              echo 'Merge conflict: product branch unchanged. Resolve the conflict on a contribution branch; no automatic conflict resolution is attempted.' >> "$GITHUB_STEP_SUMMARY"
+              git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            git push origin "HEAD:refs/heads/$sync_branch"
+          fi
+          candidate=$(git rev-parse HEAD)
+          pr=$(gh pr list --base edition/workflow-workbench --head "$sync_branch" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            gh pr create --base edition/workflow-workbench --head "$sync_branch" \
+              --title "chore: 同步上游主分支 ${upstream_sha:0:12}" \
+              --body "仅用于独立 Workbench 版本的上游同步。候选提交：$candidate。普通版与工作台测试全部通过且产品分支未变化后，才允许合入；不会自动发布安装包。"
+            pr=$(gh pr list --base edition/workflow-workbench --head "$sync_branch" --state open --json number --jq '.[0].number')
+          fi
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    # Explicit reusable CI is necessary: a GITHUB_TOKEN push/PR does not trigger
+    # another workflow automatically. This runs the exact candidate commit.
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/workflow-workbench
+    with:
+      ref: ${{ needs.prepare.outputs.candidate }}
+    permissions:
+      contents: read
+  promote:
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.changed == 'true' && needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.candidate }}
+          fetch-depth: 0
+      - name: Promote the tested merge without force-pushing
+        env:
+          EXPECTED_BASE: ${{ needs.prepare.outputs.base }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin edition/workflow-workbench
+          if [ "$(git rev-parse FETCH_HEAD)" != "$EXPECTED_BASE" ]; then
+            echo 'Product branch changed during CI; leaving candidate PR open. The next sync builds a new candidate.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git merge-base --is-ancestor "$EXPECTED_BASE" "$CANDIDATE"
+          # The candidate already contains the merge. A normal fast-forward push
+          # atomically rejects divergent intervening changes; no force or rebase.
+          git push origin "$CANDIDATE:refs/heads/edition/workflow-workbench"
+          gh pr comment "$PR_NUMBER" --body "已通过工作台与普通入口验证，并将完整测试过的合并提交快进到产品分支。未发布安装包。"

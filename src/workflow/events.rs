@@ -97,6 +97,11 @@ impl EventBus {
 
     /// 发射一个事件（所有 receiver 收到）
     pub fn emit(&self, event: WorkflowEvent) {
+        if let Some(context) = super::run_context::current() {
+            if let Some(sink) = &context.event_sink {
+                sink(&event);
+            }
+        }
         // 通道接近满载时预警，避免静默丢弃
         if self.tx.receiver_count() > 0 && self.tx.len() >= 200 {
             tracing::warn!(

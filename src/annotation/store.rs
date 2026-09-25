@@ -47,12 +47,14 @@ fn load_data_cached() -> AnnotationStoreData {
 fn store_path() -> &'static PathBuf {
     STORE_PATH.get_or_init(|| {
         let path = dirs::data_dir()
-            .map(|d| d.join(".nuphus").join("annotations"))
+            .map(|d| d.join(crate::profile::home_name()).join("annotations"))
             .unwrap_or_else(|| {
                 let home = std::env::var("HOME")
                     .or_else(|_| std::env::var("USERPROFILE"))
                     .unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(home).join(".nuphus").join("annotations")
+                PathBuf::from(home)
+                    .join(crate::profile::home_name())
+                    .join("annotations")
             });
         if let Err(e) = std::fs::create_dir_all(&path) {
             tracing::warn!("[AnnotationStore] failed to create dir: {}", e);

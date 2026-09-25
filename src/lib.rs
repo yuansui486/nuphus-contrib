@@ -28,6 +28,7 @@ pub mod mcp;
 pub mod memory;
 pub mod mobile_append;
 pub mod permissions;
+pub mod profile;
 pub mod render_bridge;
 pub mod runtime;
 pub mod security;

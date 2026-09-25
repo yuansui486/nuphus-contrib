@@ -169,7 +169,7 @@ fn models_dir_for_write() -> Result<PathBuf, String> {
     }
     let data_dir = dirs::data_dir()
         .ok_or_else(|| "无法定位用户数据目录 (dirs::data_dir 返回 None)".to_string())?;
-    let p = data_dir.join("Nuphus").join("models");
+    let p = data_dir.join(nuphus::profile::data_name()).join("models");
     std::fs::create_dir_all(&p).map_err(|e| format!("创建模型目录失败 {}: {e}", p.display()))?;
     Ok(p)
 }
@@ -179,7 +179,7 @@ fn models_dir_hint() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("NUPHUS_MODELS_DIR") {
         return Some(PathBuf::from(dir));
     }
-    dirs::data_dir().map(|d| d.join("Nuphus").join("models"))
+    dirs::data_dir().map(|d| d.join(nuphus::profile::data_name()).join("models"))
 }
 
 /// Bundled ("内置") vision-models directory shipped with the app: the

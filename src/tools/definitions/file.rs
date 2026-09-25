@@ -29,7 +29,9 @@ impl ToolRegistry {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let source = crate::utils::resolve_user_path(path);
-        let backup_dir = crate::utils::work_root().join(".nuphus").join("backup");
+        let backup_dir = crate::utils::work_root()
+            .join(crate::profile::home_name())
+            .join("backup");
         std::fs::create_dir_all(&backup_dir)
             .map_err(|e| format!("create backup dir failed: {}", e))?;
 

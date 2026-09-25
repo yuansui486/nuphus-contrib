@@ -11,6 +11,7 @@ pub mod executor;
 pub mod hud_control;
 pub mod inputs;
 pub mod references;
+pub mod run_context;
 pub mod scheduler;
 pub mod scoped_edit;
 pub mod store;
@@ -61,6 +62,8 @@ pub enum WorkflowRunSource {
     Schedule,
     /// 插件宿主触发
     Plugin,
+    /// Public Workbench API (not an embedded Agent).
+    External,
 }
 
 impl WorkflowRunSource {
@@ -75,6 +78,7 @@ impl WorkflowRunSource {
             WorkflowRunSource::Ui => "ui",
             WorkflowRunSource::Schedule => "schedule",
             WorkflowRunSource::Plugin => "plugin",
+            WorkflowRunSource::External => "external",
         }
     }
 }
@@ -165,6 +169,7 @@ impl<'a> ActiveRunGuard<'a> {
             workflow_id: workflow_id.to_string(),
             run_id: debug::current()
                 .map(|session| session.run_id.clone())
+                .or_else(|| run_context::current().map(|context| context.run_id.clone()))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             owner: source.owner_label().to_string(),
             started_at_ms: gate_now_ms(),
@@ -322,9 +327,11 @@ impl WorkflowEngine {
         // guard drop（含 validation 失败早退 / Ok / Err / panic / future 被 drop）自动释放。
         let _gate = ActiveRunGuard::acquire(self, workflow_id, &source)?;
         let debug_session = debug::current();
+        let run_context = run_context::current();
         let store = debug_session
             .as_ref()
             .map(|session| &session.store)
+            .or_else(|| run_context.as_ref().map(|context| &context.store))
             .unwrap_or(&self.store);
 
         // ── Pre-execution validation（与 execute_v2 内部校验同源）──
@@ -366,7 +373,7 @@ impl WorkflowEngine {
             .await;
 
         // ── Auto-export dual artifacts after successful execution ──
-        if result.is_ok() && debug_session.is_none() {
+        if result.is_ok() && debug_session.is_none() && run_context.is_none() {
             if let Err(e) = self.export_workflow(workflow_id).await {
                 tracing::warn!("Auto-export failed for workflow '{}': {e}", workflow_id);
             }

@@ -447,10 +447,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 
 /// 应用图标库目录：%APPDATA%/nuphus/icons/
 fn app_icons_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("nuphus")
-        .join("icons")
+    nuphus::profile::config_dir().join("icons")
 }
 
 /// icon 值是否为文件系统路径（对齐前端 isIconPath：盘符/UNC/带扩展名）

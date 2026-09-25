@@ -435,11 +435,17 @@ impl ToolRegistry {
         } else {
             Duration::from_secs(15)
         };
+        let run_context = crate::workflow::run_context::current();
         match tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    executor(&params_owned, &ctx)
+                    if let Some(context) = run_context {
+                        crate::workflow::run_context::CURRENT
+                            .sync_scope(context, || executor(&params_owned, &ctx))
+                    } else {
+                        executor(&params_owned, &ctx)
+                    }
                 }))
             }),
         )

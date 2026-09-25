@@ -88,6 +88,8 @@ impl<H: Host> Service<H> {
             | "workflow.list"
             | "workflow.get"
             | "workflow.validate"
+            | "workflow.tools"
+            | "workflow.schema"
             | "workflow.versions"
             | "workflow.export"
             | "run.list"
@@ -265,13 +267,13 @@ impl<H: Host> Service<H> {
                 self.store.draft(project, id)?;
                 self.host.view(project, id, operation, &args).await
             }
-            "automation.capabilities" | "automation.observe" | "automation.execute" => {
+            "automation.capabilities" | "workflow.tools" | "workflow.schema" => {
                 self.host.automation(&project_info, operation, &args).await
             }
-            "workflow.debug" => Err(ApiError::new(
-                "not_supported",
-                "Node debugging is not yet connected to the public service",
-            )),
+            "automation.observe" | "automation.execute" => {
+                self.run_action(principal, operation, &args).await
+            }
+            "workflow.debug" => self.start_debug(principal, &args).await,
             _ => Err(ApiError::new("unknown_operation", operation)),
         }
     }
@@ -295,13 +297,163 @@ impl<H: Host> Service<H> {
             .await
     }
 
+    async fn run_action(
+        &self,
+        principal: &Principal,
+        operation: &str,
+        args: &Value,
+    ) -> Result<Value> {
+        let project = string(args, "project_id")?;
+        let request_id = string(args, "request_id")?;
+        let hash = fingerprint(&json!({"operation":operation,"args":args}));
+        if let Some(run) = self
+            .store
+            .request_run(project, principal.id(), request_id, &hash)?
+        {
+            return Ok(json!({"run_id":run.run_id,"status":run.status,"created":false}));
+        }
+        self.host
+            .automation(&self.store.project(project)?, operation, args)
+            .await?;
+        let tool = string(args, "tool")?;
+        let parameters = args
+            .get("parameters")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| ApiError::new("invalid_params", "parameters must be an object"))?;
+        let document = json!({"id":uuid::Uuid::new_v4().to_string(),"name":format!("{operation}: {tool}"),"status":"Draft","steps":[{"id":"action","name":tool,"capture":"result","do":{"tool":tool,"with":parameters}}],"inputs":[],"run_history":[],"doc":null,"schedule":null,"dry_run":false});
+        require_passed(
+            &self
+                .host
+                .validate(&document, std::slice::from_ref(&document))
+                .await?,
+        )?;
+        self.host.preflight(&document, &json!({})).await?;
+        let version = self.store.publish_transient(project, document.clone())?;
+        let (run, created) = self.store.register_run(
+            project,
+            principal.id(),
+            request_id,
+            &hash,
+            &version,
+            json!({}),
+            json!([document]),
+        )?;
+        if created {
+            if let Err(error) = self
+                .host
+                .start(self.store.clone(), run.clone(), json!({}))
+                .await
+            {
+                self.store.transition(
+                    project,
+                    &run.run_id,
+                    RunStatus::Failed,
+                    Some(json!({"code":error.code,"message":error.message})),
+                )?;
+                return Err(error.details(json!({"run_id":run.run_id})));
+            }
+        }
+        Ok(
+            json!({"run_id":run.run_id,"status":self.store.run(project,&run.run_id)?.status,"created":created}),
+        )
+    }
+
+    async fn start_debug(&self, principal: &Principal, args: &Value) -> Result<Value> {
+        let project = string(args, "project_id")?;
+        let request_id = string(args, "request_id")?;
+        let hash = fingerprint(&json!({"operation":"workflow.debug","args":args}));
+        if let Some(run) = self
+            .store
+            .request_run(project, principal.id(), request_id, &hash)?
+        {
+            return Ok(json!({"run_id":run.run_id,"status":run.status,"created":false}));
+        }
+        let draft = self.store.draft(project, string(args, "workflow_id")?)?;
+        if revision(args)? != draft.revision {
+            return Err(ApiError::new(
+                "revision_conflict",
+                "Reload the canvas before debugging",
+            ));
+        }
+        let mode = string(args, "mode")?;
+        if !["node", "through"].contains(&mode) {
+            return Err(ApiError::new(
+                "invalid_params",
+                "mode must be node or through",
+            ));
+        }
+        let mut document = draft.document;
+        if let Some(steps) = args.get("steps") {
+            document["steps"] = steps.clone();
+        }
+        if let Some(inputs) = args.get("input_specs") {
+            document["inputs"] = inputs.clone();
+        }
+        crate::edit::check_document(&document, &draft.workflow_id)?;
+        let definitions = self.definitions(project, &document)?;
+        let variables = args.get("variables").cloned().unwrap_or_else(|| json!({}));
+        let inputs = args
+            .get("runtime_inputs")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !variables.is_object() || !inputs.is_object() {
+            return Err(ApiError::new(
+                "invalid_params",
+                "Test variables and runtime inputs must be objects",
+            ));
+        }
+        let options = json!({"mode":mode,"selected_step_id":string(args,"selected_step_id")?,"use_retry_policy":args.get("use_retry_policy").and_then(Value::as_bool).unwrap_or(false),"source":args.get("source").cloned().unwrap_or_else(||json!({"kind":"manual"}))});
+        let version = crate::Version {
+            version_id: format!("draft:{}:{}", draft.workflow_id, draft.revision),
+            workflow_id: draft.workflow_id,
+            revision: draft.revision,
+            document,
+            created_at: draft.updated_at,
+        };
+        let (run, created) = self.store.register_run_with_debug(
+            project,
+            principal.id(),
+            request_id,
+            &hash,
+            &version,
+            json!({"test_values":"See redacted invocation evidence"}),
+            json!(definitions),
+            Some(options),
+        )?;
+        if created {
+            // Native prepare_debug validates only the chosen execution scope and
+            // resolves its test data before any action can be dispatched.
+            if let Err(error) = self
+                .host
+                .start(
+                    self.store.clone(),
+                    run.clone(),
+                    json!({"variables":variables,"runtime_inputs":inputs}),
+                )
+                .await
+            {
+                self.store.transition(
+                    project,
+                    &run.run_id,
+                    RunStatus::Failed,
+                    Some(json!({"code":error.code,"message":error.message})),
+                )?;
+                return Err(error.details(json!({"run_id":run.run_id})));
+            }
+        }
+        Ok(
+            json!({"run_id":run.run_id,"created":created,"status":self.store.run(project,&run.run_id)?.status}),
+        )
+    }
+
     async fn start(&self, principal: &Principal, args: &Value) -> Result<Value> {
         let project = string(args, "project_id")?;
         if let Some(run) = self.store.request_run(
             project,
             principal.id(),
             string(args, "request_id")?,
-            &fingerprint(args),
+            &fingerprint(&json!({"operation":"workflow.run","args":args})),
         )? {
             return Ok(json!({"run_id":run.run_id,"created":false,"status":run.status}));
         }
@@ -317,7 +469,7 @@ impl<H: Host> Service<H> {
             project,
             principal.id(),
             string(args, "request_id")?,
-            &fingerprint(args),
+            &fingerprint(&json!({"operation":"workflow.run","args":args})),
             &version,
             redacted_inputs,
             json!(definitions),

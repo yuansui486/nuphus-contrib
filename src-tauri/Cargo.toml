@@ -17,6 +17,7 @@ workspace = true
 # Nuphus Core
 nuphus = { path = "../src" }
 nuphus-index = { path = "../crates/nuphus-index" }
+nuphus-workbench = { path = "../crates/nuphus-workbench" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -148,3 +149,4 @@ path = "src/main.rs"
 [features]
 default = []
 market = []
+workbench = ["nuphus/workbench", "nuphus-workbench/gateway"]

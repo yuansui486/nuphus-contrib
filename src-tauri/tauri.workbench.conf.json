@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Nuphus Workbench",
+  "identifier": "io.github.yuansui486.nuphusworkbench",
+  "version": "0.1.0",
+  "build": {
+    "beforeDevCommand": "npm run dev:workbench",
+    "beforeBuildCommand": "npm run build:workbench",
+    "devUrl": "http://localhost:5176",
+    "frontendDist": "../frontend/dist-workbench"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": ""
+    }
+  },
+  "bundle": { "createUpdaterArtifacts": false }
+}

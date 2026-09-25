@@ -738,6 +738,9 @@ pub fn resolve_project_root() -> PathBuf {
 /// 所有运行时**写入**路径应统一走这里；`resolve_project_root` 保留给路径信任
 /// 边界（workspace 内/外判定）等只读场景。
 pub fn nuphus_data_dir() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        return crate::profile::workbench_data_dir();
+    }
     if let Ok(dir) = std::env::var("NUPHUS_DATA_DIR") {
         if !dir.trim().is_empty() {
             return PathBuf::from(dir);
@@ -791,6 +794,9 @@ struct PluginRootCandidate {
 }
 
 fn resolve_plugin_root() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        return crate::profile::workbench_data_dir().join("plugin");
+    }
     let exe = std::env::current_exe().ok();
     let data_plugin_dir = nuphus_data_dir().join("plugin");
     let candidates = plugin_root_candidates(
@@ -1283,6 +1289,9 @@ pub fn active_memory_md_path() -> PathBuf {
 /// 未配置项目目录时 cwd 可能取不到（极罕见：进程启动目录已被删除）→ 回退当前盘
 /// 根目录，避免返回相对路径导致后续所有解析再次落到 cwd 上。
 pub fn work_root() -> PathBuf {
+    if let Some(context) = crate::workflow::run_context::current() {
+        return context.project_dir.clone();
+    }
     let project_dir = crate::config::UserPreferences::load().project_dir;
     if !project_dir.trim().is_empty() {
         return PathBuf::from(project_dir.trim());

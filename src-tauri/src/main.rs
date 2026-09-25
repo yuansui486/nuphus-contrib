@@ -25,6 +25,7 @@ mod startup_guard;
 mod state;
 mod utils;
 mod video;
+mod workbench;
 
 /// Win11 系统圆角：main 窗口是无装饰窗口（tauri.conf.json `decorations: false`），
 /// 四角默认裁成直角。这里向 DWM 声明圆角偏好，由系统按 Win11 规范裁剪四角。
@@ -55,6 +56,16 @@ fn apply_win11_rounded_corners<R: tauri::Runtime>(window: &tauri::WebviewWindow<
 }
 
 fn main() {
+    if nuphus::profile::WORKBENCH {
+        std::env::set_var(
+            "NUPHUS_BROWSER_PROFILE_DIR",
+            nuphus::profile::workbench_data_dir().join("browser_profile_v2"),
+        );
+        std::env::set_var(
+            "NUPHUS_MODELS_DIR",
+            nuphus::profile::workbench_data_dir().join("models"),
+        );
+    }
     // Inject the persisted external-browser CDP endpoint into the process env so
     // future BrowserClient::new() (direct channel) picks it up; the MCP channel
     // gets it via dual::nuphus_mcp_config() at spawn time.
@@ -79,7 +90,7 @@ fn main() {
         .or_else(|_| std::env::var("HOME"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".nuphus")
+        .join(nuphus::profile::home_name())
         .join("panic.log");
     std::panic::set_hook(Box::new(move |info| {
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -159,6 +170,10 @@ fn main() {
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            workbench::workbench_call,
+            workbench::workbench_clients,
+            workbench::workbench_view_state,
+            workbench::authoring::workbench_generate,
             commands::list_memories,
             commands::update_memory,
             commands::delete_memory,
@@ -482,6 +497,9 @@ fn main() {
             commands::get_changelog,
         ])
         .setup(|app| {
+            if nuphus::profile::WORKBENCH {
+                workbench::install(app.handle())?;
+            }
             let desktop_state = app.state::<state::AppState>();
             nuphus::tools::desktop_approval::install_host(
                 &desktop_state.signals,
@@ -857,7 +875,9 @@ fn main() {
             // ── 外部 Agent 交接门铃（HTTP server，仅 127.0.0.1）──
             // 事件驱动：POST 到达即入 HandoffStore，轮次边界由 react_loop 被动 drain，无轮询。
             // 启动失败内部优雅降级（warn 日志），不阻塞应用启动。
-            crate::handoff_server::spawn(app.handle().clone());
+            if !nuphus::profile::WORKBENCH {
+                crate::handoff_server::spawn(app.handle().clone());
+            }
 
             // ── Session Shelf 预热：旧镜像迁移 → SQLite 快照装回内存展示台，rail 列表立即可用 ──
             {
@@ -902,8 +922,10 @@ fn main() {
             // 新用户首次使用免配置：缺失时写入官方中继默认值；自建中继已有配置则保留。
             // 出站 WS 连中继服务器，收到任务走 submit_user_message 共享入口（source="relay"）。
             // 断线指数退避重连。（2026-08 起 Pro 体系移除，远程访问对所有配对设备免费）
-            crate::relay_client::ensure_default_config();
-            crate::relay_client::spawn_relay_loops(app.handle().clone());
+            if !nuphus::profile::WORKBENCH {
+                crate::relay_client::ensure_default_config();
+                crate::relay_client::spawn_relay_loops(app.handle().clone());
+            }
 
             // ── 移动端局域网 server：默认关闭，仅当持久化配置 enabled=true 时自动恢复 ──
             // （上次退出前处于开启状态 → 重启后继续提供服务；token/端口随配置恢复）
@@ -911,7 +933,7 @@ fn main() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let cfg = crate::mobile_server::load_config();
-                    if cfg.enabled {
+                    if cfg.enabled && !nuphus::profile::WORKBENCH {
                         let state = app_handle.state::<crate::state::AppState>();
                         match crate::mobile_server::start_server(&app_handle, &state, cfg.port).await {
                             Ok(status) => tracing::info!("[Mobile] 配置 enabled=true，已自动恢复启动（端口 {}）", status.port),
@@ -1080,7 +1102,14 @@ fn main() {
         } = event
         {
             if label == "main" {
-                if let tauri::WindowEvent::CloseRequested { .. } = win_event {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = win_event {
+                    if nuphus::profile::WORKBENCH {
+                        api.prevent_close();
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                        return;
+                    }
                     // 关闭前保存当前 session（元数据行 + Shelf 磁盘镜像）
                     if let Some(state) = app_handle.try_state::<crate::state::AppState>() {
                         let protected =

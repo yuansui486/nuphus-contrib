@@ -162,6 +162,8 @@ pub struct Run {
     pub result: Option<Value>,
     #[serde(default)]
     pub pending_request: Option<HumanRequest>,
+    #[serde(default)]
+    pub debug: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

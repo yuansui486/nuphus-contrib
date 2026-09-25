@@ -8,9 +8,10 @@ import { useLanguage } from '../../locales'
 interface TitleBarProps {
   onNewChat?: () => void
   agentState?: NuphusAvatarState
+  brand?: string
 }
 
-export function TitleBar({ onNewChat, agentState = 'idle' }: TitleBarProps) {
+export function TitleBar({ onNewChat, agentState = 'idle', brand = 'Nuphus' }: TitleBarProps) {
   const { t } = useLanguage()
   const [menuOpen, setMenuOpen] = useState(false)
   const [win, setWin] = useState<Window | null>(null)
@@ -42,7 +43,7 @@ export function TitleBar({ onNewChat, agentState = 'idle' }: TitleBarProps) {
         <div className="title-bar-icon">
           <NuphusAvatar state={agentState} size={20} />
         </div>
-        <span className="title-bar-brand">Nuphus</span>
+        <span className="title-bar-brand">{brand}</span>
       </div>
       <span className="title-bar-spacer" data-tauri-drag-region />
       {/* 桌面端：窗口控制按钮 */}

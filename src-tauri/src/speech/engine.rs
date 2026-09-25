@@ -54,7 +54,12 @@ fn stt_dir_candidates() -> Vec<PathBuf> {
         v.push(PathBuf::from(dir));
     }
     if let Some(data_dir) = dirs::data_dir() {
-        v.push(data_dir.join("Nuphus").join("models").join("stt"));
+        v.push(
+            data_dir
+                .join(nuphus::profile::data_name())
+                .join("models")
+                .join("stt"),
+        );
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(p) = exe.parent() {
@@ -401,7 +406,10 @@ mod tests {
         let Some(data_dir) = dirs::data_dir() else {
             return;
         };
-        let stt = data_dir.join("Nuphus").join("models").join("stt");
+        let stt = data_dir
+            .join(nuphus::profile::data_name())
+            .join("models")
+            .join("stt");
         if !stt.is_dir() {
             eprintln!(
                 "[stt_degrade] {} not present, nothing to test",

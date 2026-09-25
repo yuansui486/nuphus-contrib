@@ -20,8 +20,12 @@ pub fn operations() -> Vec<Operation> {
                     json!({"type":"integer","minimum":0})
                 }
                 "limit" => json!({"type":"integer","minimum":1,"maximum":1000}),
-                "focus" => json!({"type":"boolean","default":false}),
-                "document" | "inputs" | "layout" => json!({"type":"object"}),
+                "focus" | "use_retry_policy" => json!({"type":"boolean","default":false}),
+                "document" | "inputs" | "layout" | "parameters" | "variables"
+                | "runtime_inputs" => json!({"type":"object"}),
+                "steps" | "input_specs" => json!({"type":"array","items":{"type":"object"}}),
+                "source" => json!({}),
+                "mode" => json!({"type":"string","enum":["node","through"]}),
                 "authoring_mode" => json!({"type":"string","enum":["internal","external"]}),
                 "operations" => json!({"type":"array","minItems":1}),
                 _ => json!({"type":"string","minLength":1}),
@@ -162,5 +166,10 @@ pub fn operations() -> Vec<Operation> {
     add("run.cancel", "Request cancellation. Observe run events until terminal status; an in-flight action may finish first.", "run", &["project_id","run_id"], &[]);
     add("run.respond", "Respond to the current explicit wait using its request_id and decision (continue or cancel). Stale replies never approve a later wait. Requires respond permission.", "respond", &["project_id","run_id","request_id","decision"], &[]);
     add("automation.capabilities", "Discover native automation availability and restrictions before building automation steps.", "read", &["project_id"], &[]);
+    add("automation.observe", "Run an explicitly requested read-only native observation as a durable one-step run. Query run.steps for full structured output. No screenshot or private app content is sent to a model automatically.", "automation", &["project_id","request_id","tool","parameters"], &[]);
+    add("workflow.tools", "Discover native tool-step schemas from the same registry as the canvas selector. Includes file, network and automation tools; does not execute them.", "read", &["project_id"], &["tool_filter"]);
+    add("workflow.schema", "Read the upstream authoritative step JSON Schema. The document has id, name, status, steps, inputs, doc and schedule; never invent node shapes.", "read", &["project_id"], &[]);
+    add("workflow.debug", "Test one node or run through the selected node with explicit test variables and data provenance. This performs real actions and can repeat side effects in the selected scope. Debug definitions are frozen and never published over the canvas. Use run.pause/resume/cancel and run.steps to control and inspect.", "run", &["project_id","workflow_id","revision","request_id","selected_step_id","mode"], &["steps","input_specs","variables","runtime_inputs","use_retry_policy","source"]);
+    add("automation.execute", "Execute one existing native desktop/browser tool locally using the same executor and automation gate. Returns run_id; repeat the same request_id only to retry an uncertain reply. Discover schemas with automation.capabilities first. No internal Agent is invoked.", "automation", &["project_id","request_id","tool","parameters"], &[]);
     result
 }

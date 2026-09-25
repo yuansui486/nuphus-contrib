@@ -51,6 +51,61 @@ fn conflict(actual: u64) -> ApiError {
     .details(json!({"current_revision": actual}))
 }
 
+// Identity travels with a project, not with the application's registry. This
+// also adopts identities from pre-metadata projects without rewriting history.
+fn project_identity(directory: &Path, preferred: Option<&str>) -> Result<String> {
+    let data = directory.join(".nuphus-workbench");
+    std::fs::create_dir_all(&data)?;
+    let mut conn = connect(&data.join("workbench.sqlite"))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key='project_id'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let mut legacy = None;
+    for table in ["drafts", "runs"] {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if exists {
+            let body: Option<String> = tx
+                .query_row(&format!("SELECT body FROM {table} LIMIT 1"), [], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if let Some(body) = body {
+                legacy = serde_json::from_str::<Value>(&body)?
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if legacy.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let id = legacy
+        .or_else(|| preferred.map(str::to_owned))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    tx.execute(
+        "INSERT INTO metadata(key,value) VALUES('project_id',?1)",
+        [&id],
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
 fn event(
     conn: &Connection,
     project: &str,
@@ -101,7 +156,20 @@ impl WorkbenchStore {
         }
         let directory = directory.canonicalize()?.to_string_lossy().to_string();
         let conn = self.registry()?;
-        let id = uuid::Uuid::new_v4().to_string();
+        let previous: Option<String> = conn
+            .query_row(
+                "SELECT project_id FROM projects WHERE directory=?1",
+                [&directory],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = project_identity(Path::new(&directory), previous.as_deref())?;
+        if previous.as_ref().is_some_and(|old| old != &id) {
+            return Err(ApiError::new(
+                "project_identity_changed",
+                "The directory now contains a different project; register it in a new location",
+            ));
+        }
         let inserted = conn.execute("INSERT INTO projects(project_id,name,directory) VALUES(?1,?2,?3) ON CONFLICT(directory) DO NOTHING",
             params![id, name.trim(), directory])?;
         let project = conn.query_row(
@@ -189,6 +257,7 @@ impl WorkbenchStore {
             cursor INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
             workflow_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS events_run ON events(run_id,cursor);
+            CREATE TABLE IF NOT EXISTS authoring_sessions(workflow_id TEXT PRIMARY KEY, body TEXT NOT NULL);
             PRAGMA user_version=1;")?;
         Ok(conn)
     }
@@ -225,6 +294,30 @@ impl WorkbenchStore {
         )?;
         tx.commit()?;
         Ok(draft)
+    }
+
+    pub fn authoring_session(&self, project: &str, workflow: &str) -> Result<Option<Value>> {
+        self.draft(project, workflow)?;
+        let body: Option<String> = self
+            .project_db(project)?
+            .query_row(
+                "SELECT body FROM authoring_sessions WHERE workflow_id=?1",
+                [workflow],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(decode).transpose()
+    }
+
+    pub fn save_authoring_session(
+        &self,
+        project: &str,
+        workflow: &str,
+        session: &Value,
+    ) -> Result<()> {
+        self.draft(project, workflow)?;
+        self.project_db(project)?.execute("INSERT INTO authoring_sessions(workflow_id,body) VALUES(?1,?2) ON CONFLICT(workflow_id) DO UPDATE SET body=excluded.body",params![workflow,session.to_string()])?;
+        Ok(())
     }
 
     pub fn drafts(&self, project: &str) -> Result<Vec<Draft>> {
@@ -415,6 +508,29 @@ impl WorkbenchStore {
         redacted_inputs: Value,
         snapshots: Value,
     ) -> Result<(Run, bool)> {
+        self.register_run_with_debug(
+            project,
+            client,
+            request_id,
+            fingerprint,
+            version,
+            redacted_inputs,
+            snapshots,
+            None,
+        )
+    }
+
+    pub fn register_run_with_debug(
+        &self,
+        project: &str,
+        client: &str,
+        request_id: &str,
+        fingerprint: &str,
+        version: &Version,
+        redacted_inputs: Value,
+        snapshots: Value,
+        debug: Option<Value>,
+    ) -> Result<(Run, bool)> {
         if request_id.trim().is_empty() {
             return Err(ApiError::new("invalid_params", "request_id is required"));
         }
@@ -448,6 +564,7 @@ impl WorkbenchStore {
             updated_at: now(),
             result: None,
             pending_request: None,
+            debug,
         };
         tx.execute("INSERT INTO runs(run_id,workflow_id,client_id,request_id,fingerprint,body) VALUES(?1,?2,?3,?4,?5,?6)",
             params![run.run_id,run.workflow_id,client,request_id,fingerprint,serde_json::to_string(&run)?])?;
@@ -465,6 +582,33 @@ impl WorkbenchStore {
 
     pub fn run(&self, project: &str, id: &str) -> Result<Run> {
         load_run(&self.project_db(project)?, id)
+    }
+
+    /// An explicit one-action invocation still has an immutable version and
+    /// durable run record, but does not clutter the user's canvas draft list.
+    pub fn publish_transient(&self, project: &str, document: Value) -> Result<Version> {
+        let workflow_id = document
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::new("invalid_document", "Workflow ID required"))?
+            .to_owned();
+        let version = Version {
+            version_id: uuid::Uuid::new_v4().to_string(),
+            workflow_id,
+            revision: 1,
+            document,
+            created_at: now(),
+        };
+        self.project_db(project)?.execute(
+            "INSERT INTO versions(version_id,workflow_id,revision,body) VALUES(?1,?2,?3,?4)",
+            params![
+                version.version_id,
+                version.workflow_id,
+                version.revision,
+                serde_json::to_string(&version)?
+            ],
+        )?;
+        Ok(version)
     }
 
     pub fn runs(&self, project: &str) -> Result<Vec<Run>> {
@@ -601,21 +745,42 @@ impl WorkbenchStore {
     /// Call once when the host starts, before accepting clients. Reconnecting a
     /// client must not call this: connections do not own execution lifetimes.
     pub fn recover_interrupted(&self) -> Result<usize> {
+        let (recovered, errors) = self.recover_available()?;
+        if let Some((_, error)) = errors.into_iter().next() {
+            return Err(error);
+        }
+        Ok(recovered)
+    }
+
+    /// A disconnected drive must not prevent other projects from starting.
+    /// Callers display/log failures rather than silently discarding them.
+    pub fn recover_available(&self) -> Result<(usize, Vec<(String, ApiError)>)> {
         let mut recovered = 0;
+        let mut errors = Vec::new();
         for project in self.projects()? {
-            for run in self.runs(&project.project_id)? {
+            let runs = match self.runs(&project.project_id) {
+                Ok(runs) => runs,
+                Err(error) => {
+                    errors.push((project.project_id, error));
+                    continue;
+                }
+            };
+            for run in runs {
                 if !run.status.terminal() {
-                    self.transition(
+                    if let Err(error) = self.transition(
                         &project.project_id,
                         &run.run_id,
                         RunStatus::Interrupted,
                         Some(json!({"code":"host_restarted"})),
-                    )?;
+                    ) {
+                        errors.push((project.project_id.clone(), error));
+                        continue;
+                    }
                     recovered += 1;
                 }
             }
         }
-        Ok(recovered)
+        Ok((recovered, errors))
     }
 
     pub fn append_event(

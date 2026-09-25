@@ -803,7 +803,13 @@ fn sync_models_to_data_dir() {
         .join("models");
 
     let data_dir = match std::env::var("APPDATA") {
-        Ok(d) => std::path::PathBuf::from(d).join("Nuphus").join("models"),
+        Ok(d) => std::path::PathBuf::from(d)
+            .join(if std::env::var_os("CARGO_FEATURE_WORKBENCH").is_some() {
+                "nuphus-workbench"
+            } else {
+                "Nuphus"
+            })
+            .join("models"),
         Err(_) => {
             println!("cargo:warning=无法获取 APPDATA，跳过模型同步");
             return;

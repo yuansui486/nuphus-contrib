@@ -109,7 +109,7 @@ pub fn resolve_models_dir() -> Option<PathBuf> {
 
     // 2. 用户数据目录
     if let Some(data_dir) = dirs::data_dir() {
-        let p = data_dir.join("Nuphus").join("models");
+        let p = data_dir.join(crate::profile::data_name()).join("models");
         if p.exists() {
             tracing::debug!("[models] 从 data_dir 加载: {}", p.display());
             return Some(p);

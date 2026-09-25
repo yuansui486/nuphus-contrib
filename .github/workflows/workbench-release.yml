@@ -1,0 +1,83 @@
+name: Workbench installation packages
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  revision:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: edition/workflow-workbench
+      - id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  verify:
+    needs: revision
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/workflow-workbench
+    with:
+      ref: ${{ needs.revision.outputs.sha }}
+  package:
+    needs: [revision, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+            bundle: nsis
+          - os: macos-15
+            platform: macos-arm64
+            bundle: app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.revision.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: workbench-release-${{ matrix.os }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - name: Verify Apple Silicon runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = arm64
+      - name: Build independent edition (never upstream updater channel)
+        run: npx tauri build --config src-tauri/tauri.workbench.conf.json --features workbench --bundles ${{ matrix.bundle }}
+      - name: Build stdio bridge
+        run: cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbench-mcp
+      - name: Sign and package ARM64 DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app='target/release/bundle/macos/Nuphus Workbench.app'
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          stage=$(mktemp -d)
+          cp -R "$app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname 'Nuphus Workbench' -srcfolder "$stage" -format UDZO -ov 'Nuphus-Workbench-macos-arm64.dmg'
+          echo 'ARM64 preview is ad-hoc signed, not Apple notarized. macOS 15+ Accessibility/Screen Recording authorization and real-app operation need manual acceptance.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuphus-workbench-${{ matrix.platform }}-${{ needs.revision.outputs.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/release/bundle/nsis/*.exe
+            Nuphus-Workbench-macos-arm64.dmg
+            target/release/nuphus-workbench-mcp*

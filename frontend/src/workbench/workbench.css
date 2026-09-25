@@ -1,0 +1,244 @@
+.wb-app {
+  --border-color: var(--border-primary);
+  --accent-color: var(--accent);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+}
+.wb-app button,
+.wb-app input,
+.wb-app select,
+.wb-app textarea {
+  font: inherit;
+}
+.wb-nav,
+.wb-editor-mode,
+.wb-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+.wb-nav button,
+.wb-dashboard button,
+.wb-editor-mode select,
+.wb-conflict button,
+.wb-authoring button {
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  padding: 7px 12px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  cursor: pointer;
+}
+.wb-app button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.wb-nav button[aria-current],
+.wb-dashboard .wb-primary {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+.wb-theme {
+  margin-left: auto;
+}
+.wb-app input:not([type='checkbox']),
+.wb-app select,
+.wb-authoring textarea {
+  min-width: 0;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.wb-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+.wb-dashboard {
+  padding: 24px;
+  width: 100%;
+  overflow: auto;
+}
+.wb-dashboard > header {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.wb-dashboard h1 {
+  font-size: 24px;
+  margin: 0 0 8px;
+}
+.wb-dashboard h2 {
+  font-size: 17px;
+  margin: 0 0 10px;
+}
+.wb-dashboard p,
+.wb-editor-mode small {
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+.wb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 16px;
+  margin-top: 24px;
+}
+.wb-dashboard .wb-card {
+  text-align: left;
+  padding: 20px;
+  overflow-wrap: anywhere;
+}
+.wb-empty {
+  max-width: 600px;
+  margin: 60px auto;
+  text-align: center;
+}
+.wb-create {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: end;
+  margin: 20px 0;
+}
+.wb-create > label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wb-create fieldset {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border-color);
+}
+.wb-create fieldset label {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.wb-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+.wb-token {
+  border: 1px solid var(--accent-color);
+  padding: 16px;
+}
+.wb-token input {
+  width: 100%;
+  margin-bottom: 10px;
+}
+.wb-notice {
+  display: flex;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  overflow-wrap: anywhere;
+}
+.wb-notice span {
+  flex: 1;
+}
+.wb-notice button {
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.wb-editor {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.wb-editor-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.wb-canvas {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.wb-canvas > .wfc-page {
+  position: absolute;
+  inset: 0;
+}
+.wb-conflict {
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border-left: 3px solid var(--accent-color);
+  overflow-wrap: anywhere;
+}
+.wb-conflict button {
+  margin-left: 12px;
+}
+.wb-run {
+  padding: 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  margin: 12px 0;
+}
+.wb-run pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 360px;
+  overflow: auto;
+}
+.wb-authoring {
+  width: 320px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  padding: 14px;
+  gap: 12px;
+  overflow: auto;
+}
+.wb-authoring h2 {
+  font-size: 16px;
+  margin: 0;
+}
+.wb-authoring textarea {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+}
+.wb-authoring-log {
+  flex: 1;
+  min-height: 80px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+}
+@media (max-width: 1000px) {
+  .wb-authoring {
+    width: 260px;
+  }
+  .wb-nav {
+    padding: 6px 10px;
+    gap: 4px;
+  }
+}

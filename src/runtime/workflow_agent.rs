@@ -25,6 +25,16 @@ use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Optional host-owned authoring backend. The ordinary Agent keeps its original
+/// tools and persistence; editions can reuse its conversation loop without
+/// routing structured edits through filesystem writes or a second Agent.
+#[async_trait::async_trait]
+pub trait WorkflowAuthoring: Send + Sync {
+    fn schemas(&self) -> Vec<crate::api::ToolDefinition>;
+    fn system_prompt(&self) -> String;
+    async fn execute(&self, tool: &str, params: &serde_json::Value) -> ToolResult;
+}
+
 /// WorkflowAgent 配置
 pub struct WorkflowAgentConfig {
     pub max_iterations: usize,
@@ -122,6 +132,7 @@ pub struct WorkflowAgent {
     /// 内部流程标记（refine 用）：本轮 input 以 internal user 消息入 session（前端不显示），
     /// 且不重复 push（调用方已手动 push_user_internal）。
     pub(crate) internal_input: bool,
+    authoring: Option<Arc<dyn WorkflowAuthoring>>,
 }
 
 impl WorkflowAgent {
@@ -168,6 +179,7 @@ impl WorkflowAgent {
             workflow_engine: None,
             source: "desktop".to_string(),
             internal_input: false,
+            authoring: None,
         }
         .apply_supports_vision()
     }
@@ -182,6 +194,12 @@ impl WorkflowAgent {
     /// Default "desktop"; the mobile HTTP entry sets "mobile" so events carry the origin.
     pub fn set_source(&mut self, source: &str) {
         self.source = source.to_string();
+    }
+
+    pub fn set_authoring(&mut self, authoring: Arc<dyn WorkflowAuthoring>) {
+        self.authoring = Some(authoring);
+        self.cached_prompt = None;
+        self.cached_tools = None;
     }
 
     /// Emit event through shared emitter
@@ -367,11 +385,17 @@ impl WorkflowAgent {
     /// Build tool schemas — WorkflowAgent 的工具集已在构造时由 ToolRegistry::work_agent() 过滤，
     /// 此处直接取全量，无需二次过滤（LEADER_ONLY 工具本就不在其中）。
     fn get_filtered_schemas(&self) -> Vec<crate::api::ToolDefinition> {
+        if let Some(authoring) = &self.authoring {
+            return authoring.schemas();
+        }
         self.tools.get_schemas()
     }
 
     /// Build system prompt (cached)
     fn build_system_prompt(&mut self) -> String {
+        if let Some(authoring) = &self.authoring {
+            return authoring.system_prompt();
+        }
         if self.cached_prompt.is_none() {
             let tool_schemas = {
                 let schemas = self.get_filtered_schemas();
@@ -881,7 +905,9 @@ impl WorkflowAgent {
                 };
 
                 // ── workflow_validate: 静态编译检查 ──
-                let mut result = if call.tool == "workflow_validate" {
+                let mut result = if let Some(authoring) = &self.authoring {
+                    authoring.execute(&call.tool, &exec_params).await
+                } else if call.tool == "workflow_validate" {
                     let raw_id = call.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     match self.workflow_engine.as_ref() {
                         Some(engine) => {
@@ -1601,6 +1627,19 @@ impl WorkflowAgent {
         call: &ToolCall,
         cancel_flag: &AtomicBool,
     ) -> Option<ToolResult> {
+        if let Some(authoring) = &self.authoring {
+            return if authoring
+                .schemas()
+                .iter()
+                .any(|schema| schema.function.name == call.tool)
+            {
+                None // The host supplies only scoped, non-executing authoring operations.
+            } else {
+                Some(ToolResult::failure(
+                    "Tool is not available in this authoring workspace",
+                ))
+            };
+        }
         // Use permissions inherited from Runtime (synced before each run via set_tool_permissions)
         let policy = crate::permissions::PermissionPolicy::new(self.tool_permissions)
             .with_categories(self.tools.all_tool_categories());

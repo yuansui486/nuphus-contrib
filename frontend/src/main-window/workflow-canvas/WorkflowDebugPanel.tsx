@@ -2,22 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { WorkflowInputSpec, WorkflowStep } from '../../core/types'
 import { useLanguage } from '../../locales'
 import { CompactModal } from '../layout/CompactModal'
-import {
-  wfTraceList,
-  wfTraceRead,
-  wfValidate,
-  type WorkflowInvocationTrace,
-  type WorkflowRunTrace,
-} from '../lib/api'
+import { type WorkflowInvocationTrace, type WorkflowRunTrace } from '../lib/api'
 import { ExecutionTraceViewer } from './ExecutionTraceViewer'
-import {
-  debugDependencies,
-  debugPreflight,
-  parseTestValues,
-  wfDebugControl,
-  wfDebugRun,
-} from './debugSession'
+import { debugDependencies, debugPreflight, parseTestValues } from './debugSession'
 import { walkSteps } from './dataEdges'
+import { useCanvasBackend } from './CanvasBackend'
 import { mergeEditorProblems, type EditorProblem } from './editorProblems'
 import './workflow-debug.css'
 
@@ -59,6 +48,7 @@ export function WorkflowDebugPanel({
   onLocateIssue,
 }: Props) {
   const { lang, t } = useLanguage()
+  const { wfTraceList, wfTraceRead, wfValidate, wfDebugRun, wfDebugControl } = useCanvasBackend()
   const text = useCallback((zh: string, en: string) => (lang === 'zh' ? zh : en), [lang])
   const [mode, setMode] = useState<'node' | 'through'>('node')
   const [variables, setVariables] = useState('{}')

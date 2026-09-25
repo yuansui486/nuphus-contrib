@@ -76,7 +76,7 @@ impl Embedder {
             .unwrap_or_else(|| {
                 dirs::data_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
-                    .join("nuphus")
+                    .join(crate::profile::config_name())
                     .join("models")
                     .join("bge-small-zh")
             })

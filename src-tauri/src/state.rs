@@ -259,9 +259,7 @@ fn now_millis() -> i64 {
 
 impl Default for AppState {
     fn default() -> Self {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("nuphus");
+        let config_dir = nuphus::profile::config_dir();
 
         // 启动时加载已持久化的身份关系配置（relation.json）：
         // 老用户升级后桌面端未发消息时，手机端首条指令经 relation_cache 也能拿到用户定义的称呼。

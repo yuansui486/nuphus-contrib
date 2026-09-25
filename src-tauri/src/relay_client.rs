@@ -39,10 +39,7 @@ pub struct RelayClientConfig {
 }
 
 fn config_path() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("nuphus")
-        .join("relay_client.json")
+    nuphus::profile::config_dir().join("relay_client.json")
 }
 
 // ── 官方中继默认配置（开箱即用，零配置） ──────────────────────────────

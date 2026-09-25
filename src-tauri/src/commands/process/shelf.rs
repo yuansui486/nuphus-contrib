@@ -26,10 +26,7 @@ pub const SHELF_CAPACITY: usize = 10;
 
 /// 旧磁盘镜像目录（迁移用：扫描导入 SQLite；导入后文件保留不删）
 fn mirror_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("nuphus")
-        .join("sessions")
+    nuphus::profile::config_dir().join("sessions")
 }
 
 /// 旧镜像文件包装（仅迁移解析用，新 IO 走 SQLite snapshot 列）
