@@ -40,6 +40,11 @@ pub fn global_cache() -> &'static Mutex<ToolCache> {
 }
 
 fn default_store_path() -> PathBuf {
+    if crate::profile::WORKBENCH {
+        let path = crate::profile::workbench_data_dir().join("cache");
+        let _ = std::fs::create_dir_all(&path);
+        return path.join("tool_cache.json");
+    }
     // <project_root>/.nuphus/cache/tool_cache.json
     let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     path.push(".nuphus");
@@ -54,6 +59,10 @@ fn default_store_path() -> PathBuf {
 /// 计算缓存 key（tool + params_json 的哈希）
 fn cache_key(tool: &str, params_json: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
+    if crate::profile::WORKBENCH {
+        // A relative filename in another project is not the same read result.
+        crate::utils::work_root().hash(&mut hasher);
+    }
     tool.hash(&mut hasher);
     params_json.hash(&mut hasher);
     hasher.finish()
@@ -64,7 +73,18 @@ fn extract_path(params: &serde_json::Value) -> Option<String> {
     params
         .get("path")
         .and_then(|v| v.as_str())
-        .map(String::from)
+        .map(cache_file_path)
+}
+
+fn cache_file_path(path: &str) -> String {
+    if crate::profile::WORKBENCH && std::path::Path::new(path).is_relative() {
+        crate::utils::work_root()
+            .join(path)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_owned()
+    }
 }
 
 // ── 持久化条目 ──
@@ -233,7 +253,7 @@ impl ToolCache {
 
     /// 按路径失效缓存（Write / Edit 后调用）
     pub fn invalidate(&mut self, path: &str) {
-        let normalized = normalize_path(path);
+        let normalized = normalize_path(&cache_file_path(path));
         let mut to_remove = Vec::new();
 
         for (key, entry) in &self.entries {
@@ -457,6 +477,55 @@ mod tests {
         let a = cache_key("Read", r#"{"path":"/tmp/x"}"#);
         let b = cache_key("Read", r#"{"path":"/tmp/y"}"#);
         assert_ne!(a, b);
+    }
+
+    #[cfg(feature = "workbench")]
+    #[test]
+    fn workbench_cache_is_scoped_to_project_context() {
+        use crate::workflow::run_context::{RunContext, CURRENT};
+        use crate::workflow::store::WorkflowStore;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let root = std::env::temp_dir().join(format!("cache-scope-{}", uuid::Uuid::new_v4()));
+        let context = |project: &str| {
+            let project_dir = root.join(project);
+            Arc::new(RunContext {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                store: WorkflowStore::frozen(project_dir.clone(), vec![]),
+                project_dir,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                event_sink: None,
+            })
+        };
+        let first = context("first");
+        let second = context("second");
+        let mut cache = ToolCache::new(root.join("cache.json"));
+        let params = json!({"url": "https://example.com"});
+        CURRENT.sync_scope(first.clone(), || {
+            assert_eq!(
+                extract_path(&json!({"path": "README.md"})),
+                Some(
+                    root.join("first")
+                        .join("README.md")
+                        .to_string_lossy()
+                        .into_owned()
+                )
+            );
+        });
+        let key = |ctx| CURRENT.sync_scope(ctx, || cache_key("Read", r#"{"path":"README.md"}"#));
+        assert_ne!(key(first.clone()), key(second.clone()));
+        CURRENT.sync_scope(first.clone(), || {
+            cache.set("web_extract", &params, make_result("first project"));
+        });
+        CURRENT.sync_scope(second, || {
+            assert!(cache.get("web_extract", &params).is_none());
+        });
+        CURRENT.sync_scope(first, || {
+            assert_eq!(
+                cache.get("web_extract", &params).unwrap().output.as_deref(),
+                Some("first project")
+            );
+        });
     }
 
     #[test]

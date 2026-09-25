@@ -70,6 +70,7 @@ jobs:
       - run: cargo test -p nuphus-workbench --features gateway
       - run: cargo clippy -p nuphus-workbench --features gateway --all-targets -- -D warnings
       - run: cargo test -p nuphus --lib workflow --features workbench
+      - run: cargo test -p nuphus --lib cache::tool_cache --features workbench
       - run: cargo check -p nuphus-desktop --features workbench
       - run: cargo test -p nuphus-desktop --features workbench --bin nuphus workbench
       - run: cargo check -p nuphus-desktop

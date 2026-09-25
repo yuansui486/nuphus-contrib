@@ -57,14 +57,20 @@ fn apply_win11_rounded_corners<R: tauri::Runtime>(window: &tauri::WebviewWindow<
 
 fn main() {
     if nuphus::profile::WORKBENCH {
+        let models_dir = nuphus::profile::workbench_data_dir().join("models");
+        // The shared desktop resolver falls back when an override does not exist.
+        // Create the edition directory before any vision subsystem is initialized.
+        std::fs::create_dir_all(&models_dir).unwrap_or_else(|error| {
+            panic!(
+                "Cannot initialize Workbench models directory {}: {error}",
+                models_dir.display()
+            )
+        });
         std::env::set_var(
             "NUPHUS_BROWSER_PROFILE_DIR",
             nuphus::profile::workbench_data_dir().join("browser_profile_v2"),
         );
-        std::env::set_var(
-            "NUPHUS_MODELS_DIR",
-            nuphus::profile::workbench_data_dir().join("models"),
-        );
+        std::env::set_var("NUPHUS_MODELS_DIR", models_dir);
     }
     // Inject the persisted external-browser CDP endpoint into the process env so
     // future BrowserClient::new() (direct channel) picks it up; the MCP channel
