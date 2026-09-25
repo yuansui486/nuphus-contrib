@@ -67,9 +67,9 @@ jobs:
           app='target/release/bundle/macos/Nuphus Workbench.app'
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict "$app"
-          lipo "$app/Contents/MacOS/nuphus" -verify_arch arm64
+          lipo "$app/Contents/MacOS/nuphus-workbench" -verify_arch arm64
           smoke_root=$(mktemp -d)
-          NUPHUS_WORKBENCH_DATA_DIR="$smoke_root" NUPHUS_WORKBENCH_PORT=47739 "$app/Contents/MacOS/nuphus" --background > "$smoke_root/launch.log" 2>&1 &
+          NUPHUS_WORKBENCH_DATA_DIR="$smoke_root" NUPHUS_WORKBENCH_PORT=47739 "$app/Contents/MacOS/nuphus-workbench" --background > "$smoke_root/launch.log" 2>&1 &
           app_pid=$!
           trap 'kill "$app_pid" 2>/dev/null || true' EXIT
           ready=false

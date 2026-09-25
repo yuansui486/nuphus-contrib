@@ -35,6 +35,8 @@ cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbe
 ```
 
 产品名 `Nuphus Workbench`，应用标识 `io.github.yuansui486.nuphusworkbench`。
+发行程序名为 `nuphus-workbench`（Windows 带 `.exe`），安装器不会将原版 `nuphus.exe`
+当作工作台进程。Cargo 目标仍保留上游名称，由 Tauri 打包时重命名，减少核心合并冲突。
 配置、数据库、浏览器用户目录、模型缓存与原版隔离，不自动复制原版模型密钥。
 默认服务数据根目录为系统用户数据目录下 `nuphus-workbench`；
 `NUPHUS_WORKBENCH_DATA_DIR` 仅覆盖工作台注册表/默认项目，不重定向所有模型配置。
