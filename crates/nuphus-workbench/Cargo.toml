@@ -1,0 +1,19 @@
+[package]
+name = "nuphus-workbench"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Transport-independent workspace, revision and execution services for Nuphus Workbench"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

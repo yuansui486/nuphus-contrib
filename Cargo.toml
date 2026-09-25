@@ -6,6 +6,7 @@ members = [
     "src-tauri/crates/desktop-api",
     "crates/nuphus-index",
     "crates/nuphus-browser",
+    "crates/nuphus-workbench",
 ]
 exclude = ["third_party/chromiumoxide"]
 
