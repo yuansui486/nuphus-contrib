@@ -3,6 +3,13 @@
   "productName": "Nuphus Workbench",
   "identifier": "io.github.yuansui486.nuphusworkbench",
   "version": "0.1.0",
+  "app": {
+    "security": {
+      "assetProtocol": {
+        "scope": { "allow": ["$APPDATA/**", "$APPLOCALDATA/**", "$HOME/.nuphus-workbench/**", "$TEMP/**"] }
+      }
+    }
+  },
   "build": {
     "beforeDevCommand": "npm run dev:workbench",
     "beforeBuildCommand": "npm run build:workbench",
@@ -15,5 +22,5 @@
       "pubkey": ""
     }
   },
-  "bundle": { "createUpdaterArtifacts": false }
+  "bundle": { "createUpdaterArtifacts": false, "macOS": { "minimumSystemVersion": "15.0" } }
 }

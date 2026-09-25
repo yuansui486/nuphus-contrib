@@ -863,3 +863,32 @@ fn redact(value: Value, secrets: &[String]) -> Value {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_payload_redaction_preserves_identity_and_discriminants() {
+        let event = WorkflowEvent::StepRunStarted {
+            step_id: "step-1".into(),
+            step_name: "secret 1".into(),
+            depth: 1,
+            kind: "tool".into(),
+        };
+        let value = redact_event(&event, &["1".into(), "tool".into()]);
+        assert_eq!(value["event"], "step_run_started");
+        assert_eq!(value["step_id"], "step-1");
+        assert_eq!(value["kind"], "tool");
+        assert_eq!(value["depth"], 1);
+        assert_eq!(value["step_name"], "secret [REDACTED]");
+        let output = WorkflowEvent::StepRunOutput {
+            step_id: "step-1".into(),
+            text: "token=secret".into(),
+        };
+        assert_eq!(
+            redact_event(&output, &["secret".into()])["text"],
+            "token=[REDACTED]"
+        );
+    }
+}

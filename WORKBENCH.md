@@ -104,6 +104,13 @@ Mac 预览包采用 ad-hoc 签名，尚不是 Apple 公证发行包。
 工作流测试和两个版本原生 check。CI 对 Windows、Ubuntu、macOS ARM64 执行。
 接口重试、修订冲突、外部模式不调用内置 Agent、项目隔离、人工确认 ID、断线游标都需回归。
 
+`scripts/workbench-smoke.mjs` 可对真实 Windows WebView2 和原生宿主执行无模型冒烟：
+创建等待工作流、画布同步、发布运行、幂等重试、单节点调试、断点暂停、人工继续和取消。
+仅使用独立测试项目；令牌在结束时撤销。测试需要本地临时 Tauri 配置给各窗口设置
+`additionalBrowserArgs: "--remote-debugging-port=9227"`；不要把调试端口加入产品配置。
+启动时设置独立 `NUPHUS_WORKBENCH_DATA_DIR`、`NUPHUS_WORKBENCH_PORT`，然后执行
+`node scripts/workbench-smoke.mjs`。测试仍会保留其工作流与运行证据，方便检查。
+
 仍须在真实 Windows 和 macOS 15+ 上验收权限、窗口/浏览器控制、输入落点及安装并存，
 使用本版本配置的模型验收自然语言生成质量。编译和模拟测试不代替这些验收。
 当前不接入工作台的定时调度，不提供无桌面系统守护进程，也不承诺所有应用后台无焦点操作。

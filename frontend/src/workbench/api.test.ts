@@ -82,4 +82,25 @@ describe('Workbench canvas backend', () => {
     ])
     expect(ipc.mock.calls.map(([, value]) => value.args.layout_revision)).toEqual([2, 3])
   })
+  it('does not repeat a debug action after a lost acknowledgement', async () => {
+    const backend = canvasBackend(fixture(), vi.fn(), vi.fn())
+    const request = {
+      workflow_id: 'flow',
+      selected_step_id: 'wait',
+      mode: 'node' as const,
+      steps: [],
+      inputs: [],
+      source: { kind: 'manual' },
+      variables: {},
+      runtime_inputs: {},
+      use_retry_policy: false,
+    }
+    ipc.mockRejectedValueOnce(new Error('lost reply')).mockResolvedValue({ run_id: 'debug-run' })
+    await expect(backend.wfDebugRun(request)).rejects.toThrow('lost reply')
+    await expect(backend.wfDebugRun({ ...request, selected_step_id: 'another' })).rejects.toThrow(
+      'start_uncertain',
+    )
+    await backend.wfDebugRun(request)
+    expect(ipc.mock.calls[0][1].args.request_id).toBe(ipc.mock.calls[1][1].args.request_id)
+  })
 })

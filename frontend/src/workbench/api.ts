@@ -79,6 +79,7 @@ export function canvasBackend(
   started: (id: string) => void,
 ): CanvasBackend {
   let current = initial
+  let pendingDebug: { fingerprint: string; args: Record<string, unknown> } | null = null
   let layoutQueue: Promise<unknown> = Promise.resolve()
   let pendingRun: {
     project_id: string
@@ -193,13 +194,28 @@ export function canvasBackend(
       }),
     wfDebugRun: async request => {
       const { inputs, ...parameters } = request
-      const run = await call<{ run_id: string }>('workflow.debug', {
+      const args = {
         ...parameters,
         ...scope,
         revision: current.revision,
         input_specs: inputs,
-        request_id: crypto.randomUUID(),
-      })
+      }
+      const fingerprint = JSON.stringify(args)
+      if (pendingDebug && pendingDebug.fingerprint !== fingerprint) {
+        throw new WorkbenchError(
+          'start_uncertain',
+          'Inspect Runs or retry the same debug request before starting a different test.',
+        )
+      }
+      pendingDebug ??= { fingerprint, args: { ...args, request_id: crypto.randomUUID() } }
+      let run: { run_id: string }
+      try {
+        run = await call('workflow.debug', pendingDebug.args)
+      } catch (error) {
+        if (error instanceof WorkbenchError) pendingDebug = null
+        throw error
+      }
+      pendingDebug = null
       started(run.run_id)
       return run
     },

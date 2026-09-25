@@ -61,6 +61,10 @@ export default function WorkbenchApp() {
   generationRef.current = generationBusy
   const { register, leave } = useCanvasLeaveGuard()
   const fail = useCallback((error: unknown) => setNotice(String(error)), [])
+  useEffect(() => {
+    setDrafts([])
+    setRuns([])
+  }, [projectId])
 
   useEffect(() => {
     let alive = true
@@ -130,6 +134,7 @@ export default function WorkbenchApp() {
   }, [refresh, fail])
 
   const openDraft = useCallback((draft: Draft) => {
+    ++refreshSequence.current
     setActive(draft)
     setProjectId(draft.project_id)
     setPage('workflows')
@@ -187,6 +192,7 @@ export default function WorkbenchApp() {
     }
   }, [active?.workflow_id, active?.project_id, fail])
   const saved = useCallback((draft: Draft, kind?: 'layout') => {
+    ++refreshSequence.current
     const next =
       kind === 'layout' && activeRef.current
         ? { ...activeRef.current, layout: draft.layout, layout_revision: draft.layout_revision }
