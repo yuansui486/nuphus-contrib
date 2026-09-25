@@ -23,6 +23,13 @@ fn now() -> i64 {
 
 fn connect(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > 1 {
+        return Err(ApiError::new(
+            "schema_too_new",
+            "This project was written by a newer Workbench; update the application",
+        ));
+    }
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
     Ok(conn)
@@ -78,7 +85,7 @@ impl WorkbenchStore {
         &self.root
     }
 
-    fn registry(&self) -> Result<Connection> {
+    pub(crate) fn registry(&self) -> Result<Connection> {
         connect(&self.root.join("registry.sqlite"))
     }
 
@@ -95,7 +102,7 @@ impl WorkbenchStore {
         let directory = directory.canonicalize()?.to_string_lossy().to_string();
         let conn = self.registry()?;
         let id = uuid::Uuid::new_v4().to_string();
-        conn.execute("INSERT INTO projects(project_id,name,directory) VALUES(?1,?2,?3) ON CONFLICT(directory) DO NOTHING",
+        let inserted = conn.execute("INSERT INTO projects(project_id,name,directory) VALUES(?1,?2,?3) ON CONFLICT(directory) DO NOTHING",
             params![id, name.trim(), directory])?;
         let project = conn.query_row(
             "SELECT project_id,name,directory FROM projects WHERE directory=?1",
@@ -108,7 +115,15 @@ impl WorkbenchStore {
                 })
             },
         )?;
-        self.project_db(&project.project_id)?;
+        if let Err(error) = self.project_db(&project.project_id) {
+            if inserted != 0 {
+                conn.execute(
+                    "DELETE FROM projects WHERE project_id=?1",
+                    [&project.project_id],
+                )?;
+            }
+            return Err(error);
+        }
         Ok(project)
     }
 
@@ -191,6 +206,7 @@ impl WorkbenchStore {
             document: json!({"id": id, "name": name.trim(), "status":"Draft", "steps":[],
             "doc":null,"schedule":null,"run_history":[],"inputs":[],"dry_run":false}),
             layout: json!({}),
+            layout_revision: 0,
             updated_at: now(),
         };
         let mut conn = self.project_db(project)?;
@@ -328,6 +344,65 @@ impl WorkbenchStore {
         decode(body.ok_or_else(|| missing("Version"))?)
     }
 
+    pub fn update_layout(
+        &self,
+        project: &str,
+        id: &str,
+        revision: u64,
+        layout: Value,
+    ) -> Result<Draft> {
+        if !layout.is_object() {
+            return Err(ApiError::new("invalid_params", "layout must be an object"));
+        }
+        let mut conn = self.project_db(project)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut draft = load_draft(&tx, id)?;
+        if draft.layout_revision != revision {
+            return Err(conflict(draft.layout_revision));
+        }
+        draft.layout = layout;
+        draft.layout_revision += 1;
+        tx.execute(
+            "UPDATE drafts SET body=?1 WHERE workflow_id=?2",
+            params![serde_json::to_string(&draft)?, id],
+        )?;
+        event(
+            &tx,
+            project,
+            id,
+            None,
+            "canvas.layout_changed",
+            &json!({"layout_revision":draft.layout_revision}),
+        )?;
+        tx.commit()?;
+        Ok(draft)
+    }
+
+    pub fn request_run(
+        &self,
+        project: &str,
+        client: &str,
+        request: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Run>> {
+        let conn = self.project_db(project)?;
+        let old: Option<(String, String)> = conn
+            .query_row(
+                "SELECT fingerprint,body FROM runs WHERE client_id=?1 AND request_id=?2",
+                params![client, request],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match old {
+            Some((previous, _)) if previous != fingerprint => Err(ApiError::new(
+                "idempotency_conflict",
+                "request_id was already used for a different request",
+            )),
+            Some((_, body)) => Ok(Some(decode(body)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Idempotency is scoped by authenticated caller, not by caller-supplied
     /// identity. Inputs in the record must already have sensitive values masked.
     pub fn register_run(
@@ -372,6 +447,7 @@ impl WorkbenchStore {
             created_at: now(),
             updated_at: now(),
             result: None,
+            pending_request: None,
         };
         tx.execute("INSERT INTO runs(run_id,workflow_id,client_id,request_id,fingerprint,body) VALUES(?1,?2,?3,?4,?5,?6)",
             params![run.run_id,run.workflow_id,client,request_id,fingerprint,serde_json::to_string(&run)?])?;
@@ -424,6 +500,9 @@ impl WorkbenchStore {
             return Ok(run);
         }
         run.status = status;
+        if status != RunStatus::AwaitingHuman {
+            run.pending_request = None;
+        }
         run.updated_at = now();
         run.result = result;
         tx.execute(
@@ -437,6 +516,83 @@ impl WorkbenchStore {
             Some(id),
             &format!("run.{}", status.as_str()),
             &json!({"status":status,"result":run.result}),
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    pub fn await_human(&self, project: &str, id: &str, step_id: &str, prompt: &str) -> Result<Run> {
+        let mut conn = self.project_db(project)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut run = load_run(&tx, id)?;
+        if run.status.terminal() {
+            return Err(ApiError::new("invalid_run_state", "Run already finished"));
+        }
+        run.status = RunStatus::AwaitingHuman;
+        run.updated_at = now();
+        run.pending_request = Some(crate::HumanRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            step_id: step_id.into(),
+            prompt: prompt.into(),
+        });
+        tx.execute(
+            "UPDATE runs SET body=?1 WHERE run_id=?2",
+            params![serde_json::to_string(&run)?, id],
+        )?;
+        event(
+            &tx,
+            project,
+            &run.workflow_id,
+            Some(id),
+            "run.awaiting_human",
+            &json!({"request":run.pending_request}),
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    /// Claim a specific pending request once. A stale reply cannot resume a later wait.
+    pub fn respond_human(
+        &self,
+        project: &str,
+        id: &str,
+        request: &str,
+        decision: &str,
+    ) -> Result<Run> {
+        if !["continue", "cancel"].contains(&decision) {
+            return Err(ApiError::new(
+                "invalid_params",
+                "decision must be continue or cancel",
+            ));
+        }
+        let mut conn = self.project_db(project)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut run = load_run(&tx, id)?;
+        if run.status != RunStatus::AwaitingHuman
+            || run
+                .pending_request
+                .as_ref()
+                .is_none_or(|r| r.request_id != request)
+        {
+            return Err(ApiError::new(
+                "stale_human_request",
+                "This request is no longer awaiting a response; refresh run status",
+            ));
+        }
+        run.pending_request = None;
+        run.status = RunStatus::Running;
+        run.updated_at = now();
+        tx.execute(
+            "UPDATE runs SET body=?1 WHERE run_id=?2",
+            params![serde_json::to_string(&run)?, id],
+        )?;
+        event(
+            &tx,
+            project,
+            &run.workflow_id,
+            Some(id),
+            "run.response",
+            &json!({"request_id":request,"decision":decision}),
         )?;
         tx.commit()?;
         Ok(run)
@@ -533,7 +689,9 @@ impl WorkbenchStore {
 }
 
 pub fn fingerprint(value: &Value) -> String {
-    format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 fn load_draft(conn: &Connection, id: &str) -> Result<Draft> {

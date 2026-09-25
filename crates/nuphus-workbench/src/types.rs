@@ -52,7 +52,7 @@ impl From<serde_json::Error> for ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthoringMode {
     Internal,
@@ -83,6 +83,8 @@ pub struct Draft {
     pub authoring_mode: AuthoringMode,
     pub document: Value,
     pub layout: Value,
+    #[serde(default)]
+    pub layout_revision: u64,
     pub updated_at: i64,
 }
 
@@ -137,7 +139,10 @@ impl RunStatus {
                     Self::Running => {
                         matches!(self, Self::Starting | Self::Paused | Self::AwaitingHuman)
                     }
-                    Self::Paused | Self::AwaitingHuman | Self::Completed => self == Self::Running,
+                    Self::Paused | Self::AwaitingHuman => self == Self::Running,
+                    Self::Completed => {
+                        matches!(self, Self::Running | Self::Paused | Self::AwaitingHuman)
+                    }
                     Self::Failed | Self::Cancelled | Self::Interrupted => true,
                 })
     }
@@ -155,6 +160,15 @@ pub struct Run {
     pub created_at: i64,
     pub updated_at: i64,
     pub result: Option<Value>,
+    #[serde(default)]
+    pub pending_request: Option<HumanRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HumanRequest {
+    pub request_id: String,
+    pub step_id: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

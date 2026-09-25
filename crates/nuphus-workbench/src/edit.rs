@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Edit {
     AddStep {
@@ -41,7 +41,7 @@ pub enum Edit {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
     Main,
@@ -58,7 +58,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
 fn child_paths(step: &Value, path: &str) -> Vec<String> {
     [
         "/do/seq",
-        "/do/loop/body",
+        "/do/loop/do",
         "/do/if/then",
         "/do/if/else",
         "/do/auto",
@@ -153,7 +153,7 @@ fn lane_path(document: &Value, parent: Option<&str>, lane: Lane) -> Result<Strin
     } else if step.pointer("/do/seq").is_some() {
         "/do/seq"
     } else if step.pointer("/do/loop").is_some() {
-        "/do/loop/body"
+        "/do/loop/do"
     } else if step.pointer("/do/wait").is_some() {
         "/do/auto"
     } else {
