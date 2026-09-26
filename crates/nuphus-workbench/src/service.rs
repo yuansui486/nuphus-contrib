@@ -6,10 +6,20 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::{path::Path, sync::Arc};
 
+tokio::task_local! { pub static REQUEST_EPOCH: Option<String>; }
+
 /// Native capabilities stay with the application. Transports never execute a
 /// workflow, access model credentials or operate a desktop by themselves.
 #[async_trait]
 pub trait Host: Send + Sync + 'static {
+    /// Production hosts must reject missing/expired product authorization.
+    fn authorize_product(&self) -> Result<()> {
+        Ok(())
+    }
+    fn session_epoch(&self) -> Result<Option<String>> {
+        self.authorize_product()?;
+        Ok(None)
+    }
     fn schedule_next(&self, _config: &Value, _anchor: i64, _after: i64) -> Result<i64> {
         Err(ApiError::new(
             "unsupported",
@@ -93,6 +103,26 @@ impl<H: Host> Service<H> {
         operation: &str,
         args: Value,
     ) -> Result<Value> {
+        // Static discovery reveals no projects, credentials or tenant identity.
+        let epoch = if operation == "system.capabilities" {
+            self.host.session_epoch().ok().flatten()
+        } else {
+            self.host.session_epoch()?
+        };
+        REQUEST_EPOCH
+            .scope(epoch, self.dispatch_inner(principal, operation, args))
+            .await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        principal: &Principal,
+        operation: &str,
+        args: Value,
+    ) -> Result<Value> {
+        if operation != "system.capabilities" {
+            self.host.authorize_product()?;
+        }
         if !args.is_object() {
             return Err(ApiError::new(
                 "invalid_params",
@@ -142,7 +172,7 @@ impl<H: Host> Service<H> {
             principal.authorize(capability, None)?;
             return match operation {
                 "system.capabilities" => Ok(
-                    json!({"api_version":API_VERSION,"host":self.host.capabilities(),
+                    json!({"api_version":API_VERSION,"host":self.host.capabilities(),"auth_required":self.host.authorize_product().is_err(),
                         "operations":crate::catalog::operations().into_iter().filter(|op| principal.authorize(op.capability, None).is_ok()).collect::<Vec<_>>()}),
                 ),
                 "project.list" => encode(

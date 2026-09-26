@@ -85,8 +85,10 @@ cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbe
 Agent 通过 stdio 启动它，再经 Windows 当前用户专属命名管道或 macOS/Linux Unix socket 连接工作台，
 不依赖 HTTP 端口。工作台未运行时自动启动同安装目录/同 App 包内的主程序到托盘，最长等待 30 秒。
 并发客户端共用一个宿主，断开 MCP 不退出工作台、不取消运行；后续调用可重新连接重启后的应用。
-无需创建客户端、配置令牌或逐项选择权限。IPC、HTTP、MCP 和应用内画布调用同一个服务层。
-本机外部调用默认具有全部项目及全部公共能力（包括注册项目、运行、自动化和人工响应）。
+无需创建客户端、配置令牌或逐项选择权限，但须先在灵雀桌面应用中登录并取得产品授权。
+IPC、HTTP、MCP 和应用内画布调用同一个服务层。
+本机外部调用具有当前登录租户内全部项目及全部公共能力（包括注册项目、运行、自动化和人工响应）。
+退出或授权失效后停止业务及后台执行，切换账号后重新连接 MCP。完整规则见 [统一鉴权接入](LINGQUE_AUTH.md)。
 这不是项目权限隔离或 OS 沙箱：信任本机调用者，运行可产生真实桌面和文件副作用。
 仅绑定 `127.0.0.1`，拒绝网页 Origin/Fetch-Metadata 和非本机 Host；退出托盘后端口关闭。
 
@@ -118,8 +120,8 @@ HTTP 服务失败不会关闭 IPC。本机 IPC 以用户和数据目录区分实
 请求发送后丢失回复不自动重放。`NUPHUS_WORKBENCH_DATA_DIR` 指定的开发配置会写入页面生成的 MCP 配置，
 避免误连普通工作台；默认配置不包含端口或密钥。
 
-真实 MCP 验收：设置专用 `WORKBENCH_TEST_ROOT` 后运行 `node scripts/workbench-mcp-smoke.mjs`。
-脚本隔离数据，验证端口占用、双客户端冷启动、画布读写、等待工作流、重启重连和运行去重，
+未登录 MCP 验收：设置专用 `WORKBENCH_TEST_ROOT` 和 `WORKBENCH_TEST_EXPECT_AUTH_REQUIRED=1` 后运行 `node scripts/workbench-mcp-smoke.mjs`。
+脚本隔离数据，验证端口占用、双客户端冷启动、未登录拦截和重启重连；授权后的画布和运行验收使用 `scripts/lingque-auth-smoke.mjs`，
 不读取模型密钥、不调用模型、不操作业务文件。可用 `WORKBENCH_TEST_EXE` 和 `WORKBENCH_TEST_MCP`
 指定已安装或打包后的程序。
 Windows 可用 `./scripts/workbench-mcp-focus.ps1 -TestRoot <临时目录>` 包装同一验收，额外检查自动启动不抢前台焦点。

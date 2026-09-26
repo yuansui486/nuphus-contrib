@@ -172,78 +172,101 @@ try {
     hostPid,
     "Concurrent clients must share one host",
   );
-  const project_id = (await a.call("project.list"))[0].project_id;
-  const draft = await a.call("workflow.import", {
-    project_id,
-    name: "MCP smoke",
-    document: {
-      id: "import-id",
-      name: "MCP smoke",
-      status: "Draft",
-      inputs: [],
-      steps: [{ id: "wait", name: "Wait", do: { sleep: 0.05 } }],
-    },
-  });
-  const scope = { project_id, workflow_id: draft.workflow_id };
-  assert.equal(draft.authoring_mode, "external");
-  assert.equal(
-    (await b.call("canvas.get", scope)).workflow_id,
-    draft.workflow_id,
-  );
-  const version = await a.call("workflow.save", {
-    ...scope,
-    revision: draft.revision,
-  });
-  const request = {
-    project_id,
-    version_id: version.version_id,
-    request_id: "mcp-smoke-once",
-  };
-  const run = await a.call("workflow.run", request);
-  for (let i = 0; i < 40; i++) {
-    const state = await a.call("run.get", { project_id, run_id: run.run_id });
-    if (state.status === "completed") break;
-    assert.ok(
-      !["failed", "interrupted"].includes(state.status),
-      JSON.stringify(state.result),
+  if (process.env.WORKBENCH_TEST_EXPECT_AUTH_REQUIRED === "1") {
+    assert.equal(first.auth_required, true);
+    await assert.rejects(a.call("project.list"));
+    const previousPid = hostPid;
+    await stopHost();
+    hostPid = (await a.call("system.capabilities")).host.process_id;
+    assert.notEqual(hostPid, previousPid);
+    await assert.rejects(b.call("project.list"));
+    console.log(
+      JSON.stringify({
+        stage: "PASS",
+        checks: [
+          "automatic tray startup",
+          "concurrent host reuse",
+          "HTTP port conflict independence",
+          "unauthenticated business blocked",
+          "same-client reconnect remains locked",
+        ],
+        root,
+      }),
     );
-    await pause(250);
+  } else {
+    const project_id = (await a.call("project.list"))[0].project_id;
+    const draft = await a.call("workflow.import", {
+      project_id,
+      name: "MCP smoke",
+      document: {
+        id: "import-id",
+        name: "MCP smoke",
+        status: "Draft",
+        inputs: [],
+        steps: [{ id: "wait", name: "Wait", do: { sleep: 0.05 } }],
+      },
+    });
+    const scope = { project_id, workflow_id: draft.workflow_id };
+    assert.equal(draft.authoring_mode, "external");
+    assert.equal(
+      (await b.call("canvas.get", scope)).workflow_id,
+      draft.workflow_id,
+    );
+    const version = await a.call("workflow.save", {
+      ...scope,
+      revision: draft.revision,
+    });
+    const request = {
+      project_id,
+      version_id: version.version_id,
+      request_id: "mcp-smoke-once",
+    };
+    const run = await a.call("workflow.run", request);
+    for (let i = 0; i < 40; i++) {
+      const state = await a.call("run.get", { project_id, run_id: run.run_id });
+      if (state.status === "completed") break;
+      assert.ok(
+        !["failed", "interrupted"].includes(state.status),
+        JSON.stringify(state.result),
+      );
+      await pause(250);
+    }
+    assert.equal(
+      (await a.call("run.get", { project_id, run_id: run.run_id })).status,
+      "completed",
+    );
+    const trace = await b.call("run.steps", { project_id, run_id: run.run_id });
+    assert.ok(
+      trace.invocations.some(
+        (s) => s.step_id === "wait" && s.status === "success",
+      ),
+    );
+    const previousPid = hostPid;
+    await stopHost();
+    console.log("Restarting through the SAME MCP process/configuration");
+    hostPid = (await a.call("system.capabilities")).host.process_id;
+    assert.notEqual(hostPid, previousPid);
+    assert.equal((await b.call("workflow.run", request)).run_id, run.run_id);
+    assert.equal((await a.call("run.list", { project_id })).length, 1);
+    console.log(
+      JSON.stringify({
+        stage: "PASS",
+        checks: [
+          "stdio initialize/discovery",
+          "automatic tray startup",
+          "concurrent client reuse",
+          "HTTP port conflict independence",
+          "Unicode/spaced installation path",
+          "shared canvas and workflow execution",
+          "step evidence",
+          "same-client reconnection",
+          "no replay",
+        ],
+        root,
+        run_id: run.run_id,
+      }),
+    );
   }
-  assert.equal(
-    (await a.call("run.get", { project_id, run_id: run.run_id })).status,
-    "completed",
-  );
-  const trace = await b.call("run.steps", { project_id, run_id: run.run_id });
-  assert.ok(
-    trace.invocations.some(
-      (s) => s.step_id === "wait" && s.status === "success",
-    ),
-  );
-  const previousPid = hostPid;
-  await stopHost();
-  console.log("Restarting through the SAME MCP process/configuration");
-  hostPid = (await a.call("system.capabilities")).host.process_id;
-  assert.notEqual(hostPid, previousPid);
-  assert.equal((await b.call("workflow.run", request)).run_id, run.run_id);
-  assert.equal((await a.call("run.list", { project_id })).length, 1);
-  console.log(
-    JSON.stringify({
-      stage: "PASS",
-      checks: [
-        "stdio initialize/discovery",
-        "automatic tray startup",
-        "concurrent client reuse",
-        "HTTP port conflict independence",
-        "Unicode/spaced installation path",
-        "shared canvas and workflow execution",
-        "step evidence",
-        "same-client reconnection",
-        "no replay",
-      ],
-      root,
-      run_id: run.run_id,
-    }),
-  );
 } finally {
   for (const child of children) {
     child.stdin.end();

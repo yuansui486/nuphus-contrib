@@ -20,8 +20,8 @@ export function ExternalConnections({ endpoint }: { endpoint: Endpoint | null })
       <h2>{ui('本地应用接入（推荐）', 'Local application (recommended)')}</h2>
       <p>
         {ui(
-          '将下面的配置添加到 Agent 的 MCP 设置，无需填写端口或密钥。连接时会自动启动工作台到托盘，不打开主窗口。',
-          'Add this configuration to your Agent’s MCP settings. No port or key is needed. Connecting automatically starts Workbench in the tray without opening the main window.',
+          '将下面的配置添加到 Agent 的 MCP 设置，无需填写端口或登录令牌。请先在灵雀登录；连接时会自动启动工作台到托盘并恢复验证，不打开主窗口。',
+          'Add this configuration to your Agent’s MCP settings. No port or login token is needed. Sign in to Lingque first; connecting starts it in the tray and verifies the saved session without opening the main window.',
         )}
       </p>
       <p role="status">
@@ -133,8 +133,8 @@ export function ExternalConnections({ endpoint }: { endpoint: Endpoint | null })
       </details>
       <p>
         {ui(
-          '本机 Agent 可使用全部项目、画布、工作流、定时任务和自动化能力，不需要配置内置模型。断开 MCP 不会停止工作台或取消运行。仅向可信的本机程序提供此配置。',
-          'Local Agents can use all projects, canvases, workflows, schedules and automation without configuring an internal model. Disconnecting MCP does not stop Workbench or cancel runs. Share this configuration only with trusted local applications.',
+          '本机 Agent 复用当前登录，可使用当前租户的项目、画布、工作流、定时任务和自动化能力，不需要配置内置模型。断开 MCP 不会停止运行，但退出登录或授权失效会停止任务。切换账号后请重新连接 MCP。仅向可信的本机程序提供此配置。',
+          'Local Agents use the current login and its tenant’s projects, canvases, workflows, schedules and automation without an internal model. Disconnecting MCP does not stop runs; logout or invalid authorization does. Reconnect MCP after switching accounts. Share this configuration only with trusted local applications.',
         )}
       </p>
     </section>

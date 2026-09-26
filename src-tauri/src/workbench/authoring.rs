@@ -8,6 +8,7 @@ struct Authoring {
     service: Arc<Service<NativeHost>>,
     project: String,
     workflow: String,
+    epoch: String,
 }
 
 #[async_trait]
@@ -52,6 +53,7 @@ impl WorkflowAuthoring for Authoring {
     }
     async fn execute(&self, tool: &str, params: &Value) -> nuphus::ToolResult {
         let result: Result<Value> = async {
+            if self.service.host.session_epoch()?.unwrap_or_default() != self.epoch { return Err(ApiError::new("product_session_changed","旧生成任务已停止，请重新登录。")); }
             let draft=self.service.store.draft(&self.project,&self.workflow)?;
             if draft.authoring_mode != nuphus_workbench::AuthoringMode::Internal {
                 return Err(ApiError::new("authoring_mode_changed","This canvas switched to external authoring; stop this generation"));
@@ -82,12 +84,26 @@ impl WorkflowAuthoring for Authoring {
 
 struct AuthoringEmitter {
     app: AppHandle,
+    epoch: String,
     project: String,
     workflow: String,
     turn: String,
 }
 impl nuphus::agent::events::EventEmitter for AuthoringEmitter {
     fn emit(&self, event: nuphus::agent::events::NuphusEvent) {
+        if self
+            .app
+            .state::<WorkbenchState>()
+            .service
+            .host
+            .session_epoch()
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some(&self.epoch)
+        {
+            return;
+        }
         use nuphus::agent::events::NuphusEvent;
         // No reasoning chunks, model credentials or unrelated app events enter
         // this workflow-bound panel.
@@ -115,6 +131,7 @@ pub async fn workbench_generate(
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "Start Workbench"))?;
     let draft = state.service.store.draft(&project_id, &workflow_id)?;
+    let epoch = state.service.host.session_epoch()?.unwrap_or_default();
     let key = format!("{project_id}/{workflow_id}");
     if action == "history" {
         return Ok(
@@ -159,6 +176,7 @@ pub async fn workbench_generate(
     let tools = nuphus::ToolRegistry::work_agent(); // isolated generation signals; no native execution tools are exposed
     let emitter = Arc::new(AuthoringEmitter {
         app: app.clone(),
+        epoch: epoch.clone(),
         project: project_id.clone(),
         workflow: workflow_id.clone(),
         turn: uuid::Uuid::new_v4().to_string(),
@@ -186,6 +204,7 @@ pub async fn workbench_generate(
         service: state.service.clone(),
         project: project_id.clone(),
         workflow: workflow_id.clone(),
+        epoch: epoch.clone(),
     }));
     let cancel = Arc::new(AtomicBool::new(false));
     {
@@ -198,11 +217,19 @@ pub async fn workbench_generate(
         }
         generations.insert(key.clone(), cancel.clone());
     }
-    let store = state.service.store.clone();
+    let store = state.service.store.pinned()?;
     let generations = state.generations.clone();
     let returned = turn.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = agent.run(&input, &None, &cancel).await;
+    tauri::async_runtime::spawn(nuphus::profile::PRODUCT_EPOCH.scope(epoch, async move {
+        let result = tokio::select! {
+            result=agent.run(&input, &None, &cancel)=>result,
+            _=async {
+                loop {
+                    if cancel.load(Ordering::SeqCst) || nuphus::profile::require_product().is_err() { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }=>Err(nuphus::NuphusError::Tool("登录已失效或生成已取消。".into())),
+        };
         let session_result = serde_json::to_value(agent.session())
             .map_err(ApiError::from)
             .and_then(|session| store.save_authoring_session(&project_id, &workflow_id, &session));
@@ -216,10 +243,12 @@ pub async fn workbench_generate(
         if let Ok(mut active) = generations.lock() {
             active.remove(&key);
         }
+        if nuphus::profile::require_product().is_ok() {
         let _ = app.emit(
             "workbench-authoring",
             json!({"project_id":project_id,"workflow_id":workflow_id,"turn_id":turn,"event":event}),
         );
-    });
+        }
+    }));
     Ok(json!({"turn_id":returned}))
 }

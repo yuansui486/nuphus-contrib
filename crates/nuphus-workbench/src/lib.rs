@@ -12,6 +12,8 @@ pub mod gateway;
 #[cfg(feature = "gateway")]
 pub mod local;
 #[cfg(feature = "gateway")]
+pub mod product_auth;
+#[cfg(feature = "gateway")]
 pub mod resources;
 pub mod schedules;
 pub mod service;

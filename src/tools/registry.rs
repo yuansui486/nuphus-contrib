@@ -305,6 +305,15 @@ impl ToolRegistry {
         tool_name: &str,
         params: &serde_json::Value,
     ) -> std::result::Result<ToolResult, String> {
+        crate::profile::require_product()?;
+        if crate::profile::WORKBENCH
+            && matches!(
+                tool_name,
+                "workflow_run" | "workflow_validate" | "workflow_memory_update" | "schedule_cron"
+            )
+        {
+            return Err("灵雀请通过当前项目的工作台接口管理、运行和调度工作流。".into());
+        }
         // 自动化工具开关（ExecAgent 关闭）——执行侧终点。
         // schema 层已不暴露，此处兜住「凭历史上下文臆造工具名直接调用」的路径。
         if !self.automation_tools_enabled

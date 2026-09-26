@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub struct WorkbenchStore {
     root: PathBuf,
+    tenant: Option<std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -24,7 +25,7 @@ pub(crate) fn now() -> i64 {
 fn connect(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 2 {
+    if version > 3 {
         return Err(ApiError::new(
             "schema_too_new",
             "This project was written by a newer Workbench; update the application",
@@ -123,7 +124,7 @@ impl WorkbenchStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        let store = Self { root };
+        let store = Self { root, tenant: None };
         let conn = store.registry()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects(
@@ -140,11 +141,104 @@ impl WorkbenchStore {
         &self.root
     }
 
+    /// Production hosts supply a verified identity provider; never an API argument.
+    pub fn with_tenant_guard(
+        mut self,
+        guard: std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>,
+    ) -> Self {
+        self.tenant = Some(guard);
+        self
+    }
+
+    /// Retain the originating tenant for internal terminal evidence writes after logout.
+    pub fn pinned(&self) -> Result<Self> {
+        let mut store = self.clone();
+        if let Some(guard) = &self.tenant {
+            let tenant = guard()?;
+            store.tenant = Some(std::sync::Arc::new(move || Ok(tenant.clone())));
+        }
+        Ok(store)
+    }
+
+    fn owner(directory: &Path) -> Result<Option<String>> {
+        let conn = connect(&directory.join(".nuphus-workbench/workbench.sqlite"))?;
+        Ok(conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='tenant_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn check_owner(&self, directory: &Path) -> Result<()> {
+        if let Some(guard) = &self.tenant {
+            let tenant = guard()?;
+            if Self::owner(directory)?.as_deref() != Some(&tenant) {
+                return Err(ApiError::new(
+                    "tenant_access_denied",
+                    "此项目不属于当前租户，或尚未确认归属。",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn unclaimed_projects(&self) -> Result<Vec<Project>> {
+        if let Some(guard) = &self.tenant {
+            guard()?;
+        }
+        let mut raw = self.clone();
+        raw.tenant = None;
+        raw.projects()?
+            .into_iter()
+            .filter_map(|p| match Self::owner(Path::new(&p.directory)) {
+                Ok(None) => Some(Ok(p)),
+                Ok(Some(_)) => None,
+                Err(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn claim_project(&self, project_id: &str) -> Result<()> {
+        let tenant = self
+            .tenant
+            .as_ref()
+            .ok_or_else(|| ApiError::new("unauthorized", "Tenant identity required"))?(
+        )?;
+        let mut raw = self.clone();
+        raw.tenant = None;
+        let project = raw.project(project_id)?;
+        let mut conn = raw.project_db(&project.project_id)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='tenant_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if owner.as_ref().is_some_and(|old| old != &tenant) {
+            return Err(ApiError::new(
+                "tenant_access_denied",
+                "项目已属于其他租户。",
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO metadata(key,value) VALUES('tenant_id',?1)",
+            [&tenant],
+        )?;
+        tx.execute_batch("PRAGMA user_version=3;")?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn registry(&self) -> Result<Connection> {
         connect(&self.root.join("registry.sqlite"))
     }
 
     pub fn register_project(&self, directory: &Path, name: &str) -> Result<Project> {
+        let tenant = self.tenant.as_ref().map(|guard| guard()).transpose()?;
         if !directory.is_absolute() || !directory.is_dir() {
             return Err(ApiError::new(
                 "invalid_project",
@@ -155,6 +249,12 @@ impl WorkbenchStore {
             return Err(ApiError::new("invalid_project", "Project name is required"));
         }
         let directory = directory.canonicalize()?.to_string_lossy().to_string();
+        let existing_project = Path::new(&directory)
+            .join(".nuphus-workbench/workbench.sqlite")
+            .exists();
+        if existing_project && tenant.is_some() {
+            self.check_owner(Path::new(&directory))?;
+        }
         let conn = self.registry()?;
         let previous: Option<String> = conn
             .query_row(
@@ -164,6 +264,12 @@ impl WorkbenchStore {
             )
             .optional()?;
         let id = project_identity(Path::new(&directory), previous.as_deref())?;
+        if let Some(tenant) = tenant.filter(|_| !existing_project) {
+            connect(&Path::new(&directory).join(".nuphus-workbench/workbench.sqlite"))?.execute(
+                "INSERT INTO metadata(key,value) VALUES('tenant_id',?1)",
+                [&tenant],
+            )?;
+        }
         if previous.as_ref().is_some_and(|old| old != &id) {
             return Err(ApiError::new(
                 "project_identity_changed",
@@ -196,6 +302,9 @@ impl WorkbenchStore {
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
+        if let Some(guard) = &self.tenant {
+            guard()?;
+        }
         let conn = self.registry()?;
         let mut stmt = conn
             .prepare("SELECT project_id,name,directory FROM projects ORDER BY name,project_id")?;
@@ -208,11 +317,19 @@ impl WorkbenchStore {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(items)
+        if self.tenant.is_some() {
+            Ok(items
+                .into_iter()
+                .filter(|p| self.check_owner(Path::new(&p.directory)).is_ok())
+                .collect())
+        } else {
+            Ok(items)
+        }
     }
 
     pub fn project(&self, project_id: &str) -> Result<Project> {
-        self.registry()?
+        let project = self
+            .registry()?
             .query_row(
                 "SELECT project_id,name,directory FROM projects WHERE project_id=?1",
                 [project_id],
@@ -225,7 +342,9 @@ impl WorkbenchStore {
                 },
             )
             .optional()?
-            .ok_or_else(|| missing("Project"))
+            .ok_or_else(|| missing("Project"))?;
+        self.check_owner(Path::new(&project.directory))?;
+        Ok(project)
     }
 
     pub fn project_data_dir(&self, project_id: &str) -> Result<PathBuf> {
@@ -260,7 +379,17 @@ impl WorkbenchStore {
             CREATE TABLE IF NOT EXISTS authoring_sessions(workflow_id TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedules(workflow_id TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule_attempts(id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, body TEXT NOT NULL);
-            PRAGMA user_version=2;")?;
+            ")?;
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let owned: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='tenant_id')",
+            [],
+            |r| r.get(0),
+        )?;
+        let target = if owned { 3 } else { 2 };
+        if version < target {
+            conn.pragma_update(None, "user_version", target)?;
+        }
         Ok(conn)
     }
 

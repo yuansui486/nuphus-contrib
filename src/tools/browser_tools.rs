@@ -157,6 +157,7 @@ impl ToolRegistry {
         tool_name: &str,
         params: &serde_json::Value,
     ) -> std::result::Result<ToolResult, String> {
+        crate::profile::require_product()?;
         // 自动化开关（ExecAgent 关闭）——必须置于任何工具执行路径之前。
         if !self.automation_tools_enabled {
             return Ok(ToolResult::failure(format!(

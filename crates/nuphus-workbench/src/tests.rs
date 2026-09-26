@@ -4,6 +4,58 @@ use crate::{
 };
 use serde_json::json;
 
+#[test]
+fn tenant_ownership_is_explicit_persistent_and_cannot_be_reregistered() {
+    let root = tempfile::tempdir().unwrap();
+    let store = WorkbenchStore::open(root.path().join("registry")).unwrap();
+    let project = store.register_project(root.path(), "Legacy").unwrap();
+    let old = store
+        .create(&project.project_id, "Preserved", AuthoringMode::External)
+        .unwrap();
+    let a = store
+        .clone()
+        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-a".into())));
+    assert!(a.projects().unwrap().is_empty());
+    assert!(a.draft(&project.project_id, &old.workflow_id).is_err());
+    assert_eq!(a.unclaimed_projects().unwrap().len(), 1);
+    a.claim_project(&project.project_id).unwrap();
+    a.claim_project(&project.project_id).unwrap();
+    assert_eq!(
+        a.draft(&project.project_id, &old.workflow_id)
+            .unwrap()
+            .document,
+        old.document
+    );
+    let b = store
+        .clone()
+        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-b".into())));
+    assert!(b.projects().unwrap().is_empty());
+    assert!(b.claim_project(&project.project_id).is_err());
+    assert!(b.register_project(root.path(), "Steal").is_err());
+    assert!(b.events(&project.project_id, None, 0, 20).is_err());
+    let same = WorkbenchStore::open(root.path().join("another-registry"))
+        .unwrap()
+        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-a".into())));
+    assert_eq!(
+        same.register_project(root.path(), "Same tenant")
+            .unwrap()
+            .project_id,
+        project.project_id
+    );
+    let db =
+        rusqlite::Connection::open(root.path().join(".nuphus-workbench/workbench.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+            .unwrap(),
+        3
+    );
+    let unavailable = store.with_tenant_guard(std::sync::Arc::new(|| {
+        Err(ApiError::new("product_auth_required", "login"))
+    }));
+    assert!(unavailable.projects().is_err());
+    assert!(unavailable.project(&project.project_id).is_err());
+}
+
 fn fixture() -> (tempfile::TempDir, WorkbenchStore, Project, Draft) {
     let dir = tempfile::tempdir().unwrap();
     let store = WorkbenchStore::open(dir.path().join("app")).unwrap();

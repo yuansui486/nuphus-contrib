@@ -62,6 +62,7 @@ jobs:
         shell: pwsh
         run: |
           $env:WORKBENCH_TEST_ROOT = "${{ runner.temp }}/workbench-mcp"
+          $env:WORKBENCH_TEST_EXPECT_AUTH_REQUIRED = '1'
           $env:WORKBENCH_TEST_EXE = (Resolve-Path target/release/nuphus-workbench.exe).Path
           $env:WORKBENCH_TEST_MCP = (Resolve-Path target/release/nuphus-workbench-mcp.exe).Path
           ./scripts/workbench-mcp-focus.ps1 -TestRoot $env:WORKBENCH_TEST_ROOT
@@ -76,7 +77,7 @@ jobs:
           lipo "$app/Contents/MacOS/nuphus-workbench" -verify_arch arm64
           test -x "$app/Contents/MacOS/nuphus-workbench-mcp"
           lipo "$app/Contents/MacOS/nuphus-workbench-mcp" -verify_arch arm64
-          WORKBENCH_TEST_ROOT="$(mktemp -d)" WORKBENCH_TEST_EXE="$app/Contents/MacOS/nuphus-workbench" WORKBENCH_TEST_MCP="$app/Contents/MacOS/nuphus-workbench-mcp" node scripts/workbench-mcp-smoke.mjs
+          WORKBENCH_TEST_EXPECT_AUTH_REQUIRED=1 WORKBENCH_TEST_ROOT="$(mktemp -d)" WORKBENCH_TEST_EXE="$app/Contents/MacOS/nuphus-workbench" WORKBENCH_TEST_MCP="$app/Contents/MacOS/nuphus-workbench-mcp" node scripts/workbench-mcp-smoke.mjs
           smoke_root=$(mktemp -d)
           NUPHUS_WORKBENCH_DATA_DIR="$smoke_root" NUPHUS_WORKBENCH_PORT=47739 "$app/Contents/MacOS/nuphus-workbench" --background > "$smoke_root/launch.log" 2>&1 &
           app_pid=$!

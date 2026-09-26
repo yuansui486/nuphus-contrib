@@ -21,6 +21,10 @@ const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
 /// 注册 preview 协议到 Builder（main.rs Builder 链首调用）
 pub fn register<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.register_asynchronous_uri_scheme_protocol("preview", move |_ctx, request, responder| {
+        if let Err(error) = nuphus::profile::require_product() {
+            responder.respond(error_response(StatusCode::UNAUTHORIZED, &error));
+            return;
+        }
         // 文件 IO 移出协议回调线程，避免大文件阻塞事件循环
         tauri::async_runtime::spawn_blocking(move || {
             responder.respond(serve(request));

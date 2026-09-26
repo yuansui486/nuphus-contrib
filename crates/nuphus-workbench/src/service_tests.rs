@@ -14,10 +14,120 @@ use std::sync::{
 struct FakeHost {
     starts: AtomicUsize,
     busy: AtomicBool,
+    locked: AtomicBool,
+}
+
+#[tokio::test]
+async fn product_lock_blocks_every_public_operation_and_scheduling() {
+    let (_dir, service, p, _) = fixture();
+    service.host.locked.store(true, Ordering::SeqCst);
+    for operation in crate::catalog::operations() {
+        if operation.name == "system.capabilities" {
+            continue;
+        }
+        let result = service
+            .dispatch(
+                &Principal::LocalExternal,
+                operation.name,
+                json!({"project_id":p.project_id}),
+            )
+            .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "product_auth_required",
+            "{}",
+            operation.name
+        );
+    }
+    assert_eq!(
+        service
+            .tick_schedules(&p.project_id, 0)
+            .await
+            .unwrap_err()
+            .code,
+        "product_auth_required"
+    );
+    assert_eq!(
+        service
+            .recover_schedules(&p.project_id, 0)
+            .await
+            .unwrap_err()
+            .code,
+        "product_auth_required"
+    );
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn real_transports_cannot_bypass_product_lock() {
+    let (dir, service, p, _) = fixture();
+    service.host.locked.store(true, Ordering::SeqCst);
+    let root = dir.path().join("app");
+    let local = crate::local::Server::bind(&root).unwrap();
+    let local_task = tokio::spawn(local.serve(service.clone()));
+    let client = crate::local::Client::new(root, dir.path().join("missing-app"), None);
+    assert_eq!(
+        client
+            .operation("project.list", json!({}))
+            .await
+            .unwrap_err()
+            .code,
+        "product_auth_required"
+    );
+    let listener = crate::gateway::bind(0).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = crate::gateway::local_router(service.clone());
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let http = reqwest::Client::new();
+    for path in [format!("/api/v1/events?project_id={}", p.project_id)] {
+        assert_eq!(
+            http.get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+    assert_eq!(
+        http.post(format!("http://{address}/api/v1/workflow.run"))
+            .json(&json!({"project_id":p.project_id}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        http.get(format!("http://{address}/api/v1/discover"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    service.host.locked.store(false, Ordering::SeqCst);
+    assert!(client
+        .operation("project.list", json!({}))
+        .await
+        .unwrap()
+        .is_array());
+    local_task.abort();
+    http_task.abort();
 }
 
 #[async_trait]
 impl Host for FakeHost {
+    fn authorize_product(&self) -> Result<()> {
+        if self.locked.load(Ordering::SeqCst) {
+            Err(ApiError::new("product_auth_required", "请先登录灵雀"))
+        } else {
+            Ok(())
+        }
+    }
     fn schedule_next(&self, config: &Value, anchor: i64, after: i64) -> Result<i64> {
         if config["timezone"] != "UTC" {
             return Err(ApiError::new("invalid_schedule", "Invalid timezone"));

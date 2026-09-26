@@ -4792,6 +4792,7 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "rusqlite",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
@@ -4803,6 +4804,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "tokio",
  "tokio-test",
  "tokio-tungstenite",
@@ -4831,6 +4833,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "chrono",
  "dirs 5.0.1",
  "futures-util",
  "libc",

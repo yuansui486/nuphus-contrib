@@ -129,6 +129,7 @@ windows-sys = { version = "0.59", features = [
 # 同一依赖在 target 段声明，features 与通用段自动合并（非 macOS 平台不启用该 feature，
 # 避免 tauri-build 的 "remove the macos-private-api feature" 报错）。
 [target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 tauri = { version = "2", features = ["macos-private-api"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = [
     "AVCaptureDevice",
@@ -136,6 +137,7 @@ objc2-av-foundation = { version = "0.3.2", default-features = false, features = 
 ] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio-test = "0.4"
 # test feature: mobile_server 集成测试用 mock_app 驱动完整 submit_user_message 调用链
 # （仅测试构建生效，不进入生产二进制）

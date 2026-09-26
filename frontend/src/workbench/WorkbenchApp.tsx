@@ -37,9 +37,11 @@ const ModelsPage = lazy(() =>
 )
 const terminal = (status: string) =>
   ['completed', 'failed', 'cancelled', 'interrupted', 'skipped'].includes(status)
-const projectStorageKey = 'workbench:last-project'
 
-export default function WorkbenchApp() {
+export default function WorkbenchApp({ storageScope }: { storageScope?: string } = {}) {
+  const projectStorageKey = storageScope
+    ? `workbench:${storageScope}:last-project`
+    : 'workbench:last-project'
   const { lang } = useLanguage()
   const ui = useCallback((zh: string, en: string) => (lang === 'zh' ? zh : en), [lang])
   const { toggleTheme } = useTheme()
@@ -84,7 +86,7 @@ export default function WorkbenchApp() {
         /* Storage is optional. */
       }
     }
-  }, [projectId])
+  }, [projectId, projectStorageKey])
 
   useEffect(() => {
     let alive = true
@@ -113,7 +115,7 @@ export default function WorkbenchApp() {
     return () => {
       alive = false
     }
-  }, [fail, ui])
+  }, [fail, ui, projectStorageKey])
 
   const refresh = useCallback(async () => {
     if (!projectId) return

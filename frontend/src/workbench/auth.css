@@ -1,0 +1,123 @@
+.lq-login-shell {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary, #f5f7f5);
+  color: var(--text-primary, #20362e);
+}
+.lq-login-main {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  place-items: center;
+  padding: 28px 20px;
+}
+.lq-login-card {
+  width: min(100%, 440px);
+  padding: 32px;
+  border: 1px solid var(--border-color, #cddbd3);
+  border-radius: 20px;
+  background: var(--bg-secondary, #fff);
+}
+.lq-overline {
+  letter-spacing: 4px;
+  font-size: 12px;
+  color: #379578;
+}
+.lq-login-card h1 {
+  font-size: 27px;
+  margin: 12px 0;
+}
+.lq-login-card h2 {
+  font-size: 18px;
+}
+.lq-subtitle,
+.lq-device-note {
+  color: var(--text-secondary, #6e8076);
+  line-height: 1.7;
+}
+.lq-login-card form {
+  margin-top: 25px;
+}
+.lq-login-card label {
+  display: block;
+  margin: 16px 0;
+  font-size: 13px;
+}
+.lq-login-card input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 7px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #cddbd3);
+  border-radius: 8px;
+  background: var(--bg-primary, #fff);
+  color: inherit;
+}
+.lq-login-card button {
+  width: 100%;
+  padding: 11px;
+  border: 0;
+  border-radius: 8px;
+  background: #126555;
+  color: white;
+  cursor: pointer;
+}
+.lq-login-card button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.lq-login-card .lq-secondary {
+  margin-top: 10px;
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--border-color, #cddbd3);
+}
+.lq-error {
+  color: #ce553e;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.lq-device-note {
+  font-size: 11px;
+  margin: 22px 0 0;
+}
+.lq-projects {
+  padding-left: 20px;
+  max-height: 220px;
+  overflow: auto;
+}
+.lq-projects small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.lq-authorized {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.lq-authorized > .wb-app {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+.lq-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  font-size: 11px;
+  background: var(--bg-secondary, #eef5f0);
+  color: var(--text-primary, #20362e);
+}
+.lq-account button {
+  background: transparent;
+  color: inherit;
+  padding: 3px 7px;
+  border: 1px solid var(--border-color, #cddbd3);
+  border-radius: 5px;
+  cursor: pointer;
+}

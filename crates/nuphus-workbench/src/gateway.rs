@@ -76,8 +76,10 @@ fn bearer(headers: &HeaderMap) -> Result<Access> {
 
 fn error_response(error: ApiError) -> Response {
     let status = match error.code.as_str() {
-        "unauthorized" => StatusCode::UNAUTHORIZED,
-        "permission_denied" => StatusCode::FORBIDDEN,
+        "unauthorized" | "product_auth_required" | "product_session_changed" => {
+            StatusCode::UNAUTHORIZED
+        }
+        "permission_denied" | "tenant_access_denied" => StatusCode::FORBIDDEN,
         "not_found" | "unknown_operation" => StatusCode::NOT_FOUND,
         "revision_conflict" | "idempotency_conflict" | "invalid_run_state" | "automation_busy" => {
             StatusCode::CONFLICT
@@ -123,6 +125,19 @@ async fn authorize<H: Host>(
         Ok(p) => p,
         Err(e) => return error_response(e),
     };
+    let epoch = match state.service.host.session_epoch() {
+        Ok(epoch) => epoch.unwrap_or_default(),
+        Err(_)
+            if matches!(
+                request.uri().path(),
+                "/mcp" | "/api/v1/discover" | "/api/v1/system.capabilities"
+            ) =>
+        {
+            "anonymous".into()
+        }
+        Err(error) => return error_response(error),
+    };
+    let owner_id = format!("{}:{epoch}", principal.id());
     let session = request
         .headers()
         .get("mcp-session-id")
@@ -137,7 +152,7 @@ async fn authorize<H: Host>(
         };
         sessions.retain(|_, (_, time)| time.elapsed() < Duration::from_secs(3600));
         match sessions.get_mut(id) {
-            Some((owner, time)) if owner == principal.id() => *time = Instant::now(),
+            Some((owner, time)) if owner == &owner_id => *time = Instant::now(),
             _ => {
                 return error_response(ApiError::new(
                     "permission_denied",
@@ -160,7 +175,7 @@ async fn authorize<H: Host>(
             .get("mcp-session-id")
             .and_then(|h| h.to_str().ok())
         {
-            sessions.insert(id.into(), (principal.id().into(), Instant::now()));
+            sessions.insert(id.into(), (owner_id, Instant::now()));
         }
     }
     response
@@ -203,6 +218,10 @@ async fn events<H: Host>(
     Extension(token): Extension<Access>,
     Query(query): Query<EventQuery>,
 ) -> Response {
+    let epoch = match state.service.host.session_epoch() {
+        Ok(epoch) => epoch,
+        Err(error) => return error_response(error),
+    };
     let initial = token
         .principal(&state.service.store)
         .and_then(|p| p.authorize("read", Some(&query.project_id)))
@@ -216,12 +235,15 @@ async fn events<H: Host>(
         return error_response(e);
     }
     let stream = futures_util::stream::unfold(
-        (state, token, query, false),
-        |(state, token, mut query, done)| async move {
+        (state, token, query, false, epoch),
+        |(state, token, mut query, done, epoch)| async move {
             if done {
                 return None;
             }
             loop {
+                if state.service.host.session_epoch().ok().as_ref() != Some(&epoch) {
+                    return Some((Ok(Event::default().event("error").data("{\"error\":{\"code\":\"product_session_changed\",\"message\":\"请重新登录并连接灵雀\"}}")), (state, token, query, true, epoch)));
+                }
                 let result = token
                     .principal(&state.service.store)
                     .and_then(|p| p.authorize("read", Some(&query.project_id)))
@@ -243,7 +265,7 @@ async fn events<H: Host>(
                                 .data(serde_json::to_string(item).unwrap_or_default());
                             return Some((
                                 Ok::<_, Infallible>(event),
-                                (state, token, query, false),
+                                (state, token, query, false, epoch),
                             ));
                         }
                     }
@@ -251,7 +273,7 @@ async fn events<H: Host>(
                         let event = Event::default()
                             .event("error")
                             .data(json!({"error":error}).to_string());
-                        return Some((Ok(event), (state, token, query, true)));
+                        return Some((Ok(event), (state, token, query, true, epoch)));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;

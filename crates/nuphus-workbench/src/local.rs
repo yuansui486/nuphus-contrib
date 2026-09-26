@@ -130,6 +130,8 @@ pub async fn check(executable: &Path, root: &Path) -> Result<()> {
 struct Hello {
     protocol: u32,
     edition: String,
+    #[serde(default)]
+    epoch: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -137,6 +139,8 @@ struct Request {
     operation: String,
     args: Value,
     token: Option<String>,
+    #[serde(default)]
+    epoch: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Response {
@@ -192,6 +196,7 @@ impl Server {
                 let hello = serde_json::to_vec(&Hello {
                     protocol: PROTOCOL_VERSION,
                     edition: "workbench".into(),
+                    epoch: service.host.session_epoch().ok().flatten(),
                 })
                 .expect("hello");
                 let request = tokio::time::timeout(IO_TIMEOUT, async {
@@ -200,19 +205,41 @@ impl Server {
                 })
                 .await;
                 let Ok(Ok(request)) = request else { return };
-                let result = match request.token {
-                    Some(token) => match service.store.authenticate(&token) {
-                        Ok(principal) => {
+                let authorization = if request.operation == "system.capabilities" {
+                    Ok(())
+                } else {
+                    service.host.session_epoch().and_then(|epoch| {
+                        if epoch != request.epoch {
+                            Err(ApiError::new(
+                                "product_session_changed",
+                                "登录身份已变化，请重新连接灵雀。",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                };
+                let result = if let Err(error) = authorization {
+                    Err(error)
+                } else {
+                    match request.token {
+                        Some(token) => match service.store.authenticate(&token) {
+                            Ok(principal) => {
+                                service
+                                    .dispatch(&principal, &request.operation, request.args)
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        },
+                        None => {
                             service
-                                .dispatch(&principal, &request.operation, request.args)
+                                .dispatch(
+                                    &Principal::LocalExternal,
+                                    &request.operation,
+                                    request.args,
+                                )
                                 .await
                         }
-                        Err(error) => Err(error),
-                    },
-                    None => {
-                        service
-                            .dispatch(&Principal::LocalExternal, &request.operation, request.args)
-                            .await
                     }
                 };
                 let response = Response {
@@ -248,6 +275,7 @@ pub struct Client {
     host: PathBuf,
     token: Option<String>,
     gate: tokio::sync::Mutex<()>,
+    epoch: std::sync::Mutex<Option<String>>,
 }
 impl Client {
     pub fn installed(token: Option<String>) -> std::io::Result<Self> {
@@ -268,6 +296,7 @@ impl Client {
             host,
             token,
             gate: tokio::sync::Mutex::new(()),
+            epoch: std::sync::Mutex::new(None),
         }
     }
     async fn connect(&self) -> Result<platform::Stream> {
@@ -362,11 +391,12 @@ impl Client {
         }
     }
     pub async fn operation(&self, operation: &str, args: Value) -> Result<Value> {
-        let request = Request {
+        let mut request = Request {
             id: uuid::Uuid::new_v4().to_string(),
             operation: operation.into(),
             args,
             token: self.token.clone(),
+            epoch: None,
         };
         let bytes = serde_json::to_vec(&request)?;
         if bytes.len() > MAX_REQUEST {
@@ -388,6 +418,20 @@ impl Client {
             ));
         }
         // Once writing begins, never transparently retry an operation.
+        {
+            let mut epoch = self.epoch.lock().map_err(|_| transport("连接状态不可用"))?;
+            if epoch.is_some() && *epoch != hello.epoch {
+                return Err(ApiError::new(
+                    "product_session_changed",
+                    "登录身份已变化，请在 Agent 中重新连接灵雀 MCP。",
+                ));
+            }
+            if epoch.is_none() {
+                *epoch = hello.epoch;
+            }
+            request.epoch = epoch.clone();
+        }
+        let bytes = serde_json::to_vec(&request)?;
         let response: Response = tokio::time::timeout(IO_TIMEOUT, async {
             write_frame(&mut stream, &bytes, MAX_REQUEST).await?;
             read_frame(&mut stream, MAX_RESPONSE).await
@@ -448,6 +492,7 @@ mod tests {
                 &serde_json::to_vec(&Hello {
                     protocol: 999,
                     edition: "workbench".into(),
+                    epoch: None,
                 })
                 .unwrap(),
                 MAX_RESPONSE,
@@ -480,6 +525,7 @@ mod tests {
                 &serde_json::to_vec(&Hello {
                     protocol: PROTOCOL_VERSION,
                     edition: "workbench".into(),
+                    epoch: None,
                 })
                 .unwrap(),
                 MAX_RESPONSE,

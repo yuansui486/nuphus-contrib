@@ -24,6 +24,10 @@ async fn main() {
         return;
     }
 
+    if let Err(error) = nuphus::profile::require_product() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     run_single(args).await;
 }
 

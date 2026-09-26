@@ -36,6 +36,7 @@ impl Executor {
 
     /// 检查取消标志，被取消时返回 Err
     pub(super) async fn check_cancel(&self, workflow_id: &str) -> crate::Result<()> {
+        crate::profile::require_product().map_err(crate::NuphusError::Tool)?;
         if let Some(session) = crate::workflow::debug::current() {
             session.check_budget()?;
             // Empty loops must yield too, otherwise the wall-clock timeout cannot be polled.

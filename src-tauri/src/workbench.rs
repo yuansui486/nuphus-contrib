@@ -1,6 +1,8 @@
 //! Thin Tauri/native adapter. Public workflow state and operations live in the
 //! transport-independent nuphus-workbench crate.
 pub mod authoring;
+#[cfg(feature = "workbench")]
+pub mod product_auth;
 mod schedule_secrets;
 use async_trait::async_trait;
 use nuphus::workflow::{
@@ -28,6 +30,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 
 pub struct WorkbenchState {
+    #[cfg(feature = "workbench")]
+    pub authority: Arc<nuphus_workbench::product_auth::Authority>,
     pub service: Arc<Service<NativeHost>>,
     pub endpoint: Arc<Mutex<Value>>,
     local_endpoint: Arc<Mutex<Value>>,
@@ -41,6 +45,7 @@ pub struct NativeHost {
     app: AppHandle,
     cancelled: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     views: Mutex<HashMap<String, Value>>,
+    active_workflows: Arc<Mutex<HashMap<String, String>>>,
 }
 
 fn native_error(error: impl std::fmt::Display) -> ApiError {
@@ -74,7 +79,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
         }
     }
     let store = WorkbenchStore::open(nuphus::profile::workbench_data_dir())?;
-    if store.projects()?.is_empty() {
+    if !nuphus::profile::WORKBENCH && store.projects()?.is_empty() {
         let directory = store.root().join("workspace");
         std::fs::create_dir_all(&directory)?;
         store.register_project(&directory, "Workspace")?;
@@ -83,12 +88,39 @@ pub fn install(app: &AppHandle) -> Result<()> {
     for (project, error) in &recovery_errors {
         tracing::warn!(%project, %error, "Workbench project recovery deferred");
     }
+    #[cfg(feature = "workbench")]
+    let authority = product_auth::create(app)?;
+    #[cfg(feature = "workbench")]
+    let store = {
+        let auth = authority.clone();
+        nuphus::profile::install_product_guard(Box::new(move || {
+            auth.require()
+                .map(|identity| identity.epoch)
+                .map_err(|error| error.to_string())
+        }))
+        .map_err(native_error)?;
+        let auth = authority.clone();
+        store.with_tenant_guard(Arc::new(move || {
+            let identity = auth.require()?;
+            if nuphus_workbench::service::REQUEST_EPOCH
+                .try_with(|expected| expected.as_ref().is_some_and(|e| e != &identity.epoch))
+                .unwrap_or(false)
+            {
+                return Err(ApiError::new(
+                    "product_session_changed",
+                    "登录身份已变化，旧请求已停止。",
+                ));
+            }
+            Ok(identity.subject.tenant_id)
+        }))
+    };
     let service = Arc::new(Service::new(
         store,
         NativeHost {
             app: app.clone(),
             cancelled: Arc::new(Mutex::new(HashMap::new())),
             views: Mutex::new(HashMap::new()),
+            active_workflows: Arc::new(Mutex::new(HashMap::new())),
         },
     ));
     let endpoint = Arc::new(Mutex::new(json!({"status":"starting"})));
@@ -121,8 +153,17 @@ pub fn install(app: &AppHandle) -> Result<()> {
         let service = service.clone();
         tauri::async_runtime::spawn(async move {
             let mut recovered = std::collections::HashSet::new();
+            let mut epoch = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let current = service.host.session_epoch().ok();
+                if current != epoch {
+                    recovered.clear();
+                    epoch = current.clone();
+                }
+                if current.is_none() {
+                    continue;
+                }
                 let Ok(projects) = service.store.projects() else {
                     continue;
                 };
@@ -180,12 +221,16 @@ pub fn install(app: &AppHandle) -> Result<()> {
         });
     }
     app.manage(WorkbenchState {
+        #[cfg(feature = "workbench")]
+        authority: authority.clone(),
         service,
         endpoint,
         local_endpoint,
         generations: Arc::new(Mutex::new(HashMap::new())),
         _instance_lock: instance_lock,
     });
+    #[cfg(feature = "workbench")]
+    product_auth::start(app.clone(), authority);
     Ok(())
 }
 
@@ -202,6 +247,12 @@ pub async fn workbench_call(app: AppHandle, operation: String, args: Value) -> R
 
 #[tauri::command]
 pub async fn workbench_clients(app: AppHandle, action: String, args: Value) -> Result<Value> {
+    if nuphus::profile::WORKBENCH && !matches!(action.as_str(), "status" | "check") {
+        return Err(ApiError::new(
+            "unsupported_operation",
+            "灵雀外部接入复用桌面登录，不管理旧版客户端凭据。",
+        ));
+    }
     let state = app
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "Start the Workbench edition"))?;
@@ -285,6 +336,22 @@ pub fn workbench_view_state(
 
 #[async_trait]
 impl Host for NativeHost {
+    fn authorize_product(&self) -> Result<()> {
+        nuphus::profile::require_product().map_err(|e| ApiError::new("product_auth_required", e))
+    }
+    fn session_epoch(&self) -> Result<Option<String>> {
+        self.authorize_product()?;
+        #[cfg(feature = "workbench")]
+        {
+            self.app
+                .state::<WorkbenchState>()
+                .authority
+                .require()
+                .map(|identity| Some(identity.epoch))
+        }
+        #[cfg(not(feature = "workbench"))]
+        Ok(None)
+    }
     fn schedule_next(&self, config: &Value, anchor: i64, after: i64) -> Result<i64> {
         let config = serde_json::from_value(config.clone())?;
         let date = |value| {
@@ -349,6 +416,10 @@ impl Host for NativeHost {
     }
 
     async fn start(&self, store: WorkbenchStore, run: Run, inputs: Value) -> Result<()> {
+        self.authorize_product()?;
+        let epoch = self.session_epoch()?.unwrap_or_default();
+        let store = store.pinned()?;
+        let active_workflows = self.active_workflows.clone();
         let state = self.app.state::<crate::state::AppState>();
         let (lease, owner) = crate::resource_gate::acquire_execution_body_with_owner(
             &state.automation_gate,
@@ -529,9 +600,13 @@ impl Host for NativeHost {
             .map_err(native_error)?
             .insert(run.run_id.clone(), cancelled.clone());
         let cancellations = self.cancelled.clone();
+        active_workflows
+            .lock()
+            .map_err(native_error)?
+            .insert(run.run_id.clone(), run.workflow_id.clone());
         store.transition(&run.project_id, &run.run_id, RunStatus::Running, None)?;
         // Run ownership outlives the request and any external connection.
-        tauri::async_runtime::spawn(async move {
+        tauri::async_runtime::spawn(nuphus::profile::PRODUCT_EPOCH.scope(epoch, async move {
             let _lease = lease;
             let result = nuphus::automation_gate::with_execution_owner(
                 owner,
@@ -577,6 +652,20 @@ impl Host for NativeHost {
                             WorkflowRunSource::External
                         },
                     );
+                    let execute=async {
+                        tokio::select! {
+                            result=execute=>result,
+                            _=async {
+                                loop {
+                                    if cancelled.load(Ordering::SeqCst) || nuphus::profile::require_product().is_err() {
+                                        cancelled.store(true,Ordering::SeqCst);
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            }=>Err(nuphus::NuphusError::Tool("授权已失效或任务已取消；已发出的操作不能自动撤销。".into())),
+                        }
+                    };
                     if let Some(session) = &debug_session {
                         let result = nuphus::workflow::debug::CURRENT
                             .scope(session.clone(), execute)
@@ -633,7 +722,8 @@ impl Host for NativeHost {
             if let Ok(mut active) = cancellations.lock() {
                 active.remove(&run.run_id);
             }
-        });
+            if let Ok(mut active) = active_workflows.lock() { active.remove(&run.run_id); }
+        }));
         Ok(())
     }
 

@@ -8,7 +8,8 @@ host supplies the upstream compiler and executor through `service::Host`.
 
 Implemented: project registration, revision-checked IR editing, independent layout
 revisions, immutable published versions, run identity and idempotency, durable
-cursor events, zero-setup full-access local HTTP/MCP and a stdio bridge. Legacy scoped tokens remain compatible.
+cursor events, tenant-scoped local HTTP/MCP and a stdio bridge. Legacy scoped tokens remain compatible.
+Lingque product authorization is provided by the desktop host; see [LINGQUE_AUTH.md](../../LINGQUE_AUTH.md).
 
 The edition now includes a workflow-first UI, internal-generation integration,
 native debug/automation adapters and release/synchronization workflow definitions.
@@ -21,7 +22,7 @@ The Workbench application/tray hosts `http://127.0.0.1:47731` (override port usi
 `NUPHUS_WORKBENCH_PORT`). It does not start an independent privileged daemon.
 Bind failures are exposed to the UI rather than silently choosing another service.
 The desktop edition accepts native loopback callers without enrollment or a token,
-with access to all projects and capabilities. The Connections page displays status
+after desktop product login, with access to the current tenant's projects and capabilities. The Connections page displays status
 and addresses, not a client/permission management form. No internal model is required.
 Only 127.0.0.1 is bound; browser Origin/Fetch-Metadata and non-local Host headers
 are rejected. This trusts local programs: it is not an OS sandbox or a project ACL.
@@ -84,7 +85,7 @@ them automatically. Failed runs remain queryable.
 Content conflicts return `revision_conflict` and never overwrite another editor.
 Layout has its own revision. Deleting a draft preserves versions and run evidence.
 Local callers have `read`, `edit`, `run`, `respond`, `automation`, `projects` for all
-projects, including projects registered later. There is no per-node permission wizard.
+projects belonging to the authorized tenant, including projects registered later. There is no per-node permission wizard.
 Native OS permissions and existing execution coordination remain in force.
 Anonymous calls share a local-external identity, so use globally unique request IDs.
 

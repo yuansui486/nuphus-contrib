@@ -186,7 +186,10 @@ fn main() {
                 })
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+          let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool=tauri::generate_handler![
+            #[cfg(feature="workbench")]
+            workbench::product_auth::lingque_auth,
             workbench::workbench_call,
             workbench::workbench_clients,
             workbench::workbench_view_state,
@@ -512,7 +515,16 @@ fn main() {
             render::commands::pdf_render_error,
             // -- CHANGELOG（编译期嵌入，离线可读；版本与更新页展示本版改动）--
             commands::get_changelog,
-        ])
+          ];
+          move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+            #[cfg(feature="workbench")]
+            if let Err(error)=workbench::product_auth::guard_command(invoke.message.command()) {
+                invoke.resolver.reject(error);
+                return true;
+            }
+            handler(invoke)
+          }
+        })
         .setup(|app| {
             if nuphus::profile::WORKBENCH {
                 workbench::install(app.handle())?;
@@ -718,7 +730,7 @@ fn main() {
             }
 
             // Wire schedule execution callback (cron → execute_workflow)
-            {
+            if !nuphus::profile::WORKBENCH {
                 let state = app.state::<crate::state::AppState>();
                 let app_handle = app.handle().clone();
 
