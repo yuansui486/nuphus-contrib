@@ -14,14 +14,22 @@
 
 import type { IntentForm } from './intentTypes'
 
+export interface IntentTextOptions {
+  target?: 'workbench'
+}
+
 export function buildIntentTextTemplate(
   form: IntentForm,
   wid: string,
   fallbackName?: string | null,
+  options?: IntentTextOptions,
 ): string {
   const workflowName = form.workflowName?.trim() || fallbackName?.trim() || '未命名工作流'
   const header = `[意图表单→工作流] 请把以下意图整理为可执行 V2 工作流「${workflowName}」（id=${wid}）：`
-  const footer = `要求：意图解析、步骤前置与重置、循环合并、异常分支、缺失参数补偿；\n若某步涉及界面操作细节不确定，请先在实际界面探索跑通再固化；\n完成后覆写 plugin/workflows/${wid}/workflow.json（保留 id=${wid}）并跑通验证。`
+  const footer =
+    options?.target === 'workbench'
+      ? `要求：意图解析、步骤前置与重置、循环合并、异常分支、缺失参数补偿；\n通过工作台提供的画布 API 修改当前工作流（保留 id=${wid}），保留与本次请求无关的编辑，并检查修订冲突与原生校验结果；\n界面操作细节不确定时，请声明运行时输入或观察步骤，或向用户提问；不要直接写工作流文件，不要自动运行或声称已运行。运行由用户在画布确认。`
+      : `要求：意图解析、步骤前置与重置、循环合并、异常分支、缺失参数补偿；\n若某步涉及界面操作细节不确定，请先在实际界面探索跑通再固化；\n完成后覆写 plugin/workflows/${wid}/workflow.json（保留 id=${wid}）并跑通验证。`
 
   const stages = form.stages ?? []
   const named = stages.some(s => s.name.trim().length > 0)

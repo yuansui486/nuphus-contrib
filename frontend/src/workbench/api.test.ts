@@ -17,6 +17,13 @@ beforeEach(() => {
 })
 
 describe('Workbench canvas backend', () => {
+  it('binds guided authoring drafts and instructions to the workbench project', () => {
+    expect(canvasBackend(fixture(), vi.fn(), vi.fn()).intent).toEqual({
+      target: 'workbench',
+      draftScope: 'workbench:project',
+    })
+  })
+
   it('keeps content revision unchanged on layout updates and never uses legacy wf commands', async () => {
     const draft = fixture()
     const backend = canvasBackend(draft, vi.fn(), vi.fn())

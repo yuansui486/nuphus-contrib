@@ -93,6 +93,7 @@ export function canvasBackend(
     scheduling: false,
     debugging: true,
     generation: initial.authoring_mode === 'internal',
+    intent: { target: 'workbench', draftScope: `workbench:${initial.project_id}` },
     wfGetRaw: async () => current.document as unknown as Record<string, unknown>,
     wfLayoutGet: async () => current.layout,
     wfLayoutSave: async (_id, layout) => {

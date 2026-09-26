@@ -3,17 +3,50 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { LangProvider } from '../locales'
 import WorkbenchApp from './WorkbenchApp'
 import type { Draft } from './api'
+import { useEffect } from 'react'
 
-const mocks = vi.hoisted(() => ({ invoke: vi.fn() }))
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), leave: vi.fn(async () => true) }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: async () => null }))
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ toggleTheme: vi.fn() }) }))
 vi.mock('../main-window/layout/TitleBar', () => ({ TitleBar: () => <header>Workbench</header> }))
 vi.mock('../main-window/workflow-canvas/CanvasPage', () => ({
-  CanvasPage: () => <div>Canvas editor</div>,
+  CanvasPage: ({
+    onSwitchWorkflow,
+    registerLeaveGuard,
+  }: {
+    onSwitchWorkflow: (id: string) => void
+    registerLeaveGuard: (guard: null | (() => Promise<boolean>)) => void
+  }) => {
+    useEffect(() => {
+      registerLeaveGuard(mocks.leave)
+      return () => registerLeaveGuard(null)
+    }, [registerLeaveGuard])
+    return (
+      <div>
+        Canvas editor
+        <button onClick={() => onSwitchWorkflow('flow-one')}>Canvas switch workflow</button>
+      </div>
+    )
+  },
 }))
-vi.mock('./AuthoringPanel', () => ({ AuthoringPanel: () => <div>Internal composer</div> }))
+vi.mock('./AuthoringPanel', () => ({
+  AuthoringPanel: ({
+    collapsed,
+    onBusyChange,
+  }: {
+    collapsed: boolean
+    onBusyChange: (busy: boolean) => void
+  }) => (
+    <div hidden={collapsed}>
+      Internal composer
+      <input aria-label="Assistant draft" />
+      <button onClick={() => onBusyChange(true)}>Start generation</button>
+      <button onClick={() => onBusyChange(false)}>Finish generation</button>
+    </div>
+  ),
+}))
 const draft = (project: string, mode: 'internal' | 'external' = 'internal'): Draft => ({
   project_id: project,
   workflow_id: `flow-${project}`,
@@ -25,6 +58,8 @@ const draft = (project: string, mode: 'internal' | 'external' = 'internal'): Dra
   updated_at: 0,
 })
 beforeEach(() => {
+  localStorage.removeItem('workbench:last-project')
+  mocks.leave.mockReset().mockResolvedValue(true)
   localStorage.setItem('nuphus_language', 'en')
   mocks.invoke.mockReset()
   mocks.invoke.mockImplementation(async (command, payload) => {
@@ -39,6 +74,143 @@ beforeEach(() => {
   })
 })
 describe('workflow-first Workbench shell', () => {
+  it('does not reopen a slow create after the user navigates to runs', async () => {
+    let finish!: (value: Draft) => void
+    const response = new Promise<Draft>(resolve => {
+      finish = resolve
+    })
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) =>
+      payload?.operation === 'canvas.create' ? response : fallback(command, payload),
+    )
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    await screen.findByRole('button', { name: /Flow one/ })
+    fireEvent.click(screen.getByRole('button', { name: 'New canvas' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page'),
+    )
+    await act(async () => {
+      finish(draft('one'))
+      await response
+    })
+    expect(screen.queryByText('Canvas editor')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page')
+  })
+  it('does not reopen a slow mode update after the user leaves the editor', async () => {
+    let finish!: (value: { draft: Draft }) => void
+    const response = new Promise<{ draft: Draft }>(resolve => {
+      finish = resolve
+    })
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) => {
+      if (payload?.operation === 'workflow.list') return [draft('one', 'external')]
+      if (payload?.operation === 'canvas.update') return response
+      return fallback(command, payload)
+    })
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Enable AI assistant' }))
+    await waitFor(() =>
+      expect(mocks.invoke.mock.calls.some(([, args]) => args?.operation === 'canvas.update')).toBe(
+        true,
+      ),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
+    await waitFor(() => expect(screen.queryByText('Canvas editor')).not.toBeInTheDocument())
+    await act(async () => {
+      finish({ draft: draft('one') })
+      await response
+    })
+    expect(screen.queryByText('Canvas editor')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page')
+  })
+  it('moves project selection into settings and restores the previous project', async () => {
+    localStorage.setItem('workbench:last-project', 'two')
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    await screen.findByRole('button', { name: /Flow two/ })
+    expect(screen.queryByRole('combobox', { name: 'Current project' })).not.toBeInTheDocument()
+    const settings = screen.getByRole('button', { name: 'Settings' })
+    settings.focus()
+    fireEvent.click(settings)
+    expect(screen.getByRole('combobox', { name: 'Current project' })).toHaveValue('two')
+    expect(screen.getByText('/two')).toBeInTheDocument()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(settings).toHaveFocus()
+  })
+  it('falls back visibly when the saved project no longer exists', async () => {
+    localStorage.setItem('workbench:last-project', 'missing')
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    await screen.findByRole('button', { name: /Flow one/ })
+    expect(screen.getByText(/previous project is unavailable/)).toBeInTheDocument()
+    expect(localStorage.getItem('workbench:last-project')).toBe('one')
+  })
+  it('collapses the assistant without discarding input or switching authoring mode', async () => {
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    const field = screen.getByRole('textbox', { name: 'Assistant draft' })
+    fireEvent.change(field, { target: { value: 'Keep this request' } })
+    fireEvent.click(screen.getByRole('button', { name: 'AI assistant' }))
+    expect(field).not.toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'AI assistant' }))
+    expect(field).toHaveValue('Keep this request')
+    expect(field).toBeVisible()
+    expect(mocks.invoke.mock.calls.some(([, args]) => args?.operation === 'canvas.update')).toBe(
+      false,
+    )
+  })
+  it('keeps generation locked even when the panel is collapsed and blocks canvas workflow switching', async () => {
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Start generation' }))
+    fireEvent.click(screen.getByRole('button', { name: 'AI assistant' }))
+    expect(screen.getByRole('status', { name: 'Generating' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Canvas switch workflow' }))
+    expect(screen.getByText(/Stop generation before switching canvases/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'AI assistant' })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Back to workflows' }))
+    expect(screen.getByText('Canvas editor')).toBeInTheDocument()
+  })
+  it('keeps dirty editor navigation under the existing leave guard', async () => {
+    mocks.leave.mockResolvedValue(false)
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
+    await waitFor(() => expect(mocks.leave).toHaveBeenCalled())
+    expect(screen.getByText('Canvas editor')).toBeInTheDocument()
+  })
   it('creates and opens a blank canvas immediately without asking for a name', async () => {
     const fallback = mocks.invoke.getMockImplementation()!
     let finish: (value: Draft) => void = () => {}
@@ -159,6 +331,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
     await waitFor(() =>
       expect(screen.getByRole('combobox', { name: 'Current project' })).toHaveValue('one'),
     )

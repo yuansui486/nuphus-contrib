@@ -19,6 +19,21 @@ const FOOTER_OVERWRITE =
   /完成后覆写 plugin\/workflows\/wf-\d+\/workflow\.json（保留 id=wf-\d+）并跑通验证。/
 
 describe('buildIntentTextTemplate', () => {
+  it('uses canvas authoring instructions in Workbench without legacy file or execution requests', () => {
+    const form: IntentForm = {
+      workflowName: '日报导出',
+      stages: [stage('整理', ['读取 CSV', '汇总结果'])],
+    }
+    const out = buildIntentTextTemplate(form, 'wf-001', undefined, { target: 'workbench' })
+    expect(out).toContain('阶段1「整理」\n- 读取 CSV\n- 汇总结果')
+    expect(out).toContain('画布 API 修改当前工作流（保留 id=wf-001）')
+    expect(out).toContain('修订冲突与原生校验')
+    expect(out).toContain('不要直接写工作流文件，不要自动运行')
+    expect(out).not.toContain('plugin/workflows/')
+    expect(out).not.toContain('探索跑通')
+    expect(buildIntentTextTemplate(form, 'wf-001')).toMatch(FOOTER_OVERWRITE)
+  })
+
   it('场景 1：简单 3 步（无阶段嵌套 → 编号平铺）', () => {
     const form: IntentForm = {
       workflowName: '每日股价提醒',

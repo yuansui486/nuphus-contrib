@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WorkflowIR } from './types'
 import type { CanvasLeaveGuard } from './useCanvasLeaveGuard'
 import { LangProvider, useLanguage } from '../../locales'
+import { CanvasBackendContext, legacyCanvasBackend } from './CanvasBackend'
+import type { IntentForm } from './intentTypes'
 
 const mocks = vi.hoisted(() => ({
   save: vi.fn(),
@@ -87,7 +89,23 @@ vi.mock('./ProblemsPanel', () => ({
   ),
 }))
 vi.mock('./OutlinePanel', () => ({ OutlinePanel: () => null }))
-vi.mock('./IntentFormPanel', () => ({ IntentFormPanel: () => null }))
+vi.mock('./IntentFormPanel', () => ({
+  IntentFormPanel: ({
+    draftScope,
+    submitLabel,
+    onSubmit,
+  }: {
+    draftScope?: string
+    submitLabel?: string
+    onSubmit: (form: IntentForm) => Promise<boolean>
+  }) => (
+    <div role="dialog" data-testid="intent-form" data-draft-scope={draftScope}>
+      <button onClick={() => void onSubmit({ workflowName: 'Guided', stages: [] })}>
+        {submitLabel ?? 'Submit intent'}
+      </button>
+    </div>
+  ),
+}))
 vi.mock('./ScopedEditDialog', () => ({
   ScopedEditDialog: ({
     selectedIds,
@@ -154,6 +172,34 @@ function shortcut() {
 }
 
 describe('Canvas save coordination', () => {
+  it('passes workbench scope and safe intent text to the composer without running or closing', async () => {
+    const receiveIntent = vi.fn()
+    const close = vi.fn()
+    render(
+      <CanvasBackendContext.Provider
+        value={{
+          ...legacyCanvasBackend,
+          intent: { target: 'workbench', draftScope: 'workbench:project' },
+        }}
+      >
+        <CanvasPage workflowId="wf" onClose={close} onGenerateIntent={receiveIntent} />
+      </CanvasBackendContext.Provider>,
+    )
+    await screen.findByRole('button', { name: '打开 first' })
+    fireEvent.click(screen.getByText('更多'))
+    fireEvent.click(screen.getByRole('button', { name: '意图表单' }))
+    expect(screen.getByTestId('intent-form')).toHaveAttribute(
+      'data-draft-scope',
+      'workbench:project',
+    )
+    fireEvent.click(screen.getByRole('button', { name: '填入描述' }))
+    await waitFor(() => expect(receiveIntent).toHaveBeenCalledTimes(1))
+    expect(receiveIntent.mock.calls[0][0]).toContain('画布 API 修改当前工作流')
+    expect(receiveIntent.mock.calls[0][0]).not.toContain('plugin/workflows/')
+    expect(mocks.run).not.toHaveBeenCalled()
+    expect(close).not.toHaveBeenCalled()
+  })
+
   it('revalidates references when an input declaration changes without editing nodes', async () => {
     const original = workflow.steps
     workflow.steps = [

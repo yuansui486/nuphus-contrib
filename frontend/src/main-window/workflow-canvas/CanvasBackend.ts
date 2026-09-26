@@ -1,6 +1,7 @@
 import { createContext, useContext } from 'react'
 import * as api from '../lib/api'
 import { wfDebugRun, wfDebugControl } from './debugSession'
+import type { IntentTextOptions } from './intentText'
 
 /** A small edition seam: upstream editor logic stays shared, persistence does not. */
 export const legacyCanvasBackend = {
@@ -20,6 +21,8 @@ export const legacyCanvasBackend = {
   debugging: true,
   generation: true,
 }
-export type CanvasBackend = typeof legacyCanvasBackend
+export type CanvasBackend = typeof legacyCanvasBackend & {
+  intent?: IntentTextOptions & { draftScope?: string }
+}
 export const CanvasBackendContext = createContext<CanvasBackend>(legacyCanvasBackend)
 export const useCanvasBackend = () => useContext(CanvasBackendContext)

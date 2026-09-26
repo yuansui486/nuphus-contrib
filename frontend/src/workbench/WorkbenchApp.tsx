@@ -9,6 +9,15 @@ import { invoke } from '@tauri-apps/api/core'
 import { useLanguage } from '../locales'
 import { useTheme } from '../hooks/useTheme'
 import {
+  IconArrowLeft as ArrowLeft,
+  IconPlug as Cable,
+  IconHistory as History,
+  IconLayoutDashboard as LayoutDashboard,
+  IconPlus as Plus,
+  IconSettings as Settings,
+  IconSparkles as Sparkles,
+} from '../ui/Icons'
+import {
   call,
   canvasBackend,
   clients,
@@ -18,6 +27,7 @@ import {
   type Run,
 } from './api'
 import { AuthoringPanel } from './AuthoringPanel'
+import { WorkbenchSettings } from './WorkbenchSettings'
 import './workbench.css'
 
 const ModelsPage = lazy(() =>
@@ -25,6 +35,7 @@ const ModelsPage = lazy(() =>
 )
 const terminal = (status: string) =>
   ['completed', 'failed', 'cancelled', 'interrupted'].includes(status)
+const projectStorageKey = 'workbench:last-project'
 
 export default function WorkbenchApp() {
   const { lang } = useLanguage()
@@ -44,6 +55,8 @@ export default function WorkbenchApp() {
   const [conflict, setConflict] = useState(false)
   const [intent, setIntent] = useState('')
   const [generationBusy, setGenerationBusy] = useState(false)
+  const [assistantOpen, setAssistantOpen] = useState(true)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const creatingRef = useRef(false)
   const dirty = useRef(false)
   const activeRef = useRef(active)
@@ -51,6 +64,7 @@ export default function WorkbenchApp() {
   const projectRef = useRef(projectId)
   projectRef.current = projectId
   const refreshSequence = useRef(0)
+  const navigationSequence = useRef(0)
   const generationRef = useRef(generationBusy)
   generationRef.current = generationBusy
   const { register, leave } = useCanvasLeaveGuard()
@@ -58,6 +72,13 @@ export default function WorkbenchApp() {
   useEffect(() => {
     setDrafts([])
     setRuns([])
+    if (projectId) {
+      try {
+        localStorage.setItem(projectStorageKey, projectId)
+      } catch {
+        /* Storage is optional. */
+      }
+    }
   }, [projectId])
 
   useEffect(() => {
@@ -66,14 +87,28 @@ export default function WorkbenchApp() {
       .then(items => {
         if (!alive) return
         setProjects(items)
-        setProjectId(items[0]?.project_id ?? '')
+        let previous: string | null = null
+        try {
+          previous = localStorage.getItem(projectStorageKey)
+        } catch {
+          /* Storage is optional. */
+        }
+        const selected = items.find(item => item.project_id === previous)
+        setProjectId(selected?.project_id ?? items[0]?.project_id ?? '')
+        if (previous && !selected)
+          setNotice(
+            ui(
+              '上次的项目不可用，已切换到可用项目。',
+              'The previous project is unavailable; another project was selected.',
+            ),
+          )
       })
       .catch(fail)
     void invoke('finish_startup').catch(fail)
     return () => {
       alive = false
     }
-  }, [fail])
+  }, [fail, ui])
 
   const refresh = useCallback(async () => {
     if (!projectId) return
@@ -128,11 +163,15 @@ export default function WorkbenchApp() {
   }, [refresh, fail])
 
   const openDraft = useCallback((draft: Draft) => {
+    ++navigationSequence.current
     ++refreshSequence.current
     setActive(draft)
     setProjectId(draft.project_id)
     setPage('workflows')
     setConflict(false)
+    setAssistantOpen(true)
+    setSettingsOpen(false)
+    setIntent('')
     dirty.current = false
     setEpoch(value => value + 1)
   }, [])
@@ -144,7 +183,10 @@ export default function WorkbenchApp() {
         )
         return
       }
-      void leave(action)
+      void leave(() => {
+        ++navigationSequence.current
+        action()
+      })
     },
     [leave, ui],
   )
@@ -212,6 +254,7 @@ export default function WorkbenchApp() {
   const create = async () => {
     if (!projectId || creatingRef.current) return
     const requestedProject = projectId
+    const navigation = navigationSequence.current
     creatingRef.current = true
     setCreating(true)
     try {
@@ -219,8 +262,9 @@ export default function WorkbenchApp() {
         project_id: requestedProject,
         name: ui('未命名工作流', 'Untitled workflow'),
       })
-      // A slow create must not switch the user back to a project they left.
-      if (projectRef.current !== requestedProject) return
+      // Persist the result, but never reopen it after the user navigated elsewhere.
+      if (projectRef.current !== requestedProject || navigationSequence.current !== navigation)
+        return
       openDraft(draft)
       await refresh()
     } catch (error) {
@@ -231,6 +275,7 @@ export default function WorkbenchApp() {
     }
   }
   const chooseProject = async () => {
+    const navigation = navigationSequence.current
     const directory = await open({ directory: true, multiple: false })
     if (typeof directory !== 'string') return
     const project = await call<Project>('project.register', {
@@ -238,6 +283,7 @@ export default function WorkbenchApp() {
       name: directory.split(/[\\/]/).filter(Boolean).slice(-1)[0] || 'Workspace',
     })
     setProjects(await call<Project[]>('project.list'))
+    if (navigationSequence.current !== navigation) return
     setProjectId(project.project_id)
     setActive(null)
   }
@@ -253,65 +299,143 @@ export default function WorkbenchApp() {
   const mode = async (value: 'internal' | 'external') => {
     if (!active || generationBusy) return
     navigate(() => {
+      const navigation = navigationSequence.current
       void call<{ draft: Draft }>('canvas.update', {
         project_id: projectId,
         workflow_id: active.workflow_id,
         revision: activeRef.current?.revision,
         operations: [{ op: 'set_authoring_mode', mode: value }],
       })
-        .then(result => openDraft(result.draft))
+        .then(result => {
+          if (navigationSequence.current !== navigation) return
+          if (dirty.current || generationRef.current) {
+            setConflict(true)
+            return
+          }
+          openDraft(result.draft)
+        })
         .catch(fail)
     })
   }
+
+  const switchPage = (value: typeof page) =>
+    navigate(() => {
+      setSettingsOpen(false)
+      setPage(value)
+      setActive(null)
+    })
+  const selectedProject = projects.find(item => item.project_id === projectId)
+  const statusText = (status: string) =>
+    ({
+      queued: ui('排队中', 'Queued'),
+      running: ui('运行中', 'Running'),
+      paused: ui('已暂停', 'Paused'),
+      awaiting_human: ui('等待确认', 'Awaiting confirmation'),
+      completed: ui('已完成', 'Completed'),
+      failed: ui('失败', 'Failed'),
+      cancelled: ui('已取消', 'Cancelled'),
+      interrupted: ui('已中断', 'Interrupted'),
+    })[status] ?? status
 
   return (
     <div className="wb-app">
       <TitleBar brand="Nuphus Workbench" />
       <nav className="wb-nav" aria-label={ui('工作台导航', 'Workbench navigation')}>
-        <select
-          aria-label={ui('当前项目', 'Current project')}
-          value={projectId}
-          onChange={event =>
+        <div className="wb-nav-primary">
+          <button
+            aria-current={page === 'workflows' ? 'page' : undefined}
+            onClick={() => switchPage('workflows')}
+          >
+            {active && page === 'workflows' ? (
+              <ArrowLeft size={16} />
+            ) : (
+              <LayoutDashboard size={16} />
+            )}
+            {active && page === 'workflows'
+              ? ui('返回工作流', 'Back to workflows')
+              : ui('工作流', 'Workflows')}
+          </button>
+          <button
+            aria-current={page === 'runs' ? 'page' : undefined}
+            onClick={() => switchPage('runs')}
+          >
+            <History size={16} />
+            {ui('运行记录', 'Runs')}
+          </button>
+        </div>
+        <div className="wb-nav-secondary">
+          <button
+            aria-current={page === 'clients' ? 'page' : undefined}
+            onClick={() => switchPage('clients')}
+          >
+            <Cable size={16} />
+            {ui('外部接入', 'Connections')}
+          </button>
+          {active && page === 'workflows' && (
+            <button
+              id="wb-assistant-toggle"
+              aria-label={
+                active.authoring_mode === 'external'
+                  ? ui('启用 AI 助手', 'Enable AI assistant')
+                  : ui('AI 助手', 'AI assistant')
+              }
+              aria-pressed={active.authoring_mode === 'internal' && assistantOpen}
+              aria-controls="wb-assistant-panel"
+              onClick={() => {
+                if (active.authoring_mode === 'external') void mode('internal')
+                else setAssistantOpen(value => !value)
+              }}
+            >
+              <Sparkles size={16} />
+              {active.authoring_mode === 'external'
+                ? ui('启用 AI 助手', 'Enable AI assistant')
+                : ui('AI 助手', 'AI assistant')}
+              {generationBusy && (
+                <span
+                  className="wb-busy-dot"
+                  role="status"
+                  aria-label={ui('生成中', 'Generating')}
+                />
+              )}
+            </button>
+          )}
+          <button
+            aria-expanded={settingsOpen}
+            aria-haspopup="dialog"
+            onClick={() => setSettingsOpen(true)}
+          >
+            <Settings size={16} />
+            {ui('设置', 'Settings')}
+          </button>
+        </div>
+      </nav>
+      {settingsOpen && (
+        <WorkbenchSettings
+          ui={ui}
+          projects={projects}
+          projectId={projectId}
+          mode={page === 'workflows' ? active?.authoring_mode : undefined}
+          busy={generationBusy}
+          onClose={() => setSettingsOpen(false)}
+          onModels={() => switchPage('models')}
+          onTheme={toggleTheme}
+          onProject={id =>
             navigate(() => {
-              setProjectId(event.target.value)
+              setProjectId(id)
               setActive(null)
+              setSettingsOpen(false)
+              setPage('workflows')
             })
           }
-        >
-          {projects.map(project => (
-            <option key={project.project_id} value={project.project_id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-        <button onClick={() => navigate(() => void chooseProject().catch(fail))}>
-          {ui('打开项目', 'Open project')}
-        </button>
-        {(['workflows', 'runs', 'clients', 'models'] as const).map((item, index) => (
-          <button
-            key={item}
-            aria-current={page === item ? 'page' : undefined}
-            onClick={() =>
-              navigate(() => {
-                setPage(item)
-                setActive(null)
-              })
-            }
-          >
-            {
-              [
-                ui('工作流', 'Workflows'),
-                ui('运行记录', 'Runs'),
-                ui('外部接入', 'Connections'),
-                ui('模型配置', 'Models'),
-              ][index]
-            }
-          </button>
-        ))}
-        <button className="wb-theme" onClick={toggleTheme}>
-          {ui('切换主题', 'Toggle theme')}
-        </button>
-      </nav>
+          onOpenProject={() =>
+            navigate(() => {
+              setSettingsOpen(false)
+              void chooseProject().catch(fail)
+            })
+          }
+          onMode={value => void mode(value)}
+        />
+      )}
       {notice && (
         <div className="wb-notice" role="status">
           <span>{notice}</span>
@@ -333,10 +457,15 @@ export default function WorkbenchApp() {
                 <h1>{ui('工作流', 'Workflows')}</h1>
                 <p>
                   {ui(
-                    '在画布编排，或让外部 Agent 接入。运行与版本由本机工作台管理。',
-                    'Build on the canvas or connect an external Agent. This local workbench manages versions and execution.',
+                    '把重复的工作，变成可重复使用的流程。',
+                    'Turn repetitive work into reusable workflows.',
                   )}
                 </p>
+                {selectedProject && selectedProject.project_id !== projects[0]?.project_id && (
+                  <small className="wb-location" title={selectedProject.directory}>
+                    {ui('项目', 'Project')} · {selectedProject.name}
+                  </small>
+                )}
               </div>
               <button
                 className="wb-primary"
@@ -347,6 +476,7 @@ export default function WorkbenchApp() {
                   'Create a blank workflow and open the canvas',
                 )}
               >
+                <Plus size={16} />
                 {creating ? ui('创建中…', 'Creating…') : ui('画布新建', 'New canvas')}
               </button>
             </header>
@@ -379,13 +509,20 @@ export default function WorkbenchApp() {
                     <h2>{draft.document.name}</h2>
                     <p>
                       {draft.authoring_mode === 'internal'
-                        ? ui('内置生成', 'Internal authoring')
-                        : ui('外部编排', 'External authoring')}
+                        ? ui('AI 辅助', 'AI-assisted')
+                        : ui('手动 · 外部编排', 'Manual · external')}
                     </p>
                     <small>
                       {ui('修订', 'Revision')} {draft.revision} · {draft.document.steps.length}{' '}
                       {ui('个顶层节点', 'top-level steps')}
                     </small>
+                    <time
+                      className="wb-updated"
+                      dateTime={new Date(draft.updated_at).toISOString()}
+                    >
+                      {ui('更新于', 'Updated')}{' '}
+                      {new Date(draft.updated_at).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US')}
+                    </time>
                   </button>
                 ))}
             </div>
@@ -393,25 +530,6 @@ export default function WorkbenchApp() {
         )}
         {page === 'workflows' && active && backend && (
           <section className="wb-editor">
-            <div className="wb-editor-mode">
-              <span>{ui('编排方式', 'Authoring')}</span>
-              <select
-                value={active.authoring_mode}
-                disabled={generationBusy}
-                onChange={e => void mode(e.target.value as 'internal' | 'external')}
-              >
-                <option value="internal">{ui('内置生成', 'Internal generation')}</option>
-                <option value="external">
-                  {ui('外部 Agent / 手工', 'External Agent / manual')}
-                </option>
-              </select>
-              <small>
-                {ui(
-                  '切换仅改变生成入口，不删除画布内容。',
-                  'Switching changes the authoring panel, not canvas content.',
-                )}
-              </small>
-            </div>
             {conflict && (
               <div className="wb-conflict" role="alert">
                 {ui(
@@ -439,6 +557,11 @@ export default function WorkbenchApp() {
                 <AuthoringPanel
                   key={`${active.project_id}:${active.workflow_id}`}
                   draft={active}
+                  collapsed={!assistantOpen}
+                  onCollapse={() => {
+                    setAssistantOpen(false)
+                    document.getElementById('wb-assistant-toggle')?.focus()
+                  }}
                   intent={intent}
                   onIntentConsumed={() => setIntent('')}
                   onBusyChange={setGenerationBusy}
@@ -462,11 +585,24 @@ export default function WorkbenchApp() {
                     onClose={() => navigate(() => setActive(null))}
                     registerLeaveGuard={register}
                     onSwitchWorkflow={id => {
+                      // CanvasPage already checks unsaved edits; only add the host's generation lock.
+                      if (generationRef.current) {
+                        setNotice(
+                          ui(
+                            '请先停止当前生成，再切换画布。',
+                            'Stop generation before switching canvases.',
+                          ),
+                        )
+                        return
+                      }
                       const next = drafts.find(draft => draft.workflow_id === id)
                       if (next) openDraft(next)
                     }}
                     onEditorState={editorState}
-                    onGenerateIntent={setIntent}
+                    onGenerateIntent={text => {
+                      setAssistantOpen(true)
+                      setIntent(text)
+                    }}
                   />
                 </CanvasBackendContext.Provider>
               </div>
@@ -538,9 +674,10 @@ export default function WorkbenchApp() {
                     {drafts.find(draft => draft.workflow_id === run.workflow_id)?.document.name ??
                       run.workflow_id}
                   </strong>
-                  <span>{run.status}</span>
+                  <span className={`wb-run-status wb-run-status--${run.status}`}>
+                    {statusText(run.status)}
+                  </span>
                 </div>
-                <code>{run.run_id}</code>
                 {!terminal(run.status) && (
                   <div className="wb-actions">
                     {(run.status === 'running' || run.status === 'paused') && (
@@ -588,7 +725,8 @@ export default function WorkbenchApp() {
                   </div>
                 )}
                 <details>
-                  <summary>{ui('输入与结果', 'Inputs and result')}</summary>
+                  <summary>{ui('运行详情', 'Run details')}</summary>
+                  <code>{run.run_id}</code>
                   <pre>{JSON.stringify({ inputs: run.inputs, result: run.result }, null, 2)}</pre>
                 </details>
               </article>

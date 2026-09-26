@@ -1,0 +1,258 @@
+.wb-authoring {
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  flex-shrink: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--border-primary);
+  background: var(--bg-primary);
+}
+.wb-authoring[hidden] {
+  display: none;
+}
+.wb-authoring
+  :where(.wb-authoring-header, .wb-authoring-conversation, .wb-authoring-footer)
+  button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+.wb-authoring
+  :where(.wb-authoring-header, .wb-authoring-conversation, .wb-authoring-footer)
+  button:hover:not(:disabled) {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.wb-authoring
+  :where(.wb-authoring-header, .wb-authoring-conversation, .wb-authoring-footer)
+  button:focus-visible,
+.wb-authoring-composer textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.wb-authoring
+  :where(.wb-authoring-header, .wb-authoring-conversation, .wb-authoring-footer)
+  button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.wb-authoring-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-primary);
+}
+.wb-authoring-header h2 {
+  font-size: 14px;
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-authoring .wb-authoring-guided {
+  padding: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.wb-authoring-icon {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+.wb-authoring-conversation {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+}
+.wb-authoring-log {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 14px 44px;
+  font-size: 13px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.wb-authoring-empty {
+  padding: 24px 0 8px;
+  color: var(--text-secondary);
+}
+.wb-authoring-empty > svg {
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.wb-authoring-empty h3 {
+  color: var(--text-primary);
+  font-size: 17px;
+  margin: 0 0 8px;
+}
+.wb-authoring-empty p {
+  margin: 0 0 18px;
+}
+.wb-authoring-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.wb-authoring-examples button {
+  padding: 7px 9px;
+  border-color: var(--border-primary);
+  text-align: left;
+  font-size: 12px;
+}
+.wb-authoring-message {
+  margin: 0 0 16px;
+}
+.wb-authoring-message strong {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.wb-authoring-message p {
+  margin: 5px 0 0;
+  white-space: pre-wrap;
+}
+.wb-authoring-message--user {
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border-radius: 9px;
+}
+.wb-authoring .wb-authoring-latest {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 10px;
+  border-color: var(--border-primary);
+  background: var(--bg-primary);
+  white-space: nowrap;
+  font-size: 12px;
+  box-shadow: 0 2px 8px #0000000d;
+}
+.wb-authoring-footer {
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--border-primary);
+}
+.wb-authoring-activity {
+  display: block;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 8px;
+}
+.wb-authoring-error,
+.wb-authoring-input-notice {
+  font-size: 12px;
+  margin: 0 0 8px;
+  max-height: 96px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.wb-authoring-error {
+  color: var(--error, #d04b4b);
+}
+.wb-authoring-input-notice {
+  color: var(--text-secondary);
+}
+.wb-authoring-composer {
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-secondary);
+  padding: 8px;
+}
+.wb-authoring-composer:focus-within {
+  border-color: var(--accent);
+}
+.wb-authoring-composer textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 72px;
+  max-height: 180px;
+  resize: none;
+  overflow-y: auto;
+  padding: 3px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.wb-authoring-composer textarea::placeholder {
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.wb-authoring-composer textarea:focus-visible {
+  outline: none;
+}
+.wb-authoring-compose-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  padding-top: 5px;
+}
+.wb-authoring-compose-actions > small {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+.wb-authoring .wb-authoring-send {
+  padding: 6px 10px;
+  background: var(--accent);
+  color: var(--bg-primary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.wb-authoring .wb-authoring-send:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg-primary);
+  filter: brightness(0.94);
+}
+.wb-authoring-hint {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.wb-authoring-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+@media (max-width: 999px) {
+  .wb-authoring {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 320px;
+    max-width: calc(100% - 32px);
+    /* Shared canvas is z-index: 60; keep the drawer above its surface. */
+    z-index: 61;
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.12);
+  }
+}

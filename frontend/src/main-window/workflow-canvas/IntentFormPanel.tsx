@@ -22,7 +22,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useLanguage } from '../../locales'
 import { listDataDirs } from '../lib/api'
 import { intentDraftKey, readIntentDraft, writeIntentDraft } from './intentDraft'
-import { Plus, Trash2, X } from 'lucide-react'
+import { IconPlus as Plus, IconTrash2 as Trash2, IconX as X } from '../../ui/Icons'
 import type { IntentForm, IntentStage, IntentStep } from './intentTypes'
 import { INTENT_FORM_LIMITS } from './intentTypes'
 import './intent-form.css'
@@ -31,6 +31,10 @@ interface IntentFormPanelProps {
   /** 目标工作流名（画布入口预填 ir.name） */
   initialName: string
   workflowId: string
+  /** Explicit project scope; omitted callers keep using the native workspace. */
+  draftScope?: string
+  /** Allows embedded composers to describe a fill-only submission. */
+  submitLabel?: string
   /** 提交（不含空行子步骤）；父层负责关闭弹层 + 保存画布 + dispatch append-to-chat */
   onSubmit: (form: IntentForm) => Promise<boolean> | boolean | void
   /** 关闭（不发送，保留草稿） */
@@ -54,6 +58,8 @@ function newStage(): IntentStage {
 export function IntentFormPanel({
   initialName,
   workflowId,
+  draftScope,
+  submitLabel,
   onSubmit,
   onClose,
 }: IntentFormPanelProps) {
@@ -68,9 +74,19 @@ export function IntentFormPanel({
   const [confirmClear, setConfirmClear] = useState(false)
   useEffect(() => {
     let alive = true
-    void listDataDirs()
-      .then(dirs => {
-        const workspace = dirs?.find(dir => dir.key === 'plugin')?.path
+    setLoading(true)
+    setDraftKey(null)
+    recoverableKey.current = null
+    setStages([newStage()])
+    setStorageError('')
+    setSubmitError('')
+    setConfirmClear(false)
+    const scope =
+      draftScope !== undefined
+        ? Promise.resolve(draftScope)
+        : listDataDirs().then(dirs => dirs?.find(dir => dir.key === 'plugin')?.path)
+    void scope
+      .then(workspace => {
         if (!workspace) throw new Error('Workspace unavailable')
         const key = intentDraftKey(workspace, workflowId)
         if (!alive) return
@@ -89,7 +105,7 @@ export function IntentFormPanel({
     return () => {
       alive = false
     }
-  }, [workflowId])
+  }, [workflowId, draftScope])
   useEffect(() => {
     if (!draftKey || loading) return
     try {
@@ -156,7 +172,7 @@ export function IntentFormPanel({
   const submitDisabledTitle = hasStepsWithoutName
     ? t('workflowEditor.intent.missingName')
     : hasValidStage
-      ? t('workflowEditor.intent.submitHint')
+      ? (submitLabel ?? t('workflowEditor.intent.submitHint'))
       : t('workflowEditor.intent.missingSteps')
 
   const handleSubmit = async () => {
@@ -346,7 +362,9 @@ export function IntentFormPanel({
             title={submitDisabledTitle}
             onClick={handleSubmit}
           >
-            {t(submitting ? 'workflowEditor.intent.submitting' : 'workflowEditor.intent.submit')}
+            {submitting
+              ? t('workflowEditor.intent.submitting')
+              : (submitLabel ?? t('workflowEditor.intent.submit'))}
           </button>
         </div>
       </div>

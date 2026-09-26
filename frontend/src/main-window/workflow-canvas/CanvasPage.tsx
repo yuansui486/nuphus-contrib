@@ -118,7 +118,13 @@ interface CanvasPageProps {
   /** 切换到另一个工作流画布（工作台注入：换 id 即整页换成目标工作流） */
   onSwitchWorkflow?: (id: string) => void
   registerLeaveGuard?: (guard: CanvasLeaveGuard | null) => void
-  onEditorState?: (state: { dirty: boolean; selection: string[]; layerId: string; problems: Problem[]; validation: ValidationReport | null }) => void
+  onEditorState?: (state: {
+    dirty: boolean
+    selection: string[]
+    layerId: string
+    problems: Problem[]
+    validation: ValidationReport | null
+  }) => void
   onGenerateIntent?: (text: string) => void
 }
 
@@ -1562,7 +1568,7 @@ function CanvasInner({
       const saved = await save()
       if (!saved) return false
       setIntentFormOpen(false)
-      const text = buildIntentTextTemplate(form, workflowId, ir?.name)
+      const text = buildIntentTextTemplate(form, workflowId, ir?.name, backend.intent)
       if (onGenerateIntent) {
         onGenerateIntent(text)
         return true
@@ -1575,7 +1581,7 @@ function CanvasInner({
       )
       return true
     },
-    [save, onClose, workflowId, ir?.name, onGenerateIntent],
+    [save, onClose, workflowId, ir?.name, onGenerateIntent, backend.intent],
   )
 
   // ── 工具面板拖拽入画布（HTML5 DnD）──
@@ -2505,9 +2511,15 @@ function CanvasInner({
         )}
         {intentFormOpen && (
           <IntentFormPanel
-            key={workflowId}
+            key={`${backend.intent?.draftScope ?? ''}:${workflowId}`}
             workflowId={workflowId}
             initialName={ir.name}
+            draftScope={backend.intent?.draftScope}
+            submitLabel={
+              backend.intent?.target === 'workbench'
+                ? ui('填入描述', 'Add to description')
+                : undefined
+            }
             onSubmit={submitIntentForm}
             onClose={() => setIntentFormOpen(false)}
           />
