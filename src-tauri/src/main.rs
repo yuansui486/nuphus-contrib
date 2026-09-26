@@ -1058,7 +1058,7 @@ fn main() {
 
             tauri::tray::TrayIconBuilder::new()
                 .icon(icon)
-                .tooltip("Nuphus - 协同共生桌面助手")
+                .tooltip(if nuphus::profile::WORKBENCH { "灵雀 Lingque · 工作流助手" } else { "Nuphus - 协同共生桌面助手" })
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     match event.id().as_ref() {

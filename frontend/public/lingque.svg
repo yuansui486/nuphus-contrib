@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">灵雀 · 逐流</title>
+  <desc id="desc">深蓝圆角底，冰蓝折纸飞鸟，尾部连接两个流程节点，表达任务编排与执行。</desc>
+  <rect width="256" height="256" rx="58" fill="#152C4B"/>
+  <g id="mark">
+    <path d="M47 177H73L104 146" stroke="#71D9E6" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="43" cy="177" r="10" fill="#71D9E6"/>
+    <circle cx="76" cy="177" r="7" fill="#71D9E6"/>
+    <path d="M66 58L151 104L170 87L211 104L178 119L135 177L108 144L66 58Z" fill="#E8F9FF"/>
+    <path d="M66 58L151 104L108 144L66 58Z" fill="#71D9E6"/>
+    <path d="M108 144L178 119L135 177L108 144Z" fill="#35AFC7"/>
+    <path d="M151 104L170 87L178 119L151 104Z" fill="#E8F9FF"/>
+  </g>
+</svg>

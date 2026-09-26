@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { TitleBar } from '../main-window/layout/TitleBar'
 import WorkbenchApp from './WorkbenchApp'
 import './auth.css'
+import { LingqueLogo } from './LingqueLogo'
 
 export interface AuthStatus {
   state: string
@@ -154,11 +155,16 @@ export default function AuthGate() {
   }
   return (
     <div className="lq-login-shell">
-      <TitleBar brand="灵雀 Lingque" />
+      <TitleBar brand="灵雀 Lingque" brandIcon={<LingqueLogo />} />
       <main className="lq-login-main">
         <section className="lq-login-card" aria-label="灵雀登录">
-          <p className="lq-overline">LINGQUE</p>
-          <h1>欢迎使用灵雀</h1>
+          <div className="lq-login-brand">
+            <LingqueLogo size={56} />
+            <div>
+              <p className="lq-overline">LINGQUE</p>
+              <h1>欢迎使用灵雀</h1>
+            </div>
+          </div>
           <p className="lq-subtitle">连接你的工作流，让任务有序执行。</p>
           {status?.authorized ? (
             <>
@@ -245,7 +251,7 @@ export default function AuthGate() {
               </button>
             </form>
           )}
-          <p role="alert" className="lq-error">
+          <p role={error ? 'alert' : 'status'} className={error ? 'lq-error' : 'lq-status'}>
             {error || (!status?.authorized ? status?.message : '')}
           </p>
           {status === null && error && (

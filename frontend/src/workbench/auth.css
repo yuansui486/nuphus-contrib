@@ -2,8 +2,8 @@
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-primary, #f5f7f5);
-  color: var(--text-primary, #20362e);
+  background: var(--bg-primary, #fbfbfc);
+  color: var(--text-primary, #152c4b);
 }
 .lq-login-main {
   flex: 1;
@@ -12,18 +12,32 @@
   display: grid;
   place-items: center;
   padding: 28px 20px;
+  background: radial-gradient(ellipse at 50% 20%, rgb(53 175 199 / 7%), transparent 65%);
 }
 .lq-login-card {
   width: min(100%, 440px);
+  box-sizing: border-box;
   padding: 32px;
-  border: 1px solid var(--border-color, #cddbd3);
+  border: 1px solid var(--border-primary, #dce3eb);
   border-radius: 20px;
   background: var(--bg-secondary, #fff);
+  box-shadow: 0 12px 40px rgb(21 44 75 / 5%);
+}
+.lq-login-brand {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.lq-login-card .lq-login-brand h1 {
+  font-size: 24px;
+  margin: 5px 0 0;
 }
 .lq-overline {
-  letter-spacing: 4px;
-  font-size: 12px;
-  color: #379578;
+  margin: 0;
+  letter-spacing: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary, #526b83);
 }
 .lq-login-card h1 {
   font-size: 27px;
@@ -51,7 +65,7 @@
   width: 100%;
   margin-top: 7px;
   padding: 10px 12px;
-  border: 1px solid var(--border-color, #cddbd3);
+  border: 1px solid var(--border-primary, #dce3eb);
   border-radius: 8px;
   background: var(--bg-primary, #fff);
   color: inherit;
@@ -61,9 +75,17 @@
   padding: 11px;
   border: 0;
   border-radius: 8px;
-  background: #126555;
+  background: #1e4c70;
   color: white;
   cursor: pointer;
+}
+.lq-login-card button:not(.lq-secondary):hover:not(:disabled) {
+  background: #265e86;
+}
+.lq-login-card :is(input, button):focus-visible,
+.lq-account button:focus-visible {
+  outline: 2px solid #35afc7;
+  outline-offset: 3px;
 }
 .lq-login-card button:disabled {
   opacity: 0.5;
@@ -73,11 +95,16 @@
   margin-top: 10px;
   background: transparent;
   color: inherit;
-  border: 1px solid var(--border-color, #cddbd3);
+  border: 1px solid var(--border-primary, #dce3eb);
 }
 .lq-error {
   color: #ce553e;
   font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.lq-status {
+  color: var(--text-secondary, #526b83);
+  font-size: 12px;
   overflow-wrap: anywhere;
 }
 .lq-device-note {
@@ -110,14 +137,32 @@
   gap: 12px;
   padding: 7px 14px;
   font-size: 11px;
-  background: var(--bg-secondary, #eef5f0);
-  color: var(--text-primary, #20362e);
+  background: var(--bg-secondary, #f6f6f7);
+  color: var(--text-primary, #152c4b);
+  border-bottom: 1px solid var(--border-primary, #dce3eb);
 }
 .lq-account button {
   background: transparent;
   color: inherit;
   padding: 3px 7px;
-  border: 1px solid var(--border-color, #cddbd3);
+  border: 1px solid var(--border-primary, #dce3eb);
   border-radius: 5px;
   cursor: pointer;
+}
+@media (max-height: 680px) {
+  .lq-login-main {
+    padding: 16px 20px;
+  }
+  .lq-login-card {
+    padding: 24px 28px;
+  }
+  .lq-login-card form {
+    margin-top: 18px;
+  }
+  .lq-login-card label {
+    margin: 12px 0;
+  }
+  .lq-device-note {
+    margin-top: 16px;
+  }
 }

@@ -31,6 +31,7 @@ import { WorkbenchSettings } from './WorkbenchSettings'
 import { ExternalConnections } from './ExternalConnections'
 import { ScheduleControl, ScheduleHistory, type ScheduleSummary } from './ScheduleControls'
 import './workbench.css'
+import { LingqueLogo } from './LingqueLogo'
 
 const ModelsPage = lazy(() =>
   import('../main-window/pages/ModelsPage').then(m => ({ default: m.ModelsPage })),
@@ -350,7 +351,7 @@ export default function WorkbenchApp({ storageScope }: { storageScope?: string }
 
   return (
     <div className="wb-app">
-      <TitleBar brand="Nuphus Workbench" />
+      <TitleBar brand="灵雀 Lingque" brandIcon={<LingqueLogo />} />
       <nav className="wb-nav" aria-label={ui('工作台导航', 'Workbench navigation')}>
         <div className="wb-nav-primary">
           <button

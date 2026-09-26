@@ -4,8 +4,10 @@
 上游是 `mrpulor-gh/nuphus/main`。保留上游原版入口、编译器、画布和执行器，
 不维护另一套执行语义，不要求外部 Agent 复用内置 Agent。
 
-本次命名不迁移安装标识、数据目录或 MCP 命令。现有界面与安装包暂保留 `Nuphus Workbench`，
-后续品牌展示可单独更新，不能因改名丢失用户配置或使已有 MCP 连接失效。
+本次命名不迁移安装标识、数据目录或 MCP 命令。界面展示「灵雀 Lingque」，安装包产品名仍保留 `Nuphus Workbench`，
+避免丢失用户配置或使已有 MCP 连接失效。采用 B「逐流」标志；唯一 SVG 源为
+`frontend/public/lingque.svg`，运行 `node scripts/prepare-lingque-icons.mjs` 可重建专用桌面图标。
+原版图标不变；工作台构建通过轻量适配器替换启动页品牌，继续复用原版进度与下载逻辑。
 
 ## 使用方式
 

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import { getCurrentWindow, type Window } from '@tauri-apps/api/window'
 import { NuphusAvatar, type NuphusAvatarState } from '../../ui/NuphusAvatar'
 import { IconButton } from '../../ui/Button'
@@ -9,9 +9,15 @@ interface TitleBarProps {
   onNewChat?: () => void
   agentState?: NuphusAvatarState
   brand?: string
+  brandIcon?: ReactNode
 }
 
-export function TitleBar({ onNewChat, agentState = 'idle', brand = 'Nuphus' }: TitleBarProps) {
+export function TitleBar({
+  onNewChat,
+  agentState = 'idle',
+  brand = 'Nuphus',
+  brandIcon,
+}: TitleBarProps) {
   const { t } = useLanguage()
   const [menuOpen, setMenuOpen] = useState(false)
   const [win, setWin] = useState<Window | null>(null)
@@ -41,7 +47,7 @@ export function TitleBar({ onNewChat, agentState = 'idle', brand = 'Nuphus' }: T
     <header className="title-bar">
       <div className="title-bar-left" data-tauri-drag-region>
         <div className="title-bar-icon">
-          <NuphusAvatar state={agentState} size={20} />
+          {brandIcon ?? <NuphusAvatar state={agentState} size={20} />}
         </div>
         <span className="title-bar-brand">{brand}</span>
       </div>

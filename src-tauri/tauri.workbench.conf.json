@@ -24,6 +24,7 @@
     }
   },
   "bundle": {
+    "icon": ["icons-lingque/32x32.png", "icons-lingque/128x128.png", "icons-lingque/128x128@2x.png", "icons-lingque/icon.icns", "icons-lingque/icon.ico", "icons-lingque/icon.png"],
     "createUpdaterArtifacts": false,
     "externalBin": ["binaries/nuphus-workbench-mcp"],
     "windows": { "nsis": { "installerHooks": "installer/workbench-hooks.nsh" } },

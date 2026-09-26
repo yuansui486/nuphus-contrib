@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { lingqueBranding } from './workbench-branding'
 
 export default defineConfig(({ mode }) => ({
   define: {
@@ -7,7 +8,7 @@ export default defineConfig(({ mode }) => ({
       mode === 'workbench' ? 'workbench' : 'standard',
     ),
   },
-  plugins: [react()],
+  plugins: [react(), ...(mode === 'workbench' ? [lingqueBranding()] : [])],
   base: './',
   server: {
     port: 5174,

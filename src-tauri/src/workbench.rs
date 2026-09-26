@@ -68,7 +68,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
         )
     })?;
     if let Some(window) = app.get_webview_window("main") {
-        window.set_title("Nuphus Workbench").map_err(native_error)?;
+        window.set_title("灵雀 Lingque").map_err(native_error)?;
         if std::env::args().any(|arg| arg == "--background") {
             window.hide().map_err(native_error)?;
             if let Some(splash) = app.get_webview_window("splash") {
