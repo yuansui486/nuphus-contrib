@@ -161,12 +161,11 @@ mod tests {
         for name in ["a.txt", "a.rs", "a.exe", "a.pdf", "noext"] {
             let p = Path::new(name);
             assert!(
-                p.extension()
+                !p.extension()
                     .and_then(|e| e.to_str())
                     .map(|e| e.to_ascii_lowercase())
                     .map(|e| IMAGE_EXTS.contains(&e.as_str()))
-                    .unwrap_or(false)
-                    == false,
+                    .unwrap_or(false),
                 "{} 不应被识别为允许的图片",
                 name
             );
@@ -189,7 +188,13 @@ mod tests {
 
     #[test]
     fn sanitize_stem_drops_reserved_chars_and_dots() {
-        assert_eq!(sanitize_stem(Path::new(r"C:\x\a:b*c?d.jpg")), "abcd");
+        // 用当前平台的路径分隔符构造，避免把 Windows 风格字面量带到 Linux CI 上
+        // （`\` 在非 Windows 不是分隔符，file_stem() 会返回整串）。
+        let seps = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            sanitize_stem(Path::new(&format!("x{seps}a:b*c?d.jpg"))),
+            "abcd"
+        );
         assert_eq!(sanitize_stem(Path::new("  home.. .png")), "home");
         // 主名全是非法字符时不能写出隐藏文件
         assert_eq!(sanitize_stem(Path::new("... .png")), FALLBACK_STEM);

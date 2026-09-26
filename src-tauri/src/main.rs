@@ -73,8 +73,8 @@ fn main() {
         std::env::set_var("NUPHUS_MODELS_DIR", models_dir);
     }
     // Inject the persisted external-browser CDP endpoint into the process env so
-    // future BrowserClient::new() (direct channel) picks it up; the MCP channel
-    // gets it via dual::nuphus_mcp_config() at spawn time.
+    // future BrowserClient::new() picks it up; any MCP server child process
+    // spawned later inherits it.
     let prefs = nuphus::config::UserPreferences::load();
     if let Some(url) = &prefs.browser_cdp_url {
         if !url.is_empty() {
