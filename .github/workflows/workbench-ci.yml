@@ -2,9 +2,9 @@ name: Workbench CI
 
 on:
   push:
-    branches: [edition/workflow-workbench]
+    branches: [edition/lingque]
   pull_request:
-    branches: [edition/workflow-workbench]
+    branches: [edition/lingque]
   workflow_call:
     inputs:
       ref:

@@ -1,8 +1,11 @@
-# Nuphus Workbench
+# 灵雀（Lingque）
 
-独立、工作流优先的 Nuphus 版本。产品分支为 `edition/workflow-workbench`，
+灵雀是独立、工作流优先的 Nuphus 版本，英文标识为 `lingque`。产品分支为 `edition/lingque`，
 上游是 `mrpulor-gh/nuphus/main`。保留上游原版入口、编译器、画布和执行器，
 不维护另一套执行语义，不要求外部 Agent 复用内置 Agent。
+
+本次命名不迁移安装标识、数据目录或 MCP 命令。现有界面与安装包暂保留 `Nuphus Workbench`，
+后续品牌展示可单独更新，不能因改名丢失用户配置或使已有 MCP 连接失效。
 
 ## 使用方式
 
@@ -148,6 +151,8 @@ workflow.save → workflow.run → run.get/events/steps`。
 独立仓库 `yuansui486/nuphus-contrib`：
 
 1. 推送产品分支及四个 `workbench-*.yml` 工作流。
+   首次迁移到 `edition/lingque` 时，先发布新分支，再更新默认分支中的 dispatcher 引用；
+   仅本地改名不会迁移远程分支或自动更新默认分支的定时任务。确认新链路正常前保留旧远程分支。
 2. **只**将 `workbench-dispatch.yml` 安装到该仓库默认 `main`；GitHub 定时任务只从默认分支执行。
    不把产品改动合并到默认主分支，也不修改私有 Synapse 的 main。
 3. 仓库需允许 Actions 创建 PR，令牌具有 contents/pull-requests 写权限。

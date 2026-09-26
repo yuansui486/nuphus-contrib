@@ -15,12 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: edition/workflow-workbench
+          ref: edition/lingque
       - id: revision
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   verify:
     needs: revision
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/workflow-workbench
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/lingque
     with:
       ref: ${{ needs.revision.outputs.sha }}
   package:

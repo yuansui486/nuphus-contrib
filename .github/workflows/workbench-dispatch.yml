@@ -20,7 +20,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == 'yuansui486/nuphus-contrib' && (github.event_name == 'schedule' || inputs.task == 'sync')
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-sync.yml@edition/workflow-workbench
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-sync.yml@edition/lingque
   build:
     if: github.repository == 'yuansui486/nuphus-contrib' && github.event_name == 'workflow_dispatch' && inputs.task == 'build'
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@edition/workflow-workbench
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@edition/lingque
