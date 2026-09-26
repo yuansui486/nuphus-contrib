@@ -43,6 +43,13 @@ export interface Endpoint {
   url?: string
   mcp_url?: string
   message?: string
+  local?: {
+    status: string
+    available: boolean
+    executable: string
+    config: unknown
+    message?: string
+  }
 }
 export class WorkbenchError extends Error {
   constructor(

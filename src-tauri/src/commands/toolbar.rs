@@ -251,6 +251,7 @@ pub fn ensure_overlay(app: &AppHandle) -> Result<(), String> {
     .always_on_top(true)
     .skip_taskbar(true)
     .visible(false)
+    .focused(false)
     .build()
     .map_err(|e| format!("创建覆盖窗失败: {e}"))?;
 

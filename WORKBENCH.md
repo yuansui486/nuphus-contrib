@@ -77,8 +77,12 @@ cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbe
 
 ## 外部接入
 
-工作台启动后自动监听本机端口。「外部接入」显示状态及可复制的地址，
-无需创建客户端、配置令牌或逐项选择权限。HTTP、MCP 和应用内画布调用同一个服务层。
+默认使用「外部接入 → 本地应用接入」：复制页面生成的 MCP 配置到 Agent。
+安装包包含 `nuphus-workbench-mcp`，无需另装 Python/Node 或设置 PATH。
+Agent 通过 stdio 启动它，再经 Windows 当前用户专属命名管道或 macOS/Linux Unix socket 连接工作台，
+不依赖 HTTP 端口。工作台未运行时自动启动同安装目录/同 App 包内的主程序到托盘，最长等待 30 秒。
+并发客户端共用一个宿主，断开 MCP 不退出工作台、不取消运行；后续调用可重新连接重启后的应用。
+无需创建客户端、配置令牌或逐项选择权限。IPC、HTTP、MCP 和应用内画布调用同一个服务层。
 本机外部调用默认具有全部项目及全部公共能力（包括注册项目、运行、自动化和人工响应）。
 这不是项目权限隔离或 OS 沙箱：信任本机调用者，运行可产生真实桌面和文件副作用。
 仅绑定 `127.0.0.1`，拒绝网页 Origin/Fetch-Metadata 和非本机 Host；退出托盘后端口关闭。
@@ -86,14 +90,36 @@ cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbe
 - HTTP：`POST http://127.0.0.1:47731/api/v1/{operation}`，JSON 参数，无需认证请求头。
 - 发现：`GET /api/v1/discover` 返回当前客户端可用操作及 JSON Schema。
 - MCP Streamable HTTP：`http://127.0.0.1:47731/mcp`，无需令牌；工具名将点换为下划线。
-- stdio：运行 `nuphus-workbench-mcp`，无需设置令牌；
-  `NUPHUS_WORKBENCH_URL` 可覆盖本机服务地址。桥接进程不启动 Agent、不单独执行工作流。
+- stdio（推荐）：运行 `nuphus-workbench-mcp serve`，旧的无参数启动也兼容。
+  「测试连接」会启动实际桥接程序，验证 MCP 初始化、工具清单和宿主状态，不执行工作流。
+  显式设置 `NUPHUS_WORKBENCH_URL` 才走旧 HTTP 桥接，仍需手工维护 URL；未设置时走本地 IPC。
+  桥接进程不启动 Agent、不单独执行工作流。标准输出仅用于 MCP，诊断使用标准错误。
 - 持久事件：`run.events` 或 `/api/v1/events?project_id=…&after=…`；
   断线后带最后处理的游标继续读取，不以传输会话 ID 代替运行 ID。
 - MCP resources：项目索引，以及项目、画布、版本和运行记录模板。
 
 历史令牌调用保留兼容：显式发送 Bearer 时仍检查原有范围和撤销状态，不会将失效令牌
 悄悄降级成免令牌访问；但免令牌本机入口本身具有全权限，因此令牌不再构成隔离边界。
+
+配置示例（以页面生成的实际安装路径为准）：
+
+```json
+{"mcpServers":{"nuphus-workbench":{"command":"C:\\完整安装路径\\nuphus-workbench-mcp.exe","args":["serve"]}}}
+```
+
+macOS 程序位于 `Nuphus Workbench.app/Contents/MacOS/nuphus-workbench-mcp`，移动 App 后需重新复制路径。
+同一路径更新不需要修改配置；更新期间请暂停 Agent 的 MCP，完成后重新连接。
+Windows 安装器协调关闭当前安装的 MCP 程序，并在升级期间阻止自动启动主程序；
+文件无法释放时停止安装并提示重试，不跳过文件。取消安装后不会留下永久启动禁用标记。
+HTTP 服务失败不会关闭 IPC。本机 IPC 以用户和数据目录区分实例，协议不匹配时提示升级，
+请求发送后丢失回复不自动重放。`NUPHUS_WORKBENCH_DATA_DIR` 指定的开发配置会写入页面生成的 MCP 配置，
+避免误连普通工作台；默认配置不包含端口或密钥。
+
+真实 MCP 验收：设置专用 `WORKBENCH_TEST_ROOT` 后运行 `node scripts/workbench-mcp-smoke.mjs`。
+脚本隔离数据，验证端口占用、双客户端冷启动、画布读写、等待工作流、重启重连和运行去重，
+不读取模型密钥、不调用模型、不操作业务文件。可用 `WORKBENCH_TEST_EXE` 和 `WORKBENCH_TEST_MCP`
+指定已安装或打包后的程序。
+Windows 可用 `./scripts/workbench-mcp-focus.ps1 -TestRoot <临时目录>` 包装同一验收，额外检查自动启动不抢前台焦点。
 
 主要调用链：`project.list → canvas.create/get/update → workflow.validate →
 workflow.save → workflow.run → run.get/events/steps`。

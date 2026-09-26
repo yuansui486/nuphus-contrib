@@ -57,8 +57,14 @@ jobs:
         run: test "$(uname -m)" = arm64
       - name: Build independent edition (never upstream updater channel)
         run: npx tauri build --config src-tauri/tauri.workbench.conf.json --features workbench --bundles ${{ matrix.bundle }}
-      - name: Build stdio bridge
-        run: cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbench-mcp
+      - name: Windows native MCP acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:WORKBENCH_TEST_ROOT = "${{ runner.temp }}/workbench-mcp"
+          $env:WORKBENCH_TEST_EXE = (Resolve-Path target/release/nuphus-workbench.exe).Path
+          $env:WORKBENCH_TEST_MCP = (Resolve-Path target/release/nuphus-workbench-mcp.exe).Path
+          ./scripts/workbench-mcp-focus.ps1 -TestRoot $env:WORKBENCH_TEST_ROOT
       - name: Sign and package ARM64 DMG
         if: runner.os == 'macOS'
         shell: bash
@@ -68,6 +74,9 @@ jobs:
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict "$app"
           lipo "$app/Contents/MacOS/nuphus-workbench" -verify_arch arm64
+          test -x "$app/Contents/MacOS/nuphus-workbench-mcp"
+          lipo "$app/Contents/MacOS/nuphus-workbench-mcp" -verify_arch arm64
+          WORKBENCH_TEST_ROOT="$(mktemp -d)" WORKBENCH_TEST_EXE="$app/Contents/MacOS/nuphus-workbench" WORKBENCH_TEST_MCP="$app/Contents/MacOS/nuphus-workbench-mcp" node scripts/workbench-mcp-smoke.mjs
           smoke_root=$(mktemp -d)
           NUPHUS_WORKBENCH_DATA_DIR="$smoke_root" NUPHUS_WORKBENCH_PORT=47739 "$app/Contents/MacOS/nuphus-workbench" --background > "$smoke_root/launch.log" 2>&1 &
           app_pid=$!

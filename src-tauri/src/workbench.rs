@@ -30,6 +30,7 @@ use tauri::{AppHandle, Emitter, Manager};
 pub struct WorkbenchState {
     pub service: Arc<Service<NativeHost>>,
     pub endpoint: Arc<Mutex<Value>>,
+    local_endpoint: Arc<Mutex<Value>>,
     generations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     // Retained for the host lifetime: a second instance must not mark the first
     // instance's live runs interrupted during startup recovery.
@@ -65,6 +66,11 @@ pub fn install(app: &AppHandle) -> Result<()> {
         window.set_title("Nuphus Workbench").map_err(native_error)?;
         if std::env::args().any(|arg| arg == "--background") {
             window.hide().map_err(native_error)?;
+            if let Some(splash) = app.get_webview_window("splash") {
+                let _ = splash.close();
+            }
+            // An intentionally headless tray host must not trigger the UI watchdog.
+            crate::commands::toolbar::STARTUP_FINISHED.store(true, Ordering::SeqCst);
         }
     }
     let store = WorkbenchStore::open(nuphus::profile::workbench_data_dir())?;
@@ -86,6 +92,30 @@ pub fn install(app: &AppHandle) -> Result<()> {
         },
     ));
     let endpoint = Arc::new(Mutex::new(json!({"status":"starting"})));
+    let local_endpoint = Arc::new(Mutex::new(json!({"status":"unavailable"})));
+    #[cfg(feature = "workbench")]
+    {
+        let state = local_endpoint.clone();
+        let service = service.clone();
+        let root = root.clone();
+        tauri::async_runtime::spawn(async move {
+            // Tauri setup itself has no Tokio reactor. Bind inside its runtime.
+            let result = match nuphus_workbench::local::Server::bind(&root) {
+                Ok(server) => {
+                    if let Ok(mut status) = state.lock() {
+                        *status = json!({"status":"listening"});
+                    }
+                    server.serve(service).await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                if let Ok(mut status) = state.lock() {
+                    *status = json!({"status":"failed","message":error.to_string()});
+                }
+            }
+        });
+    }
     // Workbench schedules use project revisions/runs, never the legacy WorkflowStore.
     {
         let service = service.clone();
@@ -152,6 +182,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
     app.manage(WorkbenchState {
         service,
         endpoint,
+        local_endpoint,
         generations: Arc::new(Mutex::new(HashMap::new())),
         _instance_lock: instance_lock,
     });
@@ -170,13 +201,46 @@ pub async fn workbench_call(app: AppHandle, operation: String, args: Value) -> R
 }
 
 #[tauri::command]
-pub fn workbench_clients(app: AppHandle, action: String, args: Value) -> Result<Value> {
+pub async fn workbench_clients(app: AppHandle, action: String, args: Value) -> Result<Value> {
     let state = app
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "Start the Workbench edition"))?;
     let store = &state.service.store;
     match action.as_str() {
-        "status" => Ok(state.endpoint.lock().map_err(native_error)?.clone()),
+        "status" => {
+            let mut status = state.endpoint.lock().map_err(native_error)?.clone();
+            let local = state.local_endpoint.lock().map_err(native_error)?.clone();
+            #[cfg(feature = "workbench")]
+            let local = {
+                let mut local = local;
+                let executable = nuphus_workbench::local::bridge_path()?;
+                local["available"] = json!(executable.is_file());
+                local["executable"] = json!(executable);
+                local["config"] = json!({"mcpServers":{"nuphus-workbench":{"command":executable,"args":["serve"]}}});
+                // A deliberately isolated development profile stays isolated when copied.
+                if std::env::var_os("NUPHUS_WORKBENCH_DATA_DIR").is_some() {
+                    local["config"]["mcpServers"]["nuphus-workbench"]["env"] =
+                        json!({"NUPHUS_WORKBENCH_DATA_DIR":store.root()});
+                }
+                local
+            };
+            status["local"] = local;
+            Ok(status)
+        }
+        #[cfg(feature = "workbench")]
+        "check" => {
+            match nuphus_workbench::local::check(
+                &nuphus_workbench::local::bridge_path()?,
+                store.root(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    Ok(json!({"ok":true,"message":"MCP 初始化、工具发现和工作台连接均正常。"}))
+                }
+                Err(error) => Ok(json!({"ok":false,"message":error.to_string()})),
+            }
+        }
         "list" => Ok(serde_json::to_value(store.clients()?)?),
         "create" => {
             let name = nuphus_workbench::service::string(&args, "name")?;
@@ -772,7 +836,7 @@ impl Host for NativeHost {
     }
 
     fn capabilities(&self) -> Value {
-        json!({"edition":"workbench","platform":std::env::consts::OS,"workflow_execution":true,
+        json!({"edition":"workbench","platform":std::env::consts::OS,"process_id":std::process::id(),"workflow_execution":true,
             "scheduling":true,"scheduled_rpa":true,
             "direct_automation":true,"concurrent_automation":false,"model_required_for_deterministic_workflows":false})
     }

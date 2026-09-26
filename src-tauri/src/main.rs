@@ -123,6 +123,17 @@ fn main() {
     // Initialize logging (tracing + file output)
     nuphus::utils::init_logging();
 
+    let mut context = tauri::generate_context!();
+    if nuphus::profile::WORKBENCH && std::env::args().any(|arg| arg == "--background") {
+        for window in &mut context.config_mut().app.windows {
+            window.focus = false;
+            if window.label == "splash" {
+                window.visible = false;
+            }
+        }
+        // Keep main's visible-at-creation contract for Windows drag/drop registration;
+        // workbench::install immediately hides it without ever requesting focus.
+    }
     let app = preview_protocol::register(tauri::Builder::default())
         .manage(state::AppState::default())
         .plugin(tauri_plugin_dialog::init())
@@ -1097,7 +1108,7 @@ fn main() {
 
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {

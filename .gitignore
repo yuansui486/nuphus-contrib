@@ -177,3 +177,4 @@ target-test/
 
 # 本机专用的构建/启动脚本（内含本机绝对路径，不入库）
 rebuild-and-run.bat
+src-tauri/binaries/nuphus-workbench-mcp-*

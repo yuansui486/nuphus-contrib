@@ -141,9 +141,10 @@ impl<H: Host> Service<H> {
         if ["system.capabilities", "project.list", "project.register"].contains(&operation) {
             principal.authorize(capability, None)?;
             return match operation {
-                "system.capabilities" => {
-                    Ok(json!({"api_version":API_VERSION,"host":self.host.capabilities()}))
-                }
+                "system.capabilities" => Ok(
+                    json!({"api_version":API_VERSION,"host":self.host.capabilities(),
+                        "operations":crate::catalog::operations().into_iter().filter(|op| principal.authorize(op.capability, None).is_ok()).collect::<Vec<_>>()}),
+                ),
                 "project.list" => encode(
                     self.store
                         .projects()?

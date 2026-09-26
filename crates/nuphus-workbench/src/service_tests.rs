@@ -94,6 +94,60 @@ async fn scheduled_fixture(service: &Service<FakeHost>, project: &str) -> Draft 
     serde_json::from_value(result["draft"].clone()).unwrap()
 }
 
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn local_ipc_uses_shared_service_and_survives_listener_restart() {
+    let (dir, service, p, token) = fixture();
+    let root = dir.path().join("app");
+    let server = crate::local::Server::bind(&root).unwrap();
+    let task = tokio::spawn(server.serve(service.clone()));
+    let client = crate::local::Client::new(root.clone(), root.join("absent-host"), None);
+    let info = client
+        .operation("system.capabilities", json!({}))
+        .await
+        .unwrap();
+    assert!(info["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|op| op["name"] == "workflow.schedule.set"));
+    let draft = client
+        .operation(
+            "canvas.create",
+            json!({"project_id":p.project_id,"name":"IPC draft"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(draft["authoring_mode"], "external");
+    assert_eq!(service.store.drafts(&p.project_id).unwrap().len(), 1);
+    let token_client =
+        crate::local::Client::new(root.clone(), root.join("absent-host"), Some(token.clone()));
+    assert!(token_client
+        .operation("project.list", json!({}))
+        .await
+        .is_ok());
+    let principal = service.store.authenticate(&token).unwrap();
+    service.store.revoke_client(principal.id()).unwrap();
+    assert!(token_client
+        .operation("project.list", json!({}))
+        .await
+        .is_err());
+    task.abort();
+    let _ = task.await;
+    let server = crate::local::Server::bind(&root).unwrap();
+    let task = tokio::spawn(server.serve(service));
+    let result = client
+        .operation(
+            "canvas.get",
+            json!({"project_id":p.project_id,"workflow_id":draft["workflow_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["workflow_id"], draft["workflow_id"]);
+    task.abort();
+    let _ = task.await;
+}
+
 #[tokio::test]
 async fn schedule_latest_saved_snapshot_dedup_and_redaction() {
     let (_dir, service, p, _) = fixture();

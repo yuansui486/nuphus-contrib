@@ -401,6 +401,21 @@
   line-height: 1.5;
   margin: 8px 0 14px;
 }
+.wb-mcp-config {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 16px;
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  user-select: text;
+}
+.wb-http-connection {
+  margin: 24px 0;
+}
+.wb-http-connection summary {
+  cursor: pointer;
+}
 @media (max-width: 999px) {
   .wb-nav {
     padding: 0 10px;

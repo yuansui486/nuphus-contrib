@@ -44,7 +44,12 @@ the desktop host explicitly uses `local_router`. UI-only actions stay in Tauri I
   MCP resources expose `workbench://projects`; resource templates cover projects,
   canvases, versions and runs. Reads use the same project authorization as tools.
   Resources are snapshots, not a subscription; use `run_events` cursors for replay.
-* `nuphus-workbench-mcp`: stdio bridge using `NUPHUS_WORKBENCH_URL` (loopback origin)
+* `nuphus-workbench-mcp [serve]`: installed stdio application. By default it uses
+  per-user/per-profile local IPC (Windows named pipe, Unix socket), independent
+  of HTTP ports, and starts the sibling Workbench host with `--background` if absent.
+  IPC negotiates a version before dispatch, checks explicit legacy tokens, and
+  never retries a request after writing begins. Runs still belong to the host.
+  An explicit `NUPHUS_WORKBENCH_URL` selects the legacy HTTP bridge (loopback origin)
   and an optional legacy `NUPHUS_WORKBENCH_TOKEN`. No token is needed normally.
   It proxies the same service; it does not open a
   second database or execute work itself. Stdout is reserved for MCP.

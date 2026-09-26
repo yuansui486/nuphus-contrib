@@ -12,8 +12,8 @@
     }
   },
   "build": {
-    "beforeDevCommand": "npm run dev:workbench",
-    "beforeBuildCommand": "npm run build:workbench",
+    "beforeDevCommand": "node scripts/prepare-workbench-mcp.mjs --debug && npm run dev:workbench",
+    "beforeBuildCommand": "node scripts/prepare-workbench-mcp.mjs && npm run build:workbench",
     "devUrl": "http://localhost:5176",
     "frontendDist": "../frontend/dist-workbench"
   },
@@ -23,5 +23,10 @@
       "pubkey": ""
     }
   },
-  "bundle": { "createUpdaterArtifacts": false, "macOS": { "minimumSystemVersion": "15.0" } }
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "externalBin": ["binaries/nuphus-workbench-mcp"],
+    "windows": { "nsis": { "installerHooks": "installer/workbench-hooks.nsh" } },
+    "macOS": { "minimumSystemVersion": "15.0" }
+  }
 }

@@ -250,6 +250,12 @@ describe('workflow-first Workbench shell', () => {
             status: 'listening',
             url: 'http://127.0.0.1:47731',
             mcp_url: 'http://127.0.0.1:47731/mcp',
+            local: {
+              status: 'listening',
+              available: true,
+              executable: 'E:/Apps/nuphus-workbench-mcp.exe',
+              config: { mcpServers: {} },
+            },
           }
         : fallback(command, payload),
     )
@@ -259,7 +265,7 @@ describe('workflow-first Workbench shell', () => {
       </LangProvider>,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Connections' }))
-    await screen.findByText('Service running · Full access')
+    await screen.findByText('Local service ready · Full access')
     expect(screen.getByText('http://127.0.0.1:47731/mcp')).toBeInTheDocument()
     expect(screen.queryByLabelText('Client name')).not.toBeInTheDocument()
     expect(screen.queryAllByRole('checkbox')).toHaveLength(0)

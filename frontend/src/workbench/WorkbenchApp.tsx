@@ -28,6 +28,7 @@ import {
 } from './api'
 import { AuthoringPanel } from './AuthoringPanel'
 import { WorkbenchSettings } from './WorkbenchSettings'
+import { ExternalConnections } from './ExternalConnections'
 import { ScheduleControl, ScheduleHistory, type ScheduleSummary } from './ScheduleControls'
 import './workbench.css'
 
@@ -628,55 +629,7 @@ export default function WorkbenchApp() {
             </div>
           </section>
         )}
-        {page === 'clients' && (
-          <section className="wb-dashboard">
-            <h1>{ui('外部接入', 'External connections')}</h1>
-            <p>
-              {ui(
-                '本机端口随工作台自动启动，无需创建客户端或配置令牌。外部 Agent 可直接使用全部项目、画布、工作流和自动化能力。',
-                'The local endpoint starts with Workbench. No client registration or token is needed; all projects, canvas, workflow and automation capabilities are available.',
-              )}
-            </p>
-            <p role="status">
-              {endpoint?.status === 'listening'
-                ? ui('服务已启动 · 全部权限', 'Service running · Full access')
-                : (endpoint?.message ?? ui('正在启动服务…', 'Starting service…'))}
-            </p>
-            {endpoint?.status === 'listening' && (
-              <div className="wb-connections">
-                {[
-                  ['MCP', endpoint.mcp_url],
-                  ['HTTP API', endpoint.url ? `${endpoint.url}/api/v1` : undefined],
-                ].map(
-                  ([label, url]) =>
-                    url && (
-                      <div className="wb-row" key={label}>
-                        <div>
-                          <strong>{label}</strong>
-                          <code>{url}</code>
-                        </div>
-                        <button onClick={() => void navigator.clipboard.writeText(url).catch(fail)}>
-                          {ui('复制地址', 'Copy address')}
-                        </button>
-                      </div>
-                    ),
-                )}
-                <p>
-                  {ui(
-                    'MCP 客户端填写上面的地址即可连接，无需请求头。HTTP 可先 GET /api/v1/discover 查看接口。',
-                    'Connect your MCP client using the address above, without authentication headers. For HTTP, start with GET /api/v1/discover.',
-                  )}
-                </p>
-              </div>
-            )}
-            <p>
-              {ui(
-                '仅监听 127.0.0.1，拒绝网页来源请求。连接的本机程序拥有全部能力，执行可能操作真实应用和文件；退出工作台后端口关闭。外部 Agent 使用自己的模型，不需要配置内置模型。',
-                'Only 127.0.0.1 is exposed and browser-origin requests are rejected. Local programs have full access and can operate real applications and files. Quitting Workbench closes the endpoint. External Agents use their own models.',
-              )}
-            </p>
-          </section>
-        )}
+        {page === 'clients' && <ExternalConnections endpoint={endpoint} />}
         {page === 'runs' && (
           <section className="wb-dashboard">
             <h1>{ui('运行记录', 'Runs')}</h1>

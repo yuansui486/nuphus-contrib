@@ -11,7 +11,7 @@ path = "src/bin/mcp.rs"
 required-features = ["gateway"]
 
 [features]
-gateway = ["dep:axum", "dep:rmcp", "dep:futures-util", "dep:tokio-stream", "dep:reqwest", "tokio/net", "tokio/time", "tokio/rt-multi-thread"]
+gateway = ["dep:axum", "dep:rmcp", "dep:futures-util", "dep:tokio-stream", "dep:reqwest", "tokio/net", "tokio/time", "tokio/rt-multi-thread", "tokio/process", "tokio/io-util"]
 
 [lints]
 workspace = true
@@ -23,6 +23,7 @@ schemars = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+dirs = "5"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 axum = { version = "0.7", optional = true }
@@ -33,3 +34,9 @@ reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
