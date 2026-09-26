@@ -512,10 +512,12 @@ async fn rpc(
 ) -> (reqwest::StatusCode, Option<String>, Value) {
     let mut request = http
         .post(url)
-        .bearer_auth(token)
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", "2025-11-25")
         .json(&body);
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
     if let Some(session) = session {
         request = request.header("mcp-session-id", session);
     }
@@ -617,6 +619,116 @@ async fn mcp_discovery_and_calls_use_per_request_auth_and_session_ownership() {
         .0,
         401
     );
+    task.abort();
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn local_endpoint_needs_no_enrollment_and_exposes_all_capabilities_without_becoming_internal_agent(
+) {
+    let (_dir, service, p, _) = fixture();
+    let listener = crate::gateway::bind(0).await.unwrap();
+    assert!(listener.local_addr().unwrap().ip().is_loopback());
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::gateway::local_router(service.clone());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let catalog: Value = http
+        .get(format!("{base}/api/v1/discover"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog["operations"].as_array().unwrap().len(),
+        crate::catalog::operations().len()
+    );
+    for cap in crate::auth::CAPABILITIES {
+        Principal::LocalExternal
+            .authorize(cap, Some("any-project"))
+            .unwrap();
+    }
+    let args = json!({"project_id":p.project_id,"name":"No setup"});
+    let draft: Value = http
+        .post(format!("{base}/api/v1/canvas.create"))
+        .json(&args)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(draft["result"]["authoring_mode"], "external");
+    for (header, value) in [
+        ("origin", "http://localhost"),
+        ("sec-fetch-site", "none"),
+        ("host", "evil.example"),
+    ] {
+        assert_eq!(
+            http.get(format!("{base}/api/v1/discover"))
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    // Invalid explicit tokens must not silently turn into unrestricted access.
+    assert_eq!(
+        http.get(format!("{base}/api/v1/discover"))
+            .bearer_auth("revoked-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let url = format!("{base}/mcp");
+    let (status, session, body) = rpc(&http, &url, "", None, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"local","version":"1"}}})).await;
+    assert!(status.is_success(), "{body}");
+    let session = session.unwrap();
+    rpc(
+        &http,
+        &url,
+        "",
+        Some(&session),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    )
+    .await;
+    let (_, _, body) = rpc(
+        &http,
+        &url,
+        "",
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["tools"].as_array().unwrap().len(),
+        crate::catalog::operations().len()
+    );
+    let (_, _, body) = rpc(&http, &url, "", Some(&session), json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"canvas_create","arguments":args}})).await;
+    assert_eq!(
+        body["result"]["structuredContent"]["result"]["authoring_mode"],
+        "external"
+    );
+    let (_, _, body) = rpc(&http, &url, "", Some(&session), json!({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"workbench://projects"}})).await;
+    let projects: Value =
+        serde_json::from_str(body["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(projects
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["project_id"] == p.project_id));
     task.abort();
 }
 

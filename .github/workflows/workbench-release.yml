@@ -74,7 +74,7 @@ jobs:
           trap 'kill "$app_pid" 2>/dev/null || true' EXIT
           ready=false
           for attempt in $(seq 1 30); do
-            if [ "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:47739/api/v1/discover || true)" = 401 ]; then
+            if [ "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:47739/api/v1/discover || true)" = 200 ]; then
               ready=true
               break
             fi

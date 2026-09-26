@@ -98,10 +98,11 @@ pub fn install(app: &AppHandle) -> Result<()> {
                 Ok(listener) => {
                     let address = listener.local_addr().expect("bound loopback listener");
                     if let Ok(mut status) = endpoint.lock() {
-                        *status = json!({"status":"listening","url":format!("http://{address}"),"mcp_url":format!("http://{address}/mcp")});
+                        *status = json!({"status":"listening","url":format!("http://{address}"),"mcp_url":format!("http://{address}/mcp"),"access":"local_full"});
                     }
                     if let Err(error) =
-                        axum::serve(listener, nuphus_workbench::gateway::router(service)).await
+                        axum::serve(listener, nuphus_workbench::gateway::local_router(service))
+                            .await
                     {
                         if let Ok(mut status) = endpoint.lock() {
                             *status = json!({"status":"failed","message":error.to_string()});

@@ -3,7 +3,7 @@
 // Windows WebView2 additionalBrowserArgs=--remote-debugging-port=9227 in a
 // LOCAL test-only Tauri config (never add a debugging port to release config).
 // No desktop input or business files are touched. The short wait workflow and
-// revoked test client remain in the explicitly selected scratch project.
+// run evidence remain in the explicitly selected scratch project.
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 const cdpPort = process.env.WORKBENCH_TEST_CDP_PORT || "9227";
@@ -70,7 +70,6 @@ const invoke = (command, args) =>
 const ui = (operation, args = {}) =>
   invoke("workbench_call", { operation, args });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-let client;
 let projectId;
 const ownedRuns = [];
 try {
@@ -80,14 +79,6 @@ try {
   const projects = await ui("project.list");
   const project_id = projects[0].project_id;
   projectId = project_id;
-  client = await invoke("workbench_clients", {
-    action: "create",
-    args: {
-      name: "Native smoke test",
-      projects: [project_id],
-      capabilities: ["read", "edit", "run", "respond"],
-    },
-  });
   const endpoint = await invoke("workbench_clients", {
     action: "status",
     args: {},
@@ -97,7 +88,6 @@ try {
     const response = await fetch(`${endpoint.url}/api/v1/${operation}`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${client.token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(args),
@@ -327,10 +317,5 @@ try {
     )
       await ui("run.cancel", { project_id: projectId, run_id });
   }
-  if (client)
-    await invoke("workbench_clients", {
-      action: "revoke",
-      args: { client_id: client.client.client_id },
-    });
   socket.close();
 }

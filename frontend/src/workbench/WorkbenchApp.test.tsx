@@ -39,6 +39,81 @@ beforeEach(() => {
   })
 })
 describe('workflow-first Workbench shell', () => {
+  it('creates and opens a blank canvas immediately without asking for a name', async () => {
+    const fallback = mocks.invoke.getMockImplementation()!
+    let finish: (value: Draft) => void = () => {}
+    mocks.invoke.mockImplementation(async (command, payload) =>
+      payload?.operation === 'canvas.create'
+        ? new Promise<Draft>(resolve => {
+            finish = resolve
+          })
+        : fallback(command, payload),
+    )
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    await screen.findByRole('button', { name: /Flow one/ })
+    expect(screen.queryByRole('button', { name: /English|中文/ })).not.toBeInTheDocument()
+    const create = screen.getByRole('button', { name: 'New canvas' })
+    fireEvent.click(create)
+    fireEvent.click(create)
+    expect(
+      mocks.invoke.mock.calls.filter(([, args]) => args?.operation === 'canvas.create'),
+    ).toHaveLength(1)
+    expect(mocks.invoke).toHaveBeenCalledWith('workbench_call', {
+      operation: 'canvas.create',
+      args: { project_id: 'one', name: 'Untitled workflow' },
+    })
+    expect(screen.queryByLabelText('Workflow name')).not.toBeInTheDocument()
+    await act(async () => finish(draft('one')))
+    expect(screen.getByText('Canvas editor')).toBeInTheDocument()
+  })
+  it('shows ready-to-use endpoints without client registration or permission checkboxes', async () => {
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) =>
+      command === 'workbench_clients'
+        ? {
+            status: 'listening',
+            url: 'http://127.0.0.1:47731',
+            mcp_url: 'http://127.0.0.1:47731/mcp',
+          }
+        : fallback(command, payload),
+    )
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }))
+    await screen.findByText('Service running · Full access')
+    expect(screen.getByText('http://127.0.0.1:47731/mcp')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Client name')).not.toBeInTheDocument()
+    expect(screen.queryAllByRole('checkbox')).toHaveLength(0)
+    expect(
+      mocks.invoke.mock.calls
+        .filter(([cmd]) => cmd === 'workbench_clients')
+        .every(([, args]) => args.action === 'status'),
+    ).toBe(true)
+  })
+  it('shows a port failure instead of claiming the service is ready', async () => {
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) =>
+      command === 'workbench_clients'
+        ? { status: 'failed', message: 'Port occupied' }
+        : fallback(command, payload),
+    )
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Connections' }))
+    await screen.findByText('Port occupied')
+    expect(screen.queryByText('Service running · Full access')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Copy address' })).not.toBeInTheDocument()
+  })
   it('opens the workflow list in English and exposes internal generation only for internal canvases', async () => {
     render(
       <LangProvider>

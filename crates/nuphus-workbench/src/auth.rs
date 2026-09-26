@@ -19,6 +19,8 @@ pub struct Client {
 #[derive(Clone)]
 pub enum Principal {
     LocalUi,
+    /// Trusted native loopback caller. Full capabilities, but not internal authoring.
+    LocalExternal,
     Client(Client),
 }
 
@@ -26,13 +28,14 @@ impl Principal {
     pub fn id(&self) -> &str {
         match self {
             Self::LocalUi => "local-ui",
+            Self::LocalExternal => "local-external",
             Self::Client(c) => &c.client_id,
         }
     }
 
     pub fn authorize(&self, capability: &str, project: Option<&str>) -> Result<()> {
         match self {
-            Self::LocalUi => Ok(()),
+            Self::LocalUi | Self::LocalExternal => Ok(()),
             Self::Client(c)
                 if !c.revoked
                     && c.capabilities.iter().any(|s| s == capability)

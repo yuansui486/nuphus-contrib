@@ -40,19 +40,32 @@ use std::{
 
 struct Gateway<H: Host> {
     service: Arc<Service<H>>,
+    local_full_access: bool,
     sessions: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 #[derive(Clone)]
-struct Bearer(String);
+enum Access {
+    Token(String),
+    Local,
+}
 
-fn bearer(headers: &HeaderMap) -> Result<Bearer> {
+impl Access {
+    fn principal(&self, store: &crate::WorkbenchStore) -> Result<Principal> {
+        match self {
+            Self::Token(token) => store.authenticate(token),
+            Self::Local => Ok(Principal::LocalExternal),
+        }
+    }
+}
+
+fn bearer(headers: &HeaderMap) -> Result<Access> {
     headers
         .get("authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
         .filter(|t| !t.is_empty() && t.len() < 512)
-        .map(|t| Bearer(t.into()))
+        .map(|t| Access::Token(t.into()))
         .ok_or_else(|| {
             ApiError::new(
                 "unauthorized",
@@ -87,6 +100,7 @@ async fn authorize<H: Host>(
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.parse::<axum::http::uri::Authority>().ok());
     if request.headers().contains_key("origin")
+        || request.headers().contains_key("sec-fetch-site")
         || !host.is_some_and(|h| matches!(h.host(), "localhost" | "127.0.0.1" | "[::1]"))
     {
         return error_response(ApiError::new(
@@ -94,11 +108,18 @@ async fn authorize<H: Host>(
             "Only local non-browser clients are supported",
         ));
     }
-    let token = match bearer(request.headers()) {
+    // Explicit old tokens retain their scopes/revocation semantics. The desktop
+    // edition also accepts native loopback callers without enrollment.
+    let access = if state.local_full_access && !request.headers().contains_key("authorization") {
+        Ok(Access::Local)
+    } else {
+        bearer(request.headers())
+    };
+    let token = match access {
         Ok(token) => token,
         Err(e) => return error_response(e),
     };
-    let principal = match state.service.store.authenticate(&token.0) {
+    let principal = match token.principal(&state.service.store) {
         Ok(p) => p,
         Err(e) => return error_response(e),
     };
@@ -147,12 +168,12 @@ async fn authorize<H: Host>(
 
 async fn call<H: Host>(
     State(state): State<Arc<Gateway<H>>>,
-    Extension(token): Extension<Bearer>,
+    Extension(token): Extension<Access>,
     Path(operation): Path<String>,
     Json(args): Json<Value>,
 ) -> Response {
     // Recheck after receiving/parsing the body, in case the token was revoked.
-    let principal = match state.service.store.authenticate(&token.0) {
+    let principal = match token.principal(&state.service.store) {
         Ok(p) => p,
         Err(e) => return error_response(e),
     };
@@ -179,13 +200,11 @@ struct EventQuery {
 
 async fn events<H: Host>(
     State(state): State<Arc<Gateway<H>>>,
-    Extension(token): Extension<Bearer>,
+    Extension(token): Extension<Access>,
     Query(query): Query<EventQuery>,
 ) -> Response {
-    let initial = state
-        .service
-        .store
-        .authenticate(&token.0)
+    let initial = token
+        .principal(&state.service.store)
         .and_then(|p| p.authorize("read", Some(&query.project_id)))
         .and_then(|_| {
             state
@@ -203,10 +222,8 @@ async fn events<H: Host>(
                 return None;
             }
             loop {
-                let result = state
-                    .service
-                    .store
-                    .authenticate(&token.0)
+                let result = token
+                    .principal(&state.service.store)
                     .and_then(|p| p.authorize("read", Some(&query.project_id)))
                     .and_then(|_| {
                         state.service.store.events(
@@ -258,13 +275,12 @@ impl<H: Host> Mcp<H> {
         let token = context
             .extensions
             .get::<axum::http::request::Parts>()
-            .and_then(|p| p.extensions.get::<Bearer>())
+            .and_then(|p| p.extensions.get::<Access>())
             .ok_or_else(|| {
                 McpError::invalid_request("Authenticated HTTP context required", None)
             })?;
-        self.service
-            .store
-            .authenticate(&token.0)
+        token
+            .principal(&self.service.store)
             .map_err(|e| McpError::invalid_request(e.message, None))
     }
 }
@@ -376,6 +392,16 @@ impl<H: Host> ServerHandler for Mcp<H> {
 }
 
 pub fn router<H: Host>(service: Arc<Service<H>>) -> Router {
+    configured_router(service, false)
+}
+
+/// Desktop edition: no enrollment, all capabilities for native loopback clients.
+/// Must only be served on the listener returned by `bind`, never a public socket.
+pub fn local_router<H: Host>(service: Arc<Service<H>>) -> Router {
+    configured_router(service, true)
+}
+
+fn configured_router<H: Host>(service: Arc<Service<H>>, local_full_access: bool) -> Router {
     let mcp_service = service.clone();
     let mcp = StreamableHttpService::new(
         move || {
@@ -388,6 +414,7 @@ pub fn router<H: Host>(service: Arc<Service<H>>) -> Router {
     );
     let state = Arc::new(Gateway {
         service,
+        local_full_access,
         sessions: Mutex::new(HashMap::new()),
     });
     Router::new()

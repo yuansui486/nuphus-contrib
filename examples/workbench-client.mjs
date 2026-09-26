@@ -1,17 +1,13 @@
-// Node 22+. Set NUPHUS_WORKBENCH_TOKEN from the Workbench UI.
+// Node 22+. Start Workbench, then run this example; no client setup required.
 // Creates a workflow containing only a short wait; no desktop/filesystem effects.
 import { randomUUID } from "node:crypto";
 const base = process.env.NUPHUS_WORKBENCH_URL || "http://127.0.0.1:47731";
 const token = process.env.NUPHUS_WORKBENCH_TOKEN;
-if (!token)
-  throw new Error(
-    "Create a client token in Workbench and set NUPHUS_WORKBENCH_TOKEN",
-  );
 async function call(operation, args = {}) {
   const response = await fetch(`${base}/api/v1/${operation}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "Content-Type": "application/json",
     },
     body: JSON.stringify(args),

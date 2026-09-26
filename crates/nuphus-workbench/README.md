@@ -8,7 +8,7 @@ host supplies the upstream compiler and executor through `service::Host`.
 
 Implemented: project registration, revision-checked IR editing, independent layout
 revisions, immutable published versions, run identity and idempotency, durable
-cursor events, scoped client tokens, local HTTP/MCP and a stdio bridge.
+cursor events, zero-setup full-access local HTTP/MCP and a stdio bridge. Legacy scoped tokens remain compatible.
 
 The edition now includes a workflow-first UI, internal-generation integration,
 native debug/automation adapters and release/synchronization workflow definitions.
@@ -20,10 +20,18 @@ Passing service tests is not desktop, live-model or macOS acceptance.
 The Workbench application/tray hosts `http://127.0.0.1:47731` (override port using
 `NUPHUS_WORKBENCH_PORT`). It does not start an independent privileged daemon.
 Bind failures are exposed to the UI rather than silently choosing another service.
-All endpoints require `Authorization: Bearer <client token>` created by the local
-UI. No model key is an API access token. Tokens are stored hashed, displayed once,
-project scoped and revocable. Revocation is checked on every request, including
-requests in existing MCP sessions and continued application SSE event streams.
+The desktop edition accepts native loopback callers without enrollment or a token,
+with access to all projects and capabilities. The Connections page displays status
+and addresses, not a client/permission management form. No internal model is required.
+Only 127.0.0.1 is bound; browser Origin/Fetch-Metadata and non-local Host headers
+are rejected. This trusts local programs: it is not an OS sandbox or a project ACL.
+Do not expose the endpoint on a public socket or through an unauthenticated tunnel.
+
+Legacy Bearer requests still enforce the token's scope and revocation, including
+existing MCP sessions and event streams; invalid tokens are never treated as
+anonymous full access. Tokens do not isolate projects from local callers that
+omit the header. The service crate retains its token-only `router` for compatibility;
+the desktop host explicitly uses `local_router`. UI-only actions stay in Tauri IPC.
 
 * `GET /api/v1/discover`: operation names and JSON input schemas.
 * `POST /api/v1/{operation}`: operation arguments as JSON. Responses contain
@@ -37,7 +45,8 @@ requests in existing MCP sessions and continued application SSE event streams.
   canvases, versions and runs. Reads use the same project authorization as tools.
   Resources are snapshots, not a subscription; use `run_events` cursors for replay.
 * `nuphus-workbench-mcp`: stdio bridge using `NUPHUS_WORKBENCH_URL` (loopback origin)
-  and `NUPHUS_WORKBENCH_TOKEN`. It proxies the same service; it does not open a
+  and an optional legacy `NUPHUS_WORKBENCH_TOKEN`. No token is needed normally.
+  It proxies the same service; it does not open a
   second database or execute work itself. Stdout is reserved for MCP.
 
 Remote clients can use a separately authenticated tunnel to this local endpoint;
@@ -69,8 +78,10 @@ them automatically. Failed runs remain queryable.
 
 Content conflicts return `revision_conflict` and never overwrite another editor.
 Layout has its own revision. Deleting a draft preserves versions and run evidence.
-Client capabilities are `read`, `edit`, `run`, `respond`, `automation`, `projects`;
-grant only those needed, without prompting users for every ordinary workflow node.
+Local callers have `read`, `edit`, `run`, `respond`, `automation`, `projects` for all
+projects, including projects registered later. There is no per-node permission wizard.
+Native OS permissions and existing execution coordination remain in force.
+Anonymous calls share a local-external identity, so use globally unique request IDs.
 
 ## Direct automation and debugging
 
@@ -94,8 +105,8 @@ Runtime inputs declared sensitive are redacted from public run inputs and native
 trace payloads. Project files are local trusted data, not an encrypted vault:
 definitions, default values, authoring history and arbitrary debug provenance can
 contain user text. Pass secrets as sensitive runtime inputs, never in defaults,
-tool literals, canvas names or `source` metadata. Read capability exposes project
-definitions/evidence; grant it only to clients trusted with that project.
+tool literals, canvas names or `source` metadata. The local endpoint exposes project
+definitions/evidence: run only trusted native clients on this machine.
 
 Project scope selects storage and working directory; it is **not an OS sandbox**.
 Run permission allows the workflow's configured native tools/scripts. Automation

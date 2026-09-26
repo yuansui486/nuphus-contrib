@@ -12,7 +12,6 @@ import {
   call,
   canvasBackend,
   clients,
-  type Client,
   type Draft,
   type Endpoint,
   type Project,
@@ -28,7 +27,7 @@ const terminal = (status: string) =>
   ['completed', 'failed', 'cancelled', 'interrupted'].includes(status)
 
 export default function WorkbenchApp() {
-  const { lang, setLang } = useLanguage()
+  const { lang } = useLanguage()
   const ui = useCallback((zh: string, en: string) => (lang === 'zh' ? zh : en), [lang])
   const { toggleTheme } = useTheme()
   const [projects, setProjects] = useState<Project[]>([])
@@ -38,19 +37,14 @@ export default function WorkbenchApp() {
   const [epoch, setEpoch] = useState(0)
   const [runs, setRuns] = useState<Run[]>([])
   const [notice, setNotice] = useState('')
-  const [name, setName] = useState('')
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
   const [page, setPage] = useState<'workflows' | 'clients' | 'models' | 'runs'>('workflows')
-  const [clientList, setClientList] = useState<Client[]>([])
   const [endpoint, setEndpoint] = useState<Endpoint | null>(null)
-  const [clientName, setClientName] = useState('')
-  const [clientCaps, setClientCaps] = useState(['read', 'edit', 'run'])
-  const [token, setToken] = useState('')
   const [conflict, setConflict] = useState(false)
   const [intent, setIntent] = useState('')
   const [generationBusy, setGenerationBusy] = useState(false)
-  const [busy, setBusy] = useState(false)
+  const creatingRef = useRef(false)
   const dirty = useRef(false)
   const activeRef = useRef(active)
   activeRef.current = active
@@ -216,18 +210,24 @@ export default function WorkbenchApp() {
     [epoch, active?.workflow_id, saved],
   )
   const create = async () => {
-    if (!name.trim() || busy) return
-    setBusy(true)
+    if (!projectId || creatingRef.current) return
+    const requestedProject = projectId
+    creatingRef.current = true
+    setCreating(true)
     try {
-      const draft = await call<Draft>('canvas.create', { project_id: projectId, name: name.trim() })
-      setName('')
-      setCreating(false)
+      const draft = await call<Draft>('canvas.create', {
+        project_id: requestedProject,
+        name: ui('未命名工作流', 'Untitled workflow'),
+      })
+      // A slow create must not switch the user back to a project they left.
+      if (projectRef.current !== requestedProject) return
       openDraft(draft)
       await refresh()
     } catch (error) {
       fail(error)
     } finally {
-      setBusy(false)
+      creatingRef.current = false
+      setCreating(false)
     }
   }
   const chooseProject = async () => {
@@ -241,34 +241,15 @@ export default function WorkbenchApp() {
     setProjectId(project.project_id)
     setActive(null)
   }
-  const loadClients = useCallback(async () => {
-    const [items, status] = await Promise.all([
-      clients<Client[]>('list'),
-      clients<Endpoint>('status'),
-    ])
-    setClientList(items)
-    setEndpoint(status)
+  const loadEndpoint = useCallback(async () => {
+    setEndpoint(await clients<Endpoint>('status'))
   }, [])
   useEffect(() => {
-    if (page === 'clients') void loadClients().catch(fail)
-  }, [page, loadClients, fail])
-  const createClient = async () => {
-    setBusy(true)
-    try {
-      const result = await clients<{ token: string }>('create', {
-        name: clientName,
-        projects: [projectId],
-        capabilities: clientCaps,
-      })
-      setToken(result.token)
-      setClientName('')
-      await loadClients()
-    } catch (error) {
-      fail(error)
-    } finally {
-      setBusy(false)
-    }
-  }
+    if (page !== 'clients') return
+    void loadEndpoint().catch(fail)
+    const timer = setInterval(() => void loadEndpoint().catch(fail), 2000)
+    return () => clearInterval(timer)
+  }, [page, loadEndpoint, fail])
   const mode = async (value: 'internal' | 'external') => {
     if (!active || generationBusy) return
     navigate(() => {
@@ -314,7 +295,6 @@ export default function WorkbenchApp() {
               navigate(() => {
                 setPage(item)
                 setActive(null)
-                setToken('')
               })
             }
           >
@@ -330,9 +310,6 @@ export default function WorkbenchApp() {
         ))}
         <button className="wb-theme" onClick={toggleTheme}>
           {ui('切换主题', 'Toggle theme')}
-        </button>
-        <button onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}>
-          {lang === 'zh' ? 'English' : '中文'}
         </button>
       </nav>
       {notice && (
@@ -363,10 +340,14 @@ export default function WorkbenchApp() {
               </div>
               <button
                 className="wb-primary"
-                disabled={!projectId}
-                onClick={() => setCreating(true)}
+                disabled={!projectId || creating}
+                onClick={() => void create()}
+                title={ui(
+                  '新建空白工作流并直接在画布中编排',
+                  'Create a blank workflow and open the canvas',
+                )}
               >
-                {ui('新建工作流', 'New workflow')}
+                {creating ? ui('创建中…', 'Creating…') : ui('画布新建', 'New canvas')}
               </button>
             </header>
             <input
@@ -375,26 +356,6 @@ export default function WorkbenchApp() {
               value={search}
               onChange={e => setSearch(e.target.value)}
             />
-            {creating && (
-              <form
-                className="wb-create"
-                onSubmit={event => {
-                  event.preventDefault()
-                  void create()
-                }}
-              >
-                <label>
-                  {ui('工作流名称', 'Workflow name')}
-                  <input autoFocus required value={name} onChange={e => setName(e.target.value)} />
-                </label>
-                <button type="submit" disabled={busy || !name.trim()}>
-                  {ui('创建并打开画布', 'Create and open canvas')}
-                </button>
-                <button type="button" onClick={() => setCreating(false)}>
-                  {ui('取消', 'Cancel')}
-                </button>
-              </form>
-            )}
             {!drafts.length && (
               <div className="wb-empty">
                 <h2>{ui('从一个工作流开始', 'Start with a workflow')}</h2>
@@ -517,91 +478,48 @@ export default function WorkbenchApp() {
             <h1>{ui('外部接入', 'External connections')}</h1>
             <p>
               {ui(
-                '为当前项目创建访问令牌。外部 Agent 使用自己的模型；不会自动使用本机模型配置。',
-                'Create a token for the selected project. External Agents use their own models; connecting does not invoke the internal Agent.',
+                '本机端口随工作台自动启动，无需创建客户端或配置令牌。外部 Agent 可直接使用全部项目、画布、工作流和自动化能力。',
+                'The local endpoint starts with Workbench. No client registration or token is needed; all projects, canvas, workflow and automation capabilities are available.',
               )}
             </p>
-            <code>
-              {endpoint?.mcp_url ??
-                endpoint?.message ??
-                ui('正在读取服务状态…', 'Reading service status…')}
-            </code>
-            <form
-              className="wb-create"
-              onSubmit={event => {
-                event.preventDefault()
-                void createClient()
-              }}
-            >
-              <label>
-                {ui('客户端名称', 'Client name')}
-                <input required value={clientName} onChange={e => setClientName(e.target.value)} />
-              </label>
-              <fieldset>
-                <legend>{ui('允许能力', 'Capabilities')}</legend>
-                {['read', 'edit', 'run', 'respond', 'automation'].map(cap => (
-                  <label key={cap}>
-                    <input
-                      type="checkbox"
-                      checked={clientCaps.includes(cap)}
-                      onChange={e =>
-                        setClientCaps(values =>
-                          e.target.checked
-                            ? [...values, cap]
-                            : values.filter(value => value !== cap),
-                        )
-                      }
-                    />
-                    {cap}
-                  </label>
-                ))}
-              </fieldset>
-              <button disabled={!projectId || !clientName.trim() || busy}>
-                {ui('创建令牌', 'Create token')}
-              </button>
-            </form>
-            {token && (
-              <div className="wb-token">
+            <p role="status">
+              {endpoint?.status === 'listening'
+                ? ui('服务已启动 · 全部权限', 'Service running · Full access')
+                : (endpoint?.message ?? ui('正在启动服务…', 'Starting service…'))}
+            </p>
+            {endpoint?.status === 'listening' && (
+              <div className="wb-connections">
+                {[
+                  ['MCP', endpoint.mcp_url],
+                  ['HTTP API', endpoint.url ? `${endpoint.url}/api/v1` : undefined],
+                ].map(
+                  ([label, url]) =>
+                    url && (
+                      <div className="wb-row" key={label}>
+                        <div>
+                          <strong>{label}</strong>
+                          <code>{url}</code>
+                        </div>
+                        <button onClick={() => void navigator.clipboard.writeText(url).catch(fail)}>
+                          {ui('复制地址', 'Copy address')}
+                        </button>
+                      </div>
+                    ),
+                )}
                 <p>
                   {ui(
-                    '仅此时显示，请保存到客户端的安全配置中，不要放进工作流。',
-                    'Shown only now. Save in your client’s secure configuration, not in a workflow.',
+                    'MCP 客户端填写上面的地址即可连接，无需请求头。HTTP 可先 GET /api/v1/discover 查看接口。',
+                    'Connect your MCP client using the address above, without authentication headers. For HTTP, start with GET /api/v1/discover.',
                   )}
                 </p>
-                <input
-                  aria-label={ui('新令牌', 'New token')}
-                  readOnly
-                  value={token}
-                  onFocus={e => e.target.select()}
-                />
-                <button
-                  onClick={() => {
-                    void navigator.clipboard.writeText(token).catch(fail)
-                  }}
-                >
-                  {ui('复制', 'Copy')}
-                </button>
-                <button onClick={() => setToken('')}>{ui('隐藏', 'Hide')}</button>
               </div>
             )}
-            {clientList.map(client => (
-              <div className="wb-row" key={client.client_id}>
-                <div>
-                  <strong>{client.name}</strong>
-                  <p>{client.capabilities.join(' · ')}</p>
-                </div>
-                <button
-                  disabled={client.revoked}
-                  onClick={() => {
-                    void clients('revoke', { client_id: client.client_id })
-                      .then(loadClients)
-                      .catch(fail)
-                  }}
-                >
-                  {client.revoked ? ui('已撤销', 'Revoked') : ui('撤销', 'Revoke')}
-                </button>
-              </div>
-            ))}
+            <p>
+              {ui(
+                '仅监听 127.0.0.1，拒绝网页来源请求。连接的本机程序拥有全部能力，执行可能操作真实应用和文件；退出工作台后端口关闭。外部 Agent 使用自己的模型，不需要配置内置模型。',
+                'Only 127.0.0.1 is exposed and browser-origin requests are rejected. Local programs have full access and can operate real applications and files. Quitting Workbench closes the endpoint. External Agents use their own models.',
+              )}
+            </p>
           </section>
         )}
         {page === 'runs' && (

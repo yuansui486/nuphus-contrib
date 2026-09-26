@@ -11,15 +11,52 @@ use serde_json::Value;
 struct Bridge {
     client: reqwest::Client,
     base: String,
-    token: String,
+    token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdio_bridge_omits_auth_by_default_and_keeps_explicit_legacy_tokens() {
+        let mut bridge = Bridge {
+            client: reqwest::Client::new(),
+            base: "http://127.0.0.1:47731".into(),
+            token: None,
+        };
+        let request = bridge
+            .request(reqwest::Method::GET, bridge.base.clone())
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key("authorization"));
+        bridge.token = Some("legacy-test-token".into());
+        let request = bridge
+            .request(reqwest::Method::GET, bridge.base.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers()["authorization"],
+            "Bearer legacy-test-token"
+        );
+    }
 }
 
 impl Bridge {
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        let request = self.client.request(method, url);
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
     async fn operation(&self, operation: &str, args: Value) -> Result<Value, ErrorData> {
         let response = self
-            .client
-            .post(format!("{}/api/v1/{operation}", self.base))
-            .bearer_auth(&self.token)
+            .request(
+                reqwest::Method::POST,
+                format!("{}/api/v1/{operation}", self.base),
+            )
             .json(&args)
             .send()
             .await
@@ -74,9 +111,10 @@ impl ServerHandler for Bridge {
         // Do not announce a usable service when the application is stopped or
         // this token has been revoked. The remote catalog filters capabilities.
         let response = self
-            .client
-            .get(format!("{}/api/v1/discover", self.base))
-            .bearer_auth(&self.token)
+            .request(
+                reqwest::Method::GET,
+                format!("{}/api/v1/discover", self.base),
+            )
             .send()
             .await
             .map_err(|_| {
@@ -112,9 +150,10 @@ impl ServerHandler for Bridge {
         let operation = gateway::operation_for_tool(&request.name)
             .ok_or_else(|| ErrorData::invalid_params("Unknown Workbench tool", None))?;
         let response = self
-            .client
-            .post(format!("{}/api/v1/{operation}", self.base))
-            .bearer_auth(&self.token)
+            .request(
+                reqwest::Method::POST,
+                format!("{}/api/v1/{operation}", self.base),
+            )
             .json(&request.arguments.unwrap_or_default())
             .send()
             .await;
@@ -146,7 +185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("NUPHUS_WORKBENCH_URL must be a loopback HTTP origin".into());
     }
     let token = std::env::var("NUPHUS_WORKBENCH_TOKEN")
-        .map_err(|_| "Set NUPHUS_WORKBENCH_TOKEN to a token created in the Workbench UI")?;
+        .ok()
+        .filter(|s| !s.is_empty());
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

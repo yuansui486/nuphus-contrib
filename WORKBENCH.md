@@ -6,7 +6,8 @@
 
 ## 使用方式
 
-- 首页是项目中的工作流列表。新建工作流默认显示左侧内置生成面板：引导式表单或一句话描述；
+- 首页是项目中的工作流列表。「画布新建」直接创建未命名的空白工作流并打开上游画布，
+  无需预先填写名称；之后双击画布标题即可改名。默认显示左侧内置生成面板：引导式表单或一句话描述；
   使用本版本「模型设置」配置的工作流模型，生成和修改草稿，校验通过后发布，不自动运行。
 - 「外部 Agent / 手工」模式隐藏内置生成面板。外部新建的工作流默认使用此模式。
   显式切换模式不删除画布内容；确定性编排和执行不要求配置模型。
@@ -15,6 +16,7 @@
 - 外部编辑与应用编辑共享版本。内容和布局各自有修订号；干净画布自动刷新，
   有未保存编辑时提示冲突，不悄悄覆盖。画布连线由原生嵌套 IR 推导，
   修改执行顺序、容器和条件分支即修改编排，不额外保存可任意连接的第二套 DAG。
+- 工作台不展示语言切换按钮，保留上游语言基础设施和已保存语言，避免分叉公共组件。
 - 运行记录展示真实运行编号、状态、输入、结果和人工等待请求；画布调试面板查看步骤证据。
   最小化或关闭主窗口保留托盘服务，退出托盘才退出应用。重启后未完成运行标记中断，不自动重放。
 
@@ -47,17 +49,23 @@ cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbe
 
 ## 外部接入
 
-在「外部接入」为当前项目创建令牌。令牌只显示一次，可随时撤销；
-它不同于模型 API Key。HTTP、MCP 和应用内画布调用同一个服务层。
+工作台启动后自动监听本机端口。「外部接入」显示状态及可复制的地址，
+无需创建客户端、配置令牌或逐项选择权限。HTTP、MCP 和应用内画布调用同一个服务层。
+本机外部调用默认具有全部项目及全部公共能力（包括注册项目、运行、自动化和人工响应）。
+这不是项目权限隔离或 OS 沙箱：信任本机调用者，运行可产生真实桌面和文件副作用。
+仅绑定 `127.0.0.1`，拒绝网页 Origin/Fetch-Metadata 和非本机 Host；退出托盘后端口关闭。
 
-- HTTP：`POST http://127.0.0.1:47731/api/v1/{operation}`，JSON 参数，Bearer 认证。
+- HTTP：`POST http://127.0.0.1:47731/api/v1/{operation}`，JSON 参数，无需认证请求头。
 - 发现：`GET /api/v1/discover` 返回当前客户端可用操作及 JSON Schema。
-- MCP Streamable HTTP：`http://127.0.0.1:47731/mcp`，相同 Bearer；工具名将点换为下划线。
-- stdio：运行 `nuphus-workbench-mcp`，环境变量 `NUPHUS_WORKBENCH_TOKEN`；
+- MCP Streamable HTTP：`http://127.0.0.1:47731/mcp`，无需令牌；工具名将点换为下划线。
+- stdio：运行 `nuphus-workbench-mcp`，无需设置令牌；
   `NUPHUS_WORKBENCH_URL` 可覆盖本机服务地址。桥接进程不启动 Agent、不单独执行工作流。
 - 持久事件：`run.events` 或 `/api/v1/events?project_id=…&after=…`；
   断线后带最后处理的游标继续读取，不以传输会话 ID 代替运行 ID。
-- MCP resources：项目索引，以及项目、画布、版本和运行记录模板。资源读取同样校验项目权限。
+- MCP resources：项目索引，以及项目、画布、版本和运行记录模板。
+
+历史令牌调用保留兼容：显式发送 Bearer 时仍检查原有范围和撤销状态，不会将失效令牌
+悄悄降级成免令牌访问；但免令牌本机入口本身具有全权限，因此令牌不再构成隔离边界。
 
 主要调用链：`project.list → canvas.create/get/update → workflow.validate →
 workflow.save → workflow.run → run.get/events/steps`。
@@ -72,7 +80,7 @@ workflow.save → workflow.run → run.get/events/steps`。
 
 | 层 | 所在位置 | 职责 |
 | --- | --- | --- |
-| 工作台壳 | `frontend/src/workbench` | 工作流列表、模式选择、内置生成、外部客户端与运行记录 |
+| 工作台壳 | `frontend/src/workbench` | 工作流列表、模式选择、内置生成、本机接入状态与运行记录 |
 | 画布适配接口 | `CanvasBackend.ts` | 复用上游画布，替换持久化/运行入口；原版默认行为不变 |
 | 公共服务 | `crates/nuphus-workbench` | 项目、修订、发布、真实运行 ID、认证、HTTP/MCP |
 | 原生宿主适配 | `src-tauri/src/workbench*` | 接上游编译器、执行器、模型与本地工具 |
@@ -104,11 +112,12 @@ Mac 预览包采用 ad-hoc 签名，尚不是 Apple 公证发行包。
 
 本地检查：前端 tsc、ESLint、Vitest、两个版本构建；Rust fmt、服务测试/Clippy、
 工作流测试和两个版本原生 check。CI 对 Windows、Ubuntu、macOS ARM64 执行。
-接口重试、修订冲突、外部模式不调用内置 Agent、项目隔离、人工确认 ID、断线游标都需回归。
+接口重试、修订冲突、外部模式不调用内置 Agent、项目数据分离、人工确认 ID、断线游标都需回归。
+免配置 HTTP/MCP 的全能力发现、外部默认模式、网页访问拒绝和旧令牌兼容均有回归测试。
 
 `scripts/workbench-smoke.mjs` 可对真实 Windows WebView2 和原生宿主执行无模型冒烟：
 创建等待工作流、画布同步、发布运行、幂等重试、单节点调试、断点暂停、人工继续和取消。
-仅使用独立测试项目；令牌在结束时撤销。测试需要本地临时 Tauri 配置给各窗口设置
+仅使用独立测试项目，无需创建测试客户端。测试需要本地临时 Tauri 配置给各窗口设置
 `additionalBrowserArgs: "--remote-debugging-port=9227"`；不要把调试端口加入产品配置。
 启动时设置独立 `NUPHUS_WORKBENCH_DATA_DIR`、`NUPHUS_WORKBENCH_PORT`，然后执行
 `node scripts/workbench-smoke.mjs`。测试仍会保留其工作流与运行证据，方便检查。

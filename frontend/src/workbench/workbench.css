@@ -104,29 +104,6 @@
   margin: 60px auto;
   text-align: center;
 }
-.wb-create {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  align-items: end;
-  margin: 20px 0;
-}
-.wb-create > label {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.wb-create fieldset {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  border: 1px solid var(--border-color);
-}
-.wb-create fieldset label {
-  display: flex;
-  gap: 4px;
-  align-items: center;
-}
 .wb-row {
   display: flex;
   justify-content: space-between;
@@ -135,13 +112,19 @@
   padding: 14px 0;
   border-bottom: 1px solid var(--border-color);
 }
-.wb-token {
-  border: 1px solid var(--accent-color);
-  padding: 16px;
+.wb-connections {
+  max-width: 760px;
 }
-.wb-token input {
-  width: 100%;
-  margin-bottom: 10px;
+.wb-connections .wb-row > div {
+  min-width: 0;
+}
+.wb-connections code {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+.wb-connections button {
+  flex-shrink: 0;
 }
 .wb-notice {
   display: flex;
