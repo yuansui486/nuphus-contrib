@@ -2115,7 +2115,23 @@ function CanvasInner({
               <button
                 type="button"
                 className="wfc-btn"
-                onClick={() => setScheduleOpen(true)}
+                onClick={() => {
+                  void (async () => {
+                    if (backend.versioned && dirty) {
+                      if (
+                        !(await askConfirm(
+                          ui(
+                            '保存当前编辑后设置定时运行？',
+                            'Save your edits before configuring the schedule?',
+                          ),
+                        ))
+                      )
+                        return
+                      if (!(await save())) return
+                    }
+                    setScheduleOpen(true)
+                  })()
+                }}
                 disabled={!backend.scheduling}
                 title={
                   ir.schedule?.enabled
@@ -2555,13 +2571,22 @@ function CanvasInner({
         />
         <WorkflowScheduleDialog
           open={scheduleOpen}
+          backend={backend.schedule}
+          notice={
+            backend.versioned
+              ? ui(
+                  '按最新已保存内容执行；驻留托盘时继续，退出应用后停止。桌面操作需要可用的登录会话，资源占用时跳过本次。',
+                  'Runs the latest saved workflow while the app is running, including in the tray. Desktop actions need an available signed-in session. Busy resources skip an occurrence.',
+                )
+              : undefined
+          }
           workflow={{
             id: ir.id,
             title: ir.name,
             inputs: ir.inputs,
             schedule: ir.schedule ?? null,
           }}
-          readOnly={snapshot.running || gateLocked}
+          readOnly={!backend.versioned && (snapshot.running || gateLocked)}
           onClose={() => setScheduleOpen(false)}
           onChanged={schedule => setIr(current => (current ? { ...current, schedule } : current))}
         />

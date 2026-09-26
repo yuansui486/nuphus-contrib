@@ -21,9 +21,10 @@ pub fn operations() -> Vec<Operation> {
                 }
                 "limit" => json!({"type":"integer","minimum":1,"maximum":1000}),
                 "focus" | "use_retry_policy" => json!({"type":"boolean","default":false}),
-                "document" | "inputs" | "layout" | "parameters" | "variables"
+                "config" | "document" | "inputs" | "layout" | "parameters" | "variables"
                 | "runtime_inputs" => json!({"type":"object"}),
                 "steps" | "input_specs" => json!({"type":"array","items":{"type":"object"}}),
+                "preserve_sensitive" => json!({"type":"array","items":{"type":"string"}}),
                 "source" => json!({}),
                 "mode" => json!({"type":"string","enum":["node","through"]}),
                 "authoring_mode" => json!({"type":"string","enum":["internal","external"]}),
@@ -107,6 +108,49 @@ pub fn operations() -> Vec<Operation> {
         "read",
         &["project_id", "workflow_id"],
         &[],
+    );
+    add(
+        "workflow.schedule.get",
+        "Read schedule and redacted fixed inputs for a workflow.",
+        "read",
+        &["project_id", "workflow_id"],
+        &[],
+    );
+    add(
+        "workflow.schedule.list",
+        "List project schedules, including next_at Unix milliseconds. No secrets.",
+        "read",
+        &["project_id"],
+        &[],
+    );
+    add(
+        "workflow.schedule.preview",
+        "Preview the next three occurrences as Unix milliseconds using the upstream clock.",
+        "read",
+        &["project_id", "config"],
+        &[],
+    );
+    add("workflow.schedule.set", "Enable, disable or update a schedule for the latest saved workflow. Desktop/browser RPA allowed. Config uses upstream cron/timezone/enabled/label/interval_minutes fields. Requires current draft revision.", "run", &["project_id","workflow_id","revision","config"], &["inputs","preserve_sensitive"]);
+    add(
+        "workflow.schedule.remove",
+        "Remove a schedule without cancelling an already running workflow.",
+        "run",
+        &["project_id", "workflow_id", "revision"],
+        &[],
+    );
+    add(
+        "workflow.schedule.history",
+        "Read scheduled occurrences including skipped/failed triggers and actual run IDs.",
+        "read",
+        &["project_id"],
+        &["workflow_id"],
+    );
+    add(
+        "workflow.schedule.history_delete",
+        "Clear finished schedule history only; preserve workflow versions and run/step evidence.",
+        "edit",
+        &["project_id"],
+        &["workflow_id"],
     );
     add("workflow.validate", "Use the same native compiler as the desktop editor; optionally validate an unsaved document.", "read", &["project_id","workflow_id"], &["document"]);
     add("workflow.save", "Validate the exact draft revision and publish an immutable version. Incomplete drafts remain editable but cannot run.", "edit", &["project_id","workflow_id","revision"], &[]);

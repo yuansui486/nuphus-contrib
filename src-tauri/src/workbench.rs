@@ -1,6 +1,7 @@
 //! Thin Tauri/native adapter. Public workflow state and operations live in the
 //! transport-independent nuphus-workbench crate.
 pub mod authoring;
+mod schedule_secrets;
 use async_trait::async_trait;
 use nuphus::workflow::{
     compiler::Compiler,
@@ -85,6 +86,37 @@ pub fn install(app: &AppHandle) -> Result<()> {
         },
     ));
     let endpoint = Arc::new(Mutex::new(json!({"status":"starting"})));
+    // Workbench schedules use project revisions/runs, never the legacy WorkflowStore.
+    {
+        let service = service.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut recovered = std::collections::HashSet::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Ok(projects) = service.store.projects() else {
+                    continue;
+                };
+                for project in projects {
+                    let time = chrono::Utc::now().timestamp_millis();
+                    let result = if recovered.contains(&project.project_id) {
+                        service.tick_schedules(&project.project_id, time).await
+                    } else {
+                        service.recover_schedules(&project.project_id, time).await
+                    };
+                    match result {
+                        Ok(()) => {
+                            recovered.insert(project.project_id);
+                        }
+                        Err(error) => {
+                            if recovered.remove(&project.project_id) {
+                                tracing::warn!(project = %project.project_id, code = %error.code, "Workbench scheduling unavailable; recovery will be retried");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     #[cfg(feature = "workbench")]
     {
         let service = service.clone();
@@ -189,6 +221,26 @@ pub fn workbench_view_state(
 
 #[async_trait]
 impl Host for NativeHost {
+    fn schedule_next(&self, config: &Value, anchor: i64, after: i64) -> Result<i64> {
+        let config = serde_json::from_value(config.clone())?;
+        let date = |value| {
+            chrono::DateTime::from_timestamp_millis(value)
+                .ok_or_else(|| ApiError::new("invalid_params", "Invalid schedule timestamp"))
+        };
+        nuphus::workflow::scheduler::SchedulerEngine::next_at(&config, date(anchor)?, date(after)?)
+            .map(|date| date.timestamp_millis())
+            .map_err(|e| ApiError::new("invalid_schedule", e.to_string()))
+    }
+
+    fn seal_schedule_inputs(&self, inputs: &Value) -> Result<String> {
+        schedule_secrets::seal(&inputs.to_string())
+    }
+
+    fn open_schedule_inputs(&self, sealed: &str) -> Result<Value> {
+        let raw = schedule_secrets::open(sealed)?;
+        serde_json::from_str(&raw)
+            .map_err(|_| ApiError::new("decryption_failed", "Invalid stored schedule inputs"))
+    }
     async fn validate(&self, document: &Value, definitions: &[Value]) -> Result<Value> {
         let workflow: Workflow = match serde_json::from_value(document.clone()) {
             Ok(workflow) => workflow,
@@ -455,7 +507,11 @@ impl Host for NativeHost {
                                 .unwrap_or(provided),
                         ),
                         true,
-                        WorkflowRunSource::External,
+                        if run.source.as_deref() == Some("schedule") {
+                            WorkflowRunSource::Schedule
+                        } else {
+                            WorkflowRunSource::External
+                        },
                     );
                     if let Some(session) = &debug_session {
                         let result = nuphus::workflow::debug::CURRENT
@@ -717,6 +773,7 @@ impl Host for NativeHost {
 
     fn capabilities(&self) -> Value {
         json!({"edition":"workbench","platform":std::env::consts::OS,"workflow_execution":true,
+            "scheduling":true,"scheduled_rpa":true,
             "direct_automation":true,"concurrent_automation":false,"model_required_for_deterministic_workflows":false})
     }
 }
@@ -842,8 +899,11 @@ async fn configure_run_models(
 }
 
 fn redact(value: Value, secrets: &[String]) -> Value {
-    if !value.is_string() && secrets.iter().any(|s| *s == value.to_string()) {
-        return json!("[REDACTED]");
+    if !value.is_string() {
+        let serialized = value.to_string();
+        if secrets.contains(&serialized) {
+            return json!("[REDACTED]");
+        }
     }
     match value {
         Value::String(mut text) => {

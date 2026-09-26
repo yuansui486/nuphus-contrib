@@ -6,17 +6,37 @@ use crate::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
 #[derive(Default)]
 struct FakeHost {
     starts: AtomicUsize,
+    busy: AtomicBool,
 }
 
 #[async_trait]
 impl Host for FakeHost {
+    fn schedule_next(&self, config: &Value, anchor: i64, after: i64) -> Result<i64> {
+        if config["timezone"] != "UTC" {
+            return Err(ApiError::new("invalid_schedule", "Invalid timezone"));
+        }
+        let interval = config["interval_minutes"]
+            .as_i64()
+            .filter(|n| *n > 0 && *n <= 1440)
+            .ok_or_else(|| ApiError::new("invalid_schedule", "Invalid interval"))?
+            * 60_000;
+        Ok(anchor + ((after - anchor).div_euclid(interval) + 1) * interval)
+    }
+    fn seal_schedule_inputs(&self, inputs: &Value) -> Result<String> {
+        Ok(inputs.to_string().chars().rev().collect()) // TEST fake only; native crypto tested separately.
+    }
+    fn open_schedule_inputs(&self, sealed: &str) -> Result<Value> {
+        Ok(serde_json::from_str(
+            &sealed.chars().rev().collect::<String>(),
+        )?)
+    }
     async fn validate(&self, document: &Value, _: &[Value]) -> Result<Value> {
         Ok(json!({"passed":document["steps"].as_array().is_some_and(|s|!s.is_empty())}))
     }
@@ -24,6 +44,9 @@ impl Host for FakeHost {
         Ok(inputs.clone())
     }
     async fn start(&self, store: WorkbenchStore, run: Run, _: Value) -> Result<()> {
+        if self.busy.load(Ordering::SeqCst) {
+            return Err(ApiError::new("automation_busy", "Busy"));
+        }
         self.starts.fetch_add(1, Ordering::SeqCst);
         store.transition(&run.project_id, &run.run_id, RunStatus::Running, None)?;
         Ok(())
@@ -59,6 +82,408 @@ fn fixture() -> (tempfile::TempDir, Arc<Service<FakeHost>>, Project, String) {
         project,
         token,
     )
+}
+
+async fn scheduled_fixture(service: &Service<FakeHost>, project: &str) -> Draft {
+    let draft = service
+        .store
+        .create(project, "Scheduled", AuthoringMode::External)
+        .unwrap();
+    let draft = service.store.update(project,&draft.workflow_id,draft.revision,&[edit::Edit::ReplaceDocument { document:json!({"id":draft.workflow_id,"name":"Scheduled","steps":[{"id":"step","name":"List windows","do":{"tool":"desktop_list_windows","with":{}}}],"inputs":[{"name":"token","sensitive":true}]}) }]).unwrap();
+    let result = service.dispatch(&Principal::LocalUi,"workflow.schedule.set",json!({"project_id":project,"workflow_id":draft.workflow_id,"revision":draft.revision,"config":{"cron":"* * * * *","timezone":"UTC","enabled":true,"interval_minutes":1},"inputs":{"token":"secret-test-value"}})).await.unwrap();
+    serde_json::from_value(result["draft"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn schedule_latest_saved_snapshot_dedup_and_redaction() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let get = service
+        .dispatch(
+            &Principal::LocalUi,
+            "workflow.schedule.get",
+            json!({"project_id":p.project_id,"workflow_id":draft.workflow_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get["sensitive_inputs"], json!(["token"]));
+    assert!(!get.to_string().contains("secret-test-value"));
+    let mut document = draft.document.clone();
+    document["name"] = json!("Latest saved");
+    service
+        .store
+        .update(
+            &p.project_id,
+            &draft.workflow_id,
+            draft.revision,
+            &[edit::Edit::ReplaceDocument { document }],
+        )
+        .unwrap();
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
+    let runs = service.store.runs(&p.project_id).unwrap();
+    assert_eq!(runs[0].source.as_deref(), Some("schedule"));
+    assert_eq!(runs[0].snapshots[0]["name"], "Latest saved");
+    assert_eq!(runs[0].inputs["token"], "[REDACTED]");
+    let history = service
+        .dispatch(
+            &Principal::LocalUi,
+            "workflow.schedule.history",
+            json!({"project_id":p.project_id}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["run_id"], runs[0].run_id);
+    assert!(!history.to_string().contains("secret-test-value"));
+}
+
+#[tokio::test]
+async fn schedule_schema_upgrade_preserves_drafts_and_project_isolation() {
+    let (dir, service, p, _) = fixture();
+    let draft = service
+        .store
+        .create(&p.project_id, "Existing draft", AuthoringMode::External)
+        .unwrap();
+    let conn = service.store.project_db(&p.project_id).unwrap();
+    // Recreate the previous schema state; no schedules have been created yet.
+    conn.execute_batch(
+        "DROP TABLE schedules; DROP TABLE schedule_attempts; PRAGMA user_version=1;",
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        service
+            .store
+            .draft(&p.project_id, &draft.workflow_id)
+            .unwrap()
+            .document,
+        draft.document
+    );
+    let conn = service.store.project_db(&p.project_id).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drop(conn);
+    let scheduled = scheduled_fixture(&service, &p.project_id).await;
+    let second_path = dir.path().join("second-project");
+    std::fs::create_dir(&second_path).unwrap();
+    let second = service
+        .store
+        .register_project(&second_path, "Second")
+        .unwrap();
+    assert!(service
+        .store
+        .schedules(&second.project_id)
+        .unwrap()
+        .is_empty());
+    assert!(service
+        .store
+        .schedule(&second.project_id, &scheduled.workflow_id)
+        .unwrap()
+        .is_none());
+    assert_eq!(service.store.schedules(&p.project_id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn schedule_changed_secret_definition_requires_reconfiguration() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    let mut document = draft.document.clone();
+    document["inputs"][0]["sensitive"] = json!(false);
+    service
+        .store
+        .update(
+            &p.project_id,
+            &draft.workflow_id,
+            draft.revision,
+            &[edit::Edit::ReplaceDocument { document }],
+        )
+        .unwrap();
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    let history = service.store.schedule_history(&p.project_id).unwrap();
+    assert_eq!(history[0].reason.as_deref(), Some("invalid_inputs"));
+    assert!(!serde_json::to_string(&history)
+        .unwrap()
+        .contains("secret-test-value"));
+}
+
+#[tokio::test]
+async fn schedule_busy_and_active_runs_are_skipped_without_replay() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    service.host.busy.store(true, Ordering::SeqCst);
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.store.schedule_history(&p.project_id).unwrap()[0].status,
+        "skipped"
+    );
+    service.host.busy.store(false, Ordering::SeqCst);
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    service
+        .tick_schedules(&p.project_id, binding.next_at + 60_000)
+        .await
+        .unwrap();
+    service
+        .tick_schedules(&p.project_id, binding.next_at + 120_000)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service.store.schedule_history(&p.project_id).unwrap()[0]
+            .reason
+            .as_deref(),
+        Some("previous_run_active")
+    );
+}
+
+#[tokio::test]
+async fn schedule_invalid_latest_does_not_execute_old_published_version() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    service
+        .store
+        .publish_validated(&p.project_id, &draft.workflow_id, draft.revision)
+        .unwrap();
+    let mut document = draft.document.clone();
+    document["steps"] = json!([]);
+    let edited = service
+        .store
+        .update(
+            &p.project_id,
+            &draft.workflow_id,
+            draft.revision,
+            &[edit::Edit::ReplaceDocument { document }],
+        )
+        .unwrap();
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service.store.schedule_history(&p.project_id).unwrap()[0]
+            .reason
+            .as_deref(),
+        Some("validation_failed")
+    );
+    // Disabling invalid workflows must remain possible.
+    let mut config = binding.config;
+    config["enabled"] = json!(false);
+    service.dispatch(&Principal::LocalUi,"workflow.schedule.set",json!({"project_id":p.project_id,"workflow_id":draft.workflow_id,"revision":edited.revision,"config":config})).await.unwrap();
+}
+
+#[tokio::test]
+async fn schedule_recovery_and_sleep_do_not_catch_up_and_removal_stops_future_ticks() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    service
+        .recover_schedules(&p.project_id, binding.next_at + 300_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .store
+            .schedule(&p.project_id, &draft.workflow_id)
+            .unwrap()
+            .unwrap()
+            .anchor_at,
+        binding.anchor_at
+    );
+    service
+        .tick_schedules(&p.project_id, binding.next_at + 300_000)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    let due = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap()
+        .next_at;
+    service
+        .tick_schedules(&p.project_id, due + 40_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.store.schedule_history(&p.project_id).unwrap()[0]
+            .reason
+            .as_deref(),
+        Some("missed_while_unavailable")
+    );
+    service.dispatch(&Principal::LocalUi,"workflow.schedule.remove",json!({"project_id":p.project_id,"workflow_id":draft.workflow_id,"revision":draft.revision})).await.unwrap();
+    service
+        .tick_schedules(&p.project_id, due + 120_000)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    assert!(service
+        .store
+        .draft(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .document["schedule"]
+        .is_null());
+}
+
+#[tokio::test]
+async fn schedules_require_run_permission_revisions_and_do_not_arm_from_imports() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let config = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap()
+        .config;
+    let (_, token) = service
+        .store
+        .create_client(
+            "Read only",
+            vec![p.project_id.clone()],
+            vec!["read".into(), "edit".into()],
+        )
+        .unwrap();
+    let principal = service.store.authenticate(&token).unwrap();
+    let args = json!({"project_id":p.project_id,"workflow_id":draft.workflow_id,"revision":draft.revision-1,"config":config});
+    assert_eq!(
+        service
+            .dispatch(&principal, "workflow.schedule.set", args.clone())
+            .await
+            .unwrap_err()
+            .code,
+        "permission_denied"
+    );
+    assert_eq!(
+        service
+            .dispatch(&Principal::LocalUi, "workflow.schedule.set", args)
+            .await
+            .unwrap_err()
+            .code,
+        "revision_conflict"
+    );
+    let imported = service
+        .dispatch(
+            &Principal::LocalUi,
+            "workflow.import",
+            json!({"project_id":p.project_id,"name":"Imported","document":draft.document}),
+        )
+        .await
+        .unwrap();
+    assert!(imported["document"]["schedule"].is_null());
+    assert_eq!(service.store.schedules(&p.project_id).unwrap().len(), 1);
+    service
+        .store
+        .delete(&p.project_id, &draft.workflow_id, draft.revision)
+        .unwrap();
+    assert!(service.store.schedules(&p.project_id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schedule_sensitive_values_can_be_preserved_and_history_cleanup_keeps_runs() {
+    let (_dir, service, p, _) = fixture();
+    let draft = scheduled_fixture(&service, &p.project_id).await;
+    let old = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    service.dispatch(&Principal::LocalUi,"workflow.schedule.set",json!({"project_id":p.project_id,"workflow_id":draft.workflow_id,"revision":draft.revision,"config":old.config,"preserve_sensitive":["token"]})).await.unwrap();
+    let binding = service
+        .store
+        .schedule(&p.project_id, &draft.workflow_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.anchor_at, old.anchor_at);
+    assert_eq!(
+        service
+            .host
+            .open_schedule_inputs(&binding.sealed_inputs)
+            .unwrap()["token"],
+        "secret-test-value"
+    );
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    let run = service.store.runs(&p.project_id).unwrap().remove(0);
+    let args = json!({"project_id":p.project_id});
+    assert_eq!(
+        service
+            .dispatch(
+                &Principal::LocalUi,
+                "workflow.schedule.history_delete",
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    service
+        .store
+        .transition(&p.project_id, &run.run_id, RunStatus::Completed, None)
+        .unwrap();
+    assert_eq!(
+        service
+            .dispatch(
+                &Principal::LocalUi,
+                "workflow.schedule.history_delete",
+                args
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(service.store.run(&p.project_id, &run.run_id).is_ok());
+    service
+        .tick_schedules(&p.project_id, binding.next_at)
+        .await
+        .unwrap();
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

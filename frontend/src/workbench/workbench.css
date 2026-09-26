@@ -143,6 +143,33 @@
 .wb-card:hover {
   border-color: var(--accent);
 }
+.wb-card-group {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.wb-card-group > .wb-card {
+  width: 100%;
+  flex: 1;
+}
+.wb-schedule-control {
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.wb-schedule-control small {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.wb-schedule-history {
+  margin-top: 20px;
+}
+.wb-actions button[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
 .wb-card small,
 .wb-location,
 .wb-updated {

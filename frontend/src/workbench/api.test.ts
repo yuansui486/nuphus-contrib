@@ -17,6 +17,46 @@ beforeEach(() => {
 })
 
 describe('Workbench canvas backend', () => {
+  it('uses project-scoped scheduling and advances the canvas base revision', async () => {
+    const draft = fixture(),
+      changed = vi.fn()
+    const backend = canvasBackend(draft, changed, vi.fn())
+    const config = { cron: '0 9 * * *', timezone: 'UTC', enabled: true }
+    ipc.mockImplementation(async (_command, { operation }) => {
+      if (operation === 'workflow.schedule.get')
+        return { revision: 7, config, eligible: true, inputs: {}, sensitive_inputs: [] }
+      if (operation === 'workflow.schedule.set')
+        return {
+          draft: { ...draft, revision: 8, document: { ...draft.document, schedule: config } },
+        }
+      if (operation === 'canvas.update')
+        return { draft: { ...draft, revision: 9 }, diagnostics: { passed: true } }
+    })
+    expect(backend.scheduling).toBe(true)
+    await backend.schedule!.get('flow')
+    await backend.schedule!.set('flow', config, {}, [])
+    expect(changed).toHaveBeenCalledWith(expect.objectContaining({ revision: 8 }))
+    await backend.wfSave(draft.document)
+    expect(ipc).toHaveBeenLastCalledWith(
+      'workbench_call',
+      expect.objectContaining({
+        operation: 'canvas.update',
+        args: expect.objectContaining({ revision: 8 }),
+      }),
+    )
+  })
+  it('refuses a stale schedule editor without silently rebasing', async () => {
+    ipc.mockResolvedValue({
+      revision: 10,
+      config: null,
+      eligible: true,
+      inputs: {},
+      sensitive_inputs: [],
+    })
+    await expect(canvasBackend(fixture(), vi.fn(), vi.fn()).schedule!.get('flow')).rejects.toThrow(
+      'revision_conflict',
+    )
+  })
   it('binds guided authoring drafts and instructions to the workbench project', () => {
     expect(canvasBackend(fixture(), vi.fn(), vi.fn()).intent).toEqual({
       target: 'workbench',

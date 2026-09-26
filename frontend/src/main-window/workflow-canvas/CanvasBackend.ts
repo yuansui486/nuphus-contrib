@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react'
 import * as api from '../lib/api'
 import { wfDebugRun, wfDebugControl } from './debugSession'
 import type { IntentTextOptions } from './intentText'
+import type { WorkflowScheduleBackend } from '../workflow/WorkflowScheduleDialog'
 
 /** A small edition seam: upstream editor logic stays shared, persistence does not. */
 export const legacyCanvasBackend = {
@@ -22,6 +23,7 @@ export const legacyCanvasBackend = {
   generation: true,
 }
 export type CanvasBackend = typeof legacyCanvasBackend & {
+  schedule?: WorkflowScheduleBackend
   intent?: IntentTextOptions & { draftScope?: string }
 }
 export const CanvasBackendContext = createContext<CanvasBackend>(legacyCanvasBackend)

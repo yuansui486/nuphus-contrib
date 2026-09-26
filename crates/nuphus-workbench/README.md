@@ -83,6 +83,41 @@ projects, including projects registered later. There is no per-node permission w
 Native OS permissions and existing execution coordination remain in force.
 Anonymous calls share a local-external identity, so use globally unique request IDs.
 
+## Scheduling
+
+UI, HTTP and MCP share `workflow.schedule.get`, `list`, `preview`, `set`, `remove`,
+`history`, and `history_delete`. All require `project_id`; get/set/remove also require
+`workflow_id`. Set/remove use the current draft `revision` and return `{draft}` with
+an incremented revision. Set/remove require `run` capability, history cleanup requires
+`edit`, and reads require `read`. Importing/editing IR cannot implicitly enable schedules.
+
+Set accepts upstream `config: {cron, timezone, enabled, label?, interval_minutes?}`,
+`inputs` (explicit fixed values only), and `preserve_sensitive` (saved secret names).
+Five-field Cron and IANA timezones are validated by the upstream native scheduler;
+minute intervals are 1–1440 and retain their anchor when unchanged. Preview returns
+three Unix millisecond timestamps; list includes nullable `next_at`. Get returns
+redacted `inputs`, `sensitive_inputs`, `config`, `revision`, and `next_at`.
+
+Every occurrence validates the latest saved draft, publishes that exact revision,
+and starts the normal executor with frozen definitions. A claimed occurrence is
+persisted before execution; crashes never replay it. Restart/reconnect advances
+over missed times, and waking more than 30 seconds late skips the occurrence.
+Busy resources and an existing nonterminal run skip instead of queueing. Desktop
+and browser tools are supported; OS permissions/session availability still apply.
+
+History optionally filters by `workflow_id`. Each occurrence has an ID, workflow,
+title, `due_at`, status, optional reason and optional `run_id`; actual step evidence
+uses `run.steps`. Started runs carry `source: "schedule"`. A refused busy dispatch
+uses terminal status `skipped`; do not offer resume/cancel for it. Clearing finished
+schedule history preserves immutable versions, runs and step evidence. Schedule
+changes/occurrences also emit durable `schedule.changed` / `schedule.triggered` events.
+
+Schedules and attempts live in each project's schema-v2 database. Native hosts
+implement `schedule_next`, `seal_schedule_inputs` and `open_schedule_inputs`; the
+service itself still has no dependency on the internal Agent or a second executor.
+Fixed inputs are encrypted and never included in discovery, schedule lists or
+events. Copying a project to another machine requires re-entering its fixed inputs.
+
 ## Direct automation and debugging
 
 `workflow.tools` and `workflow.schema` return authoritative native tool and step

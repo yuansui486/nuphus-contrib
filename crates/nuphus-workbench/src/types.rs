@@ -108,6 +108,7 @@ pub enum RunStatus {
     Failed,
     Cancelled,
     Interrupted,
+    Skipped,
 }
 
 impl RunStatus {
@@ -121,13 +122,14 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Interrupted => "interrupted",
+            Self::Skipped => "skipped",
         }
     }
 
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted | Self::Skipped
         )
     }
 
@@ -143,13 +145,15 @@ impl RunStatus {
                     Self::Completed => {
                         matches!(self, Self::Running | Self::Paused | Self::AwaitingHuman)
                     }
-                    Self::Failed | Self::Cancelled | Self::Interrupted => true,
+                    Self::Failed | Self::Cancelled | Self::Interrupted | Self::Skipped => true,
                 })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Run {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub run_id: String,
     pub project_id: String,
     pub workflow_id: String,

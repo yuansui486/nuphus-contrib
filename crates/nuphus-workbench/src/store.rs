@@ -14,7 +14,7 @@ pub struct WorkbenchStore {
     root: PathBuf,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -24,7 +24,7 @@ fn now() -> i64 {
 fn connect(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 1 {
+    if version > 2 {
         return Err(ApiError::new(
             "schema_too_new",
             "This project was written by a newer Workbench; update the application",
@@ -106,7 +106,7 @@ fn project_identity(directory: &Path, preferred: Option<&str>) -> Result<String>
     Ok(id)
 }
 
-fn event(
+pub(crate) fn event(
     conn: &Connection,
     project: &str,
     workflow: &str,
@@ -240,7 +240,7 @@ impl WorkbenchStore {
         Ok(root.join(".nuphus-workbench"))
     }
 
-    fn project_db(&self, project_id: &str) -> Result<Connection> {
+    pub(crate) fn project_db(&self, project_id: &str) -> Result<Connection> {
         let root = self.project_data_dir(project_id)?;
         std::fs::create_dir_all(&root)?;
         let conn = connect(&root.join("workbench.sqlite"))?;
@@ -258,7 +258,9 @@ impl WorkbenchStore {
             workflow_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS events_run ON events(run_id,cursor);
             CREATE TABLE IF NOT EXISTS authoring_sessions(workflow_id TEXT PRIMARY KEY, body TEXT NOT NULL);
-            PRAGMA user_version=1;")?;
+            CREATE TABLE IF NOT EXISTS schedules(workflow_id TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schedule_attempts(id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, body TEXT NOT NULL);
+            PRAGMA user_version=2;")?;
         Ok(conn)
     }
 
@@ -348,9 +350,16 @@ impl WorkbenchStore {
         if draft.revision != revision {
             return Err(conflict(draft.revision));
         }
+        let schedule = draft
+            .document
+            .get("schedule")
+            .cloned()
+            .unwrap_or(Value::Null);
         for operation in operations {
             edit::apply(&mut draft, operation)?;
         }
+        // Only the explicit scheduling API arms/disarms tasks, never an IR import/edit.
+        draft.document["schedule"] = schedule;
         edit::check_document(&draft.document, id)?;
         draft.revision += 1;
         draft.updated_at = now();
@@ -553,6 +562,7 @@ impl WorkbenchStore {
             return Ok((decode(body)?, false));
         }
         let run = Run {
+            source: (client == "schedule").then(|| "schedule".into()),
             run_id: uuid::Uuid::new_v4().to_string(),
             project_id: project.into(),
             workflow_id: version.workflow_id.clone(),
@@ -839,6 +849,7 @@ impl WorkbenchStore {
             return Err(conflict(draft.revision));
         }
         // Immutable versions and run evidence remain available after deletion.
+        tx.execute("DELETE FROM schedules WHERE workflow_id=?1", [id])?;
         tx.execute("DELETE FROM drafts WHERE workflow_id=?1", [id])?;
         event(
             &tx,
@@ -859,7 +870,7 @@ pub fn fingerprint(value: &Value) -> String {
     format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()))
 }
 
-fn load_draft(conn: &Connection, id: &str) -> Result<Draft> {
+pub(crate) fn load_draft(conn: &Connection, id: &str) -> Result<Draft> {
     let body = conn
         .query_row("SELECT body FROM drafts WHERE workflow_id=?1", [id], |r| {
             r.get::<_, String>(0)

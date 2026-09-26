@@ -11,6 +11,7 @@ pub mod edit;
 pub mod gateway;
 #[cfg(feature = "gateway")]
 pub mod resources;
+pub mod schedules;
 pub mod service;
 pub mod store;
 pub mod types;

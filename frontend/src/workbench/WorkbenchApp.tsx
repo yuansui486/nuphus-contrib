@@ -28,13 +28,14 @@ import {
 } from './api'
 import { AuthoringPanel } from './AuthoringPanel'
 import { WorkbenchSettings } from './WorkbenchSettings'
+import { ScheduleControl, ScheduleHistory, type ScheduleSummary } from './ScheduleControls'
 import './workbench.css'
 
 const ModelsPage = lazy(() =>
   import('../main-window/pages/ModelsPage').then(m => ({ default: m.ModelsPage })),
 )
 const terminal = (status: string) =>
-  ['completed', 'failed', 'cancelled', 'interrupted'].includes(status)
+  ['completed', 'failed', 'cancelled', 'interrupted', 'skipped'].includes(status)
 const projectStorageKey = 'workbench:last-project'
 
 export default function WorkbenchApp() {
@@ -47,6 +48,8 @@ export default function WorkbenchApp() {
   const [active, setActive] = useState<Draft | null>(null)
   const [epoch, setEpoch] = useState(0)
   const [runs, setRuns] = useState<Run[]>([])
+  const [schedules, setSchedules] = useState<ScheduleSummary[]>([])
+  const [scheduledOnly, setScheduledOnly] = useState(false)
   const [notice, setNotice] = useState('')
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
@@ -72,6 +75,7 @@ export default function WorkbenchApp() {
   useEffect(() => {
     setDrafts([])
     setRuns([])
+    setSchedules([])
     if (projectId) {
       try {
         localStorage.setItem(projectStorageKey, projectId)
@@ -113,13 +117,15 @@ export default function WorkbenchApp() {
   const refresh = useCallback(async () => {
     if (!projectId) return
     const sequence = ++refreshSequence.current
-    const [nextDrafts, nextRuns] = await Promise.all([
+    const [nextDrafts, nextRuns, nextSchedules] = await Promise.all([
       call<Draft[]>('workflow.list', { project_id: projectId }),
       call<Run[]>('run.list', { project_id: projectId }),
+      call<ScheduleSummary[]>('workflow.schedule.list', { project_id: projectId }),
     ])
     if (projectRef.current !== projectId || sequence !== refreshSequence.current) return
     setDrafts(nextDrafts)
     setRuns(nextRuns)
+    setSchedules(nextSchedules ?? [])
     const current = activeRef.current
     if (!current || current.project_id !== projectId) return
     const next = nextDrafts.find(draft => draft.workflow_id === current.workflow_id)
@@ -335,6 +341,8 @@ export default function WorkbenchApp() {
       failed: ui('失败', 'Failed'),
       cancelled: ui('已取消', 'Cancelled'),
       interrupted: ui('已中断', 'Interrupted'),
+      skipped: ui('已跳过', 'Skipped'),
+      starting: ui('准备中', 'Starting'),
     })[status] ?? status
 
   return (
@@ -501,29 +509,40 @@ export default function WorkbenchApp() {
               {drafts
                 .filter(draft => draft.document.name.toLowerCase().includes(search.toLowerCase()))
                 .map(draft => (
-                  <button
-                    className="wb-card"
-                    key={draft.workflow_id}
-                    onClick={() => openDraft(draft)}
-                  >
-                    <h2>{draft.document.name}</h2>
-                    <p>
-                      {draft.authoring_mode === 'internal'
-                        ? ui('AI 辅助', 'AI-assisted')
-                        : ui('手动 · 外部编排', 'Manual · external')}
-                    </p>
-                    <small>
-                      {ui('修订', 'Revision')} {draft.revision} · {draft.document.steps.length}{' '}
-                      {ui('个顶层节点', 'top-level steps')}
-                    </small>
-                    <time
-                      className="wb-updated"
-                      dateTime={new Date(draft.updated_at).toISOString()}
+                  <div className="wb-card-group" key={draft.workflow_id}>
+                    <button
+                      className="wb-card"
+                      key={draft.workflow_id}
+                      onClick={() => openDraft(draft)}
                     >
-                      {ui('更新于', 'Updated')}{' '}
-                      {new Date(draft.updated_at).toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US')}
-                    </time>
-                  </button>
+                      <h2>{draft.document.name}</h2>
+                      <p>
+                        {draft.authoring_mode === 'internal'
+                          ? ui('AI 辅助', 'AI-assisted')
+                          : ui('手动 · 外部编排', 'Manual · external')}
+                      </p>
+                      <small>
+                        {ui('修订', 'Revision')} {draft.revision} · {draft.document.steps.length}{' '}
+                        {ui('个顶层节点', 'top-level steps')}
+                      </small>
+                      <time
+                        className="wb-updated"
+                        dateTime={new Date(draft.updated_at).toISOString()}
+                      >
+                        {ui('更新于', 'Updated')}{' '}
+                        {new Date(draft.updated_at).toLocaleString(
+                          lang === 'zh' ? 'zh-CN' : 'en-US',
+                        )}
+                      </time>
+                    </button>
+                    <ScheduleControl
+                      draft={draft}
+                      summary={schedules.find(s => s.workflow_id === draft.workflow_id)}
+                      onChanged={() => {
+                        void refresh().catch(fail)
+                      }}
+                    />
+                  </div>
                 ))}
             </div>
           </section>
@@ -661,76 +680,89 @@ export default function WorkbenchApp() {
         {page === 'runs' && (
           <section className="wb-dashboard">
             <h1>{ui('运行记录', 'Runs')}</h1>
+            <div className="wb-actions">
+              <button aria-pressed={!scheduledOnly} onClick={() => setScheduledOnly(false)}>
+                {ui('全部运行', 'All runs')}
+              </button>
+              <button aria-pressed={scheduledOnly} onClick={() => setScheduledOnly(true)}>
+                {ui('定时触发', 'Scheduled')}
+              </button>
+            </div>
             <p>
               {ui(
                 '关闭连接或隐藏窗口不会取消执行。取消会等待正在进行的本地动作结束。',
                 'Disconnecting or hiding the window does not cancel a run. Cancellation waits for an in-flight local action to finish.',
               )}
             </p>
-            {runs.map(run => (
-              <article className="wb-run" key={run.run_id}>
-                <div className="wb-row">
-                  <strong>
-                    {drafts.find(draft => draft.workflow_id === run.workflow_id)?.document.name ??
-                      run.workflow_id}
-                  </strong>
-                  <span className={`wb-run-status wb-run-status--${run.status}`}>
-                    {statusText(run.status)}
-                  </span>
-                </div>
-                {!terminal(run.status) && (
-                  <div className="wb-actions">
-                    {(run.status === 'running' || run.status === 'paused') && (
+            {scheduledOnly && projectId && (
+              <ScheduleHistory key={projectId} projectId={projectId} />
+            )}
+            {runs
+              .filter(run => !scheduledOnly || run.source === 'schedule')
+              .map(run => (
+                <article className="wb-run" key={run.run_id}>
+                  <div className="wb-row">
+                    <strong>
+                      {drafts.find(draft => draft.workflow_id === run.workflow_id)?.document.name ??
+                        run.workflow_id}
+                    </strong>
+                    <span className={`wb-run-status wb-run-status--${run.status}`}>
+                      {statusText(run.status)}
+                    </span>
+                  </div>
+                  {!terminal(run.status) && (
+                    <div className="wb-actions">
+                      {(run.status === 'running' || run.status === 'paused') && (
+                        <button
+                          onClick={() => {
+                            void call(run.status === 'paused' ? 'run.resume' : 'run.pause', {
+                              project_id: projectId,
+                              run_id: run.run_id,
+                            })
+                              .then(refresh)
+                              .catch(fail)
+                          }}
+                        >
+                          {run.status === 'paused' ? ui('继续', 'Resume') : ui('暂停', 'Pause')}
+                        </button>
+                      )}
                       <button
                         onClick={() => {
-                          void call(run.status === 'paused' ? 'run.resume' : 'run.pause', {
+                          void call('run.cancel', { project_id: projectId, run_id: run.run_id })
+                            .then(refresh)
+                            .catch(fail)
+                        }}
+                      >
+                        {ui('取消运行', 'Cancel run')}
+                      </button>
+                    </div>
+                  )}
+                  {run.pending_request && (
+                    <div className="wb-conflict">
+                      <p>{run.pending_request.prompt}</p>
+                      <button
+                        onClick={() => {
+                          void call('run.respond', {
                             project_id: projectId,
                             run_id: run.run_id,
+                            request_id: run.pending_request?.request_id,
+                            decision: 'continue',
                           })
                             .then(refresh)
                             .catch(fail)
                         }}
                       >
-                        {run.status === 'paused' ? ui('继续', 'Resume') : ui('暂停', 'Pause')}
+                        {ui('确认并继续', 'Confirm and continue')}
                       </button>
-                    )}
-                    <button
-                      onClick={() => {
-                        void call('run.cancel', { project_id: projectId, run_id: run.run_id })
-                          .then(refresh)
-                          .catch(fail)
-                      }}
-                    >
-                      {ui('取消运行', 'Cancel run')}
-                    </button>
-                  </div>
-                )}
-                {run.pending_request && (
-                  <div className="wb-conflict">
-                    <p>{run.pending_request.prompt}</p>
-                    <button
-                      onClick={() => {
-                        void call('run.respond', {
-                          project_id: projectId,
-                          run_id: run.run_id,
-                          request_id: run.pending_request?.request_id,
-                          decision: 'continue',
-                        })
-                          .then(refresh)
-                          .catch(fail)
-                      }}
-                    >
-                      {ui('确认并继续', 'Confirm and continue')}
-                    </button>
-                  </div>
-                )}
-                <details>
-                  <summary>{ui('运行详情', 'Run details')}</summary>
-                  <code>{run.run_id}</code>
-                  <pre>{JSON.stringify({ inputs: run.inputs, result: run.result }, null, 2)}</pre>
-                </details>
-              </article>
-            ))}
+                    </div>
+                  )}
+                  <details>
+                    <summary>{ui('运行详情', 'Run details')}</summary>
+                    <code>{run.run_id}</code>
+                    <pre>{JSON.stringify({ inputs: run.inputs, result: run.result }, null, 2)}</pre>
+                  </details>
+                </article>
+              ))}
           </section>
         )}
       </main>

@@ -279,7 +279,15 @@ impl Default for AppState {
         let tool_permissions = std::fs::read_to_string(&tool_permissions_path)
             .ok()
             .and_then(|data| serde_json::from_str::<ToolPermissions>(&data).ok())
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                // Workbench is a local automation provider. Preserve explicit user
+                // settings, but do not inherit the chat edition's disabled RPA default.
+                if nuphus::profile::WORKBENCH {
+                    ToolPermissions::all()
+                } else {
+                    ToolPermissions::default()
+                }
+            });
         let tool_permissions_ref = Arc::new(std::sync::Mutex::new(tool_permissions));
 
         // 全进程唯一信号状态实例：注入 ToolRegistry 与 WorkflowEngine，

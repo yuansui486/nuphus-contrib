@@ -10,6 +10,24 @@ use std::{path::Path, sync::Arc};
 /// workflow, access model credentials or operate a desktop by themselves.
 #[async_trait]
 pub trait Host: Send + Sync + 'static {
+    fn schedule_next(&self, _config: &Value, _anchor: i64, _after: i64) -> Result<i64> {
+        Err(ApiError::new(
+            "unsupported",
+            "Scheduling is unavailable in this host",
+        ))
+    }
+    fn seal_schedule_inputs(&self, _inputs: &Value) -> Result<String> {
+        Err(ApiError::new(
+            "unsupported",
+            "Schedule encryption is unavailable",
+        ))
+    }
+    fn open_schedule_inputs(&self, _sealed: &str) -> Result<Value> {
+        Err(ApiError::new(
+            "unsupported",
+            "Schedule encryption is unavailable",
+        ))
+    }
     async fn validate(&self, document: &Value, definitions: &[Value]) -> Result<Value>;
     async fn preflight(&self, document: &Value, inputs: &Value) -> Result<Value>;
     async fn start(&self, store: WorkbenchStore, run: Run, inputs: Value) -> Result<()>;
@@ -40,6 +58,7 @@ pub trait Host: Send + Sync + 'static {
 pub struct Service<H: Host> {
     pub store: WorkbenchStore,
     pub host: Arc<H>,
+    pub(crate) schedule_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub fn string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -64,6 +83,7 @@ impl<H: Host> Service<H> {
         Self {
             store,
             host: Arc::new(host),
+            schedule_guard: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -80,6 +100,12 @@ impl<H: Host> Service<H> {
             ));
         }
         let capability = match operation {
+            "workflow.schedule.get"
+            | "workflow.schedule.list"
+            | "workflow.schedule.preview"
+            | "workflow.schedule.history" => "read",
+            "workflow.schedule.set" | "workflow.schedule.remove" => "run",
+            "workflow.schedule.history_delete" => "edit",
             "system.capabilities"
             | "project.list"
             | "project.get"
@@ -135,6 +161,14 @@ impl<H: Host> Service<H> {
         let project = string(&args, "project_id")?;
         principal.authorize(capability, Some(project))?;
         let project_info = self.store.project(project)?;
+        if operation.starts_with("workflow.schedule.") {
+            return self.schedule_dispatch(operation, &args).await;
+        }
+        let _schedule_guard = if operation == "workflow.delete" {
+            Some(self.schedule_guard.lock().await)
+        } else {
+            None
+        };
         match operation {
             "project.get" => encode(project_info),
             "workflow.list" => encode(self.store.drafts(project)?),

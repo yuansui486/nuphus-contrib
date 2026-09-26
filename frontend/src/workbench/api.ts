@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core'
 import type { CanvasBackend } from '../main-window/workflow-canvas/CanvasBackend'
 import type { WorkflowIR } from '../main-window/workflow-canvas/types'
 import type { ValidationReport, WorkflowRunTrace } from '../main-window/lib/api'
+import type { WfScheduleDetails } from '../main-window/lib/api'
 
 export interface Project {
   project_id: string
@@ -19,6 +20,7 @@ export interface Draft {
   updated_at: number
 }
 export interface Run {
+  source?: string
   run_id: string
   workflow_id: string
   version_id: string
@@ -90,7 +92,47 @@ export function canvasBackend(
   const scope = { project_id: initial.project_id, workflow_id: initial.workflow_id }
   return {
     versioned: true,
-    scheduling: false,
+    scheduling: true,
+    schedule: {
+      get: async () => {
+        const details = await call<WfScheduleDetails & { revision: number }>(
+          'workflow.schedule.get',
+          scope,
+        )
+        if (details.revision !== current.revision)
+          throw new WorkbenchError(
+            'revision_conflict',
+            'Reload the changed workflow before editing its schedule',
+          )
+        return details
+      },
+      preview: async config =>
+        (
+          await call<number[]>('workflow.schedule.preview', {
+            project_id: scope.project_id,
+            config,
+          })
+        ).map(time => new Date(time).toISOString()),
+      set: async (_id, config, inputs, preserveSensitive) => {
+        const { draft } = await call<{ draft: Draft }>('workflow.schedule.set', {
+          ...scope,
+          revision: current.revision,
+          config,
+          inputs,
+          preserve_sensitive: preserveSensitive,
+        })
+        current = { ...draft, layout: current.layout, layout_revision: current.layout_revision }
+        changed(current)
+      },
+      remove: async () => {
+        const { draft } = await call<{ draft: Draft }>('workflow.schedule.remove', {
+          ...scope,
+          revision: current.revision,
+        })
+        current = { ...draft, layout: current.layout, layout_revision: current.layout_revision }
+        changed(current)
+      },
+    },
     debugging: true,
     generation: initial.authoring_mode === 'internal',
     intent: { target: 'workbench', draftScope: `workbench:${initial.project_id}` },

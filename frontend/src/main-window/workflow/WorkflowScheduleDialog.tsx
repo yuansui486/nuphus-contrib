@@ -16,6 +16,16 @@ import {
   type WfScheduleDetails,
 } from '../lib/api'
 import './workflow-schedule.css'
+import { useLanguage } from '../../locales'
+import { scheduleText } from './scheduleText'
+
+export const defaultScheduleBackend = {
+  get: wfScheduleGet,
+  preview: wfSchedulePreview,
+  set: wfScheduleSet,
+  remove: wfScheduleRemove,
+}
+export type WorkflowScheduleBackend = typeof defaultScheduleBackend
 
 export type ScheduleMode =
   'minutes' | 'hourly' | 'daily' | 'weekdays' | 'weekly' | 'monthly' | 'custom'
@@ -48,6 +58,15 @@ function localTimezone(): string {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
   } catch {
     return 'Asia/Shanghai'
+  }
+}
+
+export function formatScheduleTime(value: string, timezone: string): string {
+  try {
+    return new Date(value).toLocaleString(undefined, { timeZone: timezone, timeZoneName: 'short' })
+  } catch {
+    // Editing an incomplete timezone must not crash the open dialog.
+    return new Date(value).toLocaleString()
   }
 }
 
@@ -166,6 +185,8 @@ export function resolveScheduleInputs(
 }
 
 interface WorkflowScheduleDialogProps {
+  backend?: WorkflowScheduleBackend
+  notice?: string
   open: boolean
   workflow: Pick<WorkflowItem, 'id' | 'title' | 'inputs' | 'schedule'>
   readOnly?: boolean
@@ -181,7 +202,11 @@ export function WorkflowScheduleDialog({
   layer = 'default',
   onClose,
   onChanged,
+  backend = defaultScheduleBackend,
+  notice,
 }: WorkflowScheduleDialogProps) {
+  const { lang } = useLanguage()
+  const tr = (text: string) => scheduleText(text, lang)
   const specs = workflow.inputs ?? EMPTY_INPUTS
   const [details, setDetails] = useState<WfScheduleDetails | null>(null)
   const [pattern, setPattern] = useState(DEFAULT_PATTERN)
@@ -193,6 +218,7 @@ export function WorkflowScheduleDialog({
   const [preserved, setPreserved] = useState<Set<string>>(new Set())
   const [nextRuns, setNextRuns] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -201,7 +227,8 @@ export function WorkflowScheduleDialog({
     let alive = true
     setLoading(true)
     setError(null)
-    void wfScheduleGet(workflow.id)
+    void backend
+      .get(workflow.id)
       .then(result => {
         if (!alive) return
         if (!result) throw new Error('读取定时配置失败：后端无响应')
@@ -239,7 +266,7 @@ export function WorkflowScheduleDialog({
     return () => {
       alive = false
     }
-  }, [open, workflow.id, specs])
+  }, [open, workflow.id, specs, backend])
 
   const cron = cronFromPattern(pattern)
   const intervalError =
@@ -264,27 +291,34 @@ export function WorkflowScheduleDialog({
 
   useEffect(() => {
     if (!open || !cron || !timezone || intervalError) return
+    let alive = true
     const timer = setTimeout(() => {
-      void wfSchedulePreview(config)
+      void backend
+        .preview(config)
         .then(runs => {
+          if (!alive) return
           if (!runs) throw new Error('预览失败：后端无响应')
           setNextRuns(runs)
-          setError(null)
+          setPreviewError(null)
         })
         .catch(reason => {
+          if (!alive) return
           setNextRuns([])
-          setError(String(reason))
+          setPreviewError(String(reason))
         })
     }, 250)
-    return () => clearTimeout(timer)
-  }, [open, config, cron, timezone, intervalError])
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+  }, [open, config, cron, timezone, intervalError, backend])
 
   const save = async () => {
-    if (!details || Object.keys(resolvedInputs.errors).length > 0) return
+    if (!details || (enabled && Object.keys(resolvedInputs.errors).length > 0)) return
     setSaving(true)
     setError(null)
     try {
-      await wfScheduleSet(
+      await backend.set(
         workflow.id,
         config,
         resolvedInputs.inputs,
@@ -303,7 +337,7 @@ export function WorkflowScheduleDialog({
     setSaving(true)
     setError(null)
     try {
-      await wfScheduleRemove(workflow.id)
+      await backend.remove(workflow.id)
       onChanged(null)
       onClose()
     } catch (reason) {
@@ -317,7 +351,7 @@ export function WorkflowScheduleDialog({
     <CompactModal
       open={open}
       onClose={onClose}
-      title={`定时运行 · ${workflow.title}`}
+      title={`${tr('定时运行')} · ${workflow.title}`}
       icon={<IconClock3 size={14} />}
       size="xl"
       layer={layer}
@@ -332,11 +366,11 @@ export function WorkflowScheduleDialog({
                 disabled={readOnly || saving}
                 onClick={() => void remove()}
               >
-                <IconTrash2 size={12} /> 删除定时
+                <IconTrash2 size={12} /> {tr('删除定时')}
               </Button>
             )}
             <Button variant="ghost" size="sm" onClick={onClose}>
-              取消
+              {tr('取消')}
             </Button>
           </div>
           <div className="wcf-footer-right">
@@ -348,33 +382,37 @@ export function WorkflowScheduleDialog({
                 readOnly ||
                 loading ||
                 !details?.eligible ||
-                !!error ||
+                !!previewError ||
                 intervalError ||
-                Object.keys(resolvedInputs.errors).length > 0
+                (enabled && Object.keys(resolvedInputs.errors).length > 0)
               }
               onClick={() => void save()}
             >
-              保存并应用
+              {tr('保存并应用')}
             </Button>
           </div>
         </>
       }
     >
       {loading ? (
-        <div className="wfs-empty">加载定时配置...</div>
+        <div className="wfs-empty">{tr('加载定时配置...')}</div>
       ) : (
         <div className="wfs-body">
-          {readOnly && <div className="wfs-banner">工作流正在运行，当前只能查看定时设置。</div>}
+          {notice && <div className="wfs-banner">{notice}</div>}
+          {readOnly && (
+            <div className="wfs-banner">{tr('工作流正在运行，当前只能查看定时设置。')}</div>
+          )}
           {details && !details.eligible && (
             <div className="wfs-banner wfs-banner--warning">{details.ineligible_reason}</div>
           )}
-          {error && <div className="wfs-banner wfs-banner--error">{error}</div>}
+          {error && <div className="wfs-banner wfs-banner--error">{tr(error)}</div>}
+          {previewError && <div className="wfs-banner wfs-banner--error">{tr(previewError)}</div>}
 
           <section className="wfs-section">
-            <div className="wfs-section-title">触发规则</div>
+            <div className="wfs-section-title">{tr('触发规则')}</div>
             <div className="wfs-grid">
               <label>
-                频率
+                {tr('频率')}
                 <select
                   value={pattern.mode}
                   disabled={readOnly}
@@ -385,18 +423,18 @@ export function WorkflowScheduleDialog({
                     }))
                   }
                 >
-                  <option value="minutes">每隔几分钟</option>
-                  <option value="hourly">每小时</option>
-                  <option value="daily">每天</option>
-                  <option value="weekdays">工作日</option>
-                  <option value="weekly">每周</option>
-                  <option value="monthly">每月</option>
-                  <option value="custom">高级 Cron</option>
+                  <option value="minutes">{tr('每隔几分钟')}</option>
+                  <option value="hourly">{tr('每小时')}</option>
+                  <option value="daily">{tr('每天')}</option>
+                  <option value="weekdays">{tr('工作日')}</option>
+                  <option value="weekly">{tr('每周')}</option>
+                  <option value="monthly">{tr('每月')}</option>
+                  <option value="custom">{tr('高级 Cron')}</option>
                 </select>
               </label>
               {pattern.mode === 'minutes' && (
                 <label>
-                  间隔（分钟）
+                  {tr('间隔（分钟）')}
                   <input
                     type="number"
                     min={1}
@@ -413,13 +451,13 @@ export function WorkflowScheduleDialog({
                     }
                   />
                   {intervalError && (
-                    <span className="wfs-field-error">请输入 1–1440 的整数分钟数</span>
+                    <span className="wfs-field-error">{tr('请输入 1–1440 的整数分钟数')}</span>
                   )}
                 </label>
               )}
               {pattern.mode === 'hourly' && (
                 <label>
-                  分钟
+                  {tr('分钟')}
                   <input
                     type="number"
                     min={0}
@@ -434,7 +472,7 @@ export function WorkflowScheduleDialog({
               )}
               {['daily', 'weekdays', 'weekly', 'monthly'].includes(pattern.mode) && (
                 <label>
-                  时间
+                  {tr('时间')}
                   <input
                     type="time"
                     value={`${String(pattern.hour).padStart(2, '0')}:${String(pattern.minute).padStart(2, '0')}`}
@@ -448,7 +486,7 @@ export function WorkflowScheduleDialog({
               )}
               {pattern.mode === 'weekly' && (
                 <label>
-                  星期
+                  {tr('星期')}
                   <select
                     value={pattern.weekday}
                     disabled={readOnly}
@@ -456,19 +494,19 @@ export function WorkflowScheduleDialog({
                       setPattern(current => ({ ...current, weekday: Number(event.target.value) }))
                     }
                   >
-                    <option value={1}>星期一</option>
-                    <option value={2}>星期二</option>
-                    <option value={3}>星期三</option>
-                    <option value={4}>星期四</option>
-                    <option value={5}>星期五</option>
-                    <option value={6}>星期六</option>
-                    <option value={0}>星期日</option>
+                    <option value={1}>{tr('星期一')}</option>
+                    <option value={2}>{tr('星期二')}</option>
+                    <option value={3}>{tr('星期三')}</option>
+                    <option value={4}>{tr('星期四')}</option>
+                    <option value={5}>{tr('星期五')}</option>
+                    <option value={6}>{tr('星期六')}</option>
+                    <option value={0}>{tr('星期日')}</option>
                   </select>
                 </label>
               )}
               {pattern.mode === 'monthly' && (
                 <label>
-                  日期
+                  {tr('日期')}
                   <input
                     type="number"
                     min={1}
@@ -483,7 +521,7 @@ export function WorkflowScheduleDialog({
               )}
               {pattern.mode === 'custom' && (
                 <label className="wfs-wide">
-                  Cron（分 时 日 月 周）
+                  {tr('Cron（分 时 日 月 周）')}
                   <input
                     className="wfs-mono"
                     value={pattern.custom}
@@ -495,7 +533,7 @@ export function WorkflowScheduleDialog({
                 </label>
               )}
               <label>
-                时区
+                {tr('时区')}
                 <input
                   list="wfs-timezones"
                   value={timezone}
@@ -509,11 +547,11 @@ export function WorkflowScheduleDialog({
                 </datalist>
               </label>
               <label>
-                标签
+                {tr('标签')}
                 <input
                   value={label}
                   disabled={readOnly}
-                  placeholder="可选"
+                  placeholder={tr('可选')}
                   onChange={event => setLabel(event.target.value)}
                 />
               </label>
@@ -524,14 +562,14 @@ export function WorkflowScheduleDialog({
                   disabled={readOnly}
                   onChange={event => setEnabled(event.target.checked)}
                 />
-                启用定时任务
+                {tr('启用定时任务')}
               </label>
             </div>
             {nextRuns.length > 0 && (
               <div className="wfs-next-runs">
-                <span>接下来</span>
+                <span>{tr('接下来')}</span>
                 {nextRuns.map(value => (
-                  <time key={value}>{new Date(value).toLocaleString()}</time>
+                  <time key={value}>{formatScheduleTime(value, timezone)}</time>
                 ))}
               </div>
             )}
@@ -539,7 +577,7 @@ export function WorkflowScheduleDialog({
 
           {specs.length > 0 && (
             <section className="wfs-section">
-              <div className="wfs-section-title">运行输入</div>
+              <div className="wfs-section-title">{tr('运行输入')}</div>
               {specs.map(spec => {
                 const kind = inputKind(spec)
                 const isFixed = !!fixed[spec.name]
@@ -562,18 +600,18 @@ export function WorkflowScheduleDialog({
                             })
                         }}
                       />
-                      固定此值
+                      {tr('固定此值')}
                     </label>
                     <div className="wfs-input-main">
                       <div className="wfs-input-label">
                         <span>{spec.name}</span>
                         <span>{kind}</span>
-                        {spec.required && <span>必填</span>}
-                        {spec.sensitive && <span>敏感</span>}
+                        {spec.required && <span>{tr('必填')}</span>}
+                        {spec.sensitive && <span>{tr('敏感')}</span>}
                       </div>
                       {spec.description && <div className="wfs-input-hint">{spec.description}</div>}
                       {!isFixed ? (
-                        <div className="wfs-input-follow">触发时使用工作流当前默认值</div>
+                        <div className="wfs-input-follow">{tr('触发时使用工作流当前默认值')}</div>
                       ) : kind === 'boolean' ? (
                         <label className="wfs-toggle">
                           <input
@@ -594,7 +632,7 @@ export function WorkflowScheduleDialog({
                           rows={3}
                           value={String(values[spec.name] ?? '')}
                           disabled={readOnly}
-                          placeholder={isPreserved ? '已保存敏感值，留空保持' : 'JSON'}
+                          placeholder={isPreserved ? tr('已保存敏感值，留空保持') : 'JSON'}
                           onChange={event => {
                             setValues(current => ({ ...current, [spec.name]: event.target.value }))
                             setPreserved(current => {
@@ -609,7 +647,7 @@ export function WorkflowScheduleDialog({
                           type={spec.sensitive ? 'password' : kind === 'number' ? 'number' : 'text'}
                           value={String(values[spec.name] ?? '')}
                           disabled={readOnly}
-                          placeholder={isPreserved ? '已保存敏感值，留空保持' : ''}
+                          placeholder={isPreserved ? tr('已保存敏感值，留空保持') : ''}
                           autoComplete="off"
                           onChange={event => {
                             setValues(current => ({ ...current, [spec.name]: event.target.value }))
@@ -622,10 +660,12 @@ export function WorkflowScheduleDialog({
                         />
                       )}
                       {isPreserved && values[spec.name] === '' && (
-                        <div className="wfs-input-saved">已保存敏感值，保存时保持不变</div>
+                        <div className="wfs-input-saved">{tr('已保存敏感值，保存时保持不变')}</div>
                       )}
                       {resolvedInputs.errors[spec.name] && (
-                        <div className="wfs-field-error">{resolvedInputs.errors[spec.name]}</div>
+                        <div className="wfs-field-error">
+                          {tr(resolvedInputs.errors[spec.name])}
+                        </div>
                       )}
                     </div>
                   </div>

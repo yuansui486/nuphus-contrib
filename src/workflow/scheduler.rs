@@ -231,6 +231,23 @@ fn next_interval_occurrence(
 }
 
 impl SchedulerEngine {
+    /// Shared clock for editions with their own persistence and execution host.
+    /// Does not register a task or impose a foreground-workflow policy.
+    pub fn next_at(
+        config: &ScheduleConfig,
+        anchor_at: DateTime<Utc>,
+        after: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        let timezone = parse_timezone(&config.timezone)?;
+        let next = if let Some(minutes) = config.interval_minutes {
+            validate_interval(minutes)?;
+            next_interval_occurrence(anchor_at, minutes, after)
+        } else {
+            next_occurrence(&parse_five_field_cron(&config.cron)?, timezone, after)
+        };
+        next.ok_or_else(|| crate::NuphusError::agent("Schedule has no future occurrence"))
+    }
+
     pub fn new() -> Self {
         Self::with_persist_path(resolve_persist_path())
     }
@@ -579,6 +596,38 @@ mod tests {
             label: None,
             interval_minutes: None,
         }
+    }
+
+    #[test]
+    fn shared_clock_preserves_timezone_and_interval_anchor() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 26, 0, 0, 0).unwrap();
+        let daily = config("0 9 * * *", "Asia/Shanghai");
+        assert_eq!(
+            SchedulerEngine::next_at(&daily, now, now).unwrap(),
+            now + chrono::Duration::hours(1)
+        );
+        let mut interval = config("", "UTC");
+        interval.interval_minutes = Some(90);
+        assert_eq!(
+            SchedulerEngine::next_at(&interval, now, now + chrono::Duration::minutes(100)).unwrap(),
+            now + chrono::Duration::minutes(180)
+        );
+        interval.timezone = "invalid-zone".into();
+        assert!(SchedulerEngine::next_at(&interval, now, now).is_err());
+        interval.timezone = "UTC".into();
+        interval.interval_minutes = Some(0);
+        assert!(SchedulerEngine::next_at(&interval, now, now).is_err());
+        assert!(SchedulerEngine::next_at(&config("* * * * * *", "UTC"), now, now).is_err());
+    }
+
+    #[test]
+    fn shared_clock_handles_dst_without_guessing_local_offset() {
+        let before = Utc.with_ymd_and_hms(2026, 3, 7, 15, 0, 0).unwrap();
+        let daily = config("0 9 * * *", "America/New_York");
+        assert_eq!(
+            SchedulerEngine::next_at(&daily, before, before).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 8, 13, 0, 0).unwrap()
+        );
     }
 
     fn input(name: &str, kind: InputKind, sensitive: bool) -> InputSpec {
