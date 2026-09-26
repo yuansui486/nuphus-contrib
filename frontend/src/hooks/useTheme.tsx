@@ -82,15 +82,21 @@ function readCustomThemes(): { themes: CustomTheme[]; activeId: string | null } 
   return { themes: [], activeId: null }
 }
 
-function readBaseTheme(): ThemeId {
+export function readBaseTheme(defaultTheme: ThemeId = 'dark'): ThemeId {
   try {
     const saved = localStorage.getItem(LS_THEME) as ThemeId
     if (saved === 'dark' || saved === 'light' || saved === 'tech') return saved
   } catch {}
-  return 'dark'
+  return defaultTheme
 }
 
-export function ThemeProvider({ children }: { children: ReactNode }) {
+export function ThemeProvider({
+  children,
+  defaultTheme = 'dark',
+}: {
+  children: ReactNode
+  defaultTheme?: ThemeId
+}) {
   // 「我的主题」列表 + 激活 id（启动时迁移旧版单主题存储）
   const [customStore, setCustomStore] = useState(readCustomThemes)
   const { themes: customThemes, activeId: activeCustomId } = customStore
@@ -100,7 +106,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<ThemeId>(() => {
     const store = readCustomThemes()
     const active = store.themes.find(t => t.id === store.activeId)
-    return active?.base ?? readBaseTheme()
+    return active?.base ?? readBaseTheme(defaultTheme)
   })
   const [previewOverrides, setPreviewOverrides] = useState<Record<string, string> | null>(null)
   const appliedVarsRef = useRef<Set<string>>(new Set())

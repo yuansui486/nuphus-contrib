@@ -2,7 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './main-window/App'
 import AuthGate from './workbench/AuthGate'
-import { ThemeProvider } from './hooks/useTheme'
+import { readBaseTheme, ThemeProvider } from './hooks/useTheme'
 import { LangProvider } from './locales'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import './styles/ink.css'
@@ -10,12 +10,8 @@ import './styles/ink.css'
 import './core/pdf-render'
 
 // Initialize theme before first paint to avoid flash
-;(() => {
-  const stored = localStorage.getItem('nuphus_theme')
-  const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches
-  const theme = stored === 'light' || (!stored && prefersLight) ? 'light' : 'dark'
-  document.documentElement.setAttribute('data-theme', theme)
-})()
+const defaultTheme = import.meta.env.VITE_NUPHUS_EDITION === 'workbench' ? 'light' : 'dark'
+document.documentElement.setAttribute('data-theme', readBaseTheme(defaultTheme))
 
 // Right-click handling moved to ui/AppContextMenu (self-drawn copy menu;
 // editable fields keep the native menu for paste). Avoids exposing the
@@ -37,7 +33,7 @@ if (!root) {
 
 ReactDOM.createRoot(root).render(
   <React.StrictMode>
-    <ThemeProvider>
+    <ThemeProvider defaultTheme={defaultTheme}>
       <LangProvider>
         <ErrorBoundary onExit={() => window.close()}>
           {import.meta.env.VITE_NUPHUS_EDITION === 'workbench' ? <AuthGate /> : <App />}
