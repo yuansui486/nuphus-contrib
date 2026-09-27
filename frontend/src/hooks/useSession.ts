@@ -11,8 +11,7 @@ import type {
   TimelineEntry,
   PlanData,
   PlanTask,
-  TaskStatus,
-  TaskPriority,
+  TaskRun,
   WorkflowRunStep,
 } from '../core/types'
 import type { MoodState } from '../ui/MoodFace'
@@ -186,7 +185,6 @@ export interface SessionAPI {
   totalCalls: number
   contextLimit: number
   apiHealth: import('../core/types').ApiHealthState
-  currentTaskDesc: string
 
   // ── Setters (for useEvents) ──
   setMessages: (v: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => void
@@ -238,7 +236,6 @@ export interface SessionAPI {
   setTotalCalls: (v: number) => void
   executionCounter: number
   setExecutionCounter: React.Dispatch<React.SetStateAction<number>>
-  setCurrentTaskDesc: (v: string) => void
 
   // ── Refine ──
   refineState: { usagePercent: number; totalLimit: number } | null
@@ -283,9 +280,9 @@ export interface SessionAPI {
     }>
   >
   setTaskBubbleVisible: (v: boolean) => void
-  transitionTask: (taskId: number, status: TaskStatus) => void
-  setTaskPriority: (taskId: number, priority: TaskPriority) => void
-  reorderTask: (taskId: number, direction: -1 | 1) => void
+  /** ExecAgent 执行生命周期快照（task 面板唯一数据源） */
+  taskRuns: TaskRun[]
+  setTaskRuns: React.Dispatch<React.SetStateAction<TaskRun[]>>
 
   // ── Command palette & keyboard ──
   cmdPaletteOpen: boolean
@@ -1123,7 +1120,6 @@ export function useSession(): SessionAPI {
     totalDurationMs: execUI.totalDurationMs,
     totalCalls: execUI.totalCalls,
     contextLimit: execUI.contextLimit,
-    currentTaskDesc: execUI.currentTaskDesc,
 
     // Setters (for useEvents)
     setMessages,
@@ -1146,7 +1142,6 @@ export function useSession(): SessionAPI {
     setTotalCalls: execUI.setTotalCalls,
     executionCounter,
     setExecutionCounter,
-    setCurrentTaskDesc: execUI.setCurrentTaskDesc,
 
     // Refine
     refineState: execUI.refineState,
@@ -1167,9 +1162,8 @@ export function useSession(): SessionAPI {
     setShowReview: execUI.setShowReview,
     setApprovalState: execUI.setApprovalState,
     setTaskBubbleVisible: execUI.setTaskBubbleVisible,
-    transitionTask: execUI.transitionTask,
-    setTaskPriority: execUI.setTaskPriority,
-    reorderTask: execUI.reorderTask,
+    taskRuns: execUI.taskRuns,
+    setTaskRuns: execUI.setTaskRuns,
 
     // Command palette & keyboard
     cmdPaletteOpen,

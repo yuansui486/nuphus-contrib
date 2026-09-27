@@ -7,8 +7,7 @@ import type {
   TimelineEntry,
   PlanData,
   PlanTask,
-  TaskStatus,
-  TaskPriority,
+  TaskRun,
   WorkflowRunStep,
   ApiHealthState,
 } from '../core/types'
@@ -60,7 +59,8 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
   const [totalDurationMs, setTotalDurationMs] = useState(0)
   const [totalCalls, setTotalCalls] = useState(0)
   const [contextLimit, setContextLimit] = useState<number>(0)
-  const [currentTaskDesc, setCurrentTaskDesc] = useState('')
+  /** ExecAgent 执行生命周期快照（task 面板唯一数据源，见 agent/task_run.rs） */
+  const [taskRuns, setTaskRuns] = useState<TaskRun[]>([])
 
   // ── 上下文提炼状态 ──
   const [refineState, setRefineState] = useState<{
@@ -108,19 +108,6 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
 
   // ── TaskBubble state ──
   const [taskBubbleVisible, setTaskBubbleVisible] = useState(false)
-
-  // ── Planner task helpers ──
-  const transitionTask = useCallback((taskId: number, status: TaskStatus) => {
-    setPlanData(prev => {
-      if (!prev) return prev
-      return {
-        ...prev,
-        tasks: prev.tasks.map(t => (t.id === taskId ? { ...t, status } : t)),
-      }
-    })
-  }, [])
-  const setTaskPriority = useCallback((_taskId: number, _priority: TaskPriority) => {}, [])
-  const reorderTask = useCallback((_taskId: number, _direction: -1 | 1) => {}, [])
 
   // ── Refine handlers ──
   // in-flight 锁：executeSessionRefine 是 await 整轮提炼的 invoke（90s 级），期间
@@ -308,8 +295,6 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
     setTotalCalls,
     contextLimit,
     setContextLimit,
-    currentTaskDesc,
-    setCurrentTaskDesc,
 
     // Refine
     refineState,
@@ -351,8 +336,7 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
     setApprovalState,
     taskBubbleVisible,
     setTaskBubbleVisible,
-    transitionTask,
-    setTaskPriority,
-    reorderTask,
+    taskRuns,
+    setTaskRuns,
   }
 }

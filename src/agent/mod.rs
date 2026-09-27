@@ -14,6 +14,7 @@ pub mod goal_types;
 pub mod pause;
 pub mod prompt;
 pub mod reminders;
+pub mod task_run;
 use crate::agent::events::{EventEmitter, NuphusEvent};
 use crate::agent::reminders::ReminderQueue;
 use crate::{
@@ -168,6 +169,8 @@ pub struct ReactAgent {
     pub(crate) exec_llm: Option<Arc<dyn ApiClient>>,
     /// Event emitter for execution Agent
     pub(crate) exec_emitter: Option<Arc<dyn EventEmitter>>,
+    /// ExecAgent 执行生命周期台账（task 面板的唯一数据源，进程级单例）
+    pub(crate) task_runs: Option<Arc<task_run::TaskRunRegistry>>,
     /// Leader prompt context (soul/relation)
     pub(crate) leader_ctx: prompt::LeaderContext,
     /// Model switching factory (for runtime model switching)
@@ -250,6 +253,7 @@ impl ReactAgent {
             exec_tools: None,
             exec_llm: None,
             exec_emitter: None,
+            task_runs: None,
             leader_ctx: prompt::LeaderContext::default(),
             client_factory: None,
             pause_flag: None,
@@ -316,6 +320,13 @@ impl ReactAgent {
         self.exec_llm = Some(llm);
         let arc: Arc<dyn EventEmitter> = Arc::new(emitter);
         self.exec_emitter = Some(arc);
+    }
+
+    /// 注入执行生命周期台账（进程级单例，见 `task_run::global_registry`）。
+    /// 不注入时 dispatch 退化为「不记不显示」——台账是显示层唯一数据源，缺失即不可见，
+    /// 因此这里不用 Option 兜假状态。
+    pub fn set_task_runs(&mut self, reg: Arc<task_run::TaskRunRegistry>) {
+        self.task_runs = Some(reg);
     }
 
     /// Build API request with merged system prompt (L0+L2+L1 as single message)

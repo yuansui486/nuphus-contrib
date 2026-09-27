@@ -43,16 +43,13 @@ interface Draft {
   process: string
   description: string
   // ── v8 交互固化（高级分组，折叠）──
+  // 只保留 agent_dispatch 真实消费的字段：launch（Leader 手动启动命令）、
+  // window_hint/process（进程捕获匹配）、dispatch_steps（投递序列）。
+  // cooldown_secs/await_timeout_secs/timeout_action/timeout_script/auto_approve/
+  // auto_approve_script/confirm_keywords 后端仍解析（旧 team.toml 兼容），但无消费方，UI 不再提供编辑入口。
   launch: string
   window_hint: string
-  cooldown_secs: number
   dispatch_steps_json: string
-  await_timeout_secs: number
-  timeout_action: string
-  timeout_script: string
-  auto_approve: string
-  auto_approve_script: string
-  confirm_keywords_csv: string
 }
 
 /** dispatch_steps JSON 数组 → 缩进文本（编辑域用） */
@@ -74,19 +71,6 @@ function parseStepsJson(text: string): Array<{ tool: string; with?: Record<strin
   return parsed as Array<{ tool: string; with?: Record<string, unknown> }>
 }
 
-/** confirm_keywords 数组 → 逗号分隔文本 */
-function keywordsToCsv(keywords?: string[]): string {
-  return (keywords || []).join(', ')
-}
-
-/** 逗号分隔文本 → 数组（去空白，过滤空项） */
-function parseKeywordsCsv(text: string): string[] {
-  return text
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-}
-
 function newDraft(): Draft {
   return {
     key: '',
@@ -100,14 +84,7 @@ function newDraft(): Draft {
     description: '',
     launch: '',
     window_hint: '',
-    cooldown_secs: 120,
     dispatch_steps_json: '',
-    await_timeout_secs: 120,
-    timeout_action: 'detect_confirm',
-    timeout_script: '',
-    auto_approve: '',
-    auto_approve_script: '',
-    confirm_keywords_csv: '',
   }
 }
 
@@ -124,14 +101,7 @@ function draftFromAgent(a: ExternalAgentConfig): Draft {
     description: a.description || '',
     launch: a.launch || '',
     window_hint: a.window_hint || '',
-    cooldown_secs: a.cooldown_secs ?? 120,
     dispatch_steps_json: stepsToJson(a.dispatch_steps),
-    await_timeout_secs: a.await_timeout_secs ?? 120,
-    timeout_action: a.timeout_action || 'detect_confirm',
-    timeout_script: a.timeout_script || '',
-    auto_approve: a.auto_approve || '',
-    auto_approve_script: a.auto_approve_script || '',
-    confirm_keywords_csv: keywordsToCsv(a.confirm_keywords),
   }
 }
 
@@ -312,14 +282,7 @@ export function ExternalAgentsPage({ onClose }: { onClose: () => void }) {
         description: draft.description,
         launch: draft.launch.trim(),
         window_hint: draft.window_hint.trim(),
-        cooldown_secs: draft.cooldown_secs,
         dispatch_steps: dispatchSteps,
-        await_timeout_secs: draft.await_timeout_secs,
-        timeout_action: draft.timeout_action,
-        timeout_script: draft.timeout_script.trim(),
-        auto_approve: draft.auto_approve.trim(),
-        auto_approve_script: draft.auto_approve_script.trim(),
-        confirm_keywords: parseKeywordsCsv(draft.confirm_keywords_csv),
       })
       // pin：用户显式添加的 agent 在应用生命周期内常驻状态栏
       // （内存态，随启动清零；CustomEvent 通知状态栏立即生效）
@@ -614,19 +577,6 @@ export function ExternalAgentsPage({ onClose }: { onClose: () => void }) {
               />
               <FormRow
                 stacked
-                label={t('extAgents.cfg.cooldown')}
-                control={
-                  <input
-                    className="input"
-                    type="number"
-                    min={0}
-                    value={draft.cooldown_secs}
-                    onChange={e => update({ cooldown_secs: Number(e.target.value) || 0 })}
-                  />
-                }
-              />
-              <FormRow
-                stacked
                 label={t('extAgents.cfg.dispatchSteps')}
                 hint={
                   <span className="ext-agents-steps-hint">
@@ -643,89 +593,6 @@ export function ExternalAgentsPage({ onClose }: { onClose: () => void }) {
                     value={draft.dispatch_steps_json}
                     onChange={e => update({ dispatch_steps_json: e.target.value })}
                     placeholder={t('extAgents.cfg.dispatchStepsPlaceholder')}
-                  />
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.awaitTimeout')}
-                control={
-                  <input
-                    className="input"
-                    type="number"
-                    min={0}
-                    value={draft.await_timeout_secs}
-                    onChange={e => update({ await_timeout_secs: Number(e.target.value) || 0 })}
-                  />
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.timeoutAction')}
-                hint={t('extAgents.cfg.timeoutActionHint')}
-                control={
-                  <select
-                    className="select"
-                    value={draft.timeout_action}
-                    onChange={e => update({ timeout_action: e.target.value })}
-                  >
-                    {['detect_confirm', 'screenshot_alive', 'notify_user', 'redeliver'].map(a => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
-                    <option value="timeout_script">timeout_script（自定义）</option>
-                  </select>
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.timeoutScript')}
-                hint={t('extAgents.cfg.timeoutScriptHint')}
-                control={
-                  <input
-                    className="input"
-                    value={draft.timeout_script}
-                    onChange={e => update({ timeout_script: e.target.value })}
-                    placeholder="D:/policies/timeout.ps1"
-                  />
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.autoApprove')}
-                hint={t('extAgents.cfg.autoApproveHint')}
-                control={
-                  <input
-                    className="input"
-                    value={draft.auto_approve}
-                    onChange={e => update({ auto_approve: e.target.value })}
-                    placeholder="yes"
-                  />
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.autoApproveScript')}
-                control={
-                  <input
-                    className="input"
-                    value={draft.auto_approve_script}
-                    onChange={e => update({ auto_approve_script: e.target.value })}
-                    placeholder="D:/policies/approve.ps1"
-                  />
-                }
-              />
-              <FormRow
-                stacked
-                label={t('extAgents.cfg.confirmKeywords')}
-                hint={t('extAgents.cfg.confirmKeywordsHint')}
-                control={
-                  <input
-                    className="input"
-                    value={draft.confirm_keywords_csv}
-                    onChange={e => update({ confirm_keywords_csv: e.target.value })}
-                    placeholder="allow, confirm, proceed, yes/no"
                   />
                 }
               />

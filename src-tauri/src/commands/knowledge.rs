@@ -19,37 +19,16 @@ fn ensure_knowledge_engine(
         .lock()
         .map_err(|e| format!("锁异常: {}", e))?;
     if guard.knowledge_engine.is_none() {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-        let docs_root = find_plugin_knowledge(&exe_dir)
-            .or_else(|| find_plugin_knowledge(&std::env::current_dir().unwrap_or_default()))
-            .unwrap_or_else(|| {
-                let path = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join("plugin")
-                    .join("knowledge");
-                if path.exists() {
-                    path
-                } else {
-                    exe_dir.join("plugin").join("knowledge")
-                }
-            });
-
-        let index_dir = docs_root
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join(nuphus::profile::home_name()).join("index"))
-            .unwrap_or_else(|| {
-                let mut p = std::env::current_dir().unwrap_or_default();
-                p.push(".nuphus");
-                p.push("index");
-                p
-            });
-
+        // docs_root = plugin_root()/knowledge（utils 单一来源，缺失即创建）；
+        // index = nuphus_data_dir()/index —— 不再从 docs_root 反推两级，
+        // Tauri 端与 Agent 端共用同一推导（nuphus::utils::knowledge_*）。
+        let docs_root = nuphus::utils::knowledge_docs_root();
+        let index_dir = nuphus::utils::knowledge_index_dir();
         let index_path = index_dir.join("knowledge_index.json");
+
+        if let Err(e) = std::fs::create_dir_all(&index_dir) {
+            tracing::warn!("[knowledge] 无法创建索引目录 {:?}: {}", index_dir, e);
+        }
 
         tracing::info!(
             "[knowledge] Initializing IndexEngine: docs_root={:?}, index_path={:?}",
@@ -63,18 +42,6 @@ fn ensure_knowledge_engine(
         }));
     }
     Ok(guard)
-}
-
-fn find_plugin_knowledge(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let candidate = dir.join("plugin").join("knowledge");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        current = dir.parent();
-    }
-    None
 }
 
 // ── Tauri 命令 ──

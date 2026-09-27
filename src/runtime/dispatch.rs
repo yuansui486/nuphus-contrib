@@ -5,7 +5,6 @@
 //!
 //! Migrated from agent/leader/dispatch.rs, now a free function receiving &mut ReactAgent.
 
-use crate::agent::events::NuphusEvent;
 use crate::agent::goal_types::{self, GoalType};
 use crate::agent::prompt;
 use crate::agent::ReactAgent;
@@ -15,29 +14,59 @@ use std::sync::atomic::AtomicBool;
 
 /// Handle task_dispatch — create ExecuteAgent to run subtask and return result
 ///
-/// About plan.md auto-injection: if context parameter is an existing .plan.md file path
-/// (e.g. 'src-tauri/tasks/nuphus/plans/XX.plan.md'), the system automatically reads and injects its content.
+/// 职责边界（三个组件单向切开，见 `agent::task_run` 模块文档）：
+/// - 本函数只做「执行」：把 `title`（给人看）+ `brief`（给 Exec 看）交给一个上下文隔离的
+///   ExecuteAgent 跑完，把结论带回 Leader；
+/// - 顺手在**服务端台账**记一笔生命周期（open → settle），并推全量快照给前端面板；
+/// - **不**采集子模型自报的状态、**不**解析摘要散文、**不**管面板显示。
+///
+/// About plan.md auto-injection: if `plan_path` is an existing .plan.md file path
+/// (e.g. 'src-tauri/tasks/nuphus/plans/XX.plan.md'), the system automatically reads and
+/// injects its content (layered, focused on the referenced task).
 ///
 /// Return structure:
 /// ```json
 /// {
 ///   "status": "success|failed",
-///   "task": "task description",
-///   "summary": "Exec LLM final text output (full content, no truncation)"
+///   "summary": "Exec LLM final text output (full content, no truncation)",
+///   "run": "run-7"
 /// }
 /// ```
-/// `summary` is the final text output from Exec LLM after all tools execute, it is Exec's answer delivery to Leader.
+/// `summary` is the final text output from Exec LLM after all tools execute, it is Exec's
+/// answer delivery to Leader. `run` is the lifecycle ledger identity of this execution
+/// (same row the task panel shows) — for Leader tracing only, never a status source.
 pub(crate) async fn handle_task_dispatch(
     agent: &mut ReactAgent,
     call: &ToolCall,
     cancel_flag: &AtomicBool,
     post_warnings: &mut Vec<String>,
 ) -> crate::Result<(ToolResult, GoalType, Vec<ExecutionStep>)> {
-    let description = call
+    // ── 入参契约 ──
+    // `title`：短标题，给人看（task 面板唯一显示文本）。
+    // `brief`：长指令，给 ExecAgent 看（理解/约束/验收）。旧名 `description` 保留兼容——
+    // 老上下文与手写调用只传 description 时缺的不是参数而是标题，由前缀兜底补上。
+    // `task_no`：可选归属标签（"计划第几个方向"），仅用于面板标注，不参与生命周期。
+    let brief = call
         .params
-        .get("description")
+        .get("brief")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            call.params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string();
+    let title = call
+        .params
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(60).collect::<String>())
+        .unwrap_or_else(|| brief.chars().take(40).collect::<String>());
     let goal_type_str = call
         .params
         .get("goal_type")
@@ -49,20 +78,15 @@ pub(crate) async fn handle_task_dispatch(
         .get("plan_path")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let task_id = call
+    let task_no = call
         .params
-        .get("task_id")
+        .get("task_no")
         .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
-    let total_tasks = call
-        .params
-        .get("total_tasks")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
+        .map(|n| n as usize);
 
-    if description.is_empty() {
+    if brief.is_empty() {
         return Ok((
-            ToolResult::failure("task_dispatch missing description parameter"),
+            ToolResult::failure("task_dispatch missing brief parameter"),
             goal_type,
             vec![],
         ));
@@ -109,7 +133,8 @@ pub(crate) async fn handle_task_dispatch(
             plan_path = Some(p);
             match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let focused = extract_focused_plan_context(&content, task_id, description);
+                    let focused =
+                        extract_focused_plan_context(&content, task_no.unwrap_or(0), &brief);
                     exec_context.push_str(&format!("\n### 计划文档（分层注入）\n{}\n", focused));
                 }
                 Err(e) => {
@@ -137,7 +162,7 @@ pub(crate) async fn handle_task_dispatch(
     // bm25 返回负值（越小越好）：以最佳命中为基准归一化相关度百分比。
     // （历史 bug：曾用 score > 0.0 过滤，bm25 恒为负 → lessons 永远为空，注入失效）
     let lessons: Vec<String> =
-        match crate::store::memory::search_entries_scored(description, 5, None, false, true) {
+        match crate::store::memory::search_entries_scored(&brief, 5, None, false, true) {
             Ok(entries) => {
                 let best = entries.first().map(|(_, s)| *s).unwrap_or(0.0);
                 entries
@@ -175,7 +200,7 @@ pub(crate) async fn handle_task_dispatch(
 
     // Build dynamic user message: task + context (kept outside system prompt to maximize cache hit)
     let mut dynamic_msg = String::new();
-    dynamic_msg.push_str(&format!("## 任务\n{}\n", description));
+    dynamic_msg.push_str(&format!("## 任务\n{}\n", brief));
     if !exec_context.is_empty() {
         dynamic_msg.push_str(&format!("\n## 参考上下文\n{}", exec_context));
     }
@@ -192,10 +217,10 @@ pub(crate) async fn handle_task_dispatch(
         tracing::info!(
             "[ExecPool] 复用 Exec agent (key={}, task={})",
             reuse_key,
-            description
+            title
         );
         let mut agent_ref = agent_ref;
-        agent_ref.prepare_for_next_task(description.to_string());
+        agent_ref.prepare_for_next_task(brief.clone());
         agent_ref.set_tool_permissions(crate::permissions::ToolPermissions::all());
         if let Some(ref pause_flag) = agent.pause_flag {
             agent_ref.set_pause_flag(pause_flag.clone());
@@ -218,14 +243,10 @@ pub(crate) async fn handle_task_dispatch(
         tracing::info!(
             "[ExecPool] 新建 Exec agent (key={}, task={})",
             reuse_key,
-            description
+            title
         );
-        let mut new_agent = SubTaskRunner::new_free(
-            exec_llm.clone(),
-            exec_tools,
-            system_prompt,
-            description.to_string(),
-        );
+        let mut new_agent =
+            SubTaskRunner::new_free(exec_llm.clone(), exec_tools, system_prompt, brief.clone());
         new_agent.session.push_user(dynamic_msg);
         new_agent.set_context_window(goal_types::get_context_window_of(exec_llm.as_ref()));
         new_agent.set_goal_type(goal_type);
@@ -255,14 +276,20 @@ pub(crate) async fn handle_task_dispatch(
     exec_agent.leader_session_id = Some(agent.session.id.clone());
     exec_agent.leader_turn_id = Some(agent.session.current_turn_id());
 
-    // Send TaskStarted event
-    if let Some(ref emitter) = agent.exec_emitter {
-        emitter.emit(NuphusEvent::TaskStarted {
-            task_id,
-            total_tasks,
-            description: description.to_string(),
-        });
-    }
+    // ── 生命周期台账：开一笔 + RAII 守卫 ──
+    // 台账是 task 面板的唯一数据源；身份（run_id）由服务端下发，模型只给了标题与归属标签。
+    // RunGuard 覆盖全部退出路径：正常 settle，其余由 Drop 兜底为失败并推快照。
+    let run_registry = agent.task_runs.clone();
+    let run_emitter = agent.exec_emitter.clone();
+    let run_origin = plan_path.map(|p| crate::agent::task_run::RunOrigin {
+        plan_path: p.to_string(),
+        task_no,
+    });
+    let mut run_guard = run_registry.as_ref().map(|reg| {
+        let id = reg.open(&title, goal_type_str, run_origin.clone());
+        crate::agent::task_run::emit_snapshot(reg, run_emitter.as_deref());
+        crate::agent::task_run::RunGuard::new(reg, id, run_emitter.clone())
+    });
 
     let run_result = exec_agent.run_free(cancel_flag).await;
 
@@ -275,14 +302,9 @@ pub(crate) async fn handle_task_dispatch(
     let (run_success, summary, exec_steps) = match run_result {
         Ok((ok, msg, steps)) => (ok, msg, steps),
         Err(e) => {
-            if let Some(ref emitter) = agent.exec_emitter {
-                emitter.emit(NuphusEvent::TaskCompleted {
-                    task_id,
-                    total_tasks,
-                    success: false,
-                    description: description.to_string(),
-                    summary: format!("Executor error: {}", e).chars().take(300).collect(),
-                });
+            // 执行器错误：显式结算为失败（守卫因此不会重复兜底）
+            if let Some(g) = run_guard.as_mut() {
+                g.settle(false, &format!("Executor error: {}", e));
             }
             // Executor error: agent discarded, do NOT return to pool —
             // failed/errored agents carry broken context that poisons later dispatches.
@@ -331,6 +353,13 @@ pub(crate) async fn handle_task_dispatch(
         );
     }
 
+    // 正常路径结算：成败由执行结果决定，**不读子模型的自报状态**。
+    // （删除了从 Exec 摘要散文里刨 plan_update JSON 的旧逻辑——那是"靠模型自觉"的
+    // 最后遗迹，也是 task_id 对不上的根源；状态现在只有一个来源：这里的代码。）
+    if let Some(g) = run_guard.as_mut() {
+        g.settle(run_success, &summary);
+    }
+
     // Check if dispatch subtask was aborted due to circuit breaker
     if !run_success && summary.contains("安全检查未通过") {
         let reminder = "task_dispatch terminated due to consecutive security permission check failures, please re-evaluate the cause and switch strategy, do not continue using task_dispatch for this task.".to_string();
@@ -340,27 +369,17 @@ pub(crate) async fn handle_task_dispatch(
         );
     }
 
-    // Attempt to extract plan_update JSON from summary
-    let plan_update = extract_plan_update_from_summary(&summary)
-        .or_else(|| build_plan_update_from_steps(&exec_steps));
-
-    let mut result = serde_json::json!({
+    let result = serde_json::json!({
         "status": if run_success { "success" } else { "failed" },
         "summary": summary,
+        // 供 Leader 追溯：这次执行在台账里的身份（面板同一行）
+        "run": run_guard.as_ref().map(|g| g.run_id().to_string()),
     });
-    if let Some(pu) = plan_update {
-        result["plan_update"] = pu;
-    }
 
-    // Send TaskCompleted event
-    if let Some(ref emitter) = agent.exec_emitter {
-        emitter.emit(NuphusEvent::TaskCompleted {
-            task_id,
-            total_tasks,
-            success: run_success,
-            description: description.to_string(),
-            summary: summary.chars().take(300).collect::<String>(),
-        });
+    // 终态快照：settle 内部已推一次；这里确保「run 句柄随结果回到 Leader」与面板同源
+    // （快照幂等，重复推送无副作用）
+    if let Some(reg) = run_registry.as_ref() {
+        crate::agent::task_run::emit_snapshot(reg, run_emitter.as_deref());
     }
 
     let result_str = serde_json::to_string(&result).unwrap_or(summary);
@@ -467,66 +486,9 @@ fn extract_focused_plan_context(content: &str, task_id: usize, description: &str
 }
 
 // ═══════════════════════════════════════════════════════════════
-// plan_update extraction helpers
+// （此处曾有两个"从 Exec 摘要里刨 plan_update JSON"的辅助函数：
+//   extract_plan_update_from_summary / build_plan_update_from_steps。
+//   前者解析子模型的散文、后者还会伪造 task_id:1 把状态写到错误的行上——
+//   它们是"靠模型自觉报状态"的最后遗迹，已删除。执行生命周期的唯一真相在
+//   agent::task_run，由本文件的 dispatch 代码写入，模型不再参与状态。）
 // ═══════════════════════════════════════════════════════════════
-
-fn extract_plan_update_from_summary(summary: &str) -> Option<serde_json::Value> {
-    let mut in_json_block = false;
-    let mut json_buffer = String::new();
-    for line in summary.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```json") || trimmed == "```" {
-            if in_json_block && !json_buffer.is_empty() {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_buffer) {
-                    if parsed.get("plan_update").is_some() || parsed.get("tasks").is_some() {
-                        return Some(parsed);
-                    }
-                }
-                json_buffer.clear();
-            }
-            in_json_block = !in_json_block;
-            continue;
-        }
-        if in_json_block {
-            json_buffer.push_str(line);
-            json_buffer.push('\n');
-        }
-    }
-    if let Some(idx) = summary.find("\"plan_update\"") {
-        let start = summary[..idx].rfind('{').unwrap_or(idx);
-        let end = summary[idx..]
-            .find('}')
-            .map(|i| idx + i + 1)
-            .unwrap_or(summary.len());
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&summary[start..end]) {
-            if parsed.get("plan_update").is_some() {
-                return Some(parsed);
-            }
-        }
-    }
-    None
-}
-
-fn build_plan_update_from_steps(steps: &[ExecutionStep]) -> Option<serde_json::Value> {
-    if steps.is_empty() {
-        return None;
-    }
-    let tasks = serde_json::json!([
-        {
-            "task_id": 1,
-            "acceptance": steps.iter().enumerate().map(|(i, s)| {
-                serde_json::json!({
-                    "index": i,
-                    "passed": s.status == crate::StepStatus::Success,
-                    "note": if s.status == crate::StepStatus::Success {
-                        format!("✓ {} 执行成功", s.tool)
-                    } else {
-                        format!("✗ {} 执行失败", s.tool)
-                    }
-                })
-            }).collect::<Vec<_>>(),
-            "audit_note": format!("Exec 执行了 {} 步工具调用", steps.len())
-        }
-    ]);
-    Some(serde_json::json!({ "tasks": tasks }))
-}

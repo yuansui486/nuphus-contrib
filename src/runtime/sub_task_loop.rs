@@ -780,7 +780,10 @@ impl super::SubTaskRunner {
                     // tool-XML strip with the provider tag set), then emit
                     // thinking (is_thinking=true) before content
                     // (is_thinking=false) so the frontend order is stable.
-                    crate::agent::common::route_stream_text_delta(
+                    // 返回值（是否产出可见 text）暂不使用：子任务的过程 text 由
+                    // TimelineEntry 按事件展示，不参与跨迭代边界分隔（见
+                    // `emit_text_break` 与 react_loop 的 stream_text_seen）。
+                    let _ = crate::agent::common::route_stream_text_delta(
                         text,
                         &think_state,
                         content_tool_tags,

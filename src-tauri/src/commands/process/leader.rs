@@ -146,6 +146,24 @@ pub(crate) async fn run_runtime_with_config<E: EventEmitter + Clone>(
     exec_registry.set_signals(tools.signals().clone());
     runtime.set_exec_resources(exec_registry, exec_llm.clone(), emitter.clone());
 
+    // ExecAgent 执行生命周期台账（task 面板的唯一数据源）。进程级单例。
+    // 顺序有含义：先加载上一代并把滞留 running 判为「未结算」（只进日志与落盘快照，
+    // 那是上个轮次的事），再开新一代——面板按「轮」归零，新计划/新派发绝不会和上一轮
+    // 混在一起；上一代的终态在落盘快照里，历史不丢。
+    let run_registry = nuphus::agent::task_run::global_registry();
+    run_registry.bind_persistence(nuphus::utils::nuphus_data_dir().join("tasks"));
+    let swept = run_registry.load_and_sweep();
+    if swept > 0 {
+        tracing::info!(
+            "[TaskRun] 上一轮残留清扫：{} 条滞留 running 判为 interrupted（已落盘，不进新墙）",
+            swept
+        );
+    }
+    run_registry.start_generation();
+    // 立刻推一帧空墙：让面板在派发前就完成归零（而不是等第一次派发才清）
+    nuphus::agent::task_run::emit_snapshot(&run_registry, Some(emitter));
+    runtime.set_task_runs(run_registry.clone());
+
     // ── Apply mode: preserve mode from frontend (e.g., 'workflow') across Runtime rebuild ──
     if let Some(m) = mode {
         runtime.set_mode(m);

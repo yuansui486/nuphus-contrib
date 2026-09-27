@@ -11,7 +11,7 @@ use super::toml_ops::{
     provider_segment_exists, read_model_context_window, read_model_supports_vision,
     read_provider_api_key_from_config_toml, read_provider_base_url_from_config_toml,
     read_provider_display_name, read_provider_reasoning_effort_from_config_toml,
-    sanitize_extra_headers, sync_provider_models, update_config_toml,
+    remove_provider_segment, sanitize_extra_headers, sync_provider_models, update_config_toml,
     update_custom_provider_segment, update_model_context_window, update_model_reasoning_efforts,
     update_model_supports_vision, update_reasoning_effort, CapabilityOverride, CapabilitySource,
     SyncReport,
@@ -2280,6 +2280,29 @@ fn custom_provider_config_path(state: &AppState) -> std::path::PathBuf {
         }
         fallback
     })
+}
+
+/// 删除自定义模型实例（自定义中转站）：模型页左栏「自定义模型」条目删除图标的
+/// 后端入口。整段从 providers.toml 移除（见 `remove_provider_segment`）。
+///
+/// 与 create / update 的两处关键差异：
+/// 1. **不改内存态**：删除只落盘，调用方（前端）负责刷新服务商列表；这里不尝
+///    试同步运行时，避免「内存已删但磁盘写失败」的半成品状态反过来误导调用方。
+/// 2. **返回 false 而非报错**：段本来就不存在（重复删除 / 已被外部改动）时，
+///    前端应静默收敛——它想达成的「这个实例不存在」已经成立。
+///
+/// 前置校验故意放这里而不是只靠前端：命令是可被任意 invoke 的公开入口，
+/// 「name 非空」这类不变量必须在后端也成立一次。
+#[tauri::command]
+pub fn remove_custom_provider(state: State<'_, AppState>, name: String) -> Result<bool, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("provider name must not be empty".to_string());
+    }
+    let config_path = custom_provider_config_path(&state);
+    let removed = remove_provider_segment(&config_path, &name)?;
+    tracing::info!("remove_custom_provider: name={}, removed={}", name, removed);
+    Ok(removed)
 }
 
 /// 新建自定义模型实例（自定义中转站）：模型页 custom 表单「创建」按钮的后端入口。

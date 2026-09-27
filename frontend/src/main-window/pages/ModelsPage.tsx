@@ -22,6 +22,7 @@ import {
   setCapabilityBinding,
   createCustomProvider,
   updateCustomProvider,
+  removeCustomProvider,
   oauthBegin,
   oauthStatus,
   oauthLogout,
@@ -238,6 +239,15 @@ const TXT = {
   editContext: '设置上下文窗口（K tokens）',
   ctxUnknown: '上下文窗口未知',
   removeModelConfirm: (name: string) => `确定从本地列表移除模型「${name}」吗？`,
+  /** 删除自定义实例的二次确认：讲清后果（整段配置移除、不可撤销）。 */
+  removeInstanceConfirm: (name: string) =>
+    `确定删除自定义模型「${name}」吗？\n\n这将从本地配置中移除该实例的全部设置（地址、密钥、自定义模型列表），且无法撤销。`,
+  removeInstanceTitle: '删除自定义模型',
+  removeSuccess: (name: string) => `已删除「${name}」`,
+  removeFail: '删除失败',
+  removing: '删除中…',
+  cancel: '取消',
+  confirmDelete: '删除',
   clearKeySuccess: '密钥已清除',
   clearKeyFail: '清除失败',
   savingModel: '切换中…',
@@ -1620,6 +1630,67 @@ export function ModelsPage({
     handleProviderChange(id, configuredOverride)
   }
 
+  // ── 删除自定义模型实例（左栏条目删除图标 → 二次确认 → 落盘）──
+  /** 待确认删除的实例；null = 弹窗关闭。同时承载删除中的 loading 态。 */
+  const [pendingRemove, setPendingRemove] = useState<ProviderInfo | null>(null)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState('')
+
+  /**
+   * 确认删除：整段移除 → 重新拉列表与配置态。
+   *
+   * 三个刻意的选择：
+   * 1. **先落盘再动 UI**：与新建/编辑同一套真值观（磁盘是唯一真相），
+   *    不做「前端先摘条目、失败再插回」的乐观更新——那种做法在失败时
+   *    会让用户以为删成功了。
+   * 2. **删的是当前选中项时主动切走**：否则右栏会渲染一个已不存在的
+   *    provider，apiKey/模型列表全空而看不出原因。
+   * 3. **后端返回 false 不当失败**：段本来就不存在时目标已达成，静默收敛。
+   */
+  const confirmRemove = async () => {
+    if (!pendingRemove || removing) return
+    const target = pendingRemove
+    setRemoving(true)
+    setRemoveError('')
+    try {
+      await removeCustomProvider(target.id)
+      const [list, cfg] = await Promise.all([
+        getSupportedProviders().catch(() => null),
+        getCurrentConfig().catch(() => null),
+      ])
+      if (Array.isArray(list)) setProviders(sortProvidersStable(list))
+      const configured = cfg?.configured_providers
+      if (configured) setConfiguredProviders(configured)
+      // 删的是当前选中项 → 收起表单回到未选中态，避免右栏指向已删除实例
+      if (provider === target.id) {
+        setFormOpen(false)
+        handleProviderChange('')
+      }
+      setFeedback({ ok: true, msg: TXT.removeSuccess(instanceLabel(target)) })
+      setTimeout(() => setFeedback(null), 2500)
+      setPendingRemove(null)
+      onModelChanged?.()
+    } catch (e) {
+      // 后端原文直接展示（与新建/编辑失败同一口径）：不掩盖、不改写
+      setRemoveError(String(e))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  /** Esc 关闭删除确认：删除进行中不拦（避免用户以为取消了、实际还在删）。 */
+  useEffect(() => {
+    if (!pendingRemove || removing) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setPendingRemove(null)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [pendingRemove, removing])
+
   /** 「Custom」配置入口：展开创建态表单（旧 custom 段存在时预填其地址与协议） */
   const openCreateForm = () => {
     setActiveView('provider')
@@ -2277,23 +2348,43 @@ export function ModelsPage({
               {customInstances.map(p => {
                 const isActive = activeView === 'provider' && !formOpen && p.id === provider
                 const isConfigured = configuredProviders.includes(p.id)
+                const displayName = instanceLabel(p)
                 return (
-                  <button
-                    type="button"
+                  /* 行容器而非单个 button：删除图标必须是独立可聚焦按钮，
+                     嵌套在 <button> 内是非法 HTML 且点击会冒泡成「选中」。
+                     主区域仍占满整行，点击热区与旧版一致。 */
+                  <div
                     key={p.id}
                     className={['models-rail-item', isActive ? 'active' : '']
                       .filter(Boolean)
                       .join(' ')}
-                    onClick={() => openProviderView(p.id)}
-                    title={TXT.instanceIdTitle(p.id)}
                   >
-                    <span
-                      className={`models-rail-dot${isConfigured ? ' is-on' : ''}`}
-                      title={isConfigured ? '已配置密钥' : '未配置密钥（无鉴权端点可留空）'}
-                      aria-hidden="true"
-                    />
-                    <span className="models-rail-name">{instanceLabel(p)}</span>
-                  </button>
+                    <button
+                      type="button"
+                      className="models-rail-item-main"
+                      onClick={() => openProviderView(p.id)}
+                      title={TXT.instanceIdTitle(p.id)}
+                    >
+                      <span
+                        className={`models-rail-dot${isConfigured ? ' is-on' : ''}`}
+                        title={isConfigured ? '已配置密钥' : '未配置密钥（无鉴权端点可留空）'}
+                        aria-hidden="true"
+                      />
+                      <span className="models-rail-name">{displayName}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="models-rail-delete"
+                      onClick={() => {
+                        setRemoveError('')
+                        setPendingRemove(p)
+                      }}
+                      title={`删除「${displayName}」`}
+                      aria-label={`删除「${displayName}」`}
+                    >
+                      <IconTrash2 size={13} />
+                    </button>
+                  </div>
                 )
               })}
             </div>
@@ -3432,6 +3523,51 @@ export function ModelsPage({
             </div>
           </>
         )}
+
+        {/* ── 删除确认弹窗：与页面反馈同一套 portal 到 body 的做法（避免被
+                models-rail 的滚动容器裁剪）。Esc / 点遮罩 = 取消。── */}
+        {pendingRemove &&
+          createPortal(
+            <div
+              className="models-confirm-mask"
+              onClick={() => {
+                if (!removing) setPendingRemove(null)
+              }}
+            >
+              <div
+                className="models-confirm"
+                role="dialog"
+                aria-modal="true"
+                aria-label={TXT.removeInstanceTitle}
+                onClick={e => e.stopPropagation()}
+              >
+                <div className="models-confirm-title">{TXT.removeInstanceTitle}</div>
+                <div className="models-confirm-body">
+                  {TXT.removeInstanceConfirm(instanceLabel(pendingRemove))}
+                </div>
+                {removeError && <div className="models-confirm-error">{removeError}</div>}
+                <div className="models-confirm-actions">
+                  <button
+                    type="button"
+                    className="models-confirm-btn"
+                    onClick={() => setPendingRemove(null)}
+                    disabled={removing}
+                  >
+                    {TXT.cancel}
+                  </button>
+                  <button
+                    type="button"
+                    className="models-confirm-btn is-danger"
+                    onClick={() => void confirmRemove()}
+                    disabled={removing}
+                  >
+                    {removing ? TXT.removing : TXT.confirmDelete}
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )}
 
         {/* ── 页内反馈：与 island 同一套胶囊视觉（共享层 ui/AppPill.tsx + app-pill.css），
                位置与层级仍归本页（顶部居中 / z 10000 / 挂在 body）── */}

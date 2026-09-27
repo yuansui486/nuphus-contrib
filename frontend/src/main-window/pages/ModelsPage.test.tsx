@@ -8,6 +8,7 @@ import {
   oauthLogout,
   oauthStatus,
   openExternal,
+  removeCustomProvider,
   updateCustomProvider,
 } from '../lib/api'
 import { ModelsPage } from './ModelsPage'
@@ -41,6 +42,7 @@ vi.mock('../lib/api', () => ({
   setCapabilityBinding: vi.fn(),
   createCustomProvider: vi.fn(),
   updateCustomProvider: vi.fn(),
+  removeCustomProvider: vi.fn(),
   oauthBegin: vi.fn(),
   oauthStatus: vi.fn(),
   oauthLogout: vi.fn(),
@@ -150,6 +152,8 @@ beforeEach(() => {
   vi.mocked(getProviderBaseUrl).mockResolvedValue(null)
   vi.mocked(refreshProviderModels).mockResolvedValue({ models: [], report: null } as never)
   vi.mocked(sttStatus).mockResolvedValue(null as never)
+  // 删除：默认成功并报告「已删掉一段」。configured_providers 同步去掉该项。
+  vi.mocked(removeCustomProvider).mockResolvedValue(true)
   // 订阅账号：默认「未配 oauth」（官方服务商与只用静态密钥的实例都是这个状态）
   vi.mocked(oauthStatus).mockResolvedValue({
     configured: false,
@@ -694,5 +698,130 @@ describe('ModelsPage 自定义模型（Custom 配置入口 → 创建具名实�
     expect(await screen.findByText('已退出登录')).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: '授权登录' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * 删除自定义模型实例回归。
+ *
+ * 覆盖四件事，按「少了任何一条用户就会踩坑」挑选：
+ * 1. 删除是**二次确认**的——点图标不能直接删（误触即丢配置）；
+ * 2. 取消即什么都不发生（IPC 一次都不能发）；
+ * 3. 确认后才真落盘，且**整段移除**（remove_custom_provider，不是清模型列表）；
+ * 4. 左栏条目随之消失——这是「真的删了」的唯一可见证据。
+ */
+describe('ModelsPage 删除自定义模型实例', () => {
+  /** 左栏渲染两个自定义实例，其中一个是「已配置密钥」态 */
+  function seedInstances() {
+    providerList = [
+      provider({ id: 'deepseek', name: 'DeepSeek', base_url: 'https://api.deepseek.com' }),
+      provider({
+        id: 'custom-relay-a',
+        name: 'custom-relay-a',
+        display_name: '中转站 A',
+        provider_type: 'custom',
+        base_url: 'https://relay-a.example/v1',
+      }),
+      provider({
+        id: 'custom-relay-b',
+        name: 'custom-relay-b',
+        display_name: '中转站 B',
+        provider_type: 'custom',
+        base_url: 'https://relay-b.example/v1',
+      }),
+    ] as typeof providerList
+  }
+
+  beforeEach(() => {
+    seedInstances()
+  })
+
+  it('点删除图标弹二次确认，取消则不发 IPC、条目保留', async () => {
+    render(<ModelsPage onClose={() => {}} />)
+    const del = await screen.findByRole('button', { name: '删除「中转站 A」' })
+    fireEvent.click(del)
+
+    // 弹窗出现，且讲明了后果（不可撤销 + 移除全部设置）
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toHaveTextContent('删除自定义模型')
+    expect(dialog).toHaveTextContent('中转站 A')
+    expect(dialog).toHaveTextContent('无法撤销')
+
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(removeCustomProvider).not.toHaveBeenCalled()
+    // 条目仍在：取消必须是真正的「什么都没发生」
+    expect(await screen.findByRole('button', { name: '删除「中转站 A」' })).toBeInTheDocument()
+  })
+
+  it('确认后走 remove_custom_provider 落盘，条目从左栏消失', async () => {
+    // 删除成功后服务商列表少一段：模拟后端真实行为（磁盘是唯一真值）
+    vi.mocked(removeCustomProvider).mockImplementation(async () => {
+      providerList = providerList.filter(p => p.id !== 'custom-relay-a')
+      return true
+    })
+
+    render(<ModelsPage onClose={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: '删除「中转站 A」' }))
+    fireEvent.click(await screen.findByRole('button', { name: '删除' }))
+
+    await waitFor(() => expect(removeCustomProvider).toHaveBeenCalledWith('custom-relay-a'))
+    // 删除的必须是段 id（路由依据），不是显示名
+    expect(vi.mocked(removeCustomProvider).mock.calls[0][0]).toBe('custom-relay-a')
+    // 左栏条目消失、另一个实例不受影响
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: '删除「中转站 A」' })).not.toBeInTheDocument(),
+    )
+    expect(screen.getByRole('button', { name: '删除「中转站 B」' })).toBeInTheDocument()
+    expect(await screen.findByText('已删除「中转站 A」')).toBeInTheDocument()
+  })
+
+  it('删除失败时弹窗不关、错误原文展示、条目保留', async () => {
+    vi.mocked(removeCustomProvider).mockRejectedValue(
+      'write config.toml failed: 拒绝访问 (os error 5)',
+    )
+
+    render(<ModelsPage onClose={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: '删除「中转站 B」' }))
+    fireEvent.click(await screen.findByRole('button', { name: '删除' }))
+
+    // 失败不得静默：弹窗留着让用户看到原因，条目也不得提前消失
+    expect(await screen.findByText(/write config\.toml failed/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '删除「中转站 B」' })).toBeInTheDocument()
+  })
+
+  it('Esc 关闭确认弹窗且不发 IPC', async () => {
+    render(<ModelsPage onClose={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: '删除「中转站 A」' }))
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(removeCustomProvider).not.toHaveBeenCalled()
+  })
+
+  it('删除当前选中的实例后，右栏不残留已删除实例', async () => {
+    vi.mocked(removeCustomProvider).mockImplementation(async () => {
+      providerList = providerList.filter(p => p.id !== 'custom-relay-a')
+      return true
+    })
+
+    render(<ModelsPage onClose={() => {}} />)
+    // 先选中「中转站 A」：点左栏主区域（不是删除图标）。
+    // 用子串匹配：主按钮 title 是 instanceIdTitle 包装过的串，不是裸 id。
+    fireEvent.click(await screen.findByTitle(/custom-relay-a/))
+    expect(await screen.findByDisplayValue('https://relay-a.example/v1')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '删除「中转站 A」' }))
+    fireEvent.click(await screen.findByRole('button', { name: '删除' }))
+
+    await waitFor(() => expect(removeCustomProvider).toHaveBeenCalled())
+    // 右栏已删除实例的地址必须消失（否则用户会对着一个不存在的中转站改配置）
+    await waitFor(() =>
+      expect(screen.queryByDisplayValue('https://relay-a.example/v1')).not.toBeInTheDocument(),
+    )
   })
 })

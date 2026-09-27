@@ -401,36 +401,8 @@ impl ToolRegistry {
             signals: self.signals.clone(),
             schedule_tool: self.schedule_tool.read().ok().and_then(|slot| slot.clone()),
         };
-        // 超时分级：
-        // - system_shell/system_sleep 自带超时机制，给 600s 容纳默认 180s + 余量
-        // - web_search/web_extract/http_request 走 reqwest::blocking 慢抓取，给 120s 防误杀
-        // - video_subtitle_extract 含 yt-dlp 下载 + ffmpeg 转码 + 本地 ASR，
-        //   长视频兜底链路给 900s（15min）
-        // - image_generate 同步出图走 web 桶；video_generate 异步轮询（默认
-        //   300s 上限 600s + 下载），给 900s 桶与 video_subtitle_extract 同级
-        // - Read 读扫描件 PDF 时走「前端渲染(≤60s) + 逐页 OCR」兜底链路，
-        //   普通文件读取仍是毫秒级，仅上限放宽
-        // - memory_search semantic=true 首次调用需冷加载本地 candle embed 模型
-        //   （debug 构建下可达数十秒），默认 15s 桶会误杀，放宽到 60s
-        // - 其余工具 15s 防文件系统卡死
-        // 注：desktop_/browser_ 工具在上方分支已提前返回，不经过此处
-        let timeout = if tool_name == "system_shell" || tool_name == "system_sleep" {
-            Duration::from_secs(600) // 足够容纳默认 180s + 余量
-        } else if tool_name == "web_search"
-            || tool_name == "web_extract"
-            || tool_name == "http_request"
-            || tool_name == "image_generate"
-        {
-            Duration::from_secs(120)
-        } else if tool_name == "video_subtitle_extract" || tool_name == "video_generate" {
-            Duration::from_secs(900)
-        } else if tool_name == "Read" {
-            Duration::from_secs(180) // 容纳扫描 PDF「渲染 60s + 50 页 OCR」兜底上限
-        } else if tool_name == "memory_search" {
-            Duration::from_secs(60) // 容纳 semantic 路径 embed 模型冷加载（debug 数十秒）
-        } else {
-            Duration::from_secs(15)
-        };
+        // 超时分档与每档取值推导见 Self::tool_timeout（无出处魔数禁止入链）
+        let timeout = Self::tool_timeout(tool_name);
         let run_context = crate::workflow::run_context::current();
         match tokio::time::timeout(
             timeout,
@@ -461,14 +433,85 @@ impl ToolRegistry {
                 Ok(ToolResult::failure(msg))
             }
             Err(_elapsed) => {
-                let msg = format!(
-                    "工具 '{}' 执行超时（{}秒），已取消",
-                    tool_name,
-                    timeout.as_secs()
-                );
+                // 文案口径钉在 Self::timeout_message：超时不取消任何东西，
+                // 禁止出现「已取消」这类与实现矛盾的表述
+                let msg = Self::timeout_message(tool_name, timeout);
                 tracing::error!("[TIMEOUT] {}", msg);
                 Ok(ToolResult::failure(msg))
             }
+        }
+    }
+
+    /// 工具超时分级：`execute` 同步执行段（spawn_blocking）的等待上限。
+    ///
+    /// 纪律：每个档位必须能讲清「为什么是这个数」——无出处魔数禁止入链；
+    /// 能复用已有档位就不新造数字。各档推导：
+    /// - system_shell/system_sleep 自带超时机制，600s 容纳默认 180s + 余量
+    /// - web_search/web_extract/http_request 走 reqwest::blocking 慢抓取，120s 防误杀
+    /// - video_subtitle_extract 含 yt-dlp 下载 + ffmpeg 转码 + 本地 ASR，
+    ///   长视频兜底链路给 900s（15min）
+    /// - image_generate 同步出图走 web 桶；video_generate 异步轮询（默认
+    ///   300s 上限 600s + 下载），给 900s 桶与 video_subtitle_extract 同级
+    /// - Read 读扫描件 PDF 时走「前端渲染(≤60s) + 逐页 OCR」兜底链路，
+    ///   普通文件读取仍是毫秒级，仅上限放宽，180s
+    /// - memory_search semantic=true 首次调用需冷加载本地 candle embed 模型
+    ///   （debug 构建下可达数十秒），默认 15s 桶会误杀，放宽到 60s
+    /// - agent_dispatch：耗时完全由 team.toml 的 dispatch_steps 决定——序列环上
+    ///   没有 LLM，默认四步（激活窗口/逐字输入/enter）仅 1–2s，打不穿任何档位；
+    ///   实测能打穿 15s 兜底桶的是三种：① 长 message override——sendinput 逐字
+    ///   注入 char_delay_ms=5 ⇒ 每千字符约 5s，3000 字符即压线；② 用户自写长
+    ///   __sleep / 多步序列；③ 单步桌面调用偶发阻塞（window_activate 路径有
+    ///   sleep 上限、input_send 每码点校验前台窗口）。取 180s（复用 Read 档位）
+    ///   的关键理由：**本桶取消不了任何东西**——spawn_blocking 不可被 timeout
+    ///   取消、ext_agent 侧亦无 kill 路径，桶超时只是让 Leader 早收一条文本，
+    ///   后台序列照跑。所以桶的价值仅是「多晚停止说谎」：误报（太早超时）会
+    ///   诱导 Leader 判投递中断而重投 ⇒ 双投递、两条序列还可能交错敲键。
+    ///   宁可晚、不可早，取宽档。
+    /// - 其余工具 15s 防文件系统卡死
+    ///
+    /// 注：desktop_/browser_ 工具在上方分支已提前返回，不经过此处
+    fn tool_timeout(tool_name: &str) -> Duration {
+        if tool_name == "system_shell" || tool_name == "system_sleep" {
+            Duration::from_secs(600) // 足够容纳默认 180s + 余量
+        } else if tool_name == "web_search"
+            || tool_name == "web_extract"
+            || tool_name == "http_request"
+            || tool_name == "image_generate"
+        {
+            Duration::from_secs(120)
+        } else if tool_name == "video_subtitle_extract" || tool_name == "video_generate" {
+            Duration::from_secs(900)
+        } else if tool_name == "Read" {
+            Duration::from_secs(180) // 容纳扫描 PDF「渲染 60s + 50 页 OCR」兜底上限
+        } else if tool_name == "agent_dispatch" {
+            // 与 Read 同档 180s，不引新魔数；取值推导见本函数文档
+            Duration::from_secs(180)
+        } else if tool_name == "memory_search" {
+            Duration::from_secs(60) // 容纳 semantic 路径 embed 模型冷加载（debug 数十秒）
+        } else {
+            Duration::from_secs(15)
+        }
+    }
+
+    /// 超时返回文案。纪律：必须讲实情——spawn_blocking 上的同步执行不可能被
+    /// timeout 取消，收到这段文本时它通常仍在后台运行。写「已取消」会诱导
+    /// 「可以安全重试」的误判（agent_dispatch 即双投递、两条序列交错敲键）。
+    fn timeout_message(tool_name: &str, timeout: Duration) -> String {
+        if tool_name == "agent_dispatch" {
+            format!(
+                "工具 'agent_dispatch' 执行超过 {}秒未返回（到达超时上限，非取消）。\n\
+                 同步投递序列无法被强制中止——dispatch_steps 可能仍在后台逐条执行。\n\
+                 处置：先核对目标窗口/进程实况（windows_list / 截图看回显），确认指令是否已进入终端：\n\
+                 已进入 → 勿重复投递（双序列会交错敲键、任务被外部 Agent 执行两遍）；\n\
+                 确认未进入 → 才补输单行指令「Read {{brief_path}} and execute it.」补完投递，brief 无需重新上板。",
+                timeout.as_secs()
+            )
+        } else {
+            format!(
+                "工具 '{}' 执行超过 {}秒未返回（到达超时上限，非取消）。同步执行无法被超时强制中止，它可能仍在后台运行——重试前请先核对该工具的副作用实况（文件/窗口/进程），避免重复执行。",
+                tool_name,
+                timeout.as_secs()
+            )
         }
     }
 
@@ -816,7 +859,7 @@ pub const WORKFLOW_TOOL_EXCLUDE: &[&str] = &[
     "task_dispatch",
     "planner_create",
     "planner_parse",
-    "planner_complete",
+    "planner_archive",
     "planner_list",
     "tenet_add",
     // 记忆 / 会话检索（agent 上下文交互，注册表实际名见 definitions/memory.rs）
@@ -958,7 +1001,7 @@ impl ToolRegistry {
         self.register_task_dispatch();
         self.register_planner_create();
         self.register_planner_parse();
-        self.register_planner_complete();
+        self.register_planner_archive();
         self.register_planner_list();
         self.register_tenet_add();
         self.register_annotation_add();
@@ -1055,7 +1098,7 @@ impl ToolRegistry {
         registry.register_task_dispatch();
         registry.register_planner_create();
         registry.register_planner_parse();
-        registry.register_planner_complete();
+        registry.register_planner_archive();
         registry.register_planner_list();
         registry.register_tenet_add();
         // 额外: workflow_run + schedule_cron + wf_call
@@ -1554,5 +1597,44 @@ mod tests {
         if let Ok(tool_result) = result {
             assert!(!tool_result.success, "read_file without path should fail");
         }
+    }
+
+    /// issue #69 方向 3 回归：agent_dispatch 必须落在专属超时桶（180s，复用
+    /// Read 档位），不得落「其余工具 15s」兜底桶。默认 team.toml 四步虽打不穿
+    /// 15s，但长 message override（逐字注入 5ms/字符，每千字符约 5s）能打穿——
+    /// 误报会诱导 Leader 判投递中断而双投递。
+    #[test]
+    fn test_agent_dispatch_has_dedicated_timeout_bucket() {
+        assert_eq!(
+            ToolRegistry::tool_timeout("agent_dispatch"),
+            Duration::from_secs(180),
+            "agent_dispatch 必须有独立超时桶（复用 Read 的 180s 档），不得落 15s 兜底桶"
+        );
+        // 档位表其余部分不被顺手改宽：Read 保持 180s，兜底桶保持 15s
+        assert_eq!(ToolRegistry::tool_timeout("Read"), Duration::from_secs(180));
+        assert_eq!(ToolRegistry::tool_timeout("Write"), Duration::from_secs(15));
+    }
+
+    /// issue #69 方向 3 回归：超时文案必须讲实情——spawn_blocking 不可取消，
+    /// 禁止出现「已取消」这类与实现矛盾的表述（诱导安全重试 ⇒ 双投递/双执行）。
+    #[test]
+    fn test_timeout_message_tells_the_truth() {
+        for tool in ["agent_dispatch", "system_shell", "Read", "Write"] {
+            let msg = ToolRegistry::timeout_message(tool, Duration::from_secs(180));
+            assert!(
+                !msg.contains("已取消"),
+                "{tool} 的超时文案不得声称「已取消」（同步执行不可被取消）: {msg}"
+            );
+            assert!(
+                msg.contains("非取消") && msg.contains("后台"),
+                "{tool} 的超时文案必须说明「未取消 + 可能仍在后台运行」: {msg}"
+            );
+        }
+        // agent_dispatch 专属文案必须带「先核对实况、已进终端勿重投」指引
+        let msg = ToolRegistry::timeout_message("agent_dispatch", Duration::from_secs(180));
+        assert!(
+            msg.contains("勿重复投递") && msg.contains("确认指令是否已进入终端"),
+            "agent_dispatch 超时文案必须给出核对实况与勿重投指引: {msg}"
+        );
     }
 }

@@ -340,10 +340,6 @@ fn generate_plan_md(plan: &ParsedPlan) -> String {
         md.push('\n');
     }
 
-    md.push_str("## 执行日志\n\n");
-    md.push_str("| 时间 | 事件 | 详情 |\n");
-    md.push_str("|------|------|------|\n");
-
     md
 }
 
@@ -513,16 +509,16 @@ fn planner_parse(params: &serde_json::Value, _ctx: &ToolCtx) -> Result<ToolResul
 }
 
 // ═══════════════════════════════════════════════════════════════
-// planner_complete
+// planner_archive —— 计划台账的归档动作（只动文档，不记任何执行状态）
 // ═══════════════════════════════════════════════════════════════
 
-fn planner_complete(params: &serde_json::Value, _ctx: &ToolCtx) -> Result<ToolResult, String> {
+/// 把计划归档：状态 active → archived，移入 `archive/` 子目录，删除原文件。
+///
+/// 刻意不收 `audit_note`：执行结论属于 dispatch 的 TaskRun 台账（起止/成败/耗时自动记账），
+/// 让 Leader 往传递文档里手抄一份审计，等于把运行状态塞回文档——那是已经拆掉的回写支路。
+fn planner_archive(params: &serde_json::Value, _ctx: &ToolCtx) -> Result<ToolResult, String> {
     let plan_path = params
         .get("plan_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let audit_note = params
-        .get("audit_note")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -540,11 +536,6 @@ fn planner_complete(params: &serde_json::Value, _ctx: &ToolCtx) -> Result<ToolRe
 
     let mut content =
         std::fs::read_to_string(&path).map_err(|e| format!("read plan failed: {}", e))?;
-
-    if !audit_note.is_empty() {
-        let note_block = format!("\n### 执行审计\n\n{}\n", audit_note);
-        content.push_str(&note_block);
-    }
 
     content = content.replace("- 状态: active", "- 状态: archived");
 
@@ -716,32 +707,19 @@ impl ToolRegistry {
         });
     }
 
-    pub(crate) fn register_planner_complete(&mut self) {
+    pub(crate) fn register_planner_archive(&mut self) {
         self.register(ToolDef {
-            name: "planner_complete".to_string(),
-            description: "Archive plan after all tasks done — writes audit note and sets status to archived. 调用前必须先 leader_memory_update。".to_string(),
+            name: "planner_archive".to_string(),
+            description: "Archive plan after all tasks done — sets status to archived and moves the doc into archive/. Doc-only action: execution status lives in the dispatch ledger, not in the plan. Call leader_memory_update before archiving.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "plan_path": { "type": "string", "description": "Path to .plan.md file" },
-                    "task_results": {
-                        "type": "array",
-                        "description": "Audit results per direction",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "task_id": { "type": "integer" },
-                                "passed": { "type": "boolean" },
-                                "note": { "type": "string" }
-                            }
-                        }
-                    },
-                    "audit_note": { "type": "string", "description": "Leader's overall audit note" }
+                    "plan_path": { "type": "string", "description": "Path to .plan.md file" }
                 },
                 "required": ["plan_path"]
             }),
             category: ToolCategory::Core,
-            executor: planner_complete,
+            executor: planner_archive,
             depends_on: vec![],
         });
     }

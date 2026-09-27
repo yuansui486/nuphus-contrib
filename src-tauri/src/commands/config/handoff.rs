@@ -1,6 +1,6 @@
 //! 外部 Agent 工作台 —— 阶段 0（地基）：agent 目录初始化 + 门铃预检 + 交付上报。
 //!
-//! 目录约定（项目根 = find_plugin_dir().parent()）：
+//! 目录约定（项目根 = plugin_root().parent()，即 workspace_root()）：
 //!   {root}/.nuphus/handoff/{agent}/
 //!     read.md          —— 对接协议（模板内嵌，{agent_name}/{description} 已替换）
 //!     memory.md        —— 该 Agent 跨任务记忆骨架
@@ -62,17 +62,156 @@ const READ_TEMPLATE: &str = r#"# {agent_name} 对接协议
 - 禁止长时间静默空转：受阻立即 blocked 并说明原因。
 "#;
 
-/// handoff 根目录：{项目根}/.nuphus/handoff
+/// handoff 根目录：{项目根}/.nuphus/handoff —— **唯一权威推导**。
+///
+/// 派生规则纯函数见 `nuphus::utils::handoff_root_from`：
+/// 开发机（plugin 根在源码检出内）→ `<repo>/.nuphus/handoff`（零迁移）；
+/// 发布版（plugin 根落在 nuphus_data_dir() 之下）→ `nuphus_data_dir()/handoff`。
 pub fn handoff_root() -> PathBuf {
-    crate::plugin_apps::find_plugin_dir()
-        .parent()
-        .map(|root| root.join(nuphus::profile::home_name()).join("handoff"))
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(nuphus::profile::home_name())
-                .join("handoff")
-        })
+    nuphus::utils::handoff_root_from(
+        &nuphus::utils::plugin_root(),
+        &nuphus::utils::nuphus_data_dir(),
+    )
+}
+
+/// 旧 handoff 根 → 新根的一次性迁移汇总（**agent 目录级**粒度）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HandoffMigrationReport {
+    /// 从旧根拷入新根的 agent 名（按来源顺序）
+    pub copied: Vec<String>,
+    /// 新根已有同名 agent 目录 → 保留新根、弃用旧副本的 agent 名
+    pub skipped: Vec<String>,
+    /// (agent 名, 错误信息)；单个 agent 失败不影响其余迁移
+    pub failed: Vec<(String, String)>,
+}
+
+impl HandoffMigrationReport {
+    /// 无任何实质动作（没迁、没跳、没失败）。
+    pub fn is_empty(&self) -> bool {
+        self.copied.is_empty() && self.skipped.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// 迁移核心（root 注入，可单测）：把多个候选旧根下的 agent 目录合并进 target。
+///
+/// 粒度是 **agent 目录级**：target 已有该 agent 目录即跳过——绝不能整根跳过，
+/// 否则首次启动建出新根后，迁移逻辑永远不会再触发。
+/// 同一 agent 在多个来源都出现时，按 `sources` 顺序首个胜出。
+/// 来源目录不存在 / 不可读 → 视为无此来源，不报错。
+pub fn migrate_handoff_agents_into(target: &Path, sources: &[PathBuf]) -> HandoffMigrationReport {
+    let mut report = HandoffMigrationReport::default();
+    for source in sources {
+        let Ok(entries) = std::fs::read_dir(source) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue; // 只迁 agent 目录，散落文件不处理
+            }
+            let Some(agent) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let dest = target.join(&agent);
+            if dest.exists() {
+                report.skipped.push(agent);
+                continue;
+            }
+            // 第一次真实拷贝时才确保 target 存在（无内容可迁不凭空建新根）
+            if let Err(e) = std::fs::create_dir_all(target) {
+                report
+                    .failed
+                    .push((agent, format!("创建 handoff 根 {target:?} 失败: {e}")));
+                continue;
+            }
+            match copy_dir_recursive(&path, &dest) {
+                Ok(()) => report.copied.push(agent),
+                Err(e) => {
+                    let msg = format!("拷贝 {agent} 目录失败: {e}");
+                    report.failed.push((agent, msg));
+                }
+            }
+        }
+    }
+    report
+}
+
+/// 递归拷贝目录内容（不存在目标层级时逐级创建）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target_path)?;
+        } else {
+            std::fs::copy(entry.path(), &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// 启动期接线：候选旧根 → 新 handoff 根的一次性合并迁移（详见 `migrate_handoff_agents_into`）。
+///
+/// 旧根候选覆盖历史全部布局：
+/// ① `<exe_dir>/.nuphus/handoff`（exe 同级）
+/// ② `<cwd>/.nuphus/handoff`（发布版 cwd 常 ≠ exe_dir）
+/// ③ `nuphus_data_dir()/.nuphus/handoff`（历史版本嵌进 data_dir 的嵌套坑）
+///
+/// 必须在 `reset_all_statuses_at_startup()` **之前**调用：后者按新根清零
+/// status.json，先迁移才能让迁过来的真实状态参与本轮生命周期判定。
+pub fn migrate_legacy_handoff_roots() -> HandoffMigrationReport {
+    let data_dir = nuphus::utils::nuphus_data_dir();
+    let target = nuphus::utils::handoff_root_from(&nuphus::utils::plugin_root(), &data_dir);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let sources = legacy_handoff_sources_at(
+        &data_dir,
+        exe_dir.as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        nuphus::profile::home_name(),
+    );
+
+    // 去重（cwd == exe_dir 时同一路径出现两次）+ 排除目标自身（自拷贝）
+    let mut uniq: Vec<PathBuf> = Vec::new();
+    for s in sources {
+        if s != target && !uniq.contains(&s) {
+            uniq.push(s);
+        }
+    }
+
+    let report = migrate_handoff_agents_into(&target, &uniq);
+    if !report.is_empty() {
+        tracing::info!(
+            "[Handoff] 旧根合并迁移: target={:?}, copied={:?}, skipped={:?}, failed={:?}",
+            target,
+            report.copied,
+            report.skipped,
+            report.failed
+        );
+    }
+    report
+}
+
+/// Keep edition migration sources separate: Lingque must never import the
+/// original application's `.nuphus` directories during an upstream upgrade.
+fn legacy_handoff_sources_at(
+    data_dir: &Path,
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    home_name: &str,
+) -> Vec<PathBuf> {
+    exe_dir
+        .into_iter()
+        .chain(cwd)
+        .chain(std::iter::once(data_dir))
+        .map(|root| root.join(home_name).join("handoff"))
+        .collect()
 }
 
 /// 应用启动时清空全部 agent 运行时状态（重启即清空，杜绝陈旧显示）。
@@ -161,7 +300,36 @@ pub fn agent_id_prefix(id: &str) -> Option<&str> {
     id.split("::").next().filter(|s| !s.is_empty())
 }
 
-/// 原子写 status.json：先写 .tmp 再 rename，避免半写残留。
+/// 从门铃事件 id 解析事件自带的 task_id（id 约定 `{agent}::{task_id}`）。
+/// 缺 `::` 分隔、task_id 段为空 → None（旧式纯 id 无从比对归属，见
+/// [`update_agent_status_from_doorbell_at`] 的一致性闸处置）。
+fn event_task_id(id: &str) -> Option<&str> {
+    id.split("::")
+        .nth(1)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// status.json 写锁：把同进程内所有 agent 的 status.json 写临界区串行化。
+/// 门铃事件（handoff_server 的 axum handler）与派发编排（ext_agent）分属不同线程，
+/// 共用固定 tmp 名时并发写会互相覆盖、甚至 rename 找不到 tmp 而丢整次写入。
+static STATUS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// status.json 临时文件序号（配合 pid）：让并发写各写各的 tmp，同进程/跨进程都不撞名。
+static STATUS_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取 status.json 写锁。锁中毒也照常放行——临界区内只做「序列化 + 写文件 + rename」，
+/// 没有需要回滚的进程内中间态， poisoned 仅说明某线程曾在临界区内 panic。
+///
+/// 注意：持锁期间**禁止**再调用 [`write_status_at`]（std Mutex 不可重入，会自死锁）；
+/// 已在临界区内时改用 [`write_status_locked`]。
+fn status_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    STATUS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 原子写 status.json：先写 tmp 再 rename，避免半写残留与并发互踩。
 /// 阶段 0 提供为模块公共 API（供阶段 1 前端运行时态面板/外部调用方消费），
 /// 阶段 0 内部写入走 root 注入的 `write_status_at`，故此处暂未在二进制内引用。
 #[allow(dead_code)]
@@ -169,13 +337,32 @@ pub fn write_status(agent: &str, status: &serde_json::Value) -> Result<(), Strin
     write_status_at(&handoff_root(), agent, status)
 }
 
+/// 原子写 status.json（自带写锁）。tmp 名带 pid + 自增序号：同一 agent 目录下多个
+/// 并发写各持一份 tmp，不会出现「对方已 rename 走、自己 rename 落空」的丢写。
 fn write_status_at(root: &Path, agent: &str, status: &serde_json::Value) -> Result<(), String> {
+    let _guard = status_write_lock();
+    write_status_locked(root, agent, status)
+}
+
+/// [`write_status_at`] 的锁内变体：调用方已通过 [`status_write_lock`] 持有写锁时用它，
+/// 以便把「读—改—写」整段纳入同一临界区（否则锁只保护 rename 前的一瞬，仍会丢更新）。
+/// tmp 名刻意不沿用仓库里常见的固定 `<file>.json.tmp`：status.json 是同进程内唯一被
+/// 两类线程（门铃 HTTP handler / 派发编排）并发读改写 + 跨进程也可能并写的文件，
+/// 固定 tmp 名会互相覆盖、或对方已 rename 走导致自己 rename 落空而整次丢写。
+fn write_status_locked(root: &Path, agent: &str, status: &serde_json::Value) -> Result<(), String> {
     let path = root.join(agent).join("status.json");
-    let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(status)
         .map_err(|e| format!("序列化 status.json 失败: {e}"))?;
+    let tmp = path.with_file_name(format!(
+        "status.json.{}.{}.tmp",
+        std::process::id(),
+        STATUS_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, content).map_err(|e| format!("写 status.json tmp 失败: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("落盘 status.json 失败: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp); // rename 失败不留垃圾 tmp
+        return Err(format!("落盘 status.json 失败: {e}"));
+    }
     Ok(())
 }
 
@@ -383,6 +570,12 @@ pub(crate) fn ensure_handoff_at(
             "updated_at".to_string(),
             serde_json::json!(chrono::Local::now().to_rfc3339()),
         );
+        // 新一轮派发清掉上一轮的失败痕迹：否则上一轮 error 的 error_reason 会留在
+        // 一个 state=dispatched 的新 record 旁边，读文件的人无法判断现在到底失没失败
+        // （与下面「清掉上一轮审计结论」同一纪律）。
+        obj.remove("error_reason");
+        obj.remove("error_task_id");
+        obj.remove("error_at");
         // 派发基线：目标工作区 + 当下 HEAD。非 git 目录 / git 不可用 / 未声明 workspace
         // → 不记（宁可缺失，不可错记）；新一轮派发清掉上一轮的审计结论。
         match workspace.map(str::trim).filter(|s| !s.is_empty()) {
@@ -407,6 +600,63 @@ pub(crate) fn ensure_handoff_at(
     write_status_at(root, agent, &doc)?;
 
     Ok(build_contract(agent, task_id, &dir))
+}
+
+/// 派发失败 → 给该 agent 落 error 态，打破「state 永久停在 dispatched」的幽灵
+/// （前端 `ExternalAgentsStatusBar` 早把 `error` 映射成 is-error，只差没人写它）。
+///
+/// `reason` 必须人类可读且能指认失败环节，让用户判断是「进程没起来 / 窗口没捕获 /
+/// 输入没进去」中的哪一种（前端暂不展示原因，人打开 status.json 即可定位）。
+///
+/// 语义纪律：
+/// - 上板**前**失败（agent 未登记、brief 写不进、workspace 不是目录）同样要落 —— 否则
+///   状态栏还停在上一轮 state，用户看不到本轮派发根本没成功；
+/// - 只动 state/error 相关字段，绝不覆盖别的轮次：`task_id` 仅在「当前无在途任务」
+///   （空/缺失）时补记本次失败的任务，失败任务自身记在 `error_task_id` 里；
+/// - 落 error 本身失败只 warn，绝不因此改变派发的错误返回。
+pub(crate) fn mark_agent_error_at(root: &Path, agent: &str, task_id: Option<&str>, reason: &str) {
+    if let Err(e) = validate_agent(agent) {
+        tracing::warn!("[Handoff] 落 error 态被拒：agent 名非法（{e}）");
+        return;
+    }
+    // 目录可能还不存在（agent 从未初始化/未登记也得能看到失败），补建后再写
+    if let Err(e) = std::fs::create_dir_all(root.join(agent)) {
+        tracing::warn!("[Handoff] 落 error 态失败：无法创建 agent[{agent}] 目录: {e}");
+        return;
+    }
+    let task = task_id.map(str::trim).filter(|s| !s.is_empty());
+    let _guard = status_write_lock();
+    let mut doc = match read_status_at(root, agent) {
+        Some(d) if d.as_object().is_some() => d,
+        _ => serde_json::json!({
+            "agent": agent,
+            "state": "idle",
+            "task_id": "",
+            "last_event": null
+        }),
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
+    let has_task = obj
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !has_task {
+        // 无在途任务才补 task_id：有在途任务时它是另一轮的归属，不能在本轮失败里被改写
+        obj.insert("task_id".to_string(), serde_json::json!(task.unwrap_or("")));
+    }
+    let now = chrono::Local::now().to_rfc3339();
+    obj.insert("state".to_string(), serde_json::json!("error"));
+    obj.insert("error_reason".to_string(), serde_json::json!(reason));
+    obj.insert("error_task_id".to_string(), serde_json::json!(task));
+    obj.insert("error_at".to_string(), serde_json::json!(now.clone()));
+    obj.insert("updated_at".to_string(), serde_json::json!(now));
+    if let Err(e) = write_status_locked(root, agent, &doc) {
+        tracing::warn!("[Handoff] 落 agent[{agent}] error 态失败: {e}");
+    }
 }
 
 /// 查询 agent 当前状态；未初始化返回 {"state":"uninitialized"}
@@ -700,6 +950,15 @@ pub(crate) fn build_contract(agent: &str, task_id: &str, dir: &Path) -> String {
 ///
 /// 状态映射：progress→in_progress / done→done / blocked→blocked。
 /// ready 保留兼容解析（旧 Agent 可能仍上报），但产品流程（read.md/契约）不再要求 ready。
+///
+/// ## task_id 一致性闸
+/// status.json 的 `task_id` 是「当前在板上的是哪一轮任务」，由 [`ensure_handoff_at`] 在上板时写入。
+/// 上一轮的迟到事件（task_A 的 progress/done 晚于 task_B 上板到达）若直接落盘，就会把 task_A 的
+/// 结论写到 task_B 的 state/task_id 上，并拿 task_B 的 `base_head` 基线跑完工审计——命中后
+/// 经 handoff_server 推出「本轮出现了不是你派发的提交」的误报，连唤醒指令都指错任务。
+/// 因此：事件自带 task_id 与板上 task_id **不一致时**只追加 `last_event`（保留事件原值）+
+/// warn，不动 state/task_id、不跑 head_audit、不返回审计结论。事件本身绝不丢弃——done/blocked
+/// 是唯一唤醒源，唤醒只认事件 status 与 status.json 无关，保守落盘不影响它进队。
 pub fn update_agent_status_from_doorbell(
     id: &str,
     status: &str,
@@ -724,9 +983,54 @@ fn update_agent_status_from_doorbell_at(
         "blocked" => "blocked",
         _ => return None, // 未知状态：不落盘（与 push_event 校验语义一致）
     };
+    // 整段「读—判—改—写」在同一把写锁内完成：门铃 handler 与派发编排分属不同线程，
+    // 只锁写不锁读会先读到旧 doc、再把旧 task_id/基线写回去（丢更新）。
+    // 代价是完工审计的 git 查询也在锁内（done/blocked 才走，事件低频，可接受）。
+    let _guard = status_write_lock();
     // 未初始化 / 无 status.json / 不是对象 → 静默跳过，不覆盖
     let mut doc = read_status_at(root, agent)?;
     doc.as_object()?;
+
+    // 一致性闸：只在「板上已有明确 task_id 且事件也带 task_id」时可判。
+    // doc.task_id 为空/缺失（从未派发）或事件为旧式无 `::` 纯 id → 无从比对，维持原行为
+    // （这类情况下 doc 也没有 workspace/base_head 审计基线，不会推出错误结论）。
+    let event_task = event_task_id(id);
+    let board_task = doc
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let stale = matches!((board_task, event_task), (Some(b), Some(e)) if b != e);
+    if stale {
+        // 跨任务迟到事件：事件是真的（可能是上一轮的真实完工），所以 last_event 照记并
+        // 保留事件自带 task_id 原值供追溯；但 state/task_id 属于板上那一轮，不能改。
+        tracing::warn!(
+            "[Handoff] 忽略跨任务迟到事件的 state 变更：agent[{agent}] 板上 task_id={}，事件 {} 属于 task_id={}（只记 last_event，不改 state/task_id、不跑完工审计）",
+            board_task.unwrap_or_default(),
+            id,
+            event_task.unwrap_or_default()
+        );
+        let obj = doc.as_object_mut()?;
+        obj.insert(
+            "last_event".to_string(),
+            serde_json::json!({
+                "status": status,
+                "summary": summary,
+                "report_path": report_path,
+                "task_id": event_task,
+                "ts": chrono::Local::now().to_rfc3339(),
+            }),
+        );
+        obj.insert(
+            "updated_at".to_string(),
+            serde_json::json!(chrono::Local::now().to_rfc3339()),
+        );
+        if let Err(e) = write_status_locked(root, agent, &doc) {
+            tracing::warn!("[Handoff] 追加 agent[{agent}] last_event 失败（不影响门铃流程）: {e}");
+        }
+        return None;
+    }
+
     // 完工审计：只在 done/blocked 上做（progress 只是开工确认，此时工作区还没动）。
     let audit = if matches!(status, "done" | "blocked") {
         head_audit(&doc)
@@ -761,7 +1065,7 @@ fn update_agent_status_from_doorbell_at(
         "updated_at".to_string(),
         serde_json::json!(chrono::Local::now().to_rfc3339()),
     );
-    if let Err(e) = write_status_at(root, agent, &doc) {
+    if let Err(e) = write_status_locked(root, agent, &doc) {
         tracing::warn!("[Handoff] 更新 agent[{agent}] status.json 失败（不影响门铃流程）: {e}");
     }
     audit
@@ -770,6 +1074,66 @@ fn update_agent_status_from_doorbell_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lingque_handoff_migration_does_not_import_original_data() {
+        let root = std::env::temp_dir().join(format!("lingque-handoff-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let exe = root.join("app");
+        let cwd = root.join("cwd");
+        for base in [&data, &exe, &cwd] {
+            let original = base.join(".nuphus/handoff/original-agent");
+            std::fs::create_dir_all(&original).unwrap();
+            std::fs::write(original.join("memory.md"), "original").unwrap();
+        }
+        let legacy = data.join(".nuphus-workbench/handoff/lingque-agent");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("memory.md"), "lingque").unwrap();
+        let sources = legacy_handoff_sources_at(&data, Some(&exe), Some(&cwd), ".nuphus-workbench");
+        let target = data.join("handoff");
+        let report = migrate_handoff_agents_into(&target, &sources);
+        assert_eq!(report.copied, vec!["lingque-agent"]);
+        assert!(!target.join("original-agent").exists());
+        std::fs::write(target.join("lingque-agent/memory.md"), "newer").unwrap();
+        let repeated = migrate_handoff_agents_into(&target, &sources);
+        assert!(repeated.copied.is_empty());
+        assert_eq!(repeated.skipped, vec!["lingque-agent"]);
+        assert_eq!(
+            std::fs::read_to_string(target.join("lingque-agent/memory.md")).unwrap(),
+            "newer"
+        );
+        assert!(legacy.join("memory.md").exists());
+        assert!(cwd
+            .join(".nuphus/handoff/original-agent/memory.md")
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn original_handoff_migration_sources_remain_compatible() {
+        let sources = legacy_handoff_sources_at(
+            Path::new("data"),
+            Some(Path::new("app")),
+            Some(Path::new("cwd")),
+            ".nuphus",
+        );
+        assert_eq!(
+            sources,
+            vec![
+                PathBuf::from("app/.nuphus/handoff"),
+                PathBuf::from("cwd/.nuphus/handoff"),
+                PathBuf::from("data/.nuphus/handoff"),
+            ]
+        );
+        assert_eq!(
+            nuphus::profile::home_name(),
+            if nuphus::profile::WORKBENCH {
+                ".nuphus-workbench"
+            } else {
+                ".nuphus"
+            }
+        );
+    }
 
     /// 隔离测试根目录：每个用例独立 tmp 子目录，避免污染真实 .nuphus/handoff
     fn tmp_root(name: &str) -> PathBuf {
@@ -1015,6 +1379,96 @@ mod tests {
         assert_eq!(status_at(&root, "ghost")["state"], "uninitialized");
     }
 
+    /// 多源合并 + agent 目录级跳过：目标已有该 agent 目录必须原样保留
+    /// （绝不「整根存在即跳过」——那会导致建出新根后迁移永不触发）。
+    #[test]
+    fn test_migrate_handoff_merges_sources_with_agent_level_skip() {
+        let base = tmp_root("migrate");
+        let target = base.join("target");
+        let src1 = base.join("src1");
+        let src2 = base.join("src2");
+
+        // src1：web_agent（含子目录递归内容）+ claude-code + 散落文件
+        std::fs::create_dir_all(src1.join("web_agent").join("briefs")).unwrap();
+        std::fs::write(src1.join("web_agent").join("read.md"), "src1 web").unwrap();
+        std::fs::write(
+            src1.join("web_agent").join("briefs").join("t1-brief.md"),
+            "b1",
+        )
+        .unwrap();
+        std::fs::create_dir_all(src1.join("claude-code")).unwrap();
+        std::fs::write(src1.join("claude-code").join("read.md"), "src1 cc").unwrap();
+        std::fs::write(src1.join("loose-file.md"), "x").unwrap();
+
+        // src2：web_agent（旧副本，必须被跳过）+ gemini
+        std::fs::create_dir_all(src2.join("web_agent")).unwrap();
+        std::fs::write(src2.join("web_agent").join("read.md"), "src2 web").unwrap();
+        std::fs::create_dir_all(src2.join("gemini")).unwrap();
+        std::fs::write(src2.join("gemini").join("status.json"), "{}").unwrap();
+
+        // target 已有 claude-code（新根数据优先，旧副本不得覆盖）
+        std::fs::create_dir_all(target.join("claude-code")).unwrap();
+        std::fs::write(target.join("claude-code").join("read.md"), "target cc").unwrap();
+
+        let report = migrate_handoff_agents_into(&target, &[src1.clone(), src2.clone()]);
+
+        // read_dir 顺序不保证，两个汇总都按「排序后比较集合」断言。
+        // 同一 agent 在多个来源出现时首个 copy、其余 skip：因此 src2 的 web_agent
+        // 旧副本**也会进 skipped**——这正是「不覆盖已有数据」的期望行为（见下方
+        // 「src2 同名副本被跳过不覆盖」的断言），不是漏记。
+        let mut copied = report.copied.clone();
+        copied.sort();
+        assert_eq!(
+            copied,
+            vec!["gemini".to_string(), "web_agent".to_string()],
+            "copied 应含两个真实拷入的 agent"
+        );
+        let mut skipped = report.skipped.clone();
+        skipped.sort();
+        assert_eq!(
+            skipped,
+            vec!["claude-code".to_string(), "web_agent".to_string()],
+            "目标已有的 agent 与后到的同名旧副本，都必须逐个跳过并记录"
+        );
+        assert!(report.failed.is_empty());
+
+        // web_agent 来自 src1（含子目录递归拷贝）；src2 同名副本被跳过不覆盖
+        assert_eq!(
+            std::fs::read_to_string(target.join("web_agent").join("read.md")).unwrap(),
+            "src1 web"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("web_agent").join("briefs").join("t1-brief.md"))
+                .unwrap(),
+            "b1"
+        );
+        // claude-code 保留目标版本（agent 目录级跳过的核心语义）
+        assert_eq!(
+            std::fs::read_to_string(target.join("claude-code").join("read.md")).unwrap(),
+            "target cc"
+        );
+        assert!(target.join("gemini").join("status.json").is_file());
+        assert!(
+            !target.join("loose-file.md").exists(),
+            "散落文件不属于 agent 目录"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 全部来源不存在 → 空汇总，且不得凭空创建新根。
+    #[test]
+    fn test_migrate_handoff_tolerates_missing_sources() {
+        let base = tmp_root("migrate-empty");
+        let target = base.join("target");
+        let report =
+            migrate_handoff_agents_into(&target, &[base.join("nope1"), base.join("nope2")]);
+        assert!(report.is_empty());
+        assert!(!target.exists(), "无内容可迁时不得创建空的新根");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn test_list_agent_statuses() {
         let root = tmp_root("list");
@@ -1092,6 +1546,247 @@ mod tests {
         update_agent_status_from_doorbell_at(&root, "web_agent::task-001", "running", "x", None);
     }
 
+    /// 一致性闸（回归 issue #69 第 2 项①）：上一轮的迟到 done 不得把结论写到下一轮头上。
+    /// 同时守住 ②：不一致时 last_event 照记（保留事件自带 task_id）、不跑 head_audit。
+    #[test]
+    fn test_stale_cross_task_doorbell_is_isolated_from_current_task() {
+        let root = tmp_root("stale-task");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        let Some((ws, base)) = tmp_git_workspace("stale-repo") else {
+            eprintln!("跳过：环境无 git");
+            return;
+        };
+
+        // 轮次 A 上板（记基线 base）
+        ensure_handoff_at(&root, "web_agent", "task-A", "任务A", Some(&ws)).unwrap();
+        assert_eq!(
+            status_json(&root, "web_agent")["base_head"],
+            serde_json::json!(base)
+        );
+
+        // A 执行期间工作区多出一个 commit（A 的真实产出）
+        assert!(git_run(
+            Path::new(&ws),
+            &["commit", "-q", "--allow-empty", "-m", "A work"]
+        )
+        .is_some());
+        let head_a = git_run(Path::new(&ws), &["rev-parse", "HEAD"]).unwrap();
+
+        // 轮次 B 上板：基线重新快照为 head_a，板上 task_id 变成 task-B
+        ensure_handoff_at(&root, "web_agent", "task-B", "任务B", Some(&ws)).unwrap();
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["task_id"], "task-B");
+        assert_eq!(status["base_head"], serde_json::json!(head_a));
+
+        // B 执行期间又出一个 commit（相对 B 的基线也是「变了」）
+        assert!(git_run(
+            Path::new(&ws),
+            &["commit", "-q", "--allow-empty", "-m", "B work"]
+        )
+        .is_some());
+
+        // A 的 done 迟到到达：不得返回审计结论（否则 handoff_server 会推「本轮出现了
+        // 不是你派发的提交」的误报），不得改 B 的 state/task_id，不得写 head_check
+        let audit = update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-A",
+            "done",
+            "A 完成（迟到）",
+            Some("C:/a-report.md"),
+        );
+        assert!(audit.is_none(), "跨任务迟到事件不得产出完工审计结论");
+        let status = status_json(&root, "web_agent");
+        assert_eq!(
+            status["state"], "dispatched",
+            "不允许用上一轮的结论覆盖 B 的 state"
+        );
+        assert_eq!(status["task_id"], "task-B", "不允许改写板上 task_id");
+        assert!(
+            status.get("head_check").is_none(),
+            "不得用 B 的基线审 A 的事件"
+        );
+        assert_eq!(status["last_event"]["status"], "done", "事件本身不许被丢弃");
+        assert_eq!(
+            status["last_event"]["task_id"], "task-A",
+            "last_event 必须保留事件自带的 task_id 原值以便追溯"
+        );
+        assert_eq!(status["last_event"]["report_path"], "C:/a-report.md");
+
+        // B 自己的 done 按时到达：正常路径零变化（审计照跑、state 照改、唤醒照常）
+        let audit = update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-B",
+            "done",
+            "B 完成",
+            None,
+        )
+        .expect("本轮任务的完工必须正常审计");
+        assert!(audit.changed, "B 的基线 head_a 之后确实有新提交");
+        assert_eq!(audit.workspace, ws);
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["state"], "done");
+        assert_eq!(status["task_id"], "task-B");
+        assert_eq!(status["head_check"]["changed"], serde_json::json!(true));
+    }
+
+    /// 上板后失败落 error 态（回归 issue #69 第 2 项②）：打破 dispatched 永久幽灵，
+    /// 且 error 不是终态——同一任务的门铃照常恢复 state。
+    #[test]
+    fn test_mark_agent_error_state_and_recovery() {
+        let root = tmp_root("error-state");
+
+        // ① agent 从未初始化/未登记（上板前失败）也要能看到 error
+        mark_agent_error_at(
+            &root,
+            "ghost_agent",
+            Some("task-001"),
+            "agent「ghost_agent」未在 team.toml 登记，请先在外部 Agent 配置中心登记",
+        );
+        let status = status_json(&root, "ghost_agent");
+        assert_eq!(status["state"], "error");
+        assert_eq!(
+            status["task_id"], "task-001",
+            "无在途任务时补记本次失败的任务"
+        );
+        assert_eq!(status["error_task_id"], "task-001");
+        assert!(status["error_reason"]
+            .as_str()
+            .unwrap()
+            .contains("未在 team.toml 登记"));
+        assert!(status["error_at"].as_str().is_some());
+
+        // ② 上板后失败：另一轮在途任务的 task_id 不被本轮失败改写
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-A", "任务A", None).unwrap();
+        mark_agent_error_at(
+            &root,
+            "web_agent",
+            Some("task-B"),
+            "投递失败（第 3 步 desktop_input）：hwnd 已失效",
+        );
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["state"], "error");
+        assert_eq!(status["task_id"], "task-A", "不能覆盖另一轮在途任务的归属");
+        assert_eq!(status["error_task_id"], "task-B");
+        assert!(status["error_reason"]
+            .as_str()
+            .unwrap()
+            .contains("desktop_input"));
+        assert!(
+            status.get("dispatched_at").is_some(),
+            "error 态不清空其他字段"
+        );
+
+        // ③ 非法 agent 名 → 拒绝落盘，不 panic、不建目录
+        mark_agent_error_at(&root, "../evil", Some("t"), "x");
+        assert!(!root.parent().unwrap().join("evil").exists());
+
+        // ④ error 不是终态：同任务的后续门铃照常改写 state（接管 SOP 补投递后的恢复路径）
+        assert!(update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-A",
+            "done",
+            "完成",
+            None
+        )
+        .is_none());
+        assert_eq!(status_json(&root, "web_agent")["state"], "done");
+        assert_eq!(
+            status_json(&root, "web_agent")["task_id"],
+            "task-A",
+            "一致时不改 task_id"
+        );
+
+        // ⑤ 重新派发清掉上一轮的失败痕迹（与「清掉上一轮审计结论」同一纪律）：
+        // 否则 error_reason 会留在一个 state=dispatched 的新 record 旁边误导读文件的人
+        ensure_handoff_at(&root, "web_agent", "task-B", "任务B", None).unwrap();
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["state"], "dispatched");
+        assert_eq!(status["task_id"], "task-B");
+        assert!(
+            status.get("error_reason").is_none(),
+            "新一轮派发必须清掉上一轮 error 痕迹"
+        );
+        assert!(status.get("error_at").is_none());
+    }
+
+    /// 并发写 status.json 不丢数据（回归 issue #69 附录 A）：每个写入都成功、最终文件是
+    /// 某一次写入的完整快照、不留 tmp 残留。
+    #[test]
+    fn test_concurrent_status_writes_do_not_lose_data() {
+        let root = tmp_root("concurrent-write");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        let n = 8u64;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = serde_json::json!({
+                    "agent": "web_agent",
+                    "state": "in_progress",
+                    "task_id": format!("task-{i}"),
+                    "seq": i,
+                });
+                write_status_at(&root, "web_agent", &payload)
+            }));
+        }
+        for h in handles {
+            assert!(h.join().unwrap().is_ok(), "并发写不允许丢写");
+        }
+        let final_doc = status_json(&root, "web_agent");
+        assert!(
+            (0..n).any(|i| final_doc["seq"] == serde_json::json!(i)),
+            "最终内容必须是某一次写入的完整快照，实际: {final_doc}"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(root.join("web_agent"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rename 完成后不得残留 tmp: {leftovers:?}"
+        );
+    }
+
+    /// 并发门铃事件（读—改—写整段在锁内）不产生半写/混合内容。
+    #[test]
+    fn test_concurrent_doorbell_events_keep_status_json_intact() {
+        let root = tmp_root("concurrent-doorbell");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-001", "任务", None).unwrap();
+        let n = 8u64;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                update_agent_status_from_doorbell_at(
+                    &root,
+                    "web_agent::task-001",
+                    "progress",
+                    &format!("进展 {i}"),
+                    None,
+                )
+            }));
+        }
+        for h in handles {
+            assert!(h.join().unwrap().is_none(), "progress 不产出审计结论");
+        }
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["state"], "in_progress");
+        let summaries: Vec<String> = (0..n).map(|i| format!("进展 {i}")).collect();
+        assert!(
+            summaries.contains(
+                &status["last_event"]["summary"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            ),
+            "last_event 必须是某一条事件的完整记录"
+        );
+    }
+
     #[test]
     fn test_agent_id_prefix() {
         assert_eq!(agent_id_prefix("web_agent::task-1"), Some("web_agent"));
@@ -1099,6 +1794,17 @@ mod tests {
         assert_eq!(agent_id_prefix("web_agent"), Some("web_agent")); // 无 '::' 退化为整串，不匹配目录即跳过
         assert_eq!(agent_id_prefix(""), None);
         assert_eq!(agent_id_prefix("::foo"), None);
+    }
+
+    /// 事件自带 task_id 解析：一致性闸的判据来源。
+    #[test]
+    fn test_event_task_id() {
+        assert_eq!(event_task_id("web_agent::task-001"), Some("task-001"));
+        assert_eq!(event_task_id("claude-code::0728-01"), Some("0728-01"));
+        // 旧式无 '::' 纯 id 不带 task_id → 无从比对归属
+        assert_eq!(event_task_id("web_agent"), None);
+        // task_id 段为空视作缺失
+        assert_eq!(event_task_id("web_agent::"), None);
     }
 
     /// 用 std FileTimes 固定 mtime，保证排序断言确定性

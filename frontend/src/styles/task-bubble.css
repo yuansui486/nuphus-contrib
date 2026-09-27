@@ -149,10 +149,6 @@
   border: 1px solid transparent;
 }
 
-.task-track-item.expandable {
-  cursor: pointer;
-}
-
 .task-track-item:hover {
   background: var(--glass-0);
   border-color: var(--glass-1);
@@ -166,44 +162,6 @@
   min-width: 0;
 }
 
-/* ── 展开 chevron ── */
-.task-track-chevron {
-  flex-shrink: 0;
-  font-size: 8px;
-  color: var(--spark-dim);
-  transition: transform 0.2s ease;
-}
-
-.task-track-chevron.open {
-  transform: rotate(180deg);
-}
-
-/* ── 步骤详情（planner 理解全文）── */
-.task-track-detail {
-  margin: 6px 2px 2px 26px; /* 左对齐 name（dot 18px + gap 8px） */
-  padding: 6px 10px;
-  background: var(--glass-0);
-  border-left: 2px solid var(--glass-2);
-  border-radius: 6px;
-  font-size: var(--fz-sm);
-  line-height: 1.65;
-  color: var(--spark-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  animation: taskTrackDetailIn 0.18s ease-out;
-}
-
-@keyframes taskTrackDetailIn {
-  from {
-    opacity: 0;
-    transform: translateY(-3px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 .task-track-dot {
   width: 18px;
   height: 18px;
@@ -211,16 +169,23 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 9px;
-  font-weight: 700;
   flex-shrink: 0;
   transition: all 0.35s ease;
 }
 
-.task-track-dot.pending {
-  background: var(--glass-2);
-  color: var(--spark-dim);
-  opacity: 0.6;
+/* 图标本身不拥有颜色：stroke 用 currentColor，由外层 .task-track-dot.<state> 决定 */
+.task-track-glyph {
+  display: block;
+}
+
+.task-track-glyph.spin {
+  animation: taskTrackSpin 1.6s linear infinite;
+}
+
+@keyframes taskTrackSpin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .task-track-dot.running {
@@ -246,6 +211,19 @@
   background: var(--glass-2);
   color: var(--spark-dim);
   opacity: 0.4;
+}
+
+/* 附加信息（重试计数 / 计划归属 / 耗时）：沿用原有小号弱化文字的语言，
+   不加底色不加 pill —— 以前那套样式的观感就够了 */
+.task-track-attempt,
+.task-track-origin,
+.task-track-duration {
+  margin-left: 6px;
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--spark-dim);
+  letter-spacing: 0.3px;
 }
 
 @keyframes dotPulse {

@@ -636,11 +636,15 @@ export interface ExternalAgentConfig {
   note?: string
   /** Agent 工作目录（用户个性化配置；Leader 查找/定位用） */
   dir?: string
-  // ── v8 交互固化字段（终端型推荐配置；agent_dispatch 使用）──
+  // ── v8 交互固化字段 ──
+  // 当前生效（agent_dispatch 真实消费）：
   launch?: string
   window_hint?: string
-  cooldown_secs?: number
   dispatch_steps?: Array<{ tool: string; with?: Record<string, unknown> }>
+
+  // ── 以下字段服务端仍会解析并返回（team.toml AgentFields schema 不动，
+  // 旧配置兼容），但当前不被 agent_dispatch 消费，UI 已不再提供编辑入口 ──
+  cooldown_secs?: number
   await_timeout_secs?: number
   timeout_action?: string
   timeout_script?: string
@@ -659,9 +663,9 @@ export function upsertExternalAgent(agent: ExternalAgentConfig) {
   return invoke<string>('upsert_external_agent', { agent })
 }
 
-/** 删除外部 Agent 段（不删除 .nuphus/handoff/{key}/ 目录） */
+/** 删除外部 Agent 段（不删除 .nuphus/handoff/{key}/ 目录）；false = 本来就不存在（零改动） */
 export function deleteExternalAgent(key: string) {
-  return invoke<void>('delete_external_agent', { key })
+  return invoke<boolean>('delete_external_agent', { key })
 }
 
 /** 提取应用图标为 data URL（图片文件直接编码；exe/dll/ico 提取关联图标转 PNG） */
@@ -1050,6 +1054,22 @@ export function updateCustomProvider(
     headers,
     oauth,
   })
+}
+
+/**
+ * 删除自定义模型实例 —— 模型页左栏「自定义模型」条目删除图标的落盘入口。
+ *
+ * 后端整段移除 `providers.toml` 里对应的 `[[providers]]`（见
+ * `remove_provider_segment`），不只是清空段内模型列表。
+ *
+ * 返回 `false` 表示**段本来就不存在**（重复删除 / 已被外部改动），这不是错误：
+ * 调用方想达成的「该实例不存在」已经成立，应静默收敛而不是弹失败。
+ * 只有真正的 IO / 解析失败才 reject。
+ *
+ * 删除只落盘、不同步运行时：调用方负责在成功后重新拉取服务商列表。
+ */
+export function removeCustomProvider(name: string) {
+  return invoke<boolean>('remove_custom_provider', { name })
 }
 
 // ── OAuth 订阅登录（custom 实例的授权码 + 本地回调流程）──

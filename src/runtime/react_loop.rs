@@ -3,7 +3,7 @@
 //! ReactAgent::run()'s ~630 line loop body is inlined here;
 //! Runtime truly owns the execution loop, ReactAgent degrades to a pure state container.
 
-use crate::agent::events::{NuphusEvent, TaskItem};
+use crate::agent::events::NuphusEvent;
 use crate::agent::prompt;
 use crate::agent::reminders::{ReminderCategory, ReminderPriority};
 use crate::runtime::protection::{ProtectionAlert, ProtectionGuard};
@@ -271,7 +271,23 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
         // Prevents infinite follow-up loops; resets each run() call.
         let mut reasoning_followup_done = false;
 
+        // ── 跨迭代 text 边界分隔（issue #66 后续）──
+        // 前端把 llm_text_delta 做纯字符串拼接（useEvents.ts：m.content + event.text
+        // 与 last.text + event.text），自身不插任何分隔——它无法知道一轮 LLM 调用
+        // 在哪里结束。一轮任务通常横跨多个 react 迭代（每次工具调用后又是一轮 LLM），
+        // 于是上一轮末句与下一轮首句直接相邻：MarkdownContent 收到的是整块无 \n 的
+        // 文本，走单行分支不产 span.md-line，多步过程性文字塌成连续文字流。
+        // 这里在每轮「首个内容 text」之前补一个换行；本轮无 text 则不补，纯工具轮
+        // 不会留下孤立空行。修在 Rust 侧而非前端，一次覆盖气泡 / timeline / mobile。
+        let stream_text_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         for iteration in 0..self.agent.config.max_iterations {
+            // 本轮是否需要补分隔 = 此前是否已有迭代产出过内容 text。
+            // 用独立 Arc 而非复用 stream_text_seen：发出即清零，保证同轮后续
+            // chunk 不会被反复插入换行。
+            let break_before_text = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                stream_text_seen.load(std::sync::atomic::Ordering::SeqCst),
+            ));
             if iteration > 0 && iteration % 5 == 0 {
                 let progress = crate::agent::common::render_ascii_progress(
                     iteration,
@@ -442,6 +458,8 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                 let collected_clone = collected.clone();
                 let think_state = in_think.clone();
                 let first_token_clone = first_token_at.clone();
+                let break_before_text_clone = break_before_text.clone();
+                let stream_text_seen_clone = stream_text_seen.clone();
                 let emitter = Box::new(move |event: crate::api::AssistantEvent| {
                     // 首 token 时间戳：首个内容/推理 chunk 到达即记录（dsh turn-metrics
                     // 的 firstTokenTime 等价物）。TTFT = 该戳 - gen_attempt_start。
@@ -456,17 +474,26 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         }
                     }
                     if let crate::api::AssistantEvent::TextDelta(text) = &event {
+                        // 迭代边界分隔：本内容 chunk 若是本轮首个可见 text 且此前已有
+                        // 迭代产出过 text，先补一个换行（swap 保证同轮只补一次）
+                        if break_before_text_clone.swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            crate::agent::common::emit_text_break(exec_emitter.as_deref(), false);
+                        }
                         // Single routing entry: process_text_delta (think split +
                         // tool-XML strip with the provider tag set), then emit
                         // thinking (is_thinking=true) before content
                         // (is_thinking=false) so the frontend order is stable.
-                        crate::agent::common::route_stream_text_delta(
+                        if crate::agent::common::route_stream_text_delta(
                             text,
                             &think_state,
                             content_tool_tags,
                             false,
                             exec_emitter.as_deref(),
-                        );
+                        ) {
+                            // 本轮确实产出了可见 text → 下一轮需要补分隔
+                            stream_text_seen_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     if let crate::api::AssistantEvent::Reasoning(text) = &event {
                         // DeepSeek thinking mode: reasoning_content deltas arrive as
@@ -1377,40 +1404,10 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                 };
                 self.agent.steps.push(step.clone());
 
-                // planner_create success → push TaskList
-                if call.tool == "planner_create" && result.success {
-                    if let Some(ref output) = result.output {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(output) {
-                            if let Some(plan) = parsed.get("plan") {
-                                if let Some(tasks) = plan.get("tasks").and_then(|t| t.as_array()) {
-                                    let task_items: Vec<TaskItem> = tasks
-                                        .iter()
-                                        .enumerate()
-                                        .filter_map(|(i, t)| {
-                                            Some(TaskItem {
-                                                id: i + 1,
-                                                name: t.get("name")?.as_str()?.to_string(),
-                                                status: "pending".to_string(),
-                                            })
-                                        })
-                                        .collect();
-                                    if !task_items.is_empty() {
-                                        if let Some(ref emitter) = self.agent.exec_emitter {
-                                            emitter.emit(NuphusEvent::TaskList {
-                                                plan_path: parsed
-                                                    .get("plan_path")
-                                                    .and_then(|p| p.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string(),
-                                                tasks: task_items,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                // 注意：这里**不再**因 planner_create 成功而推任务列表。
+                // 计划文档是「理解传递」工件，任务列表的上墙归 dispatch 的 TaskRun 台账
+                // （见 runtime::dispatch / agent::task_run）——传递层与显示层单向切开，
+                // 墙不再来自文档，未派发的任务不该出现在执行面板上。
 
                 if result.success {
                     let output_str = result.output.as_deref().unwrap_or("");

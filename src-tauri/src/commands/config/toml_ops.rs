@@ -884,6 +884,58 @@ pub fn clear_provider_models_in_config_toml(
     Ok(0)
 }
 
+/// Remove a whole `[[providers]]` entry (by its `name`) from config.toml.
+///
+/// 与 `clear_provider_models_in_config_toml` 的分工：那个只清空段内 `models`
+/// 数组、保留段本身；这里整段删除。用于「删除自定义模型实例」——用户要求的是
+/// 从本地配置里彻底移除该中转站，而不是留一个空壳段。
+///
+/// 返回是否真的删除了东西（段不存在 = `false`，不算错误：重复删除 / 已被外部
+/// 改动时调用方应静默收敛，而不是弹一个失败）。
+///
+/// 写了同样的加密回写路径（`encrypt_plaintext_provider_keys`）：本函数只删段，
+/// 但序列化前仍会走一遍密钥加密，避免「删一段把旁别的明文 key 落成明文」。
+pub fn remove_provider_segment(
+    config_path: &std::path::Path,
+    provider_name: &str,
+) -> Result<bool, String> {
+    // 文件不存在 = 没什么可删
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    let mut doc: toml::Value = match content.parse() {
+        Ok(d) => d,
+        Err(e) => return Err(format!("parse config.toml failed: {}", e)),
+    };
+
+    let providers = match doc.get_mut("providers").and_then(|p| p.as_array_mut()) {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    let before = providers.len();
+    // 只删 name 精确匹配的段。自定义实例的段 id 即 name（前端按 slug 生成），
+    // 与内置 provider 的 name（opencode-go / custom / local 等）不会碰撞。
+    providers.retain(|p| p.get("name").and_then(|n| n.as_str()) != Some(provider_name));
+    let removed = before - providers.len();
+    if removed == 0 {
+        return Ok(false);
+    }
+
+    nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
+    let new_content =
+        toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {}", e))?;
+    std::fs::write(config_path, new_content)
+        .map_err(|e| format!("write config.toml failed: {}", e))?;
+    tracing::info!(
+        "remove_provider_segment: removed {} segment(s) for provider={}",
+        removed,
+        provider_name
+    );
+    Ok(true)
+}
+
 /// Update `reasoning_effort` on a `[[providers]]` entry in config.toml.
 /// `None`/empty removes the field so the provider returns to its default
 /// (transport sends no `reasoning_effort` parameter).
@@ -1767,6 +1819,85 @@ mod tests {
         ));
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    /// 删除自定义实例：整段从 providers 数组消失，其余段原样保留。
+    #[test]
+    fn remove_provider_segment_drops_only_target_segment() {
+        let path = write_temp_config(
+            r#"
+[[providers]]
+name = "deepseek"
+provider_type = "deepseek"
+api_key = "sk-keep"
+base_url = "https://api.deepseek.com"
+
+[[providers]]
+name = "custom-my-relay"
+display_name = "我的中转站"
+provider_type = "custom"
+base_url = "https://relay.example/v1"
+
+[[providers]]
+name = "opencode-go"
+provider_type = "opencode-go"
+base_url = "https://opencode.ai/zen/go/v1"
+"#,
+        );
+
+        let removed = remove_provider_segment(&path, "custom-my-relay").unwrap();
+        assert!(removed, "目标段存在时应报告已删除");
+
+        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let providers = doc.get("providers").and_then(|p| p.as_array()).unwrap();
+        assert_eq!(providers.len(), 2, "只删目标段，其余两个必须保留");
+        let names: Vec<&str> = providers
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["deepseek", "opencode-go"]);
+        assert!(
+            !names.contains(&"custom-my-relay"),
+            "目标段必须已移除: {names:?}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 目标段不存在时返回 false 而非报错：重复删除 / 已被外部改动时应静默收敛。
+    #[test]
+    fn remove_provider_segment_absent_is_not_an_error() {
+        let path = write_temp_config(
+            r#"
+[[providers]]
+name = "deepseek"
+provider_type = "deepseek"
+"#,
+        );
+
+        let removed = remove_provider_segment(&path, "custom-never-existed").unwrap();
+        assert!(!removed, "段不存在时不得声称删除了东西");
+
+        let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc.get("providers")
+                .and_then(|p| p.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            1,
+            "不得误删任何段"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 配置文件不存在时同样是 Ok(false)：不能因为「没文件」就让调用方弹失败。
+    #[test]
+    fn remove_provider_segment_missing_file_is_ok_false() {
+        let path = std::env::temp_dir().join("nuphus_toml_ops_absent_test.toml");
+        std::fs::remove_file(&path).ok();
+        let removed = remove_provider_segment(&path, "whatever").unwrap();
+        assert!(!removed);
     }
 
     #[test]

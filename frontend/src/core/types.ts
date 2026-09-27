@@ -510,9 +510,8 @@ export interface TimelineEntry {
   maxCount?: number
   summary?: string
   fromTask?: boolean
-  /** Task node fields (used by workflow task_started/task_completed events) */
-  taskId?: number
-  totalTasks?: number
+  /** 执行面板任务行字段（来自服务端 TaskRun 台账快照，键为 run_id） */
+  runId?: string
 }
 
 export interface ToolExecuteResult {
@@ -585,24 +584,13 @@ export type NuphusEvent =
       total_calls: number
     }
   | { type: 'execution_error'; step_index: number; error: string }
+  /**
+   * ExecAgent 执行生命周期**全量快照**（后端 NuphusEvent::TaskRuns）。
+   * task 面板的唯一数据源：前端只渲染，不做 id 配对/状态推断。
+   */
   | {
-      type: 'task_started'
-      task_id: number
-      total_tasks: number
-      description: string
-    }
-  | {
-      type: 'task_completed'
-      task_id: number
-      total_tasks: number
-      success: boolean
-      description: string
-      summary: string
-    }
-  | {
-      type: 'task_list'
-      plan_path: string
-      tasks: Array<{ id: number; name: string; status: string }>
+      type: 'task_runs'
+      runs: TaskRun[]
     }
   | { type: 'seed_generated'; seed_id: string; seed_type: string; summary: string }
   | { type: 'execution_paused'; action_id: string }
@@ -741,6 +729,31 @@ export type NuphusEvent =
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled' | 'failed'
 export type TaskPriority = 'high' | 'medium' | 'low'
+
+// ── ExecAgent 执行生命周期（服务端台账快照，见后端 agent/task_run.rs）──
+/** 没有 pending：未派发的任务属于计划文档的意图，不属于执行生命周期 */
+export type TaskRunState = 'running' | 'completed' | 'failed' | 'interrupted'
+
+export interface TaskRunOrigin {
+  plan_path: string
+  task_no: number | null
+}
+
+export interface TaskRun {
+  /** 服务端下发的唯一身份（进程内单调 */
+  run_id: string
+  title: string
+  goal_type: string
+  origin: TaskRunOrigin | null
+  /** 同标题/同归属的第几次执行（重试计数，从 1 开始） */
+  attempt: number
+  state: TaskRunState
+  started_at: number
+  settled_at: number | null
+  duration_ms: number | null
+  ok: boolean | null
+  summary: string | null
+}
 
 export interface PlanTask {
   id: number

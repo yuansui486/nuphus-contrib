@@ -15,20 +15,12 @@ fn get_or_init_engine() -> Result<std::sync::MutexGuard<'static, Option<IndexEng
         .lock()
         .map_err(|e| format!("锁异常: {}", e))?;
     if guard.is_none() {
-        let docs_root = find_plugin_knowledge().ok_or_else(|| {
-            "知识库目录未找到: plugin/knowledge/。请确认知识库目录存在。".to_string()
-        })?;
-
-        let index_dir = docs_root
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join(crate::profile::home_name()).join("index"))
-            .unwrap_or_else(|| {
-                let mut p = std::env::current_dir().unwrap_or_default();
-                p.push(".nuphus");
-                p.push("index");
-                p
-            });
+        // docs_root / index_dir 均来自 utils 单一权威推导，与 Tauri 端共用
+        // （nuphus::utils::knowledge_docs_root / knowledge_index_dir）。
+        // 禁止在本地从 docs_root 反推两级拼索引路径——两侧各建一份索引会分裂。
+        // docs_root 缺失时由解析侧创建，不再报「知识库目录未找到」。
+        let docs_root = crate::utils::knowledge_docs_root();
+        let index_dir = crate::utils::knowledge_index_dir();
         let index_path = index_dir.join("knowledge_index.json");
 
         if let Err(e) = std::fs::create_dir_all(&index_dir) {
@@ -91,38 +83,5 @@ impl ToolRegistry {
             },
             depends_on: vec![],
         });
-    }
-}
-
-/// 查找 plugin/knowledge 目录（绝对路径）
-fn find_plugin_knowledge() -> Option<std::path::PathBuf> {
-    let candidates: Vec<std::path::PathBuf> = vec![
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-        std::env::current_dir().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    for base in &candidates {
-        let path = base.join("plugin").join("knowledge");
-        if path.exists() {
-            tracing::debug!("[knowledge_search] 找到知识库: {:?}", path);
-            return Some(path);
-        }
-    }
-
-    // 兜底：以 current_dir 为准（即使不存在也返回，让 IndexEngine 报友好错误）
-    let fallback = std::env::current_dir()
-        .unwrap_or_default()
-        .join("plugin")
-        .join("knowledge");
-    if fallback.exists() {
-        Some(fallback)
-    } else {
-        tracing::warn!("[knowledge_search] 知识库目录不存在: {:?}", fallback);
-        None
     }
 }

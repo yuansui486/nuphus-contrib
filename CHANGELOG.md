@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Removed
+- **重复的构建验证政策文档**：删除 `plugin/knowledge/nuphus-self/build-verification-policy.md`，
+  统一保留 `prompts/build-verification-policy.md`（此前两份逐字节相同）。`plugin/knowledge/`
+  不在 `src/build.rs` 的随包资产白名单内，发布版二进制从不内嵌该路径，保留两份只会让副本
+  之间漂移；`plugin/knowledge/nuphus-self/` 目录随之移除。
+
 ## [0.2.22] - 2026-09-26
 
 ### Added

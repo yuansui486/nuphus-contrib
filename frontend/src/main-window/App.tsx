@@ -323,6 +323,18 @@ export default function App() {
   // ref 镜像避免 once-registered 监听捕获陈旧闭包。
   const reloadFromBackendRef = useRef(s.reloadChatFromBackend)
   reloadFromBackendRef.current = s.reloadChatFromBackend
+  // 从设置中心进入 模型 / 画布 后，二者关闭时应回到设置中心。
+  // 只对「设置中心」这一个入口置位：Ctrl+K、标题栏快捷入口等其它入口关闭后
+  // 仍回到原界面，不会被意外拉起设置弹窗。
+  const settingsReturnRef = useRef(false)
+  /** 关页统一出口：关闭后若本次是从设置中心进来的，则把设置中心重新拉起。 */
+  const closeWithSettingsReturn = (close: () => void) => {
+    close()
+    if (settingsReturnRef.current) {
+      settingsReturnRef.current = false
+      setShowSettingsCenter(true)
+    }
+  }
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void listen<{ seq: number; event: { type: string } }>('nuphus-event', ({ event }) => {
@@ -748,7 +760,7 @@ export default function App() {
           {/* ── Task Bubble ── */}
           <TaskBubble
             visible={s.taskBubbleVisible}
-            tasks={s.planData?.tasks || []}
+            runs={s.taskRuns}
             onClose={() => s.setTaskBubbleVisible(false)}
           />
 
@@ -814,11 +826,13 @@ export default function App() {
                     variant="modal-close"
                     label="关闭"
                     className="models-page-close"
-                    onClick={() => {
-                      s.setShowModels(false)
-                      setModelsInitialView('provider')
-                      s.refreshModelInfo()
-                    }}
+                    onClick={() =>
+                      closeWithSettingsReturn(() => {
+                        s.setShowModels(false)
+                        setModelsInitialView('provider')
+                        s.refreshModelInfo()
+                      })
+                    }
                   >
                     <IconX size={14} />
                   </IconButton>
@@ -833,11 +847,13 @@ export default function App() {
                 <div className="models-page-body">
                   <ModelsPage
                     initialView={modelsInitialView}
-                    onClose={() => {
-                      s.setShowModels(false)
-                      setModelsInitialView('provider')
-                      s.refreshModelInfo()
-                    }}
+                    onClose={() =>
+                      closeWithSettingsReturn(() => {
+                        s.setShowModels(false)
+                        setModelsInitialView('provider')
+                        s.refreshModelInfo()
+                      })
+                    }
                     onModelChanged={() => s.refreshModelInfo()}
                   />
                 </div>
@@ -1012,10 +1028,12 @@ export default function App() {
                   workflowId={s.canvasWorkflowId}
                   replayRunId={scheduleReplay?.runId ?? null}
                   onExitReplay={() => setScheduleReplay(null)}
-                  onClose={() => {
-                    setScheduleReplay(null)
-                    s.closeCanvas()
-                  }}
+                  onClose={() =>
+                    closeWithSettingsReturn(() => {
+                      setScheduleReplay(null)
+                      s.closeCanvas()
+                    })
+                  }
                 />
               </div>
             </Suspense>
@@ -1036,6 +1054,7 @@ export default function App() {
                    点击后关闭面板，改走各自既有全屏宿主链路（与 Ctrl+K 入口同一实现）。 */
                 onOpenCanvas={workflowId => {
                   setShowSettingsCenter(false)
+                  settingsReturnRef.current = true
                   setScheduleReplay(null)
                   s.openCanvas(workflowId ?? null)
                 }}
@@ -1046,6 +1065,7 @@ export default function App() {
                 }}
                 onOpenModels={() => {
                   setShowSettingsCenter(false)
+                  settingsReturnRef.current = true
                   s.setShowModels(true)
                 }}
               />

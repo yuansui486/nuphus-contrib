@@ -530,6 +530,58 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 自定义实例行：主按钮铺满 + 删除图标按钮收在右侧。
+   行容器（div.models-rail-item）不再自带 cursor/hover——交互归属主按钮，
+   避免「鼠标指着删除图标也显示成可选中条目」的误导。 */
+.models-rail-item-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  /* 抵消行容器 padding，让主按钮自身扛起点击热区与视觉内边距 */
+  margin: -7px -9px;
+  padding: 7px 9px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.models-rail-delete {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin-right: -3px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--fg-4);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+/* 悬停整行或图标本身时显现：键盘 focus 也必须可见（不能只靠鼠标） */
+.models-rail-item:hover .models-rail-delete,
+.models-rail-delete:focus-visible {
+  opacity: 1;
+}
+.models-rail-delete:hover {
+  background: rgba(var(--error-rgb), 0.14);
+  color: var(--error);
+}
+.models-rail-delete:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
 .models-rail-note {
   padding: var(--space-2);
   color: var(--fg-4);
@@ -1164,4 +1216,89 @@
 .custom-oauth-hint {
   color: var(--fg-3);
   font-size: var(--fz-sm);
+}
+
+/* ── 删除自定义模型实例：二次确认弹窗 ──
+   遮罩层级需高于模型页宿主（models-page-host 为全屏覆盖层，z 2500），
+   否则弹窗会被压在页面底下看不见。 */
+.models-confirm-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 2600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+.models-confirm {
+  width: min(420px, 100%);
+  padding: 20px;
+  border: 1px solid var(--glass-3, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius-3, 14px);
+  background: var(--surface-1);
+  box-shadow: var(--shadow-modal);
+}
+.models-confirm-title {
+  margin-bottom: 10px;
+  color: var(--fg-1);
+  font-size: var(--fz-lg);
+  font-weight: 600;
+}
+.models-confirm-body {
+  color: var(--fg-3);
+  font-size: var(--fz-md);
+  line-height: 1.6;
+  /* 文案含 \n\n：保留换行，否则两段话会挤成一行 */
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.models-confirm-error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: var(--radius-1);
+  background: rgba(var(--error-rgb), 0.1);
+  color: var(--error);
+  font-size: var(--fz-sm);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.models-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: 18px;
+}
+.models-confirm-btn {
+  min-width: 76px;
+  padding: 7px 14px;
+  border: 1px solid var(--glass-2, rgba(255, 255, 255, 0.1));
+  border-radius: var(--radius-1);
+  background: var(--surface-2);
+  color: var(--fg-2);
+  font: inherit;
+  font-size: var(--fz-md);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.models-confirm-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--fg-1);
+}
+.models-confirm-btn.is-danger {
+  border-color: transparent;
+  background: var(--error);
+  color: #fff;
+}
+.models-confirm-btn.is-danger:hover:not(:disabled) {
+  /* 不用 filter：直接提亮，避免把文字也一起压暗 */
+  background: color-mix(in srgb, var(--error) 88%, white);
+}
+.models-confirm-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }

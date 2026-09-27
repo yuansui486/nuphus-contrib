@@ -370,16 +370,12 @@ const en: Record<string, string> = {
   'extAgents.cfg.deleteConfirm':
     'Delete this external agent config? (handoff workspace will not be deleted)',
   // 鈹€鈹€ v8 advanced group: interaction hardening 鈹€鈹€
-  'extAgents.cfg.advanced': 'Interaction hardening (optional, recommended for terminal agents)',
-  'extAgents.cfg.advancedHint':
-    'Once configured, Leader calls agent_dispatch once to auto capture window 鈫?position 鈫?deliver 鈫?await confirmation',
-  'extAgents.cfg.launch': 'Cold-start command (launch)',
+  'extAgents.cfg.launch': 'Launch command (launch)',
   'extAgents.cfg.launchHint':
-    'Command to spawn when the window is not found (e.g. wt.exe -p PowerShell opencode)',
+    'The command Leader uses to start this agent manually (skill section 2 startup SOP). agent_dispatch performs no implicit cold start - if the window cannot be captured it fails outright',
   'extAgents.cfg.windowHint': 'Window match hint (window_hint)',
   'extAgents.cfg.windowHintField':
     'Matched when window title or process name contains it (falls back to process field)',
-  'extAgents.cfg.cooldown': 'Cold-start wait limit (seconds)',
   'extAgents.cfg.dispatchSteps': 'Dispatch sequence (dispatch_steps)',
   'extAgents.cfg.dispatchStepsHint': 'JSON array; format follows workflow Action::Tool',
   'extAgents.cfg.dispatchStepsTools':
@@ -394,26 +390,12 @@ const en: Record<string, string> = {
   { "tool": "desktop_clipboard_clean", "with": {} },
   { "tool": "desktop_input", "with": { "hwnd": "{hwnd}", "mode": "hotkey", "keys": ["enter"] } }
 ]`,
-  'extAgents.cfg.awaitTimeout': 'Confirm wait limit (seconds)',
-  'extAgents.cfg.timeoutAction': 'Timeout self-check strategy',
-  'extAgents.cfg.timeoutActionHint':
-    'detect_confirm=keyword-match confirm screen (default) / screenshot_alive=window alive+screenshot / notify_user=escalate to user / redeliver=auto redeliver / custom script wins',
-  'extAgents.cfg.timeoutScript': 'Custom self-check script',
-  'extAgents.cfg.timeoutScriptHint':
-    'Takes precedence over timeout_action; stdout becomes the self-check result',
-  'extAgents.cfg.autoApprove': 'Confirmation auto-reply whitelist (auto_approve)',
-  'extAgents.cfg.autoApproveHint':
-    'Auto-reply content (e.g. yes) when blocked and platform keywords hit',
-  'extAgents.cfg.autoApproveScript': 'Auto-reply decision script',
-  'extAgents.cfg.confirmKeywords': 'Confirm-screen keywords (comma separated)',
-  'extAgents.cfg.confirmKeywordsHint':
-    'Used by detect_confirm timeout self-check; hit = stuck on confirm screen',
   'extAgents.cfg.dir': 'Agent directory',
   'extAgents.cfg.dirHint': 'Agent working directory; lets Leader locate context directly',
   'extAgents.cfg.dirPlaceholder': 'e.g. C:\\projects\\myapp',
   'extAgents.cfg.agentConfig': 'Agent configuration (technical)',
   'extAgents.cfg.agentConfigHint':
-    'Launch / window targeting / dispatch sequence details; collapsed by default, expand to configure as needed',
+    'Launch command (used by Leader to start it manually) / window targeting / dispatch sequence; collapsed by default, expand to configure as needed',
   // note (field-test notes) is a Leader-only field: no UI editing entry, maintained via orchestration-layer calibration
 
   'cmd.externalAgents': 'External Agents',
@@ -1217,6 +1199,7 @@ const en: Record<string, string> = {
 
   'taskBubble.idle': 'Idle',
   'taskBubble.failed': ' → {0} failed',
+  'taskBubble.interrupted': ' → {0} unsettled',
 
   'security.low': 'Low Risk',
   'security.medium': 'Medium Risk',

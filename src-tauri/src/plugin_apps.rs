@@ -2,7 +2,7 @@
 //!
 //! 契约：docs/plugin-app-system-plan.md §3（包格式/硬限制）/ §4.3（主题快照）/ §5（Bridge 后端落点）/ §6.2（安装器）。
 //! 目录惯例：`plugin/apps/{id}/` + `plugin/apps/registry.json`，与 skills/knowledge/workflows 同级。
-//! 路径解析**复用** commands::knowledge 的模式（exe 相对 → current_dir，向上遍历父目录），禁止自创规则。
+//! 路径解析唯一权威来源 = `nuphus::utils::plugin_root()`（apps/knowledge 等同级目录均由其派生）。
 //!
 //! 安全边界：
 //! - 安装器：zip-slip 防逃逸（enclosed_name 规范化 + 硬限制 20MB/500 文件/manifest 64KB）
@@ -62,40 +62,13 @@ const MAX_PLUGIN_CHAT_HISTORY_CHARS: usize = 64 * 1024;
 const PERMISSIONS_ALLOWED: [&str; 5] = ["kv", "notify", "theme.get", "agent.chat", "workflow.run"];
 
 // ============================================================================
-// 路径解析（复用 commands::knowledge::find_plugin_knowledge 的向上遍历模式）
+// 路径解析（唯一权威来源 = nuphus::utils::plugin_root()）
 // ============================================================================
 
-/// 查找 plugin 根目录：exe 相对 → current_dir，各自向上遍历父目录，
-/// 命中含 `plugin/apps` 或 `plugin/knowledge` 的 `plugin` 目录即返回。
-/// 与 commands::knowledge 的解析顺序完全一致，兜底 current_dir/plugin。
-pub fn find_plugin_dir() -> PathBuf {
-    let candidates: Vec<PathBuf> = vec![
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf())),
-        std::env::current_dir().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-
-    for base in &candidates {
-        let mut current = Some(base.as_path());
-        while let Some(dir) = current {
-            let plugin = dir.join("plugin");
-            if plugin.join("apps").exists() || plugin.join("knowledge").exists() {
-                return plugin;
-            }
-            current = dir.parent();
-        }
-    }
-
-    std::env::current_dir().unwrap_or_default().join("plugin")
-}
-
-/// 插件 apps 根目录（plugin/apps/）
+/// 插件 apps 根目录（plugin/apps/）—— 由权威 plugin 根派生。
+/// 发布版 plugin/ 缺位时由 `plugin_root()` 自身兜底到 `nuphus_data_dir()/plugin`。
 pub fn apps_root() -> PathBuf {
-    find_plugin_dir().join("apps")
+    nuphus::utils::plugin_root().join("apps")
 }
 
 // ============================================================================

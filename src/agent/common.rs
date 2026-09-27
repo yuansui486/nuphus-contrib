@@ -230,6 +230,32 @@ pub fn process_events(
     }
 }
 
+/// Emit one newline as a content `LlmTextDelta` — the **inter-iteration text
+/// boundary separator** (issue #66 follow-up).
+///
+/// Why this exists: the frontend accumulates `llm_text_delta` by pure string
+/// concatenation (`useEvents.ts`: `m.content + event.text` and
+/// `last.text + event.text`) with **no separator of its own** — it cannot know
+/// where one LLM attempt ended and the next began. When a run spans multiple
+/// react iterations (the normal case: each tool call is followed by another
+/// LLM turn), the last sentence of turn N and the first of turn N+1 end up
+/// directly adjacent. `MarkdownContent` then sees one contiguous block with no
+/// `\n`, takes its single-line branch, and emits no `span.md-line` — so every
+/// step's process text collapses into one unbroken run of characters.
+///
+/// Inserting the break on the Rust side rather than the frontend fixes all
+/// consumers at once (desktop bubble + desktop timeline + `mobile/store.ts`).
+/// A `None` emitter makes this a no-op.
+pub fn emit_text_break(emitter: Option<&dyn EventEmitter>, from_task: bool) {
+    if let Some(emitter) = emitter {
+        emitter.emit(NuphusEvent::LlmTextDelta {
+            text: "\n".to_string(),
+            is_thinking: false,
+            from_task,
+        });
+    }
+}
+
 /// Route one streaming `TextDelta` through the shared text cleaner and forward
 /// the split results as frontend events.
 ///
@@ -239,14 +265,20 @@ pub fn process_events(
 /// then emits any reasoning chunk first (`is_thinking: true`) and any non-empty
 /// content text second (`is_thinking: false`) so the frontend timeline always
 /// shows thinking before content. A `None` emitter makes this a no-op.
+///
+/// Returns whether **content** text was emitted (reasoning-only chunks, or
+/// chunks fully consumed by think-tag handling, return `false`). Callers use
+/// this to decide whether an iteration contributed visible text — see
+/// [`emit_text_break`].
 pub fn route_stream_text_delta(
     text: &str,
     think_state: &AtomicU32,
     extra_tags: &[&str],
     from_task: bool,
     emitter: Option<&dyn EventEmitter>,
-) {
+) -> bool {
     let (reasoning, text_clean) = crate::utils::process_text_delta(text, think_state, extra_tags);
+    let mut emitted_content = false;
     if let Some(emitter) = emitter {
         if let Some(r) = reasoning {
             emitter.emit(NuphusEvent::LlmTextDelta {
@@ -261,8 +293,10 @@ pub fn route_stream_text_delta(
                 is_thinking: false,
                 from_task,
             });
+            emitted_content = true;
         }
     }
+    emitted_content
 }
 
 /// Extract tool calls from assistant message blocks (dedup + filter empty params)

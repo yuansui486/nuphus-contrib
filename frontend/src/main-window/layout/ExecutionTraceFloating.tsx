@@ -287,13 +287,14 @@ function ToolDetail({ entry }: { entry: TimelineEntry }) {
   }
 
   if (entry.toolName === 'task_dispatch') {
-    const description = (p?.description as string) || ''
+    // 新契约：title（人看）+ brief（给 Exec）+ task_no（可选归属标签）。
+    // 旧契约的 description/task_id/total_tasks 仍兼容读取（老上下文与历史记录）。
+    const description = (p?.title as string) || (p?.description as string) || ''
     const goalType = (p?.goal_type as string) || ''
     const planPath = (p?.plan_path as string) || ''
-    const taskId = (p?.task_id as number) || 1
-    const totalTasks = (p?.total_tasks as number) || 1
+    const taskNo = p?.task_no as number | undefined
 
-    // Output is JSON { status, task, summary } — extract summary for cleaner display
+    // Output is JSON { status, summary, run } — extract summary for cleaner display
     let summary = outputStr
     let execStatus = ''
     try {
@@ -315,15 +316,11 @@ function ToolDetail({ entry }: { entry: TimelineEntry }) {
             </span>
           )}
         </div>
-        {(goalType || planPath || totalTasks > 1) && (
+        {(goalType || planPath || taskNo != null) && (
           <div className="tc-task-meta">
             {goalType && <span className="tc-meta-tag">{goalType}</span>}
             {planPath && <span className="tc-meta-tag tc-meta-path">{planPath}</span>}
-            {totalTasks > 1 && (
-              <span className="tc-meta-progress">
-                步骤 {taskId}/{totalTasks}
-              </span>
-            )}
+            {taskNo != null && <span className="tc-meta-progress">计划#{taskNo}</span>}
           </div>
         )}
         {summary && (
@@ -1158,17 +1155,10 @@ export function ExecutionTraceFloating({
                     )
                   }
                   if (entry.kind === 'task') {
-                    const progress =
-                      entry.taskId != null && entry.totalTasks != null
-                        ? `[${entry.taskId}/${entry.totalTasks}] `
-                        : ''
                     return (
                       <div key={entry.id} className="term-line term-task">
                         <StatusIcon status={entry.status} />
-                        <span className="term-task-text">
-                          {progress}
-                          {entry.text}
-                        </span>
+                        <span className="term-task-text">{entry.text}</span>
                         {entry.summary && (
                           <span className="term-task-summary">{entry.summary}</span>
                         )}

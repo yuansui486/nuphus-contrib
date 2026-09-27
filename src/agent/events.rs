@@ -98,27 +98,14 @@ pub enum NuphusEvent {
     /// STEP execution error
     ExecutionError { step_index: usize, error: String },
 
-    // ── Task decomposition events ──
-    /// A decomposed task has started execution
-    TaskStarted {
-        task_id: usize,
-        total_tasks: usize,
-        description: String,
-    },
-
-    /// A decomposed task has completed execution
-    TaskCompleted {
-        task_id: usize,
-        total_tasks: usize,
-        success: bool,
-        description: String,
-        summary: String,
-    },
-
-    /// Task list (pushed after planning, for TaskBubble display)
-    TaskList {
-        plan_path: String,
-        tasks: Vec<TaskItem>,
+    // ── Task run lifecycle（task 面板的唯一数据源）──
+    /// ExecAgent 执行生命周期**全量快照**。
+    ///
+    /// 取代早期的 `TaskStarted` / `TaskCompleted` / `TaskList` 三个增量事件：那三个要求
+    /// 前端按模型给的 task_id 配对、按计划行对齐，漏一个就永久停在「执行中」。快照语义下
+    /// 前端只渲染，丢失一个事件最多旧一帧，下一次变迁自愈。
+    TaskRuns {
+        runs: Vec<crate::agent::task_run::TaskRun>,
     },
 
     // ── Evolution events (received by both views) ──
@@ -340,13 +327,6 @@ pub enum NuphusEvent {
 }
 
 // ── Helper types ──
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskItem {
-    pub id: usize,
-    pub name: String,
-    pub status: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepInfo {

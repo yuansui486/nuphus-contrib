@@ -10,17 +10,17 @@ impl ToolRegistry {
     pub(crate) fn register_task_dispatch(&mut self) {
         self.register(ToolDef {
             name: "task_dispatch".to_string(),
-            description: "Dispatch a sub-task to ExecAgent. Returns status and summary. ExecAgent has NO desktop/browser automation tools — use for long/multi-step tasks, project_analysis, code_generation, debug_diagnose, file_operation, research_query, and scripting_exec. Structure the description per the dispatch spec (task/context/quality-baseline/anti-patterns/output).".to_string(),
+            description: "Dispatch a sub-task to ExecAgent. Returns status, summary and the ledger run id. ExecAgent has NO desktop/browser automation tools — use for long/multi-step tasks, project_analysis, code_generation, debug_diagnose, file_operation, research_query, and scripting_exec. Structure the brief per the dispatch spec (task/context/quality-baseline/anti-patterns/output).".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "description": { "type": "string", "description": "What to achieve, constraints, expected output format. Be thorough — this is Exec's primary directive." },
+                    "title": { "type": "string", "description": "Short human-readable task title (shown in the task panel). Required for a readable panel; omit only for throwaway one-liners." },
+                    "brief": { "type": "string", "description": "Full directive for Exec: what to achieve, constraints, expected output format. Be thorough — this is Exec's primary directive. Formerly named `description` (still accepted)." },
                     "goal_type": { "type": "string", "enum": ["project_analysis", "code_generation", "debug_diagnose", "file_operation", "research_query", "scripting_exec"], "default": "file_operation", "description": "project_analysis: understand codebase structure. code_generation: implement or modify code. debug_diagnose: fix bugs. file_operation: manage files. research_query: web search. scripting_exec: run commands/tests (ExecAgent cannot use desktop/browser tools)" },
                     "plan_path": { "type": "string", "description": "Explicit .plan.md path to inject as execution guide" },
-                    "task_id": { "type": "integer", "description": "Task number 1-based for progress display, default 1" },
-                    "total_tasks": { "type": "integer", "description": "Total tasks for progress display, default 1" }
+                    "task_no": { "type": "integer", "description": "Optional provenance label: which numbered direction of the plan this run belongs to. Display-only — omit if unsure, it never affects execution or lifecycle." }
                 },
-                "required": ["description"]
+                "required": ["brief"]
             }),
             category: ToolCategory::SystemAutomation,
             executor: |_params, _ctx| {

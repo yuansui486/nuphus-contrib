@@ -15,7 +15,7 @@ impl ToolRegistry {
     pub(crate) fn register_agent_dispatch(&mut self) {
         self.register(ToolDef {
             name: "agent_dispatch".to_string(),
-            description: "把任务派发给外部 Agent（Claude Code / opencode 等）。前置：Leader 已按 skill §2 启动 SOP 启动/核验外部 Agent 并持有其实况 PID。本工具一次完成：上板 brief（文末自动内嵌门铃契约原文）→ 对当次实况解析目标窗口 → 按 team.toml 的 dispatch_steps 确定性投递。返回 {ok:true, submitted, brief_path, window, steps} 或 {ok:false, failed_step, error, hint}。门铃事件为异步推送，会自动注入 Leader 上下文；工具不做同步等待。仅当需要与外部 Agent 显式交互时使用。".to_string(),
+            description: "把任务派发给外部 Agent（Claude Code / opencode 等）。前置：Leader 已按 skill §2 启动 SOP 启动/核验外部 Agent 并持有其实况 PID。本工具一次完成：上板 brief（文末自动内嵌门铃契约原文）→ 对当次实况解析目标窗口 → 按 team.toml 的 dispatch_steps 确定性投递。返回 {ok:true, submitted, brief_path, window, steps} 或 {ok:false, failed_step, error, hint}。submitted 仅表示 brief 已上板（已落盘且 status.json 置 dispatched），不代表指令已被外部 Agent 收到；上板前失败不返回该 JSON（错误文本直传，status.json 落 error + error_reason）。工具层超时（180s）到达时同步序列不会被取消、可能仍在后台执行——按 hint 核对窗口实况、确认指令已进终端则勿重投，禁止未核对直接重调本工具。门铃事件为异步推送，会自动注入 Leader 上下文；工具不做同步等待。仅当需要与外部 Agent 显式交互时使用。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -45,7 +45,7 @@ impl ToolRegistry {
                     },
                     "message": {
                         "type": "string",
-                        "description": "可选：覆盖模板 —— 实际投递给外部 Agent 的指令文本；缺省用 brief 渲染后的任务指令（占位符 {task_id}/{brief_path} 已替换）"
+                        "description": "可选：覆盖模板 —— 实际投递给外部 Agent 的指令文本；缺省用 brief 渲染后的任务指令（占位符 {task_id}/{brief_path} 已替换）。注入为逐字模拟键入，约 5ms/字符（char_delay_ms=5，每千字符约 5s）：长文本必须写进 brief 文件，本参数只留一行指针（如 Read {brief_path} and execute it.）——中文长文有 IME 上屏风险，多行文本会被终端逐行误执行"
                     }
                 },
                 "required": ["agent", "task_id", "brief"]

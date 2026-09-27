@@ -12,7 +12,7 @@ import type {
   TimelineEntry,
   PlanData,
   PlanTask,
-  TaskStatus,
+  TaskRun,
 } from '../core/types'
 import type { MutableRefObject } from 'react'
 import type { ExecutionStage } from './useExecutionState'
@@ -109,8 +109,9 @@ export interface EventHandlers {
   >
   setTotalDurationMs: (v: number) => void
   setTotalCalls: (v: number) => void
-  setCurrentTaskDesc: (v: string) => void
   setPlanData: React.Dispatch<React.SetStateAction<PlanData | null>>
+  /** ExecAgent 执行生命周期快照（task 面板唯一数据源） */
+  setTaskRuns: React.Dispatch<React.SetStateAction<TaskRun[]>>
   setShowReview: (v: boolean) => void
   setShowPlannerModal: (v: boolean) => void
   setApprovalState: React.Dispatch<
@@ -148,7 +149,6 @@ export interface EventHandlers {
 
   // Callbacks
   addMessage: (msg: ChatMessage) => void
-  transitionTask?: (taskId: number, status: TaskStatus) => void
 }
 
 // ════════════════════════════════════════════════════════════
@@ -519,6 +519,8 @@ export function useEvents(h: EventHandlers) {
             h.setStepIndex(event.step_index)
             h.setGoal(event.goal)
             h.setTimeline([])
+            // 新一轮 = 新的一面墙：task 面板按「轮」归零，不与上一轮的派发混在一起
+            h.setTaskRuns([])
             h.setCompleted(false)
             h.setTotalDurationMs(0)
             h.setTotalCalls(0)
@@ -537,6 +539,8 @@ export function useEvents(h: EventHandlers) {
           h.setStepIndex(event.step_index)
           h.setGoal(event.goal)
           h.setTimeline([])
+          // 新一轮 = 新的一面墙：task 面板按「轮」归零，不与上一轮的派发混在一起
+          h.setTaskRuns([])
           h.setCompleted(false)
           h.setTotalDurationMs(0)
           h.setTotalCalls(0)
@@ -595,11 +599,6 @@ export function useEvents(h: EventHandlers) {
           h.setMood(
             h.refs.interruptedRef.current ? 'idle' : toolToMood[event.tool_name] || 'working',
           )
-
-          // planner_update → task_status changed (from inline tool call)
-          if (event.tool_name === 'planner_update' && !event.from_task) {
-            h.setTaskBubbleVisible(true)
-          }
           break
         }
         case 'tool_output_line': {
@@ -670,38 +669,9 @@ export function useEvents(h: EventHandlers) {
               console.error('Failed to parse planner_create output:', e)
             }
           }
-          // planner_update → update task status from exec agent
-          if (event.tool_name === 'planner_update' && event.success) {
-            try {
-              const output = JSON.parse(event.output_preview)
-              if (output.task_id && output.status) {
-                h.transitionTask?.(output.task_id, output.status)
-              }
-            } catch (e) {
-              console.error('Failed to parse planner_update output:', e)
-            }
-          }
-          // task_dispatch → update task status from plan_update embedded in output
-          if (event.tool_name === 'task_dispatch' && event.success) {
-            try {
-              const output = JSON.parse(event.output_preview)
-              const pu = output.plan_update
-              if (pu) {
-                if (pu.task_id && pu.status) {
-                  h.transitionTask?.(pu.task_id, pu.status)
-                }
-                if (pu.tasks) {
-                  for (const t of pu.tasks) {
-                    if (t.task_id && t.status) {
-                      h.transitionTask?.(t.task_id, t.status)
-                    }
-                  }
-                }
-              }
-            } catch (e) {
-              console.error('Failed to parse task_dispatch output:', e)
-            }
-          }
+          // 注意：这里不再解析任何"任务状态"。task_dispatch 的生命周期由服务端台账
+          // 记账并经 `task_runs` 快照下发（见本文件 task_runs 分支），
+          // 历史上从 Exec 摘要里刨 plan_update JSON 的软耦合已删除。
 
           // tenet_add → approval modal
           if (event.tool_name === 'tenet_add' && event.success) {
@@ -913,7 +883,6 @@ export function useEvents(h: EventHandlers) {
           // 「执行完成」：原 HUD 相位 'done' → island success（映射见 islandChannel）
           showAppFeedbackByHudPhase('执行完成', 'done')
           setTimeout(() => h.setExecPhase(''), 2000)
-          h.setCurrentTaskDesc('')
           h.setMood('success')
           setTimeout(() => h.setMood('idle'), 3000)
           break
@@ -986,49 +955,40 @@ export function useEvents(h: EventHandlers) {
             },
           ])
           break
-        case 'task_started':
-          h.setTaskBubbleVisible(true)
-          h.setCurrentTaskDesc(event.description)
-          h.transitionTask?.(event.task_id, 'in_progress')
-          h.setTimeline((prev: TimelineEntry[]) => [
-            ...prev,
-            {
-              id: `task-${event.task_id}`,
+        // ExecAgent 执行生命周期**全量快照**（后端 agent::task_run）。
+        // 前端是纯投影：不推断 id、不配对事件、不维护状态机——丢失一个快照最多旧一帧，
+        // 下一次变迁自愈。执行面板的 task 行与 TaskBubble 共用这一份数据。
+        case 'task_runs': {
+          const runs = event.runs
+          h.setTaskRuns(runs)
+          h.setTaskBubbleVisible(runs.length > 0)
+          h.setTimeline((prev: TimelineEntry[]) => {
+            const byId = new Map(runs.map(r => [r.run_id, r]))
+            const rowFor = (r: TaskRun): TimelineEntry => ({
+              id: `task-${r.run_id}`,
               kind: 'task' as const,
-              text: event.description,
-              taskId: event.task_id,
-              totalTasks: event.total_tasks,
-              status: 'running',
-            },
-          ])
-          break
-        case 'task_completed':
-          h.setTaskBubbleVisible(true)
-          h.transitionTask?.(event.task_id, 'completed')
-          h.setTimeline((prev: TimelineEntry[]) =>
-            prev.map(t => {
-              if (t.kind === 'task' && t.taskId === event.task_id) {
-                return { ...t, status: event.success ? 'success' : 'error', summary: event.summary }
-              }
-              return t
-            }),
-          )
-          break
-        case 'task_list':
-          h.setTaskBubbleVisible(true)
-          if (event.tasks && h.setPlanData) {
-            h.setPlanData((prev: PlanData | null) => {
-              if (!prev) return prev
-              const updatedTasks = prev.tasks?.map((t: PlanTask) => {
-                const found = event.tasks.find(
-                  (et: { id: number; status: string }) => et.id === t.id,
-                )
-                return found ? { ...t, status: found.status as TaskStatus } : t
-              })
-              return { ...prev, tasks: updatedTasks }
+              runId: r.run_id,
+              text: r.title,
+              status:
+                r.state === 'running'
+                  ? ('running' as const)
+                  : r.ok
+                    ? ('success' as const)
+                    : ('error' as const),
+              summary: r.summary ?? undefined,
             })
-          }
+            const known = new Set<string>()
+            const updated = prev.map(t => {
+              if (t.kind !== 'task' || !t.runId) return t
+              known.add(t.runId)
+              const r = byId.get(t.runId)
+              return r ? { ...rowFor(r), id: t.id } : t
+            })
+            const added = runs.filter(r => !known.has(r.run_id)).map(rowFor)
+            return [...updated, ...added]
+          })
           break
+        }
         case 'token_usage':
           // 事件级 trace：**默认静音**（见 core/debug.ts）——每个 token_usage 事件一行，
           // 与 IPC 日志叠加会把 DevTools 打满。排查：DevTools 里

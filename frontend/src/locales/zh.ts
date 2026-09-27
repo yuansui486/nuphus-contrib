@@ -357,14 +357,11 @@ const zh: Record<string, string> = {
   'extAgents.cfg.loadFail': '加载失败',
   'extAgents.cfg.deleteConfirm': '确定删除该外部 Agent 配置？(handoff 工作目录不会被删除)',
   // ── v8 高级分组：交互固化 ──
-  'extAgents.cfg.advanced': '交互固化（可选，终端型推荐配置）',
-  'extAgents.cfg.advancedHint':
-    '配置后 Leader 用 agent_dispatch 单次调用即可自动完成 捕获窗口 → 归位 → 投递 → 等确认',
-  'extAgents.cfg.launch': '冷启动命令 (launch)',
-  'extAgents.cfg.launchHint': '窗口未捕获到时自动拉起的命令（如 wt.exe -p PowerShell opencode）',
+  'extAgents.cfg.launch': '启动命令 (launch)',
+  'extAgents.cfg.launchHint':
+    'Leader 手动启动该 Agent 时用的命令（按 skill §2 启动 SOP 执行）；agent_dispatch 不做隐式冷启动，捕获不到窗口会直接失败',
   'extAgents.cfg.windowHint': '窗口匹配特征 (window_hint)',
   'extAgents.cfg.windowHintField': '窗口标题或进程名包含该特征即命中（也回退匹配 process 字段）',
-  'extAgents.cfg.cooldown': '冷启动等待上限（秒）',
   'extAgents.cfg.dispatchSteps': '投递序列 (dispatch_steps)',
   'extAgents.cfg.dispatchStepsHint': 'JSON 数组，格式对齐工作流 Action::Tool',
   'extAgents.cfg.dispatchStepsTools':
@@ -379,23 +376,12 @@ const zh: Record<string, string> = {
   { "tool": "desktop_clipboard_clean", "with": {} },
   { "tool": "desktop_input", "with": { "hwnd": "{hwnd}", "mode": "hotkey", "keys": ["enter"] } }
 ]`,
-  'extAgents.cfg.awaitTimeout': '等待确认上限（秒）',
-  'extAgents.cfg.timeoutAction': '超时自检策略',
-  'extAgents.cfg.timeoutActionHint':
-    'detect_confirm=词表匹配确认屏（默认）/ screenshot_alive=窗口存活+截图 / notify_user=转呈大王 / redeliver=自动重投 / 自定义脚本优先',
-  'extAgents.cfg.timeoutScript': '自定义自检脚本',
-  'extAgents.cfg.timeoutScriptHint': '设置后优先于 timeout_action；stdout 作为自检结论',
-  'extAgents.cfg.autoApprove': '确认态代答白名单 (auto_approve)',
-  'extAgents.cfg.autoApproveHint': 'blocked 且命中平台特征词时自动代答的内容（如 yes）',
-  'extAgents.cfg.autoApproveScript': '代答决策脚本',
-  'extAgents.cfg.confirmKeywords': '确认态检测词表（逗号分隔）',
-  'extAgents.cfg.confirmKeywordsHint': 'detect_confirm 超时自检用；命中判定停在确认屏',
   'extAgents.cfg.dir': 'Agent 目录',
   'extAgents.cfg.dirHint': 'Agent 工作目录，供 Leader 直接查找/定位上下文',
   'extAgents.cfg.dirPlaceholder': 'e.g. C:\\projects\\myapp',
   'extAgents.cfg.agentConfig': 'Agent 配置（技术参数）',
   'extAgents.cfg.agentConfigHint':
-    '启动方式 / 窗口定位 / 投递序列等交互细节；默认收起，展开按需配置',
+    '启动命令（Leader 手动启动用）/ 窗口定位特征 / 投递序列；默认收起，展开按需配置',
   // note（实测记录）为 Leader 专属字段：不提供 UI 编辑入口，由编排层实景校准维护
 
   'cmd.externalAgents': '外部 Agent',
@@ -1159,6 +1145,7 @@ const zh: Record<string, string> = {
 
   'taskBubble.idle': '待命',
   'taskBubble.failed': ' · {0}失败',
+  'taskBubble.interrupted': ' · {0}未结算',
 
   'security.low': '低风险',
   'security.medium': '中风险',

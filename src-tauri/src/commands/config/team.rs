@@ -1,6 +1,6 @@
 //! 外部 Agent 登记簿（plugin/team.toml）CRUD —— 阶段 2 配置中心。
 //!
-//! 文件路径：{plugin_dir}/team.toml（plugin_dir = find_plugin_dir()）。
+//! 文件路径：{plugin_root}/team.toml（plugin_root = nuphus::utils::plugin_root()）。
 //!
 //! 段 schema（新字段带默认值，旧文件兼容；写回只增删目标段，不动其它段）：
 //! ```toml
@@ -123,7 +123,7 @@ fn mode_to_type(mode: &str) -> &'static str {
 /// 列出全部外部 Agent（每个段 → 扁平字段，含默认值补全）。按 key 排序，稳定输出。
 #[tauri::command]
 pub fn list_external_agents() -> Result<Vec<serde_json::Value>, String> {
-    list_external_agents_at(&crate::plugin_apps::find_plugin_dir())
+    list_external_agents_at(&nuphus::utils::plugin_root())
 }
 
 fn list_external_agents_at(plugin_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
@@ -149,7 +149,7 @@ fn list_external_agents_at(plugin_dir: &Path) -> Result<Vec<serde_json::Value>, 
 /// 段不存在 → Ok(None)；文件损坏 → Err。
 /// pub(crate)：ext_agent（agent_dispatch 编排）读取 dispatch_steps 等字段。
 pub(crate) fn agent_config(key: &str) -> Result<Option<serde_json::Value>, String> {
-    agent_config_at(&crate::plugin_apps::find_plugin_dir(), key)
+    agent_config_at(&nuphus::utils::plugin_root(), key)
 }
 
 fn agent_config_at(plugin_dir: &Path, key: &str) -> Result<Option<serde_json::Value>, String> {
@@ -165,6 +165,7 @@ fn agent_config_at(plugin_dir: &Path, key: &str) -> Result<Option<serde_json::Va
 /// 字段清单：key/display_name/icon/type/mode/open/args/process/description/note +
 /// launch/window_hint/cooldown_secs/dispatch_steps/await_timeout_secs/timeout_action/
 /// timeout_script/auto_approve/auto_approve_script/confirm_keywords
+/// （后 7 个仅为旧 team.toml 兼容返回，当前无消费方——见 `AgentFields` 注释）
 fn agent_json(key: &str, obj: &toml::Table) -> serde_json::Value {
     serde_json::json!({
         "key": key,
@@ -301,6 +302,16 @@ fn toml_lit(s: &str) -> String {
 }
 
 /// 段字段（含 v8 交互固化字段）。写回时目标段由模板重生成（行内注释不保留）。
+///
+/// ⚠️ 字段集即 schema：`cooldown_secs` / `await_timeout_secs` / `timeout_action` /
+/// `timeout_script` / `auto_approve` / `auto_approve_script` / `confirm_keywords`
+/// 保留**仅为旧 team.toml 兼容解析**——当前 `agent_dispatch` 不消费这些字段
+/// （同步路径零等待、禁隐式冷启动，detect_confirm/自动代答从未实现），UI 也已
+/// 不再提供编辑入口；读路径 (`agent_json`) 仍会带默认值返回它们，删字段会让旧
+/// 配置读不到默认补全，故一律不删。
+/// 真正生效的只有：`dispatch_steps`（SeqRunner 逐条执行）与
+/// `window_hint` / `process`（进程捕获匹配）；`launch` 供 Leader 按 skill §2
+/// 启动 SOP 手动启动，agent_dispatch 不做隐式拉起。
 struct AgentFields {
     type_: String,
     mode: String,
@@ -646,25 +657,27 @@ fn upsert_external_agent_at(plugin_dir: &Path, agent: &serde_json::Value) -> Res
     Ok(is_new)
 }
 
-/// 删除一个 agent 段（段不存在 → 无操作成功）。不删除 .nuphus/handoff/{key}/ 目录。
+/// 删除一个 agent 段。返回 `false` = team.toml 不存在或段本来就不存在（零改动），
+/// `true` = 真实删除并写回。
+/// 不删除 .nuphus/handoff/{key}/ 目录。
 #[tauri::command]
-pub fn delete_external_agent(key: String) -> Result<(), String> {
-    delete_external_agent_at(&crate::plugin_apps::find_plugin_dir(), &key)
+pub fn delete_external_agent(key: String) -> Result<bool, String> {
+    delete_external_agent_at(&nuphus::utils::plugin_root(), &key)
 }
 
-fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<(), String> {
+fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<bool, String> {
     validate_key(key)?;
     let path = team_toml_path(plugin_dir);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()), // 无文件视为已删除
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false), // 无文件 = 本来就没有
         Err(e) => return Err(format!("读 team.toml 失败: {e}")),
     };
     let mut doc = split_doc(&content);
     let before = doc.blocks.len();
     doc.blocks.retain(|b| b.key != key);
     if doc.blocks.len() == before {
-        return Ok(()); // 段不存在，无操作
+        return Ok(false); // 段不存在 = 本来就没有
     }
     let mut out = doc.head.clone();
     for b in &doc.blocks {
@@ -672,7 +685,8 @@ fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<(), String> 
         out.push('\n');
     }
     out.push_str(&doc.tail);
-    atomic_write(&path, &out)
+    atomic_write(&path, &out)?;
+    Ok(true)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -683,7 +697,7 @@ fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<(), String> 
 /// .nuphus/handoff/{key}/（read.md 职责 = description）。返回 "created"/"updated"。
 #[tauri::command]
 pub fn upsert_external_agent(agent: serde_json::Value) -> Result<String, String> {
-    let plugin_dir = crate::plugin_apps::find_plugin_dir();
+    let plugin_dir = nuphus::utils::plugin_root();
     let is_new = upsert_and_init_at(&plugin_dir, &handoff_root(), &agent)?;
     Ok(if is_new { "created" } else { "updated" }.to_string())
 }
@@ -910,16 +924,22 @@ process = "opencode.exe"
     fn test_delete_agent() {
         let root = tmp_root("delete");
         std::fs::write(root.join("team.toml"), SAMPLE).unwrap();
-        delete_external_agent_at(&root, "opencode").unwrap();
+        assert!(
+            delete_external_agent_at(&root, "opencode").unwrap(),
+            "真实删除并写回必须返回 true"
+        );
         let list = list_external_agents_at(&root).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["key"], "claude-code");
         let content = std::fs::read_to_string(root.join("team.toml")).unwrap();
         assert!(!content.contains("[opencode]"));
         assert!(content.contains("[claude-code]"));
-        // 删除不存在段 → 无操作不报错
-        delete_external_agent_at(&root, "ghost").unwrap();
+        // 段不存在 → false（零改动），不再返回 Ok(()) 冒充「删除成功」
+        assert!(!delete_external_agent_at(&root, "ghost").unwrap());
         assert_eq!(list_external_agents_at(&root).unwrap().len(), 1);
+        // team.toml 文件不存在 → false（发布版路径失真时的「假成功」根因）
+        let missing = tmp_root("delete-missing");
+        assert!(!delete_external_agent_at(&missing, "ghost").unwrap());
     }
 
     #[test]
@@ -1030,8 +1050,8 @@ note = "Google Gemini 官网问答版，Chrome 标签页，窗口标题 'Google 
         let we = content.find("[web_agent]").unwrap();
         assert!(cc < oc && oc < we, "段顺序应保持，新段追加在尾部");
 
-        // delete 后消失
-        delete_external_agent_at(&root, "gemini").unwrap();
+        // delete 后消失（真删 → true）
+        assert!(delete_external_agent_at(&root, "gemini").unwrap());
         let list = list_external_agents_at(&root).unwrap();
         assert_eq!(list.len(), 4); // web_agent + 原 3 段 - gemini
         assert!(!list.iter().any(|a| a["key"] == "gemini"));

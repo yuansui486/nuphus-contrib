@@ -302,6 +302,7 @@ fn main() {
             commands::get_supported_providers,
             commands::create_custom_provider,
             commands::update_custom_provider,
+            commands::remove_custom_provider,
             commands::oauth_begin,
             commands::oauth_status,
             commands::oauth_logout,
@@ -942,6 +943,12 @@ fn main() {
                     tracing::info!("[MODE] 启动恢复 current_mode from 镜像: {}", mode);
                 }
             }
+
+            // ── 外部 Agent handoff 旧根迁移（exe 旁 / cwd / data_dir 嵌套坑的
+            //    历史布局 → plugin_root() 派生的新根，agent 目录级合并）──
+            // 必须在状态清零之前：清零读的是新根，先迁移才能让迁来的真实
+            // status.json 参与本轮生命周期判定（否则首启即永久空白）。
+            crate::commands::config::handoff::migrate_legacy_handoff_roots();
 
             // ── 外部 Agent 状态清零：上一轮生命周期的 status.json 一律作废，
             //    状态栏仅显示本轮真实启动且经门铃上报验证过的 agent ──

@@ -162,7 +162,7 @@ Constitution > Safety > Evidence > Goal > System > Efficiency > Style
 
 ## 构建/验证/测试原则
 
-构建、验证或测试前必读 `plugin/knowledge/nuphus-self/build-verification-policy.md`，禁止未读盲目构建、验证和测试。
+构建、验证或测试前必读 `prompts/build-verification-policy.md`，禁止未读盲目构建、验证和测试。
 "#;
 
 const L0_RUNTIME: &str = r#"
@@ -489,8 +489,17 @@ pub fn build_l2_leader() -> String {
 
 ## 任务调度
 
+### 工具契约（三个组件单向切开）
+- `planner_*`（create/parse/list/archive）= **理解传递层**：把意图、约束、现状理解写进 `.plan.md`，
+  供 Exec 注入与事后查证。它是**只读工件**，不承担任何执行状态。
+- `task_dispatch` = **执行层**：`title`（短标题，给人看）+ `brief`（长指令，给 Exec 看）。
+  **生命周期由代码记账**（每次派发服务端下发 run 身份，起止/成败/耗时自动落台账并推给面板），
+  你**不需要、也不应该**向任何工具汇报"任务做完了"——没有这类工具。
+- 任务面板 = 台账的**只读投影**：有计划时只多一个「计划#N」归属标签（`task_no`，可不传），
+  与执行结果无关。
+
 ### 描述规范
-`description` 按五段骨架组织：
+`brief` 按五段骨架组织：
 1. **任务定义** — 做什么 + 成功标准
 2. **上下文** — 已核实事实（文件:行号）/ 约束 / 依赖，让 Exec 免于重复侦察
 3. **质量基线** — 可验证的通过条件
@@ -558,7 +567,7 @@ pub fn exec_blocked_tools() -> &'static [&'static str] {
         "planner_create",
         "planner_parse",
         "planner_list",
-        "planner_complete",
+        "planner_archive",
         "task_dispatch",
         "memory_stats",
         "annotation_add",

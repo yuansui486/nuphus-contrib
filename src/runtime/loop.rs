@@ -433,6 +433,11 @@ impl Runtime {
         self.agent.set_exec_resources(exec_tools, exec_llm, emitter);
     }
 
+    /// Inject execution lifecycle ledger (for task_dispatch, see `agent::task_run`)
+    pub fn set_task_runs(&mut self, reg: Arc<crate::agent::task_run::TaskRunRegistry>) {
+        self.agent.set_task_runs(reg);
+    }
+
     /// Get current mode
     pub fn mode(&self) -> Mode {
         self.config.mode

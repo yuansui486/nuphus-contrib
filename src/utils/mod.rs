@@ -834,6 +834,49 @@ fn dev_checkout_root() -> Option<PathBuf> {
     root.join("Cargo.toml").exists().then_some(root)
 }
 
+/// handoff 根目录推导——**纯函数**，`data_dir` 显式入参（测试无需改环境变量）。
+///
+/// 规则：
+/// - `plugin_root` 位于 `data_dir` 之下（发布版：`%APPDATA%\.nuphus\plugin`）→
+///   `data_dir/handoff`。handoff 落在用户数据根旁边，避开 `plugin_root.parent()`
+///   直接拼 `.nuphus` 造成的 `.nuphus\.nuphus\handoff` 嵌套坑
+/// - 否则（开发机：`<repo>/plugin`）→ `plugin_root.parent()/.nuphus/handoff`
+///   = `<repo>/.nuphus/handoff`，与收敛前逐字节一致、零迁移
+pub fn handoff_root_from(plugin_root: &Path, data_dir: &Path) -> PathBuf {
+    if plugin_root.starts_with(data_dir) {
+        return data_dir.join("handoff");
+    }
+    match plugin_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(".nuphus").join("handoff"),
+        // 退化输入（相对 plugin 根无父目录）：与发布版同样收敛到 data_dir，
+        // 绝不拼出依赖 cwd 的 `.nuphus/handoff`
+        _ => data_dir.join("handoff"),
+    }
+}
+
+/// 知识库文档根目录：`{plugin_root}/knowledge`，缺失则创建（root 注入形式，可单测）。
+///
+/// 干净克隆 / 发布版首启里该目录不存在：**由这里负责创建**（失败仅 warn）。
+/// 消费方不得各自判存在性再报「知识库目录找不到」——那是历史两份解析器的病症。
+pub fn knowledge_docs_root_at(plugin_root: &Path) -> PathBuf {
+    let docs = plugin_root.join("knowledge");
+    if let Err(e) = std::fs::create_dir_all(&docs) {
+        tracing::warn!("[utils] 创建 knowledge 目录失败 {:?}: {e}", docs);
+    }
+    docs
+}
+
+/// 知识库文档根目录（运行时权威入口）：`plugin_root()/knowledge`。
+pub fn knowledge_docs_root() -> PathBuf {
+    knowledge_docs_root_at(&plugin_root())
+}
+
+/// 知识库索引目录：`nuphus_data_dir()/index`——Tauri 端与 Agent 端共用的唯一来源。
+/// 旧实现从 `docs_root` 反推两级父目录再拼 `.nuphus/index`，两侧各推一份必然分裂。
+pub fn knowledge_index_dir() -> PathBuf {
+    nuphus_data_dir().join("index")
+}
+
 /// 按优先级构造候选列表。
 ///
 /// 纯构造、不碰文件系统 —— 「优先级顺序」这条不变量因此可以直接单测，
@@ -2165,6 +2208,69 @@ mod tests {
         assert_eq!(pick_usable_root(&cs), Some(data_plugin.clone()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── handoff / knowledge 路径权威派生 ─────────────────────────────
+
+    /// 开发机（plugin 根在源码检出内，不在 data_dir 之下）：
+    /// handoff 仍解析到 `<repo>/.nuphus/handoff`，零迁移。
+    #[test]
+    fn handoff_root_from_dev_checkout_stays_repo_dot_nuphus() {
+        let repo = Path::new("C:/Users/Administrator/Nuphus");
+        let data_dir = Path::new("C:/Users/Administrator/AppData/Roaming/.nuphus");
+        let root = super::handoff_root_from(&repo.join("plugin"), data_dir);
+        assert_eq!(
+            root,
+            repo.join(".nuphus").join("handoff"),
+            "开发机行为必须不变：handoff 仍在仓库 .nuphus/handoff"
+        );
+    }
+
+    /// 发布版（plugin 根落在 data_dir 之下）：handoff 收敛到 data_dir/handoff，
+    /// 不得出现 `.nuphus/.nuphus/handoff` 嵌套。
+    #[test]
+    fn handoff_root_from_data_dir_plugin_avoids_nested_dot_nuphus() {
+        let data_dir = Path::new("C:/Users/x/AppData/Roaming/.nuphus");
+        let root = super::handoff_root_from(&data_dir.join("plugin"), data_dir);
+        assert_eq!(root, data_dir.join("handoff"));
+        assert!(
+            !root.to_string_lossy().contains(".nuphus\\.nuphus")
+                && !root.to_string_lossy().contains(".nuphus/.nuphus"),
+            "不得出现 data_dir 内二次嵌套 .nuphus，实际 {:?}",
+            root
+        );
+    }
+
+    /// docs 根在干净克隆 / 发布版首启里不存在——创建它，而不是让工具报错。
+    #[test]
+    fn knowledge_docs_root_at_creates_missing_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "nuphus-utils-knowledge-{}-{}",
+            std::process::id(),
+            "docs_root"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docs = super::knowledge_docs_root_at(&dir);
+        assert_eq!(docs, dir.join("knowledge"));
+        assert!(
+            docs.is_dir(),
+            "knowledge 目录缺失时必须由解析侧创建，否则两侧工具只会报「目录找不到」"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 索引目录必须挂在 nuphus_data_dir()/index 单一来源下（Tauri 与 Agent 共用），
+    /// 不得从 docs_root 反推两级。
+    #[test]
+    fn knowledge_index_dir_hangs_under_data_dir() {
+        let idx = super::knowledge_index_dir();
+        assert_eq!(idx.file_name(), Some(std::ffi::OsStr::new("index")));
+        assert_eq!(
+            idx.parent(),
+            Some(super::nuphus_data_dir().as_path()),
+            "索引目录唯一来源 = nuphus_data_dir()/index，禁止从 docs_root 反推"
+        );
     }
 
     // ── 随包只读资产内嵌 / 落盘 ─────────────────────────────────────
