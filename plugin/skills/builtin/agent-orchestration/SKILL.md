@@ -13,18 +13,11 @@ tags: [agent, 外部Agent, 并行, 编排]
 
 ## 1. 登记（team.toml）
 
-渐进登记：每用一个外部 Agent，在 `plugin/team.toml` 追加一段。只记稳定事实（mode/launch/process/window_hint/dispatch_steps/note），禁止记 PID/窗口句柄/绝对坐标（ui-maps 保存语义定位器或视觉锚点规则；PID/hwnd 每次启动必变，hwnd 编号还会被 OS 复用给无关窗口——易变事实必须按当次实况重新解析）。
-
-```toml
-[{key}]
-mode = "embedded"          # background | embedded | standalone | web —— 决定交互协议（§2）
-launch = "<启动命令>"      # Leader 手动启动命令（见 §2 启动 SOP）
-window_hint = "<窗口特征>" # 窗口标题特征（windows_list 匹配用）
-process = "<进程名>"       # 进程名特征（process_list 识别依赖此字段）
-```
+渐进登记：每用一个外部 Agent，在 `plugin/team.toml` 追加一段。只记稳定事实（mode/launch/process/window_hint/dispatch_steps/note）；PID/hwnd 每次启动必变、hwnd 会被 OS 复用给无关窗口——一律按当次实况重新解析，禁止写死。
 
 > 本段只示**格式**（键名与注释）；字段值一律占位，不代表任何已登记 agent 的实况。
 > 任何具体 agent 的字段值，一律以 `plugin/team.toml` 当次读取为准。
+> 完整段示例（含 dispatch_steps）见本节末尾第 3 条，此处不重复。
 
 **双登记路径（实测均有效）**：
 - **手改 team.toml**：直接编辑保存即可被运行中系统即时读取（无需重启），适合快速实验与本轮临时接入；
@@ -36,17 +29,10 @@ process = "<进程名>"       # 进程名特征（process_list 识别依赖此�
 
 新外部 Agent 首次**跑通验证**后，必须当轮登记归档，禁止「以后再用再配」——不归档则下次会话无从知晓其存在与用法，跑通经验直接丢失。
 
-1. **配置中心录入**：桌面 设置 → 外部 Agent → 新增（走 `upsert_external_agent`，字段填全）：
-   - `key`：唯一 id（字母数字-_；保存后不可改）
-   - `mode`：background / embedded / standalone / web ——窗口分类依据（§2 交互方式由此决定）
-   - `display_name` / `icon`：状态栏与人读标识
-   - `launch` / `args`：启动命令与参数（Leader 手动启动时使用，§2 启动 SOP）
-   - `window_hint`：窗口标题特征（windows_list 匹配；终端类运行时标题常被覆写，hint 应选稳定前缀）
-   - `process`：进程名特征（process_list 识别依赖此字段）
-   - `description`：职责一句话（路由提示；新 agent 自动同步为其 `.nuphus/handoff/{key}/read.md` 的职责段）
-   - `note`：Leader 专属实测备忘（如某热键不生效、某交互必须换路径等一手观察），随配置读取并在派发结果中回显；UI 禁止编辑
-   > **已废弃不生效**：`cooldown_secs` / `await_timeout_secs` / `timeout_action` / `timeout_script` / `auto_approve` / `auto_approve_script` / `confirm_keywords`——早期设想（隐式冷启等待/投递后短等/超时自检/确认词自动代答）均未落地，当前同步路径零等待、禁隐式冷启动，agent_dispatch 不消费这些字段；后端仅为旧 team.toml 兼容而继续解析，配置中心 UI 也不再提供录入——**配了等同没配，不要依赖**。
-   > **字段全集以代码为准**：`AgentFields`（`src-tauri/src/commands/config/team.rs`）——上面只列 Leader 步骤必须用到的字段，其余（type/open/args/dir 等）以该结构体定义为准；其中 cooldown_secs/await_timeout_secs/timeout_action/timeout_script/auto_approve/auto_approve_script/confirm_keywords 仅为旧配置兼容保留、当前不生效（见上文），本文档不重复维护。
+1. **配置中心录入**：桌面 设置 → 外部 Agent → 新增（走 `upsert_external_agent`）：
+   - **派发必需**：`key`（唯一、保存后不可改）/ `mode`（窗口分类依据，§2 交互方式由此决定）/ `launch`+`args`（§2 启动 SOP 手动启动用）/ `window_hint`（终端类标题常被覆写，选稳定前缀）/ `process`（process_list 识别依赖此字段）/ `dispatch_steps`（§1.1——配错一步指令就打不进去，第一责任区）
+   - **人读与备忘**：`display_name`/`icon`/`description`（description 会同步为该 agent read.md 的职责段）；`note` = Leader 专属实测备忘（随配置读取、派发结果回显、UI 禁编辑）——opencode 的「window_hint 扫描无效、走 pid 路径」结论就记在这里
+   > **已废弃不生效**：`cooldown_secs` / `await_timeout_secs` / `timeout_action` / `timeout_script` / `auto_approve` / `auto_approve_script` / `confirm_keywords`——早期设想均未落地，配了等同没配，不要依赖（后端仅为旧配置兼容解析，UI 不再提供录入）。字段全集以代码为准：`AgentFields`（`src-tauri/src/commands/config/team.rs`）。
 2. **落盘核对**：`plugin/team.toml` 出现该段且原有段未被破坏（写回是段级增量）；新 key 联动生成 handoff 工作目录。
 3. 完整段示例（**全量字段的格式示例**；值一律占位，实况以 `plugin/team.toml` 为准）：
 
@@ -59,9 +45,6 @@ launch = "<启动命令>"
 window_hint = "<窗口特征>"
 process = "<进程名>"
 note = "<Leader 实测备忘>（Leader 专属，UI 不可编辑）"
-
-# 旧配置里可能还有 cooldown_secs / await_timeout_secs / timeout_action /
-# confirm_keywords 等字段：后端兼容解析，但当前不生效——不要配、不要依赖
 
 [[{key}.dispatch_steps]]
 tool = "desktop_window_activate"
@@ -109,6 +92,7 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 | 症状 | 根因 |
 |---|---|
 | 工具报 step 失败 hwnd 无效 | agent 已被关闭/PID 过期 → 重走 §2 启动 SOP 取新窗口 |
+| 显式 pid 捕获失败（「PID 及其父进程链上均无可见窗口」）但进程活着 | agent 已关闭 / TUI 启动中窗口未就绪（等 5–10s 重试）→ 按 §2 窗口定位诊断路径核对实况后重派；标题被覆写时 window_hint 扫描同样无效，勿反复重扫 |
 | 终端出现 `{hwnd}` 字面文本 | 占位符拼写错误或该变量本轮未提供 |
 | 指令只进去一半 | 多行文本被终端逐行执行 → 改单行 message + 走文件 |
 | 输入后 TUI 无反应 | 未等 TUI 就绪就发送 → 首步激活与输入之间补 `__sleep` |
@@ -129,15 +113,13 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 
 **桌面类首跑流程**：发现并绑定目标 → UIA/Accessibility 观察 → 从当前候选选择动作 → 本地执行与状态回读。工具列表含 `desktop_agent_step` 时使用增强判断入口，交回主模型后直接接手，不重复请求同一决策。语义能力不足时再截图/感知，使用本次 capture_id + element_id；缓存保存稳定 locator、动作能力和视觉锚点规则，不保存临时 ID 或绝对坐标。每次回放重新解析，旧缓存不是本次定位证据。
 
-### 窗口定位（terminal 类，不可跳过）
+### 窗口定位（terminal 类）
 
-```
-1. process_list 找 Agent 进程（按 team.toml process 字段）→ 记 PID
-2. 查父进程（Get-CimInstance Win32_Process）→ 父进程 MainWindowHandle → windows_list 定位
-3. 截图 + OCR 确认是 Agent（提示符/任务输出）——运行时标题常被覆写（TUI 类常见「前缀 | 任务名」形态），不能靠标题
-```
+**主路径（一行）**：process_list 按 `process` 字段拿 agent PID → 直接传给 `agent_dispatch`。窗口解析由机制完成：按 process_id 直配，落空自动回溯父进程链（≤4 级）——TUI 窗口建在宿主 shell 名下时靠它命中（opencode 实例：agent 11332 → 宿主 powershell 11248 的窗口）。**Leader 不需要自己查父进程/宿主 PID。**
 
-**宿主归属注意（实测）**：TUI 进程自身（如 TUI 可执行文件 / 其宿主 shell）的 MainWindowHandle 可能为 0——顶层窗口可能宿主在 Windows Terminal 或 conhost 名下，也可能正在启动中尚未建窗。判定顺序：先 windows_list 全表扫 window_hint/标题特征；无果再等 5–10s 重查一次（冷启动 TUI 渲染需要时间）；仍无果按 §5 回退用 Start-Process `-WindowStyle Normal` 重新拉起。**禁止凭进程存在就认定「窗口存在」，也禁止把任何缓存句柄当激活目标——每次以当次枚举实况为准。**
+**诊断路径（仅捕获失败时）**：windows_list 扫目标窗口确认它在；标题被覆写（「前缀 | 任务名」）时按父链查——Get-CimInstance 查 agent 进程的父进程 → 父进程 MainWindowHandle → windows_list 定位。window_hint 全表扫对标题覆写型 TUI 无效（宿主进程名也不含 hint），**扫空即停，勿重扫**。
+
+**通则**：禁止凭进程存在就认定「窗口存在」；禁止把任何缓存句柄当激活目标（每次以当次枚举实况为准）；截图 + OCR 仅在有忙闲疑虑时做（§7.4 禁止把 OCR 当盯梢手段）。TUI 冷启动首窗未就绪 → 等 5–10s 重查，仍无果按 §5 回退重新拉起。
 
 有 `plugin/ui-maps/{应用名}.json` 缓存 → 按缓存的 locate/default_pos 直接定位，校验窗口状态后使用（见 §6）。
 
@@ -146,26 +128,15 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 - 短指令（≤200 字）→ desktop_input 直接输入；仅填写时显式 send="none"，需要发送时按已核实的目标约定指定 enter/快捷键，不假定所有即时通讯应用都是 ctrl+enter。
 - 长指令（>200 字）→ Write 文件，desktop_input 只发「读 {文件路径} 并执行」
 
-### 派发闭环（首次建立共识，后续直接派）
+### 派发闭环 = 派发 → 门铃 → 验收（§7）
 
-**闭环 = 派发 → 门铃 → 验收**，每轮正式任务都走。读规则只做一次：
-
-```
-首次派发（新会话 / agent 无上下文）：
-  先走读规则环——派「读 {brief} 并回报关键理解」→ agent 门铃 progress（含理解要点）
-  → Leader 验收理解一致（不符 → 返工重读）→ 通过即建立共识
-
-同会话后续派发：
-  共识已建立，直接派正式任务 → agent 执行 → 门铃 done/blocked → 验收（§7.4）
-```
-
-首次通过后即共识，禁止：用 OCR 盯 Read 动作（盯梢不是闭环）。
+本会话**首次**对接该 agent 才走读规则环——操作序列唯一定义在 §7.0 步骤 2 与启动 SOP Step 4，此处不重复；共识建立后同会话直接派正式任务。禁止：用 OCR 盯 Read 动作（盯梢不是闭环）；每轮重复读协议。
 
 ### 启动（Leader 主导四步 SOP——外部 Agent 的第一步动作）
 
 **Step 1 读配置与注意事项**：Read team.toml 对应段 → 记住 `launch` 启动命令、`window_hint`、`process` 与 `note` 实测备忘（逐条记住——投递方式可能因此不同；cooldown/超时自检/确认词表等旧字段不生效，读了也不要依其决策）。
 
-**Step 2 查已有实例（复用优先）**：process_list 按 `process` 字段查活进程；windows_list 按 `window_hint` 扫窗口。有且健康 → 直接记下 PID/hwnd 进入 Step 4。
+**Step 2 查已有实例（复用优先）**：process_list 按 `process` 字段查活进程 → 记下 PID 进入 Step 4。该 PID 直接用于派发——窗口解析（含 TUI 宿主的父链回溯）由 `agent_dispatch` 内置完成，无需自己定位窗口；捕获失败时按 §2 窗口定位的诊断路径排查。
 
 **Step 3 首轮手动启动并记录 PID**：无实例才执行——`system_shell` 用 `Start-Process` 以 **`-WindowStyle Normal` 显式带窗启动** `launch` 命令；等待窗口出现后记录 PID 与 hwnd。禁止依赖工具内部的隐式冷启动或历史缓存句柄（易变事实不可作为派发依据，§1 铁律）。自启失败请用户手动打开。
 
@@ -208,7 +179,7 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 3. 桌面 UI 定位失败 → 分页/局部语义观察 → 能力不足才走本地 OCR/视觉锚点；目标仍不清晰时请用户帮助（见 §6）
 4. ui-maps 缓存失效（布局实质变化）→ 重新识别并更新参数文件
 5. 产出不合格 → §7.4 返工（brief 升版本重发 ≤3 轮）→ 超限报告用户
-6. **agent_dispatch 工具超时/失败接管 SOP**（实测有效）：① Read `.nuphus/handoff/{agent}/status.json` + briefs/ —— 确认上板是否已完成（brief 存在即算）；② process_list/windows_list 按 team 配置核对进程与窗口实况；③ **超时≠取消**：工具层超时（180s）或投递步骤失败时，同步序列不会被取消、可能仍在后台逐条执行——先截图/看回显确认指令是否已进入终端：**已进入则勿重投**（两条序列会交错敲键、任务被执行两遍），确认未进入才 `desktop_window_activate` 激活窗口后 `desktop_input` 直输「Read {brief_path} and execute it.」补完投递；④ 进程已死或从未启动 → 重走 §2 启动 SOP；⑤ 全程以文件与实况为准，禁止凭工具报错文本猜根因。
+6. **agent_dispatch 工具超时/失败接管 SOP**（实测有效）：① Read `.nuphus/handoff/{agent}/status.json` + briefs/ —— 确认上板是否已完成（brief 存在即算）；若 `state=error` 先读 `error_reason`——派发链路八个失败点（未登记 / workspace 非目录 / 上板失败 / desktop_client 缺失 / 进程窗口捕获失败 / 项目名非法 / 产物目录失败 / 投递步骤失败）都会把可指认环节写在这里，先于任何终端排查；② process_list/windows_list 按 team 配置核对进程与窗口实况；③ **超时≠取消**：工具层超时（180s）或投递步骤失败时，同步序列不会被取消、可能仍在后台逐条执行——先截图/看回显确认指令是否已进入终端：**已进入则勿重投**（两条序列会交错敲键、任务被执行两遍），确认未进入才 `desktop_window_activate` 激活窗口后 `desktop_input` 直输「Read {brief_path} and execute it.」补完投递；④ 进程已死或从未启动 → 重走 §2 启动 SOP；⑤ 全程以文件与实况为准，禁止凭工具报错文本猜根因。
 
 ---
 
@@ -254,7 +225,7 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 **Leader 完整操作序列**：
 
 ```
-0. 前置：外部 Agent 已按 §2 启动 SOP 启动/复用，PID 与窗口实况在手；
+0. 前置：外部 Agent 已按 §2 启动 SOP 启动/复用，PID 在手（窗口解析交给机制）；
    handoff 工作目录已初始化（read.md 存在；缺失则先 agent_init 或走配置中心录入补齐）。
 1. 上板+派发（主路径）：调 agent_dispatch 工具（参数 agent / task_id / brief / project 可选 /
    message 可选）——一次完成：写入 briefs/{task_id}-brief.md（内嵌契约原文）、置状态、
@@ -280,14 +251,11 @@ with = { hwnd = "{hwnd}", … } # 参数表；值中的 {hwnd}/{message} 等占�
 ### 7.1 派发前强制 Checklist（缺一不可）
 
 ```text
-□ 1. 已调 agent_dispatch 上板+派发（一次建 brief + 置 status + 内嵌契约，见 7.0）——禁止手写 brief 文件绕过
-□ 2. brief 门铃契约段 = dispatch 自动拼接的 contract 原文（含 X-Handoff-Token 头 + 可直接复制执行的上报示例），禁止手写转述/凭记忆写令牌
-□ 3. 已要求接收方写 report 到契约给出的 report_path（固定四段）
-□ 4. 已确认目标 agent 的 read.md 为最新协议版（含「开工即报 progress」纪律）——旧版协议文件会让状态栏缺失「执行中」态
-□ 5. 已确认门铃纪律随契约下发：开工 health 自检 → 过程 progress → 完工 done（含 report_path）
-□ 6. 下发：长指令走文件（终端只发「Read {brief 路径} and execute it.」单行短指令）
-□ 7. 执行中不轮询不打断（禁止 sleep 空等；状态自动流转，看门铃注入即可）
-□ 8. 本生命周期首次对接：先走首次握手（让 agent 读 read.md 回报理解，验证通路，见 §2 启动 Step4 / §7.0 步骤2）；共识已立后直接派正式任务
+□ 1. 已调 agent_dispatch 上板+派发（一次建 brief + 置 status + 内嵌契约 + 投递）——禁止手写 brief 文件绕过；门铃契约段是 dispatch 自动拼接的 contract 原文，禁止手写转述/凭记忆写令牌
+□ 2. brief 已要求接收方写 report 到契约给出的 report_path（固定四段：完成项 / 改动文件 / 验证证据 / 遗留）
+□ 3. 本生命周期首次对接该 agent：先走首次握手（Step 4 / §7.0 步骤 2），共识已立后直接派正式任务
+□ 4. 长指令走文件：终端只发单行英文指针「Read {brief_path} and execute it.」——message 参数可省略，工具默认模板即是该指针，只有定制指令时才传
+□ 5. 执行中不轮询不打断；在途闸已内置（板上有未终态任务时，不同 task_id 的派发会被自动拒绝、看板不受影响），被拒时按错误文本给出的两个出口处置
 ```
 
 ### 7.2 回传（门铃）——实证契约
@@ -310,7 +278,9 @@ GET /handoff/health → 免令牌自检
 | 422 | JSON 缺必填字段（id/status/summary） | 补全四个字段：id/status/summary/report_path(可 null) |
 | 400 | status 非法值 或 id/summary 为空 | status 只允许 done/progress/blocked |
 
-语义细节：progress 同 id 折叠（只注入最新一条）；done/blocked 终态幂等且到达后清除同 id 陈旧 progress；summary 换行压平、500 字截断。
+语义细节：progress 同 id 折叠（只注入最新一条）；done/blocked 终态幂等且到达后清除同 id 陈旧 progress；summary 换行压平、500 字截断。上报形态两种等价：裸 POST（如上）或契约内置的 `nuphus-task.exe task ...` CLI（终端类 agent 实测在用）——以契约原文为准，不要求 agent 改换形态。
+
+**task_id 一致性闸**：状态栏的 task_id 是「板上当前轮」、上板时写入。迟到的旧轮事件（事件 id 的 task_id 与板上不一致）只追加 last_event + 后台 warn——不动 state/task_id、不跑完工审计，但事件绝不丢弃（done/blocked 唤醒只认事件 status，与状态栏无关）。因此 agent 侧「上报返回 200 但状态栏没动」的正当成因之一是 task_id 不匹配：先核对事件 id 是否 `{agent}::{task_id}` 且 task_id 为本轮 brief 的值，再怀疑链路故障。
 
 - 终端类：curl 直调；**PowerShell 必须发 UTF-8 字节体**（`-Body ([Text.Encoding]::UTF8.GetBytes($json))`），字符串 body 会把中文压成 `?`（实测）；纯 ASCII body 才可用单引号直传
 - 公网 Web 类：回复末尾输出 ```handoff 代码块，Leader 提取后代表中转
@@ -345,11 +315,10 @@ Nuphus 重启（有在途任务）→ 令牌已轮换（旧令牌 403，契约�
 
 **重启重置（设计意图）**：应用重启会把 status.json 重置为 idle/空 task_id（运行时态不跨重启）。在途任务经重启后，验收依据 = brief/report 文件（`.nuphus/handoff/`），状态栏只反映重启后的新事件；续派需重新 dispatch。
 
-**契约未送达的探测信号**：状态栏 `in_progress` 停留但 `last_event` 长时间为 null → agent 大概率没拿到可用契约或上报被门铃拒绝（403/422，见 7.2 错误码表）。不要干等：Read brief 检查门铃契约段是否为 contract 原文（含 token/header/示例）→ 缺失则补发正确契约并让 agent 重报；agent 在终端反复试错探测端点也是同一信号。
-
-
-**投递链路中断的探测信号**：`in_progress` + `last_event: null` + 终端无任何反应（agent 从未收到指令）→ 上板已完成但投递步骤失败。典型成因：派发前 agent 已被关闭、窗口句柄过期、dispatch 被外层超时切断。处置按 §5 第 6 条接管 SOP：核对进程/窗口实况，截图确认指令未进入终端后，激活并补输「Read {brief_path} and execute it.」即可恢复，无需重新上板；若指令已进入终端（序列可能仍在后台跑）则勿重投，转交门铃/自然验收点验证。
+**两个探测信号（`in_progress` 停留 + `last_event` 长时间 null）**：终端无任何反应 = 投递断裂（agent 从未收到指令）；终端反复试错探测端点 = 契约未送达（上报被拒 403/422，查 7.2 错误码表）。两者处置同一条路——§5 第 6 条接管 SOP：Read brief 核对契约原文 → 核对进程/窗口实况 → 截图确认指令是否已进终端：未进才补输「Read {brief_path} and execute it.」（无需重新上板），已进则勿重投（序列可能仍在后台跑），转交门铃验证。
 
 ### 7.6 归档
 
 brief + report 保留 `.nuphus/handoff/`（外部产出无 task_trace，这是唯一追溯链）；经验入记忆；新平台补登 team.toml。
+
+**路径与登记边界（实测）**：handoff 根 dev 机 = `<repo>/.nuphus/handoff`，发布版 = `%APPDATA%\.nuphus\handoff`（agent 侧一律用契约绝对路径；Leader 手动 Read status/report 时按此定位，不要去 `%APPDATA%\.nuphus\handoff` 找 dev 机的文件）。`plugin/team.toml` 被 `.gitignore` 显式忽略——登记簿**本机独有、不随仓库分发**，换机/干净克隆后需重新登记（设计意图：含机器相关 launch 路径，非配置丢失）。

@@ -12,7 +12,7 @@ import {
   type AgentDeliverable,
 } from '../lib/api'
 import { AgentIconAuto } from '../components/AgentIconAuto'
-import { PreviewOverlay } from './PreviewOverlay'
+import { baseName, PreviewOverlay } from './PreviewOverlay'
 import '../../styles/external-agents.css'
 
 const POLL_INTERVAL_MS = 3000
@@ -367,6 +367,9 @@ export default function ExternalAgentsStatusBar({
   forcedRef.current = forced
   const reports = (deliverables || []).filter(d => d.kind === 'report')
   const artifacts = (deliverables || []).filter(d => d.kind === 'artifact')
+  /** The last event can predate the active task. Preserve its report path verbatim. */
+  const reportPath = openAgent?.last_event?.report_path
+  const latestReportPath = reportPath?.trim() ? reportPath : null
   /** 胶囊整体可见：强制常驻 ∪ hover 展开 ∪ 渐隐中 ∪ 有弹窗 */
   const shown = forced || revealed || fading || openAgent !== null
 
@@ -481,6 +484,24 @@ export default function ExternalAgentsStatusBar({
               <div className="ext-agent-popover-summary">{openAgent.last_event.summary}</div>
             ) : null}
             <div className="ext-agent-popover-body">
+              {latestReportPath && (
+                <button
+                  type="button"
+                  className="ext-agent-deliver-row"
+                  onClick={() => setPreviewPath(latestReportPath)}
+                  aria-label={t('extAgents.deliver.latestReport')}
+                  title={`${t('extAgents.deliver.latestReport')}\n${latestReportPath}`}
+                >
+                  <IconFile size={14} />
+                  <span className="ext-agent-deliver-info">
+                    <span className="ext-agent-deliver-name">
+                      {t('extAgents.deliver.latestReport')}
+                    </span>
+                    <span className="ext-agent-deliver-name">{baseName(latestReportPath)}</span>
+                  </span>
+                  <IconEye size={13} className="ext-agent-deliver-eye" />
+                </button>
+              )}
               {delError && (
                 <button
                   type="button"
@@ -494,7 +515,9 @@ export default function ExternalAgentsStatusBar({
               {loadingDeliv ? (
                 <div className="ext-agent-popover-empty">{t('extAgents.deliver.loading')}</div>
               ) : (deliverables || []).length === 0 ? (
-                <div className="ext-agent-popover-empty">{t('extAgents.deliver.empty')}</div>
+                !latestReportPath && (
+                  <div className="ext-agent-popover-empty">{t('extAgents.deliver.empty')}</div>
+                )
               ) : (
                 [
                   reports.length > 0 ? (

@@ -24,6 +24,7 @@ function stubState(overrides: Partial<WorkflowInputsState> = {}): WorkflowInputs
     canSubmit: true,
     errors: {},
     setValue: () => {},
+    applyPreset: () => {},
     payload: {},
     ...overrides,
   }

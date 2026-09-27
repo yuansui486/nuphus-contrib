@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { WorkflowIR } from './types'
 import type { CanvasLeaveGuard } from './useCanvasLeaveGuard'
@@ -163,9 +163,24 @@ beforeEach(() => {
   mocks.refresh.mockResolvedValue({ locked: false })
   mocks.save.mockResolvedValue({ saved: true, report: { passed: true, issues: [] } })
 })
+/** Flush the mocked API promises and cascading effects before querying canvas nodes. */
+async function renderCanvas(element = <CanvasPage workflowId="wf" onClose={() => {}} />) {
+  let view!: ReturnType<typeof render>
+  await act(async () => {
+    view = render(element)
+  })
+  return view
+}
+
+async function openNode(id: string) {
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: `打开 ${id}` }))
+  })
+}
+
 async function open(id = 'first') {
-  render(<CanvasPage workflowId="wf" onClose={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: `打开 ${id}` }))
+  await renderCanvas()
+  await openNode(id)
 }
 function shortcut() {
   fireEvent.keyDown(window, { key: 's', ctrlKey: true })
@@ -201,6 +216,7 @@ describe('Canvas save coordination', () => {
   })
 
   it('revalidates references when an input declaration changes without editing nodes', async () => {
+    vi.useFakeTimers()
     const original = workflow.steps
     workflow.steps = [
       {
@@ -210,15 +226,22 @@ describe('Canvas save coordination', () => {
       },
     ]
     try {
-      await open()
-      await waitFor(() =>
-        expect(screen.getByTestId('local-check')).toHaveTextContent('input_reference'),
-      )
+      await renderCanvas()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300)
+      })
+      expect(screen.getByTestId('local-check')).toHaveTextContent('input_reference')
       fireEvent.click(screen.getByText('更多'))
       fireEvent.click(screen.getByRole('button', { name: '外部输入' }))
       fireEvent.click(screen.getByRole('button', { name: '应用测试输入' }))
-      await waitFor(() => expect(screen.getByTestId('local-check')).toHaveTextContent('[]'))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300)
+      })
+      expect(screen.getByTestId('local-check')).toHaveTextContent('[]')
     } finally {
+      /** Clear the component's pending timers before returning to the real clock. */
+      cleanup()
+      vi.useRealTimers()
       workflow.steps = original
     }
   })
@@ -330,13 +353,13 @@ describe('Canvas save coordination', () => {
       const { setLang } = useLanguage()
       return <button onClick={() => setLang('en')}>Switch English</button>
     }
-    const view = render(
+    const view = await renderCanvas(
       <LangProvider>
         <LanguageControl />
         <CanvasPage workflowId="wf" onClose={() => {}} />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: '打开 first' }))
+    await openNode('first')
     fireEvent.change(panel('first').getByRole('combobox', { name: '保存输出到变量' }), {
       target: { value: 'unsaved_result' },
     })
@@ -407,7 +430,7 @@ describe('Canvas save coordination', () => {
   })
   it('registers one leave confirmation for unfinished drafts', async () => {
     let guard: CanvasLeaveGuard | null = null
-    render(
+    await renderCanvas(
       <CanvasPage
         workflowId="wf"
         onClose={() => {}}
@@ -416,7 +439,7 @@ describe('Canvas save coordination', () => {
         }}
       />,
     )
-    fireEvent.click(await screen.findByRole('button', { name: '打开 first' }))
+    await openNode('first')
     fireEvent.change(panel('first').getByLabelText(/^名称/), { target: { value: '没保存' } })
     let result!: Promise<boolean>
     act(() => {
@@ -444,7 +467,7 @@ describe('Canvas save coordination', () => {
     fireEvent.change(panel('second').getByRole('textbox', { name: /参数 JSON/ }), {
       target: { value: '{broken' },
     })
-    fireEvent.click(screen.getByRole('button', { name: '打开 first' }))
+    await openNode('first')
     fireEvent.change(panel('first').getByLabelText(/^名称/), { target: { value: '保留草稿' } })
     shortcut()
     await screen.findByText(/请先修正/)

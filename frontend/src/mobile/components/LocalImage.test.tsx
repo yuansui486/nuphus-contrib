@@ -45,6 +45,7 @@ let revokeObjectURL: ReturnType<typeof vi.fn>
 
 beforeEach(() => {
   fetchMock.mockReset()
+  localStorage.removeItem('nuphus_language')
   FakeIntersectionObserver.instances = []
   createObjectURL = vi.fn(() => 'blob:nuphus-image')
   revokeObjectURL = vi.fn()
@@ -178,5 +179,158 @@ describe('LocalImage', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     // 已进入视口：观察器随即释放，避免重复触发
     expect(observer.disconnected).toBe(1)
+  })
+
+  it('网络失败后就地重试保留中文路径，加载期间禁用重复点击并跳过懒加载等待', async () => {
+    const path = String.raw`C:\截图\中文目录\最新结果.png`
+    globalThis.IntersectionObserver =
+      FakeIntersectionObserver as unknown as typeof IntersectionObserver
+    let completeRetry!: (blob: Blob) => void
+    fetchMock.mockRejectedValueOnce(new Error('network unavailable')).mockImplementationOnce(
+      () =>
+        new Promise<Blob>(resolve => {
+          completeRetry = resolve
+        }),
+    )
+    render(<LocalImage path={path} />)
+    act(() => FakeIntersectionObserver.instances[0].trigger(true))
+
+    fireEvent.click(await screen.findByRole('button', { name: '重新加载图片' }))
+
+    const loading = screen.getByRole('button', { name: '正在加载图片…' })
+    expect(loading).toBeDisabled()
+    expect(screen.getByText(path)).toBeInTheDocument()
+    fireEvent.click(loading)
+    fireEvent.click(loading)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(FakeIntersectionObserver.instances).toHaveLength(1)
+
+    await act(async () => completeRetry(new Blob(['image'], { type: 'image/png' })))
+    expect(await screen.findByRole('img', { name: path })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '正在加载图片…' })).toBeNull()
+    expect(fetchMock).toHaveBeenLastCalledWith(path)
+  })
+
+  it('解码失败重试下载新图片，同时保留其他实例仍在使用的旧 objectURL', async () => {
+    createObjectURL.mockReturnValueOnce('blob:old-image').mockReturnValueOnce('blob:new-image')
+    fetchMock.mockResolvedValue(new Blob(['image'], { type: 'image/png' }))
+    const first = render(<LocalImage path={WINDOWS_PATH} />)
+    const second = render(<LocalImage path={WINDOWS_PATH} />)
+    const firstView = within(first.container)
+    const secondView = within(second.container)
+    fireEvent.click(await firstView.findByRole('img'))
+    fireEvent.error(within(firstView.getByRole('dialog')).getByRole('img'))
+    expect(firstView.queryByRole('dialog')).toBeNull()
+
+    fireEvent.click(firstView.getByRole('button', { name: '重新加载图片' }))
+    expect(await firstView.findByRole('img')).toHaveAttribute('src', 'blob:new-image')
+    expect(secondView.getByRole('img')).toHaveAttribute('src', 'blob:old-image')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(revokeObjectURL).not.toHaveBeenCalledWith('blob:old-image')
+
+    second.unmount()
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:old-image'))
+    expect(revokeObjectURL).not.toHaveBeenCalledWith('blob:new-image')
+    const third = render(<LocalImage path={WINDOWS_PATH} />)
+    expect(await within(third.container).findByRole('img')).toHaveAttribute('src', 'blob:new-image')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    first.unmount()
+    expect(revokeObjectURL).not.toHaveBeenCalledWith('blob:new-image')
+    third.unmount()
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:new-image'))
+    expect(revokeObjectURL).toHaveBeenCalledTimes(2)
+  })
+
+  it('重试再次失败时保留路径并允许再试，英文界面显示英文状态', async () => {
+    localStorage.setItem('nuphus_language', 'en')
+    fetchMock.mockRejectedValue(new Error('network unavailable'))
+    render(<LocalImage path={WINDOWS_PATH} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Reload image' }))
+
+    expect(await screen.findByRole('button', { name: 'Reload image' })).toBeEnabled()
+    expect(screen.getByText(WINDOWS_PATH)).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('img')).toBeNull()
+  })
+
+  it('同路径失败实例先后重试共享新请求，旧引用清理不会回收新图片', async () => {
+    let completeRetry!: (blob: Blob) => void
+    fetchMock.mockRejectedValueOnce(new Error('network unavailable')).mockImplementationOnce(
+      () =>
+        new Promise<Blob>(resolve => {
+          completeRetry = resolve
+        }),
+    )
+    const first = render(<LocalImage path={WINDOWS_PATH} />)
+    const second = render(<LocalImage path={WINDOWS_PATH} />)
+    const firstView = within(first.container)
+    const secondView = within(second.container)
+
+    fireEvent.click(await firstView.findByRole('button', { name: '重新加载图片' }))
+    fireEvent.click(await secondView.findByRole('button', { name: '重新加载图片' }))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    first.unmount()
+
+    await act(async () => completeRetry(new Blob(['image'], { type: 'image/png' })))
+    expect(await secondView.findByRole('img')).toHaveAttribute('src', 'blob:nuphus-image')
+    expect(revokeObjectURL).not.toHaveBeenCalled()
+    const third = render(<LocalImage path={WINDOWS_PATH} />)
+    expect(await within(third.container).findByRole('img')).toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    second.unmount()
+    expect(revokeObjectURL).not.toHaveBeenCalled()
+    third.unmount()
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledTimes(1))
+  })
+
+  it('重试未完成时卸载，迟到的 objectURL 仍被回收', async () => {
+    let completeRetry!: (blob: Blob) => void
+    fetchMock.mockRejectedValueOnce(new Error('network unavailable')).mockImplementationOnce(
+      () =>
+        new Promise<Blob>(resolve => {
+          completeRetry = resolve
+        }),
+    )
+    const { unmount } = render(<LocalImage path={WINDOWS_PATH} />)
+    fireEvent.click(await screen.findByRole('button', { name: '重新加载图片' }))
+    unmount()
+
+    await act(async () => completeRetry(new Blob(['image'], { type: 'image/png' })))
+
+    expect(revokeObjectURL).toHaveBeenCalledExactlyOnceWith('blob:nuphus-image')
+    expect(screen.queryByRole('img')).toBeNull()
+  })
+
+  it('重试未完成时切换路径，迟到的旧图片不会覆盖新路径', async () => {
+    const nextPath = String.raw`C:\新目录\截图.png`
+    let completeRetry!: (blob: Blob) => void
+    fetchMock
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Blob>(resolve => {
+            completeRetry = resolve
+          }),
+      )
+      .mockResolvedValueOnce(new Blob(['next image'], { type: 'image/png' }))
+    createObjectURL.mockReturnValueOnce('blob:next-image').mockReturnValueOnce('blob:late-image')
+    const { rerender, unmount } = render(<LocalImage path={WINDOWS_PATH} />)
+    fireEvent.click(await screen.findByRole('button', { name: '重新加载图片' }))
+    rerender(<LocalImage path={nextPath} />)
+    expect(await screen.findByRole('img', { name: nextPath })).toHaveAttribute(
+      'src',
+      'blob:next-image',
+    )
+
+    await act(async () => completeRetry(new Blob(['old image'], { type: 'image/png' })))
+
+    expect(screen.getByRole('img', { name: nextPath })).toHaveAttribute('src', 'blob:next-image')
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:late-image')
+    expect(revokeObjectURL).not.toHaveBeenCalledWith('blob:next-image')
+    unmount()
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith('blob:next-image'))
   })
 })

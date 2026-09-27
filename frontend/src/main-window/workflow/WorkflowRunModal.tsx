@@ -104,7 +104,9 @@ export function WorkflowRunModal({
       }
     >
       {/* ── 外部输入表单（仅在声明了 inputs 时出现；未声明 → 与既有弹窗完全一致）── */}
-      {hasInputs && <WorkflowInputsForm specs={inputSpecs} state={inputState} />}
+      {hasInputs && (
+        <WorkflowInputsForm specs={inputSpecs} state={inputState} workflowId={workflow.id} />
+      )}
 
       {/* 步骤列表 — 保留原有的 step card 结构 */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

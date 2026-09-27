@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+### Fixed
+- **外部 Agent 编排五处缺陷**（#69）：plugin 根解析收敛到 `plugin_root()` 单一权威并补 handoff 多源迁移，修复发布版配置中心空白与 `agent_dispatch` 必然失败；`agent_dispatch` 独立 180s 超时桶，文案改为实情口径（超时不取消任何东西、禁止诱导重投）；门铃事件增加 task_id 一致性闸，跨任务迟到事件不再串改状态与完工审计；派发失败统一落 `state=error` + `error_reason`，八个失败点收口，消除永久 `dispatched` 幽灵；status.json 读—改—写纳入同一把写锁、临时文件名带 pid+序号。
+
+### Changed
+- **agent_dispatch 窗口解析与并发防护**：显式 PID 匹配落空时自动回溯父进程链（TUI 窗口建在宿主进程名下时，传 agent 自身 PID 即可命中宿主窗口）；上板前增加在途任务闸——板上有未终态任务时拒绝不同 task_id 的派发（防两个任务在同一终端交错执行），同 task_id 重派放行作为刷新出口。
+
 ### Removed
 - **重复的构建验证政策文档**：删除 `plugin/knowledge/nuphus-self/build-verification-policy.md`，
   统一保留 `prompts/build-verification-policy.md`（此前两份逐字节相同）。`plugin/knowledge/`

@@ -353,3 +353,25 @@
   font-size: var(--fz-xs);
   color: var(--error);
 }
+
+.wcf-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--glass-1);
+}
+
+.wcf-presets-row {
+  display: flex;
+  gap: 8px;
+}
+
+.wcf-presets-row .wcf-input-control {
+  min-width: 0;
+  flex: 1;
+}
+
+.wcf-presets-row button {
+  flex-shrink: 0;
+}

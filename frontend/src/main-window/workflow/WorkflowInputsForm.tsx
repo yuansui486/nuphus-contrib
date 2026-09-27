@@ -14,6 +14,7 @@ import type { WorkflowInputKind, WorkflowInputSpec } from '../../core/types'
 import { IconWorkflow } from '../../ui/Icons'
 import { Button } from '../../ui/Button'
 import { CompactModal } from '../layout/CompactModal'
+import { WorkflowInputPresets } from './WorkflowInputPresets'
 import '../../styles/workflow-modal.css'
 
 /** 编辑态值：文本控件为 string，布尔控件为 boolean */
@@ -27,6 +28,8 @@ export interface WorkflowInputsState {
   /** 字段级阻断原因：name → 原因文案 */
   errors: Record<string, string>
   setValue: (name: string, value: WorkflowInputEditValue) => void
+  /** Apply declared non-sensitive preset fields over the latest defaults. */
+  applyPreset: (values: Record<string, WorkflowInputEditValue>) => void
   /** 提交对象：仅已声明字段；未填（空）字段不发送，交由后端「未提供 → 不注入」语义处理 */
   payload: Record<string, unknown>
 }
@@ -139,7 +142,27 @@ export function useWorkflowInputs(
     return { errors, payload }
   }, [specs, values])
 
-  return { values, canSubmit: Object.keys(errors).length === 0, errors, setValue, payload }
+  const applyPreset = useCallback(
+    (saved: Record<string, WorkflowInputEditValue>) => {
+      const next = initialValues(specs)
+      for (const spec of specs) {
+        if (!spec.sensitive && Object.prototype.hasOwnProperty.call(saved, spec.name)) {
+          next[spec.name] = saved[spec.name]
+        }
+      }
+      setSnapshot({ token: resetToken, values: next })
+    },
+    [resetToken, specs],
+  )
+
+  return {
+    values,
+    canSubmit: Object.keys(errors).length === 0,
+    errors,
+    setValue,
+    applyPreset,
+    payload,
+  }
 }
 
 function inputType(spec: WorkflowInputSpec): 'text' | 'number' | 'password' {
@@ -163,13 +186,22 @@ function placeholderOf(spec: WorkflowInputSpec): string | undefined {
 interface WorkflowInputsFormProps {
   specs: WorkflowInputSpec[]
   state: WorkflowInputsState
+  workflowId?: string
 }
 
 /** 声明式输入表单（纯展示：状态由 useWorkflowInputs 提供，便于两个宿主复用） */
-export function WorkflowInputsForm({ specs, state }: WorkflowInputsFormProps) {
+export function WorkflowInputsForm({ specs, state, workflowId }: WorkflowInputsFormProps) {
   return (
     <div className="wcf-inputs">
       <div className="wcf-inputs-title">运行前需要填写外部输入</div>
+      {workflowId && specs.some(spec => !spec.sensitive) && (
+        <WorkflowInputPresets
+          key={workflowId}
+          workflowId={workflowId}
+          specs={specs}
+          state={state}
+        />
+      )}
       {specs.map(spec => {
         const kind = kindOf(spec)
         const fieldId = `wcf-input-${spec.name}`
@@ -229,6 +261,7 @@ export function WorkflowInputsForm({ specs, state }: WorkflowInputsFormProps) {
 interface WorkflowInputsDialogProps {
   open: boolean
   specs: WorkflowInputSpec[]
+  workflowId?: string
   /** 重置令牌（工作流 id 等）：变化即回到 default 预填态 */
   resetToken: string
   title?: string
@@ -245,6 +278,7 @@ interface WorkflowInputsDialogProps {
 export function WorkflowInputsDialog({
   open,
   specs,
+  workflowId,
   resetToken,
   title = '启动工作流 · 外部输入',
   confirmLabel = '启动',
@@ -282,7 +316,7 @@ export function WorkflowInputsDialog({
         </>
       }
     >
-      <WorkflowInputsForm specs={specs} state={state} />
+      <WorkflowInputsForm specs={specs} state={state} workflowId={workflowId} />
     </CompactModal>
   )
 }

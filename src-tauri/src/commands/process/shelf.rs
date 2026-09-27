@@ -461,7 +461,13 @@ fn delete_mirror(id: &str) {
 
 /// 启动恢复：SQLite 中最新快照（按 updated_at）。供 leader.rs 恢复链最前端调用。
 pub(crate) fn load_latest_mirror() -> Option<(String, Session)> {
-    let Ok(Some((mode, json))) = nuphus::store::session::latest_snapshot() else {
+    let conn = nuphus::store::db::acquire().ok()?;
+    load_latest_mirror_with_conn(&conn)
+}
+
+/** Keep snapshot restoration testable with an isolated database connection. */
+fn load_latest_mirror_with_conn(conn: &rusqlite::Connection) -> Option<(String, Session)> {
+    let Ok(Some((mode, json))) = nuphus::store::session::latest_snapshot_with_conn(conn) else {
         return None;
     };
     let session: Session = serde_json::from_str(&json).ok()?;
@@ -474,11 +480,20 @@ pub(crate) fn load_latest_mirror() -> Option<(String, Session)> {
 /// 启动预热：SQLite 快照装回内存展示台（≤10 个最新），供列表命令直接消费。
 /// updated_at 使用 sessions 表时间（RFC3339），非文件 mtime。
 pub(crate) fn warm_from_disk(shelf: &mut ShelfState) {
-    let Ok(snapshots) = nuphus::store::session::list_snapshots(SHELF_CAPACITY) else {
+    let Ok(conn) = nuphus::store::db::acquire() else {
+        return;
+    };
+    warm_from_disk_with_conn(shelf, &conn);
+}
+
+/** Warm the shelf from one connection without consulting the global database. */
+fn warm_from_disk_with_conn(shelf: &mut ShelfState, conn: &rusqlite::Connection) {
+    let Ok(snapshots) = nuphus::store::session::list_snapshots_with_conn(conn, SHELF_CAPACITY)
+    else {
         return;
     };
     for (id, mode, updated_at) in snapshots {
-        let Ok(Some((_, json))) = nuphus::store::session::get_snapshot(&id) else {
+        let Ok(Some((_, json))) = nuphus::store::session::get_snapshot_with_conn(conn, &id) else {
             continue;
         };
         let Ok(file_session) = serde_json::from_str::<Session>(&json) else {
@@ -492,7 +507,7 @@ pub(crate) fn warm_from_disk(shelf: &mut ShelfState) {
         }
         // 标题回读：优先 DB 已存标题（用户改过名），为空才派生默认——此前无条件
         // derive_title，重启后自定义标题被打回第一条 user 消息（实测回归）
-        let stored_title = nuphus::store::session::get_session(&file_session.id)
+        let stored_title = nuphus::store::session::get_session_with_conn(conn, &file_session.id)
             .ok()
             .flatten()
             .map(|r| r.summary)
@@ -1764,63 +1779,86 @@ mod tests {
         let _ = nuphus::store::session::delete_session(&s.id);
     }
 
+    /** Match the production sessions schema without sharing the application database. */
+    fn snapshot_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                depth INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                summary TEXT DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'leader',
+                snapshot TEXT
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    /** Explicit timestamps make snapshot ordering independent of clock precision and sleeps. */
+    fn insert_snapshot(
+        conn: &rusqlite::Connection,
+        mode: &str,
+        session: &Session,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, updated_at, mode, snapshot)
+             VALUES (?1, ?2, ?2, ?3, ?4)",
+            rusqlite::params![
+                session.id,
+                updated_at,
+                mode,
+                serde_json::to_string(session).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn warm_from_disk_loads_snapshots_from_sqlite() {
-        // 写两个快照（不同 updated_at），warm_from_disk 应从 SQLite 装回内存展示台
+        let conn = snapshot_conn();
         let a = session_with_user(&["快照A"]);
         let b = session_with_user(&["快照B"]);
-        write_mirror("leader", &a, &[]);
-        // upsert_snapshot 的 updated_at 为 RFC3339 秒级精度——sleep 必须跨秒，
-        // 否则两条快照时间戳相同、ORDER BY updated_at DESC 排序不稳定（回归 2026-08-30）
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        write_mirror("workflow", &b, &[]);
+        insert_snapshot(&conn, "workflow", &b, "2026-01-01T00:00:01Z");
+        insert_snapshot(&conn, "leader", &a, "2026-01-01T00:00:00Z");
+        conn.execute(
+            "UPDATE sessions SET summary = ?1 WHERE id = ?2",
+            rusqlite::params!["自定义标题", b.id],
+        )
+        .unwrap();
 
         let mut shelf = ShelfState::default();
-        warm_from_disk(&mut shelf);
+        warm_from_disk_with_conn(&mut shelf, &conn);
         assert!(shelf.contains(&a.id), "A 应被装载");
         assert!(shelf.contains(&b.id), "B 应被装载");
         let entry_b = shelf.get(&b.id).expect("B 应有条目");
         assert_eq!(entry_b.mode, "workflow", "mode 应来自快照");
-        // order 必须 newest-first：最新（B）在 order[0]，较旧（A）排在其后——
-        // 保证此后 put 超限 pop() 淘汰的是最旧而非最新（回归 2026-08-30）。
-        // 注意：共享测试库可能存在其他测试残留快照，order 末尾不一定是 A，
-        // 因此断言位置先后而非「A 恰在末尾」。
-        let pos_a = shelf
-            .order
-            .iter()
-            .position(|id| id == &a.id)
-            .expect("A 应在 order 中");
-        let pos_b = shelf
-            .order
-            .iter()
-            .position(|id| id == &b.id)
-            .expect("B 应在 order 中");
-        assert_eq!(pos_b, 0, "最新快照 B 应在 order[0]");
-        assert!(
-            pos_a > pos_b,
-            "较旧快照 A 应排在较新快照 B 之后（newest-first）"
+        assert_eq!(entry_b.title, "自定义标题");
+        assert_eq!(
+            shelf.titles.get(&b.id).map(String::as_str),
+            Some("自定义标题")
         );
-
-        let _ = nuphus::store::session::delete_session(&a.id);
-        let _ = nuphus::store::session::delete_session(&b.id);
+        assert_eq!(shelf.order, vec![b.id, a.id], "快照应按时间降序装载");
+        assert!(shelf.warmed);
     }
 
     #[test]
     fn load_latest_mirror_prefers_most_recent_snapshot() {
+        let conn = snapshot_conn();
         let a = session_with_user(&["旧快照"]);
         let b = session_with_user(&["新快照"]);
-        write_mirror("leader", &a, &[]);
-        // upsert_snapshot 的 updated_at 为 RFC3339 秒级精度——sleep 必须跨秒，
-        // 否则两条快照时间戳相同、ORDER BY updated_at DESC 排序不稳定（Windows 偶发返回旧快照）
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        write_mirror("workflow", &b, &[]);
+        insert_snapshot(&conn, "workflow", &b, "2026-01-01T00:00:01Z");
+        insert_snapshot(&conn, "leader", &a, "2026-01-01T00:00:00Z");
 
-        let (mode, latest) = load_latest_mirror().expect("应有最新快照");
-        assert_eq!(latest.id, b.id, "最新写入的快照应优先");
+        let (mode, latest) = load_latest_mirror_with_conn(&conn).expect("应有最新快照");
+        assert_eq!(latest.id, b.id, "updated_at 最新的快照应优先");
         assert_eq!(mode, "workflow");
-
-        let _ = nuphus::store::session::delete_session(&a.id);
-        let _ = nuphus::store::session::delete_session(&b.id);
     }
 
     #[test]

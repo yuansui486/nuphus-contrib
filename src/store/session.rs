@@ -60,8 +60,15 @@ pub fn upsert_session(session: &SessionRow) -> crate::Result<()> {
 /// 按 ID 读取一条 session 记录
 pub fn get_session(session_id: &str) -> crate::Result<Option<SessionRow>> {
     let guard = crate::store::db::acquire()?;
+    get_session_with_conn(&guard, session_id)
+}
 
-    let mut stmt = guard.prepare(
+/** Read session metadata through the caller's connection. */
+pub fn get_session_with_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> crate::Result<Option<SessionRow>> {
+    let mut stmt = conn.prepare(
         "SELECT id, parent_id, depth, created_at, updated_at,
                 message_count, token_count, summary
          FROM sessions WHERE id = ?1",
@@ -155,8 +162,15 @@ pub fn upsert_snapshot(id: &str, mode: &str, snapshot: &str) -> crate::Result<()
 /// 按 ID 读取快照，返回 (mode, snapshot_json)。无快照（列 NULL 或行不存在）返回 None。
 pub fn get_snapshot(id: &str) -> crate::Result<Option<(String, String)>> {
     let guard = crate::store::db::acquire()?;
+    get_snapshot_with_conn(&guard, id)
+}
 
-    let mut stmt = guard.prepare(
+/** Read a snapshot through the caller's connection. */
+pub fn get_snapshot_with_conn(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> crate::Result<Option<(String, String)>> {
+    let mut stmt = conn.prepare(
         "SELECT mode, snapshot FROM sessions
          WHERE id = ?1 AND snapshot IS NOT NULL",
     )?;
@@ -171,8 +185,15 @@ pub fn get_snapshot(id: &str) -> crate::Result<Option<(String, String)>> {
 /// 列出有快照的会话（按 updated_at 降序，最新在前）。返回 (id, mode, updated_at)。
 pub fn list_snapshots(limit: usize) -> crate::Result<Vec<(String, String, String)>> {
     let guard = crate::store::db::acquire()?;
+    list_snapshots_with_conn(&guard, limit)
+}
 
-    let mut stmt = guard.prepare(
+/** List snapshots through the caller's connection, newest first. */
+pub fn list_snapshots_with_conn(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> crate::Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
         "SELECT id, mode, updated_at FROM sessions
          WHERE snapshot IS NOT NULL
          ORDER BY updated_at DESC
@@ -192,8 +213,14 @@ pub fn list_snapshots(limit: usize) -> crate::Result<Vec<(String, String, String
 /// 获取最新的快照（按 updated_at 降序取 1 条），返回 (mode, snapshot_json)。
 pub fn latest_snapshot() -> crate::Result<Option<(String, String)>> {
     let guard = crate::store::db::acquire()?;
+    latest_snapshot_with_conn(&guard)
+}
 
-    let mut stmt = guard.prepare(
+/** Read the latest snapshot through the caller's connection. */
+pub fn latest_snapshot_with_conn(
+    conn: &rusqlite::Connection,
+) -> crate::Result<Option<(String, String)>> {
+    let mut stmt = conn.prepare(
         "SELECT mode, snapshot FROM sessions
          WHERE snapshot IS NOT NULL
          ORDER BY updated_at DESC

@@ -366,11 +366,55 @@ fn write_status_locked(root: &Path, agent: &str, status: &serde_json::Value) -> 
     Ok(())
 }
 
-/// 读 status.json；不存在 / 不可解析 → None（调用方按语义处理）
-fn read_status_at(root: &Path, agent: &str) -> Option<serde_json::Value> {
+/// 读 status.json；不存在 / 不可解析 → None（调用方按语义处理）。
+/// pub(crate)：ext_agent 派发前的在途闸预检要读它——闸门判据必须看真实看板，
+/// 不能凭调用方（LLM）自述「我以为 agent 空闲」。
+pub(crate) fn read_status_at(root: &Path, agent: &str) -> Option<serde_json::Value> {
     let path = root.join(agent).join("status.json");
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// 在途闸（派发前预检，纯判定）：板上 state 为 `dispatched`/`in_progress` **且**板上
+/// task_id 与本轮新任务不同 → 返回阻止原因（Some）；否则放行（None）。
+///
+/// 为什么建这道闸：`agent_dispatch` 原本不看在板状态就直接上板——agent 还在跑 task_A
+/// 时派 task_B，两个任务会在同一个 TUI 里交错执行（键入互相插入、门铃归属混乱；
+/// task_id 一致性闸只能保状态不串，保不了终端执行不互相干扰）。
+/// 放行边界（保守，不挡正当路径）：
+/// - 同一 task_id 的重派/续派放行——失败重试、契约刷新都走这条路（brief 覆盖是幂等语义）；
+/// - 板上 task_id 为空（骨架/异常态）放行——新上板会顺带修复看板；
+/// - doc 缺失/不可解析放行——无法判定在途时不挡路，由上板路径自愈。
+pub(crate) fn in_flight_block_reason(
+    doc: Option<&serde_json::Value>,
+    new_task_id: &str,
+) -> Option<String> {
+    let doc = doc?;
+    let obj = doc.as_object()?;
+    let state = obj
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if state != "dispatched" && state != "in_progress" {
+        return None;
+    }
+    let board = obj
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    if board == new_task_id {
+        return None; // 同 task_id 重派/续派放行
+    }
+    Some(format!(
+        "agent 有在途任务未到终态（task_id={board}，state={state}）——拒绝派发 {new_task_id}，\
+         避免两个任务在同一终端交错执行。\n\
+         出口：① 等在途任务的门铃终态（done/blocked）到达后再派；\n\
+         ② 若确认在途任务已死（终端空闲、无执行痕迹），用原 task_id「{board}」重新派发刷新看板\
+         （新 brief 覆盖旧板，agent 按新契约上报）。\n\
+         禁令：禁止手改 status.json 绕闸。"
+    ))
 }
 
 /// 初始化 agent 工作目录（幂等：目录/文件已存在则补缺不覆盖）。
@@ -968,6 +1012,10 @@ pub fn update_agent_status_from_doorbell(
     update_agent_status_from_doorbell_at(&handoff_root(), id, status, summary, report_path)
 }
 
+/**
+ * Once a task is assigned, only matching reports may update its state or trigger an audit.
+ * Unassigned agents still accept legacy events; unmatched reports remain in last_event.
+ */
 fn update_agent_status_from_doorbell_at(
     root: &Path,
     id: &str,
@@ -991,16 +1039,13 @@ fn update_agent_status_from_doorbell_at(
     let mut doc = read_status_at(root, agent)?;
     doc.as_object()?;
 
-    // 一致性闸：只在「板上已有明确 task_id 且事件也带 task_id」时可判。
-    // doc.task_id 为空/缺失（从未派发）或事件为旧式无 `::` 纯 id → 无从比对，维持原行为
-    // （这类情况下 doc 也没有 workspace/base_head 审计基线，不会推出错误结论）。
     let event_task = event_task_id(id);
     let board_task = doc
         .get("task_id")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let stale = matches!((board_task, event_task), (Some(b), Some(e)) if b != e);
+    let stale = board_task.is_some() && event_task != board_task;
     if stale {
         // 跨任务迟到事件：事件是真的（可能是上一轮的真实完工），所以 last_event 照记并
         // 保留事件自带 task_id 原值供追溯；但 state/task_id 属于板上那一轮，不能改。
@@ -1141,6 +1186,39 @@ mod tests {
         let dir = base.join(format!("{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn doc(state: &str, task_id: &str) -> serde_json::Value {
+        serde_json::json!({"agent": "a", "state": state, "task_id": task_id, "last_event": null})
+    }
+
+    #[test]
+    fn test_in_flight_gate_blocks_different_task() {
+        let d = doc("in_progress", "task-a");
+        let reason = in_flight_block_reason(Some(&d), "task-b").expect("在途不同任务必须阻止");
+        assert!(reason.contains("task-a"), "原因须指认在途任务: {reason}");
+        assert!(reason.contains("task-b"), "原因须指认被拒任务: {reason}");
+        // dispatched 同样阻止（上板未投/未确认也是在途）
+        assert!(in_flight_block_reason(Some(&doc("dispatched", "task-a")), "task-b").is_some());
+    }
+
+    #[test]
+    fn test_in_flight_gate_allows_legit_paths() {
+        // 同 task_id 重派/续派放行（失败重试与契约刷新的唯一出口）
+        assert!(in_flight_block_reason(Some(&doc("in_progress", "task-a")), "task-a").is_none());
+        // 终态后放行
+        for s in ["done", "blocked", "error", "idle"] {
+            assert!(
+                in_flight_block_reason(Some(&doc(s, "task-a")), "task-b").is_none(),
+                "终态 {s} 不应阻止新派发"
+            );
+        }
+        // 板上 task_id 为空（骨架/异常态）放行——新上板顺带修复看板
+        assert!(in_flight_block_reason(Some(&doc("in_progress", "")), "task-b").is_none());
+        assert!(in_flight_block_reason(Some(&doc("in_progress", "  ")), "task-b").is_none());
+        // 无 status / 非对象 doc：无法判定在途，不挡路
+        assert!(in_flight_block_reason(None, "task-b").is_none());
+        assert!(in_flight_block_reason(Some(&serde_json::json!("oops")), "task-b").is_none());
     }
 
     /// 跑一条 git 命令；成功返回 trim 后的 stdout。环境无 git / 命令失败 → None。
@@ -1495,9 +1573,151 @@ mod tests {
     }
 
     #[test]
+    fn test_doorbell_keeps_assigned_task_state_for_unattributed_events() {
+        let root = tmp_root("superseded-events");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-001", "旧任务", None).unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-002", "当前任务", None).unwrap();
+        let before = status_json(&root, "web_agent");
+
+        for event_id in [
+            "web_agent::task-001",
+            "web_agent",
+            "web_agent::",
+            "web_agent::   ",
+        ] {
+            for event_status in ["ready", "progress", "done", "blocked"] {
+                assert!(update_agent_status_from_doorbell_at(
+                    &root,
+                    event_id,
+                    event_status,
+                    "旧任务迟到的上报",
+                    Some("C:/报告/旧任务.md"),
+                )
+                .is_none());
+                let status = status_json(&root, "web_agent");
+                assert_eq!(
+                    status["state"], before["state"],
+                    "{event_id} {event_status}"
+                );
+                assert_eq!(status["task_id"], before["task_id"]);
+                assert_eq!(status["head_check"], before["head_check"]);
+                assert_eq!(status["last_event"]["status"], event_status);
+                assert_eq!(status["last_event"]["summary"], "旧任务迟到的上报");
+                assert_eq!(status["last_event"]["report_path"], "C:/报告/旧任务.md");
+                let expected_task = if event_id == "web_agent::task-001" {
+                    serde_json::json!("task-001")
+                } else {
+                    serde_json::Value::Null
+                };
+                assert_eq!(status["last_event"]["task_id"], expected_task);
+            }
+        }
+
+        update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-002",
+            "progress",
+            "当前任务开始",
+            None,
+        );
+        let progress = status_json(&root, "web_agent");
+        assert_eq!(progress["task_id"], "task-002");
+        assert_eq!(progress["state"], "in_progress");
+        assert_eq!(progress["last_event"]["summary"], "当前任务开始");
+
+        update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-002",
+            "done",
+            "当前任务完成",
+            Some("C:/报告/当前任务.md"),
+        );
+        let done = status_json(&root, "web_agent");
+        assert_eq!(done["task_id"], "task-002");
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["last_event"]["summary"], "当前任务完成");
+        assert_eq!(done["last_event"]["report_path"], "C:/报告/当前任务.md");
+    }
+
+    #[test]
+    fn test_doorbell_does_not_audit_unattributed_events() {
+        let root = tmp_root("superseded-audit");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        let Some((ws, _)) = tmp_git_workspace("superseded-audit-repo") else {
+            eprintln!("跳过：环境无 git");
+            return;
+        };
+        ensure_handoff_at(&root, "web_agent", "task-001", "旧任务", None).unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-002", "当前任务", Some(&ws)).unwrap();
+        assert!(git_run(
+            Path::new(&ws),
+            &["commit", "-q", "--allow-empty", "-m", "current task change"]
+        )
+        .is_some());
+        let before = status_json(&root, "web_agent");
+
+        for event_id in [
+            "web_agent::task-001",
+            "web_agent",
+            "web_agent::",
+            "web_agent::   ",
+        ] {
+            for event_status in ["done", "blocked"] {
+                assert!(
+                    update_agent_status_from_doorbell_at(
+                        &root,
+                        event_id,
+                        event_status,
+                        "无法归属当前任务的终态",
+                        None,
+                    )
+                    .is_none(),
+                    "{event_id} {event_status}"
+                );
+                let status = status_json(&root, "web_agent");
+                for field in [
+                    "state",
+                    "task_id",
+                    "workspace",
+                    "base_head",
+                    "base_branch",
+                    "head_check",
+                ] {
+                    assert_eq!(
+                        status[field], before[field],
+                        "{event_id} {event_status} {field}"
+                    );
+                }
+                assert_eq!(status["last_event"]["status"], event_status);
+            }
+        }
+
+        let audit = update_agent_status_from_doorbell_at(
+            &root,
+            "web_agent::task-002",
+            "done",
+            "当前任务完成",
+            None,
+        )
+        .expect("当前任务仍应使用自身派发基线审计");
+        assert!(audit.changed);
+        assert_eq!(
+            status_json(&root, "web_agent")["head_check"]["changed"],
+            true
+        );
+    }
+
+    #[test]
     fn test_doorbell_grouping_updates_status_and_skips_unknown() {
         let root = tmp_root("group");
         init_agent_at(&root, "web_agent", "desc").unwrap();
+
+        update_agent_status_from_doorbell_at(&root, "web_agent", "ready", "旧式就位事件", None);
+        let status = status_json(&root, "web_agent");
+        assert_eq!(status["task_id"], "");
+        assert_eq!(status["state"], "in_progress");
+        assert_eq!(status["last_event"]["summary"], "旧式就位事件");
 
         // ready 命中 agent 前缀 → state=in_progress（ready/progress 都是「开始确认」拉铃）+ last_event 保留原始值
         update_agent_status_from_doorbell_at(&root, "web_agent::task-001", "ready", "已就位", None);
@@ -1505,6 +1725,7 @@ mod tests {
             &std::fs::read_to_string(root.join("web_agent").join("status.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(status["task_id"], "");
         assert_eq!(status["state"], "in_progress");
         assert_eq!(status["last_event"]["status"], "ready");
 

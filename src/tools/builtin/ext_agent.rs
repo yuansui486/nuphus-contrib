@@ -33,7 +33,7 @@ impl ToolRegistry {
                     },
                     "pid": {
                         "type": "integer",
-                        "description": "可选但推荐：Leader 手动启动外部 Agent 后记录的进程 PID。提供时按当次窗口列表校验存活并解析 hwnd；缺省时按 window_hint 当次扫描。禁止传入历史缓存值"
+                        "description": "可选但推荐：Leader 手动启动外部 Agent 后记录的进程 PID。提供时按当次窗口列表校验存活并解析 hwnd（直配落空自动回溯父进程链——TUI 窗口常建在宿主进程名下，传 agent 自身 PID 即可命中宿主窗口）；缺省时按 window_hint 当次扫描。禁止传入历史缓存值。注意：板上有未终态的在途任务（不同 task_id）时派发会被在途闸拒绝，这是为防止两个任务在同一终端交错执行"
                     },
                     "project": {
                         "type": "string",

@@ -10,11 +10,13 @@
  * - 缓存：同一路径并发/重复渲染共享同一次请求与同一个 objectURL（引用计数），
  *   最后一个使用者卸载时 revokeObjectURL，避免内存泄漏；
  * - 降级：请求失败 / 解码失败 → 显示原始路径文本（绝不空白、绝不破图图标）。
+ * - 重试：用户手动重新加载失败图片，期间保留路径并禁用重复点击。
  */
 
 import { useEffect, useRef, useState } from 'react'
 import { X } from 'lucide-react'
 import { fetchFileBlob } from '../api'
+import { t } from '../i18n'
 
 interface CachedImage {
   /** 已完成或进行中的 objectURL 请求（同一路径共享，避免重复下载） */
@@ -26,11 +28,11 @@ interface CachedImage {
 const imageCache = new Map<string, CachedImage>()
 
 /** 取用某路径的 objectURL（引用计数 +1）；同路径复用同一请求 */
-function acquireImageUrl(path: string): Promise<string> {
+function acquireImageUrl(path: string): CachedImage {
   const hit = imageCache.get(path)
   if (hit) {
     hit.refs += 1
-    return hit.url
+    return hit
   }
   const entry: CachedImage = {
     refs: 1,
@@ -41,16 +43,19 @@ function acquireImageUrl(path: string): Promise<string> {
   entry.url.catch(() => {
     if (imageCache.get(path) === entry) imageCache.delete(path)
   })
-  return entry.url
+  return entry
 }
 
-/** 归还引用（-1）；归零时 revokeObjectURL 并移出缓存 */
-function releaseImageUrl(path: string): void {
-  const entry = imageCache.get(path)
-  if (!entry) return
+/** 失效只移除当前版本，旧 URL 由仍持有它的组件负责归还。 */
+function invalidateImageUrl(path: string, entry: CachedImage): void {
+  if (imageCache.get(path) === entry) imageCache.delete(path)
+}
+
+/** 归还实际取得的版本，避免旧实例卸载时误回收同路径的新缓存。 */
+function releaseImageUrl(path: string, entry: CachedImage): void {
   entry.refs -= 1
   if (entry.refs > 0) return
-  imageCache.delete(path)
+  invalidateImageUrl(path, entry)
   void entry.url.then(
     url => URL.revokeObjectURL(url),
     () => {
@@ -67,26 +72,57 @@ interface Props {
 export default function LocalImage({ path }: Props) {
   const [url, setUrl] = useState<string | null>(null)
   const [failed, setFailed] = useState(false)
+  const [retrying, setRetrying] = useState(false)
   const [preview, setPreview] = useState(false)
   const holderRef = useRef<HTMLSpanElement | null>(null)
+  const imageRef = useRef<CachedImage | null>(null)
+  const retryRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    let acquired = false
+    let entry: CachedImage | null = null
+    let loading = false
     setUrl(null)
     setFailed(false)
+    setRetrying(false)
 
     const load = () => {
-      if (acquired) return
-      acquired = true
-      acquireImageUrl(path).then(
+      if (cancelled || entry) return
+      loading = true
+      entry = acquireImageUrl(path)
+      imageRef.current = entry
+      entry.url.then(
         objectUrl => {
-          if (!cancelled) setUrl(objectUrl)
+          loading = false
+          if (!cancelled) {
+            setUrl(objectUrl)
+            setFailed(false)
+            setRetrying(false)
+          }
         },
         () => {
-          if (!cancelled) setFailed(true)
+          loading = false
+          if (!cancelled) {
+            setFailed(true)
+            setRetrying(false)
+          }
         },
       )
+    }
+
+    /** 手动重试立即拉取，不再等待视口；同步守卫防止连续点击重复发送。 */
+    retryRef.current = () => {
+      if (cancelled || loading) return
+      if (entry) {
+        invalidateImageUrl(path, entry)
+        releaseImageUrl(path, entry)
+        entry = null
+        imageRef.current = null
+      }
+      setUrl(null)
+      setPreview(false)
+      setRetrying(true)
+      load()
     }
 
     const holder = holderRef.current
@@ -111,13 +147,16 @@ export default function LocalImage({ path }: Props) {
     return () => {
       cancelled = true
       observer?.disconnect()
-      // 只有真正取用过引用才归还，避免未进入视口的实例误减他人计数
-      if (acquired) releaseImageUrl(path)
+      retryRef.current = null
+      imageRef.current = null
+      /** 未进入视口的实例不持有引用；已开始的请求完成后也能正确回收。 */
+      if (entry) releaseImageUrl(path, entry)
     }
   }, [path])
 
   /** 解码失败时关闭预览并降级，避免切换路径后旧预览状态重新出现。 */
   const handleImageError = () => {
+    if (imageRef.current) invalidateImageUrl(path, imageRef.current)
     setPreview(false)
     setFailed(true)
   }
@@ -125,8 +164,16 @@ export default function LocalImage({ path }: Props) {
   // ▸ 降级：原始路径文本（可换行，不截断）
   if (failed) {
     return (
-      <span className="m-local-image-error" data-image-path={path}>
+      <span className="m-local-image-error" data-image-path={path} aria-busy={retrying}>
         {path}
+        <button
+          type="button"
+          className="m-local-image-retry"
+          disabled={retrying}
+          onClick={() => retryRef.current?.()}
+        >
+          {t(retrying ? 'mobile.imageReloading' : 'mobile.imageReload')}
+        </button>
       </span>
     )
   }

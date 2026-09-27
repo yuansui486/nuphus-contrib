@@ -5,8 +5,12 @@
 //!      （brief 内嵌 build_contract 渲染的门铃契约）→ status.json 置 dispatched
 //!      （上板≠执行：in_progress 由外部 Agent 第一声 ready/progress 门铃触发）
 //!   ② 进程捕获（当次实况，Leader 主导启动模型）：显式 pid → 当次 windows_list
-//!      按 process_id 匹配可见窗口；缺省 → 按 window_hint/process 全表扫描。
-//!      禁止历史缓存句柄、禁止隐式冷启动——进程生命周期归 Leader（skill §2 启动 SOP）
+//!      按 process_id 匹配可见窗口（**直配落空自动回溯父进程链**——TUI 窗口常建在
+//!      宿主 shell 名下，如 opencode.exe 的窗口宿主是 powershell.exe）；缺省 → 按
+//!      window_hint/process 全表扫描。禁止历史缓存句柄、禁止隐式冷启动——进程生命
+//!      周期归 Leader（skill §2 启动 SOP）
+//!   ②b 在途闸（上板前）：板上有未终态任务且 task_id 不同 → 拒绝派发（不落 error、
+//!      不动看板——在途任务的 state 属于那一轮）；同 task_id 重派/续派放行
 //!   ③ SeqRunner：按 team.toml dispatch_steps 工具序列确定性执行（不经 LLM），
 //!      每步成败结构化回传，禁止静默
 //!   ④ 门铃异步：同步路径不做任何等待——门铃事件到达后自动注入 Leader 上下文，
@@ -168,6 +172,19 @@ async fn dispatch_async(app: AppHandle, params: serde_json::Value) -> Result<Str
         .unwrap_or_default()
         .trim()
         .to_string();
+
+    // ② 在途闸（上板前最后一道）：agent 有未终态的在途任务时拒绝派发——两个任务会
+    // 在同一个 TUI 里交错执行（task_id 一致性闸只保状态不串，保不了终端执行不互扰）。
+    // 拒绝**不落 error 态、不动看板**：在途任务还在跑，它的 state/task_id 属于那一轮，
+    // 不能被本轮拒绝污染（mark_agent_error_at 无条件写 state=error，故此处不能用
+    // fail_dispatch）。同 task_id 的重派/续派放行（失败重试的唯一出口）。
+    if let Some(reason) = crate::commands::config::handoff::in_flight_block_reason(
+        crate::commands::config::handoff::read_status_at(&root, &agent).as_ref(),
+        &task_id,
+    ) {
+        tracing::warn!("[ext_agent] {agent}::{task_id} 被在途闸拒绝");
+        return Err(reason);
+    }
 
     // 上板失败（brief 写不进 / 目录建不出 / 基线记不下）同样落 error 态：
     // 这一刻任务并没有真正上板，停留在上一轮 state 会让用户误判。
@@ -369,9 +386,10 @@ async fn capture_process(
     if let Some(pid) = pid {
         return resolve_hwnd_by_pid(client, pid).await.ok_or_else(|| {
             format!(
-                "PID {pid} 当前无可见窗口或进程已退出（外部 Agent「{agent}」）。\n\
-                 可能原因：① agent 已被关闭；② TUI 尚在启动中窗口未就绪（等 5–10s 重试）；\n\
-                 ③ 终端宿主为 Windows Terminal 时窗口登记在其他进程名下（此时不传 pid 改走 window_hint 扫描）。"
+                "PID {pid} 及其父进程链上均无可见窗口（外部 Agent「{agent}」）。\n\
+                 （TUI 窗口建在宿主进程名下时已自动回溯父进程——此处是回溯后仍失败。）\n\
+                 可能原因：① agent 已被关闭；② TUI 尚在启动中、窗口未就绪（等 5–10s 重试）。\n\
+                 处置：process_list / windows_list 核对实况后重派——PID/hwnd 按当次解析，禁止缓存。"
             )
         });
     }
@@ -384,23 +402,78 @@ async fn capture_process(
     })
 }
 
-/// 按 PID 在当次 windows_list 匹配可见窗口并提取 hwnd。
+/// 按 PID 在当次 windows_list 匹配可见窗口并提取 hwnd。**TUI 类 agent 的顶层窗口
+/// 常建在宿主 shell 名下**（实测：opencode.exe 11332 的窗口宿主是 powershell.exe 11248），
+/// 直配 agent PID 会落空——因此按「PID 自身 → 父进程链（至多 4 级）」逐级匹配，取最近命中。
+/// PID/hwnd 每次启动必变且会被 OS 复用，只对当次实况负责，禁止缓存。
 async fn resolve_hwnd_by_pid(client: &DesktopClient, pid: u32) -> Option<HashMap<String, String>> {
     let list = client.windows_list().await.ok()?;
     let windows = list.get("result")?.as_array()?;
-    for w in windows {
-        if w.get("process_id").and_then(|v| v.as_u64()) == Some(pid as u64) {
-            let hwnd = w.get("hwnd").and_then(|v| v.as_i64())?;
-            let mut vars = HashMap::new();
-            vars.insert("hwnd".to_string(), hwnd.to_string());
-            vars.insert("pid".to_string(), pid.to_string());
-            if let Some(t) = w.get("title").and_then(|v| v.as_str()) {
-                vars.insert("title".to_string(), t.to_string());
+    resolve_hwnd_by_pid_chain(windows, &pid_ancestor_chain(pid, 4))
+}
+
+/// 纯匹配核（可单测，不碰桌面/进程 API）：窗口列表 × PID 链，取链上第一个拥有
+/// 可见窗口的 PID；vars 记**命中窗口自身**的 pid/hwnd/title。
+fn resolve_hwnd_by_pid_chain(
+    windows: &[serde_json::Value],
+    chain: &[u32],
+) -> Option<HashMap<String, String>> {
+    for pid in chain {
+        for w in windows {
+            if w.get("process_id").and_then(|v| v.as_u64()) == Some(*pid as u64) {
+                let hwnd = w.get("hwnd").and_then(|v| v.as_i64())?;
+                let mut vars = HashMap::new();
+                vars.insert("hwnd".to_string(), hwnd.to_string());
+                vars.insert("pid".to_string(), pid.to_string());
+                if let Some(t) = w.get("title").and_then(|v| v.as_str()) {
+                    if !t.is_empty() {
+                        vars.insert("title".to_string(), t.to_string());
+                    }
+                }
+                return Some(vars);
             }
-            return Some(vars);
         }
     }
     None
+}
+
+/// PID 自身 + 至多 max_depth 级父进程（去重、防环）。跨平台走 sysinfo——
+/// TUI 窗口建在宿主进程名下时，父链是「agent 进程 → 宿主窗口」的唯一连接。
+fn pid_ancestor_chain(pid: u32, max_depth: usize) -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    let parent_of = |p: u32| {
+        sys.process(sysinfo::Pid::from(p as usize))
+            .and_then(|proc| proc.parent())
+            .map(|parent| parent.as_u32())
+    };
+    ancestor_chain_with(parent_of, pid, max_depth)
+}
+
+/// 祖先链纯核（可单测）：自身打头，逐级取父进程；链内去重防环，深度封顶
+/// max_depth（链路意外深时不穷追）。
+fn ancestor_chain_with(
+    parent_of: impl Fn(u32) -> Option<u32>,
+    pid: u32,
+    max_depth: usize,
+) -> Vec<u32> {
+    let mut chain = vec![pid];
+    let mut cur = pid;
+    for _ in 0..max_depth {
+        match parent_of(cur) {
+            Some(p) if !chain.contains(&p) => {
+                chain.push(p);
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    chain
 }
 
 /// 按 window_hint 在 windows_list 中匹配（标题/进程名包含，大小写不敏感）。
@@ -430,4 +503,72 @@ async fn find_window(client: &DesktopClient, hint: &str) -> Option<HashMap<Strin
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(pid: u32, hwnd: i64, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hwnd": hwnd,
+            "title": title,
+            "process_id": pid,
+            "process_name": "x.exe",
+        })
+    }
+
+    /// opencode 实况复刻：agent 11332 无窗口，宿主 11248 持有 hwnd 1509460
+    #[test]
+    fn test_resolve_hwnd_by_pid_chain_parent_hit() {
+        let list = vec![win(11248, 1509460, "OC | Fix E0599")];
+        let vars = resolve_hwnd_by_pid_chain(&list, &[11332, 11248]).expect("父链应命中宿主窗口");
+        assert_eq!(vars.get("hwnd").map(String::as_str), Some("1509460"));
+        // vars 里的 pid 必须是命中窗口自身的宿主 pid，不是请求的 agent pid
+        assert_eq!(vars.get("pid").map(String::as_str), Some("11248"));
+        assert_eq!(
+            vars.get("title").map(String::as_str),
+            Some("OC | Fix E0599")
+        );
+    }
+
+    #[test]
+    fn test_resolve_hwnd_by_pid_chain_direct_hit_preferred() {
+        let list = vec![win(100, 11, "self"), win(200, 22, "host")];
+        let vars = resolve_hwnd_by_pid_chain(&list, &[100, 200]).expect("自身直配优先");
+        assert_eq!(vars.get("hwnd").map(String::as_str), Some("11"));
+        assert_eq!(vars.get("pid").map(String::as_str), Some("100"));
+    }
+
+    #[test]
+    fn test_resolve_hwnd_by_pid_chain_no_hit() {
+        let list = vec![win(999, 11, "other")];
+        assert!(resolve_hwnd_by_pid_chain(&list, &[11332, 11248]).is_none());
+        assert!(resolve_hwnd_by_pid_chain(&list, &[]).is_none());
+        assert!(resolve_hwnd_by_pid_chain(&[], &[11332]).is_none());
+    }
+
+    #[test]
+    fn test_ancestor_chain_with_basic_and_cycle() {
+        // 简单链 5→4→3→2，深度封顶 4
+        let parents = std::collections::HashMap::from([(5u32, 4u32), (4, 3), (3, 2)]);
+        assert_eq!(
+            ancestor_chain_with(|p| parents.get(&p).copied(), 5, 4),
+            vec![5, 4, 3, 2]
+        );
+        // 无父进程：链只有自身
+        assert_eq!(ancestor_chain_with(|_| None, 7, 4), vec![7]);
+        // 防环：5→4→5 必须终止且不重复
+        let cyc = std::collections::HashMap::from([(5u32, 4u32), (4, 5)]);
+        assert_eq!(
+            ancestor_chain_with(|p| cyc.get(&p).copied(), 5, 8),
+            vec![5, 4]
+        );
+        // 深度封顶：链再深也只取 max_depth 级
+        let deep = std::collections::HashMap::from([(1u32, 2u32), (2, 3), (3, 4), (4, 5), (5, 6)]);
+        assert_eq!(
+            ancestor_chain_with(|p| deep.get(&p).copied(), 1, 2),
+            vec![1, 2, 3]
+        );
+    }
 }
