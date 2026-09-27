@@ -20,6 +20,7 @@ jobs:
       changed: ${{ steps.merge.outputs.changed }}
       candidate: ${{ steps.merge.outputs.candidate }}
       base: ${{ steps.merge.outputs.base }}
+      upstream: ${{ steps.merge.outputs.upstream }}
       pr: ${{ steps.merge.outputs.pr }}
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +40,9 @@ jobs:
           upstream_sha=$(git rev-parse FETCH_HEAD)
           base_sha=$(git rev-parse HEAD)
           echo "base=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "Product baseline: $base_sha" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream revision: $upstream_sha" >> "$GITHUB_STEP_SUMMARY"
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             echo 'Workbench already contains upstream main.' >> "$GITHUB_STEP_SUMMARY"
@@ -58,6 +62,9 @@ jobs:
             git push origin "HEAD:refs/heads/$sync_branch"
           fi
           candidate=$(git rev-parse HEAD)
+          git merge-base --is-ancestor "$base_sha" "$candidate"
+          git merge-base --is-ancestor "$upstream_sha" "$candidate"
+          echo "Candidate revision: $candidate" >> "$GITHUB_STEP_SUMMARY"
           pr=$(gh pr list --base edition/lingque --head "$sync_branch" --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr" ]; then
             gh pr create --base edition/lingque --head "$sync_branch" \
@@ -71,8 +78,8 @@ jobs:
   verify:
     needs: prepare
     if: needs.prepare.outputs.changed == 'true'
-    # Explicit reusable CI is necessary: a GITHUB_TOKEN push/PR does not trigger
-    # another workflow automatically. This runs the exact candidate commit.
+    # Explicit reusable CI is authoritative: bot PR checks may require approval.
+    # Never depend on the separate PR event to validate the candidate.
     uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/lingque
     with:
       ref: ${{ needs.prepare.outputs.candidate }}
@@ -91,6 +98,7 @@ jobs:
         env:
           EXPECTED_BASE: ${{ needs.prepare.outputs.base }}
           CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
           PR_NUMBER: ${{ needs.prepare.outputs.pr }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -102,7 +110,35 @@ jobs:
             exit 1
           fi
           git merge-base --is-ancestor "$EXPECTED_BASE" "$CANDIDATE"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$CANDIDATE"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
           # The candidate already contains the merge. A normal fast-forward push
           # atomically rejects divergent intervening changes; no force or rebase.
           git push origin "$CANDIDATE:refs/heads/edition/lingque"
+          echo "Promoted tested revision: $CANDIDATE" >> "$GITHUB_STEP_SUMMARY"
           gh pr comment "$PR_NUMBER" --body "已通过工作台与普通入口验证，并将完整测试过的合并提交快进到产品分支。未发布安装包。"
+  summary:
+    if: always()
+    needs: [prepare, verify, promote]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Report synchronization outcome
+        env:
+          BASE: ${{ needs.prepare.outputs.base }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          CHANGED: ${{ needs.prepare.outputs.changed }}
+          PREPARE: ${{ needs.prepare.result }}
+          VERIFY: ${{ needs.verify.result }}
+          PROMOTE: ${{ needs.promote.result }}
+        run: |
+          {
+            echo '### Lingque synchronization'
+            echo "Baseline: $BASE"
+            echo "Upstream: $UPSTREAM_SHA"
+            echo "Candidate: $CANDIDATE"
+            echo "Changed: $CHANGED; prepare: $PREPARE; verify: $VERIFY; promote: $PROMOTE"
+            echo 'No installers published. Approval expiry on a separate PR run is not a compilation failure; candidate verification above is authoritative.'
+          } >> "$GITHUB_STEP_SUMMARY"

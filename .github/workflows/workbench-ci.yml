@@ -22,6 +22,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+      - name: Verify exact candidate revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.ref || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -52,6 +59,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+      - name: Verify exact candidate revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.ref || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -77,8 +94,14 @@ jobs:
         run: ./src-tauri/installer/test-workbench-mcp.ps1 -McpExecutable target/debug/nuphus-workbench-mcp.exe -TestRoot "${{ runner.temp }}/workbench-mcp-check"
       - run: cargo test -p nuphus --lib workflow --features workbench
       - run: cargo test -p nuphus --lib cache::tool_cache --features workbench
+      - name: Upstream path and tool compatibility
+        run: |
+          cargo test -p nuphus --lib utils::tests:: --features workbench
+          cargo test -p nuphus --lib tools::registry::tests:: --features workbench
       - run: cargo check -p nuphus-desktop --features workbench
       - run: cargo test -p nuphus-desktop --features workbench --bin nuphus workbench
+      - name: Handoff migration and edition isolation
+        run: cargo test -p nuphus-desktop --features workbench --bin nuphus commands::config::handoff::tests
       - run: cargo check -p nuphus-desktop
       - name: macOS desktop contracts
         if: runner.os == 'macOS'

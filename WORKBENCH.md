@@ -152,6 +152,9 @@ workflow.save → workflow.run → run.get/events/steps`。
 
 ### GitHub Actions 配置
 
+日常同步、冲突处理、CI 故障分类、分支迁移及回退步骤见
+[灵雀上游同步维护手册](docs/lingque-upstream-maintenance.md)。
+
 独立仓库 `yuansui486/nuphus-contrib`：
 
 1. 推送产品分支及四个 `workbench-*.yml` 工作流。

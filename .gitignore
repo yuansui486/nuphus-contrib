@@ -54,6 +54,7 @@ audit/
 # 内部文档（开发/审计/路线图/计划，均不公开推送；开源壳子仅保留根 README）
 # 插件市场建好后会重写公开开发文档
 docs/*
+!docs/lingque-upstream-maintenance.md
 !docs/readme-hero/
 !docs/readme-hero/*
 
