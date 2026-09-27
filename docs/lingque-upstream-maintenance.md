@@ -58,6 +58,7 @@ git log -5 --oneline
 gh run list -R yuansui486/nuphus-contrib --limit 10
 gh run view <run-id> -R yuansui486/nuphus-contrib --log-failed
 gh run view <run-id> -R yuansui486/nuphus-contrib --json jobs,conclusion,headSha,url
+gh run list -R yuansui486/nuphus-contrib --workflow workbench-dispatch.yml --event schedule --limit 5
 ```
 
 ## 合并原则
@@ -135,4 +136,27 @@ Mac 预览包仍为 ad-hoc 签名，并非 Apple 公证发行包；本次同步�
 
 - 2026-09-27：在 E 盘建立隔离修复目录，完成远程旧产品历史与上游 `8b65dcf` 合并；
   保留灵雀授权和工作流上下文，增加交接迁移隔离测试。
-- 分支发布、完整 CI 与调度切换：待验证后补充实际结果，不以计划代替完成状态。
+- 本地验证：TypeScript、ESLint（无错误，保留既有警告）、Prettier、Rust fmt、
+  工作台服务 Clippy 通过；前端 125 个测试文件、1,211 项测试通过；Rust 服务及桥接器 60 项测试通过。
+  原版与工作台前端均成功构建。工作流 YAML 经 actionlint v1.7.12 检查通过。
+- 产品提交 `42004e4a6e175bee8143c33b956db0bc7167afc6` 已首次发布到 `edition/lingque`；
+  [首轮 CI](https://github.com/yuansui486/nuphus-contrib/actions/runs/36324210621)
+  前端、Windows、Ubuntu、macOS ARM64 全部成功。
+- 完成上述验证后，默认分支以 `8494fb00711df8cc35ba4d8fd5bbc1f53e574859` 切换 dispatcher；
+  仅改两处产品引用。该提交的
+  [默认分支 CI](https://github.com/yuansui486/nuphus-contrib/actions/runs/36325616992) 也已通过。
+- 手动触发的
+  [新同步链路验收](https://github.com/yuansui486/nuphus-contrib/actions/runs/36325617562)
+  发现上游新提交 `1399ddf0237d532feb9cc0af39cbe868aae29133`，自动建立
+  [候选 PR #4](https://github.com/yuansui486/nuphus-contrib/pull/4)，候选 SHA 为
+  `d1c3b2eda78e99b47a06f3092e9c09de8c6a918f`。本次对照仓库、SHA 和差异后，
+  按 GitHub 正常流程批准了这一条独立 PR 检查；未修改审批策略或配置自动批准。
+- 新同步链路的 prepare、三平台 verify、promote 和 summary 全部成功；
+  远程产品分支已快进到同一个候选 `d1c3b2eda78e99b47a06f3092e9c09de8c6a918f`，
+  PR #4 自动标记合并。没有手工替代 promote，没有发布安装包。
+- 随后的[无更新验收](https://github.com/yuansui486/nuphus-contrib/actions/runs/36327599391)
+  成功：prepare 和 summary 正常结束，verify／promote／build 按预期跳过，不产生重复合并。
+- [候选的独立 PR CI](https://github.com/yuansui486/nuphus-contrib/actions/runs/36325632626)
+  经正常审批后前端及三个原生平台全部通过；同步自身的 verify 仍独立执行，不以此替代。
+- 定时入口已启用并保持 `17 * * * *`。上述两次端到端验收均由手动 dispatch 触发；
+  切换后的下一次自然 `schedule` 事件尚待观察，不将手动运行冒充定时触发。
