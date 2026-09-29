@@ -133,14 +133,17 @@ fn manual_hint(tool: BinTool, err: &str) -> String {
 
 /// yt-dlp single-file binary (GitHub releases; CN mirror first, mirrors
 /// speech/download.rs 与 embed.rs 的 CN 优先回退惯例).
+/// 镜像按 2026-09-28 同资产 5MB range 实测排序：gh-proxy ~6.4 MB/s ≫ ghfast ~295 KB/s；
+/// 故 ghfast 不再入列——它比 GitHub 权威源的失败重试还慢，列在最前只会拖慢回退。
 const YTDLP_URLS: &[&str] = &[
-    "https://ghfast.top/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+    "https://gh-proxy.com/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
 ];
 /// ffmpeg release archives (must contain bin/ffmpeg.exe + bin/ffprobe.exe).
+/// gyan.dev 是官方 Windows 构建源、非 GitHub 镜像，保留首位；GitHub 源走 gh-proxy。
 const FFMPEG_ZIP_URLS: &[&str] = &[
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-    "https://ghfast.top/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+    "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
 ];
 

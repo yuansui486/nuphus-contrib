@@ -659,10 +659,20 @@ fn upsert_external_agent_at(plugin_dir: &Path, agent: &serde_json::Value) -> Res
 
 /// 删除一个 agent 段。返回 `false` = team.toml 不存在或段本来就不存在（零改动），
 /// `true` = 真实删除并写回。
-/// 不删除 .nuphus/handoff/{key}/ 目录。
+/// 不删除 .nuphus/handoff/{key}/ 目录——但**联动清掉运行时态 status.json**：
+/// 状态栏唯一边据即 status.json（L0 配置与 L1 运行时态联动注销），删之即从列表
+/// 消失且重启不复活；briefs/projects/memory.md/read.md 全留，追溯链不断。
 #[tauri::command]
-pub fn delete_external_agent(key: String) -> Result<bool, String> {
-    delete_external_agent_at(&nuphus::utils::plugin_root(), &key)
+pub fn delete_external_agent(
+    key: String,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<bool, String> {
+    let removed = delete_external_agent_at(&nuphus::utils::plugin_root(), &key)?;
+    if removed {
+        crate::commands::config::handoff::clear_runtime_state_at(&handoff_root(), &key)?;
+        nuphus::state::SignalState::unhide_ext_agent(&state.signals, &key);
+    }
+    Ok(removed)
 }
 
 fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<bool, String> {
@@ -695,10 +705,19 @@ fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<bool, String
 
 /// upsert 外部 Agent；新 agent 时联动 handoff::init_agent_at 生成
 /// .nuphus/handoff/{key}/（read.md 职责 = description）。返回 "created"/"updated"。
+///
+/// 配置中心显式保存 = 用户主动纳入 → 同时撤销该 agent 的「从列表移出」显示态
+/// （移除遵循用户选择：只有新的用户显式动作能覆盖它）。
 #[tauri::command]
-pub fn upsert_external_agent(agent: serde_json::Value) -> Result<String, String> {
+pub fn upsert_external_agent(
+    agent: serde_json::Value,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<String, String> {
     let plugin_dir = nuphus::utils::plugin_root();
     let is_new = upsert_and_init_at(&plugin_dir, &handoff_root(), &agent)?;
+    if let Some(key) = agent.get("key").and_then(|v| v.as_str()) {
+        nuphus::state::SignalState::unhide_ext_agent(&state.signals, key);
+    }
     Ok(if is_new { "created" } else { "updated" }.to_string())
 }
 

@@ -578,6 +578,37 @@ fn apply_session_sort_prefs(
     (group_order, sort_key)
 }
 
+/// 设置会话工作台置顶会话（组内置顶，数组序即组内展示序）。
+///
+/// 归一（去空白/去空/去重/保序）后**整表替换**落盘，并把归一后的结果回给前端——
+/// 前端据此校准本地状态，避免「界面显示 A、落盘 B」。已删除/已归档会话的残留 id
+/// 不在此处清理（命令层看不到当轮可见会话）：由 `list_shelf_sessions` 读取时剔除，
+/// 配置文件不被轮询反复重写。
+///
+/// 生效路径：`list_shelf_sessions` 每次返回 `pinned_sessions` → 会话工作台 5s 轮询即读到
+/// 新值（桌面 SessionRail / 移动端 NavBar 共用同一返回体）。
+#[tauri::command]
+pub fn set_pinned_sessions(ids: Vec<String>) -> Result<Vec<String>, String> {
+    let mut prefs = nuphus::config::UserPreferences::load();
+    let applied = apply_pinned_sessions(&mut prefs, &ids);
+    prefs.save().map_err(|e| e.to_string())?;
+    tracing::info!("Pinned sessions set: {applied:?}");
+    Ok(applied)
+}
+
+/// 置顶会话归一 + 写回（纯逻辑，便于测试）：返回即落盘值。
+///
+/// 归一实现收敛在 `nuphus::config::normalize_pinned_sessions`（与 `list_shelf_sessions`
+/// 下发读数、前端 `normalizePinnedSessions` 同源），此处只负责写回。
+fn apply_pinned_sessions(
+    prefs: &mut nuphus::config::UserPreferences,
+    ids: &[String],
+) -> Vec<String> {
+    let applied = nuphus::config::normalize_pinned_sessions(ids);
+    prefs.pinned_sessions = applied.clone();
+    applied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +712,45 @@ mod tests {
         assert_eq!(applied, ("bookmark".to_string(), "updated".to_string()));
         assert_eq!(prefs.session_group_order, "bookmark");
         assert_eq!(prefs.session_sort_key, "updated");
+    }
+
+    /// 置顶会话往返：写 → 读回一致；反向清空同样成立。
+    /// 只测纯逻辑 `apply_pinned_sessions`（不 load/save 真实 prefs 文件，避免测试污染）。
+    #[test]
+    fn set_pinned_sessions_roundtrip() {
+        let mut prefs = nuphus::config::UserPreferences::default();
+
+        let applied = apply_pinned_sessions(&mut prefs, &["s-1".to_string(), "s-2".to_string()]);
+        assert_eq!(applied, vec!["s-1", "s-2"]);
+        assert_eq!(
+            prefs.pinned_sessions(),
+            vec!["s-1", "s-2"],
+            "置顶 id 应写回且读数一致"
+        );
+
+        let applied = apply_pinned_sessions(&mut prefs, &[]);
+        assert!(applied.is_empty(), "取消全部置顶 → 空表");
+        assert!(prefs.pinned_sessions().is_empty());
+    }
+
+    /// 置顶归一（不拒绝、不落脏值）：空串 / 重复 / 带空白 id 被清洗，
+    /// 返回的即落盘值——前端据此校准本地状态。
+    #[test]
+    fn apply_pinned_sessions_cleans_dirty_ids() {
+        let mut prefs = nuphus::config::UserPreferences::default();
+
+        let applied = apply_pinned_sessions(
+            &mut prefs,
+            &[
+                " s-1 ".to_string(),
+                String::new(),
+                "s-1".to_string(),
+                "s-2".to_string(),
+                "  ".to_string(),
+            ],
+        );
+        assert_eq!(applied, vec!["s-1", "s-2"]);
+        assert_eq!(prefs.pinned_sessions, vec!["s-1", "s-2"]);
     }
 
     fn cmd(args: &[&str]) -> Vec<std::ffi::OsString> {

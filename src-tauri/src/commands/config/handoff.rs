@@ -713,9 +713,30 @@ pub fn agent_status(agent: String) -> Result<serde_json::Value, String> {
 /// 遍历 handoff_root() 下的 agent 目录，读各自 status.json；
 /// 目录不存在 → 空数组；单个目录无 status.json / 不可解析 → 跳过（不 panic）。
 /// 返回按 agent 名排序的 status 数组（每个元素含 agent 字段）。
+///
+/// 每项附 `hidden`（用户是否已从列表栏移出）——显示态由后端共享集标注
+/// （应用生命周期内保持、重启即净），前端不再自持移出状态。
 #[tauri::command]
-pub fn list_agent_statuses() -> Result<Vec<serde_json::Value>, String> {
-    Ok(list_agent_statuses_at(&handoff_root()))
+pub fn list_agent_statuses(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let hidden = nuphus::state::SignalState::hidden_ext_agents(&state.signals);
+    let mut list = list_agent_statuses_at(&handoff_root());
+    for item in list.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let agent = obj
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        obj.insert(
+            "hidden".to_string(),
+            serde_json::json!(hidden.contains_key(&agent)),
+        );
+    }
+    Ok(list)
 }
 
 fn list_agent_statuses_at(root: &Path) -> Vec<serde_json::Value> {
@@ -748,8 +769,9 @@ fn status_at(root: &Path, agent: &str) -> serde_json::Value {
     read_status_at(root, agent).unwrap_or_else(|| serde_json::json!({ "state": "uninitialized" }))
 }
 
-/// 用户把外部 Agent 从列表栏移出 → 往「下一条提示」注入位写一句，
-/// 由下一个轮次边界带进 agent 上下文（只进上下文、界面不显示）。
+/// 用户把外部 Agent 从列表栏移出 → ①显示态写入后端共享集（应用生命周期内保持，
+/// 重启即净——前端 UI 显示跟随应用生命周期，遵循用户选择）；②往「下一条提示」
+/// 注入位写一句，由下一个轮次边界带进 agent 上下文（只进上下文、界面不显示）。
 ///
 /// 目的：让 agent 知道「这个外部 Agent 已被用户暂时移出，后续需用户显式指定才可调用」，
 /// 避免它继续自动派发/重试。显示层操作，不动配置与 team.toml。
@@ -760,11 +782,54 @@ pub fn notify_ext_agent_removed(
 ) -> Result<(), String> {
     let agent = agent.trim().to_string();
     validate_agent(&agent)?;
+    // 显示态归应用生命周期：写入进程内共享集（src/state.rs）。
+    // 撤销只有两条显式路径：时刻更晚的新门铃活动 / 配置中心保存。
+    nuphus::state::SignalState::hide_ext_agent(
+        &state.signals,
+        &agent,
+        chrono::Utc::now().timestamp_millis(),
+    );
     nuphus::state::SignalState::push_notice(
         &state.signals,
         format!("[外部 Agent 列表栏] 用户已把外部 Agent「{agent}」移出：后续需用户显式指定才可调用，不要自动派发或重试它。"),
     );
     Ok(())
+}
+
+/// 门铃事件到达后的显示态撤销：事件时刻**严格晚于**移出时刻 → 撤销「从列表移出」
+/// （新一轮真实调用 = 用户的新选择，条目应回到列表栏）。无 status / 无 last_event /
+/// 未移出 → 无操作。纯判定在 [`nuphus::state::SignalState::event_revives_hidden`]。
+pub fn revive_hidden_ext_agent_on_event(signals: &nuphus::state::SharedSignals, id: &str) {
+    let Some(agent) = agent_id_prefix(id) else {
+        return;
+    };
+    let Some(hidden_since) = nuphus::state::SignalState::hidden_ext_agent_since(signals, agent)
+    else {
+        return;
+    };
+    let event_ts = read_status_at(&handoff_root(), agent)
+        .and_then(|d| d.get("last_event")?.get("ts")?.as_str().map(str::to_string))
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.timestamp_millis());
+    if let Some(ts) = event_ts {
+        if nuphus::state::SignalState::event_revives_hidden(hidden_since, ts) {
+            nuphus::state::SignalState::unhide_ext_agent(signals, agent);
+        }
+    }
+}
+
+/// 注销外部 Agent 时清运行时态：**只删 status.json**（briefs/projects/memory.md/
+/// read.md 全留——追溯链不断）。状态栏唯一边据即 status.json，删之即从列表消失
+/// 且重启不复活（reset 只重置 status.json，文件没了无从重置）。
+/// 目录/文件不存在 → Ok(())（幂等）。
+pub fn clear_runtime_state_at(root: &Path, agent: &str) -> Result<(), String> {
+    validate_agent(agent)?;
+    let path = root.join(agent).join("status.json");
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("删除 status.json 失败: {e}")),
+    }
 }
 
 /// 列出某 agent 的交付物：briefs/ 下的任务报告（`{task_id}-report.md` 约定）
@@ -1219,6 +1284,30 @@ mod tests {
         // 无 status / 非对象 doc：无法判定在途，不挡路
         assert!(in_flight_block_reason(None, "task-b").is_none());
         assert!(in_flight_block_reason(Some(&serde_json::json!("oops")), "task-b").is_none());
+    }
+
+    /// 注销清运行时态：status.json 删光，briefs/report/memory/read.md 全留
+    /// （L0 配置与 L1 运行时态联动注销，追溯链不断）；幂等。
+    #[test]
+    fn test_clear_runtime_state_keeps_traceability() {
+        let root = tmp_root("clear-runtime");
+        init_agent_at(&root, "web_agent", "desc").unwrap();
+        ensure_handoff_at(&root, "web_agent", "task-001", "brief", None).unwrap();
+        assert!(root.join("web_agent").join("status.json").exists());
+
+        clear_runtime_state_at(&root, "web_agent").unwrap();
+        assert!(!root.join("web_agent").join("status.json").exists());
+        // 追溯链资产一动没动
+        assert!(root
+            .join("web_agent")
+            .join("briefs")
+            .join("task-001-brief.md")
+            .exists());
+        assert!(root.join("web_agent").join("read.md").exists());
+
+        // 幂等：再删/删不存在的 agent 都不报错
+        clear_runtime_state_at(&root, "web_agent").unwrap();
+        clear_runtime_state_at(&root, "no_such_agent").unwrap();
     }
 
     /// 跑一条 git 命令；成功返回 trim 后的 stdout。环境无 git / 命令失败 → None。

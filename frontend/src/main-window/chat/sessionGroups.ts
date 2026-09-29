@@ -16,6 +16,11 @@
  * 5. 组内折叠上限 = 全局单值 `collapsed_limit`（决策 9），超出部分由 UI 折叠为
  *    「展开其余 N 个会话」——折叠/展开是运行时 UI 状态，故此处只给切片结果。
  *
+ * 置顶（组内置顶，issue #83 第一期）：`pinnedIds`（= 后端 `pinned_sessions`，数组序即
+ * 展示序）内的会话恒在其**所属组**最上方，优先于组内排序键；置顶项不占折叠额度
+ * （恒可见），未被置顶的会话 fold 逻辑不变。参数可选、缺省 = 无置顶——移动端
+ * NavBar 不传参时，行为与本功能引入前逐项一致。
+ *
  * 排序偏好（两个**独立**维度，落 preferences、桌面/移动同一读数）：
  * - **组序维度** `groupOrder`：`bookmark` = 组顺序 = 书签顺序（默认，= 现状）；
  *   `recent` = 仍按项目分组，但组顺序改为「组内最近一次会话时间」倒序，
@@ -73,6 +78,26 @@ export function normalizeSessionSortPrefs(raw: unknown): SessionSortPrefs {
   }
 }
 
+/**
+ * 置顶会话 id 清洗：去首尾空白、剔空串、去重（保留首次出现）、保序。
+ *
+ * 与后端 `normalize_pinned_sessions` 同义（后端是唯一权威，此处只做前端兜底）：
+ * 非数组 / 非字符串元素一律忽略，绝不把脏值带进置顶序。
+ */
+export function normalizePinnedSessions(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const v of raw) {
+    if (typeof v !== 'string') continue
+    const id = v.trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
 /** 分组所需的最小会话形状（桌面 ShelfSessionItem / 移动端 ShelfSessionItem 均结构兼容） */
 export interface GroupSessionLike {
   id: string
@@ -107,8 +132,12 @@ export interface SessionGroup<T extends GroupSessionLike = GroupSessionLike> {
   isCurrent: boolean
   /** true = 未收藏但有会话的自动组（只读：不可重命名/归档——决策 7） */
   auto: boolean
-  /** 组内会话，已按排序偏好排好（`updated` 倒序 / `created` 升序） */
+  /** 组内会话，已按排序偏好排好（`updated` 倒序 / `created` 升序）；
+   *  置顶会话恒在最前（按 `pinnedIds` 数组序），见 `buildSessionGroups` */
   sessions: T[]
+  /** 组内置顶会话数（= `sessions` 最前 N 条即置顶区）；0 = 无置顶。
+   *  置顶恒可见、不占折叠额度（见 `visibleGroupSessions`） */
+  pinnedCount: number
 }
 
 /** 路径末段名（自动组无 name 时的兜底展示名，沿用项目中心 nameFromPath 规则） */
@@ -162,13 +191,30 @@ function createdMillis(item: GroupSessionLike): number {
   return created > 0 ? created : toMillis(item.updated_at)
 }
 
-/** 组内排序：`updated` = 更新时间倒序（默认）；`created` = 创建时间升序（早的在上） */
-function sortSessions<T extends GroupSessionLike>(list: T[], sortKey: SessionSortKey): T[] {
-  if (sortKey !== 'created') return sortByUpdatedDesc(list)
-  return list
-    .map((item, index) => ({ item, index, ts: createdMillis(item) }))
-    .sort((a, b) => a.ts - b.ts || a.index - b.index)
-    .map(x => x.item)
+/**
+ * 组内排序：`updated` = 更新时间倒序（默认）；`created` = 创建时间升序（早的在上）。
+ *
+ * `pinnedRank`（id → 置顶序）非空时，置顶会话按 pinned 序前置，其余保持排序键
+ * 顺序——置顶优先于排序键，但不改变未置顶会话的相对次序。
+ * 空/缺省 pinnedRank 时与该函数本来的逐项行为一致（移动端不传参的契约）。
+ */
+function sortSessions<T extends GroupSessionLike>(
+  list: T[],
+  sortKey: SessionSortKey,
+  pinnedRank?: Map<string, number>,
+): T[] {
+  const sorted =
+    sortKey !== 'created'
+      ? sortByUpdatedDesc(list)
+      : list
+          .map((item, index) => ({ item, index, ts: createdMillis(item) }))
+          .sort((a, b) => a.ts - b.ts || a.index - b.index)
+          .map(x => x.item)
+  if (!pinnedRank || pinnedRank.size === 0) return sorted
+  const rank = (s: T) => pinnedRank.get(s.id)
+  const pinned = sorted.filter(s => rank(s) !== undefined).sort((a, b) => rank(a)! - rank(b)!)
+  const rest = sorted.filter(s => rank(s) === undefined)
+  return [...pinned, ...rest]
 }
 
 /** 组内最近一次会话时间（组序维度 `recent` 用）；空组返回 null（恒末位） */
@@ -210,12 +256,15 @@ function sortGroupsByRecency<T extends GroupSessionLike>(
  * @param projects         可见项目文件夹（书签 → auto），顺序即组顺序（`bookmark` 维度）
  * @param archivedProjects 已归档项目文件夹（整组隐藏，其会话不落「未分组」）
  * @param prefs            排序偏好（组序维度 + 组内键）；缺省 = 默认（按项目 / 更新时间）
+ * @param pinnedIds        置顶会话 id（数组序即展示序，= 后端 `pinned_sessions`）；
+ *                         缺省 = 无置顶（移动端 NavBar 不传参，行为与本功能引入前一致）
  */
 export function buildSessionGroups<T extends GroupSessionLike>(
   items: readonly T[],
   projects: readonly GroupProjectLike[],
   archivedProjects: readonly GroupProjectLike[],
   prefs: SessionSortPrefs = DEFAULT_SESSION_SORT_PREFS,
+  pinnedIds: readonly string[] = [],
 ): SessionGroup<T>[] {
   const archivedKeys = new Set<string>()
   const archivedLowerKeys = new Set<string>()
@@ -232,6 +281,12 @@ export function buildSessionGroups<T extends GroupSessionLike>(
   const groups: SessionGroup<T>[] = []
   const byKey = new Map<string, SessionGroup<T>>()
   const byLowerKey = new Map<string, SessionGroup<T>>()
+  // 置顶序（id → pinned 数组下标）：只按 id 记序，不管会话落在哪个组——
+  // 一个会话只可能属于一个组（含「未分组」），故置顶天然是「组内」效果。
+  const pinnedRank = new Map<string, number>()
+  normalizePinnedSessions(pinnedIds).forEach((id, index) => {
+    if (!pinnedRank.has(id)) pinnedRank.set(id, index)
+  })
   for (const p of projects) {
     const key = normalizePathKey(p.path)
     if (!key || byKey.has(key)) continue
@@ -242,6 +297,7 @@ export function buildSessionGroups<T extends GroupSessionLike>(
       isCurrent: !!p.is_current,
       auto: !!p.auto,
       sessions: [],
+      pinnedCount: 0,
     }
     byKey.set(key, group)
     const lower = key.toLowerCase()
@@ -269,19 +325,24 @@ export function buildSessionGroups<T extends GroupSessionLike>(
     }
   }
 
-  // 组内排序键（两个维度互相独立：此处只动组内顺序）
-  for (const g of groups) g.sessions = sortSessions(g.sessions, prefs.sortKey)
+  // 组内排序键（两个维度互相独立：此处只动组内顺序）；置顶会话按 pinned 序前置
+  for (const g of groups) {
+    g.sessions = sortSessions(g.sessions, prefs.sortKey, pinnedRank)
+    g.pinnedCount = g.sessions.filter(s => pinnedRank.has(s.id)).length
+  }
   // 组序维度：'recent' 时按组内最近会话倒序（空组末位）；'bookmark' 保持书签顺序
   const ordered = prefs.groupOrder === 'recent' ? sortGroupsByRecency(groups) : groups
   if (ungrouped.length > 0) {
     // 「未分组」兜底组恒定末位（决策 6），不参与组序维度重排
+    const sessions = sortSessions(ungrouped, prefs.sortKey, pinnedRank)
     ordered.push({
       key: UNGROUPED_GROUP_KEY,
       path: null,
       name: '',
       isCurrent: false,
       auto: false,
-      sessions: sortSessions(ungrouped, prefs.sortKey),
+      sessions,
+      pinnedCount: sessions.filter(s => pinnedRank.has(s.id)).length,
     })
   }
   return ordered
@@ -298,6 +359,9 @@ export interface GroupSlice<T extends GroupSessionLike> {
 /**
  * 组内展示切片：未展开且超出上限时只给前 limit 条。
  * 折叠/展开由 UI 逐组持有（运行时状态，不持久化——决策 11）。
+ *
+ * 置顶区（`sessions` 最前 `pinnedCount` 条）恒可见且**不占**折叠额度：只有未置顶
+ * 部分参与 limit 切片；未置顶会话的折叠/展开行为与本功能引入前完全一致。
  */
 export function visibleGroupSessions<T extends GroupSessionLike>(
   group: SessionGroup<T>,
@@ -305,11 +369,13 @@ export function visibleGroupSessions<T extends GroupSessionLike>(
   expanded: boolean,
 ): GroupSlice<T> {
   const lim = normalizeGroupLimit(limit)
-  if (expanded || group.sessions.length <= lim) {
+  const pinned = group.sessions.slice(0, group.pinnedCount)
+  const rest = group.sessions.slice(group.pinnedCount)
+  if (expanded || rest.length <= lim) {
     return { sessions: group.sessions, hiddenCount: 0 }
   }
   return {
-    sessions: group.sessions.slice(0, lim),
-    hiddenCount: group.sessions.length - lim,
+    sessions: [...pinned, ...rest.slice(0, lim)],
+    hiddenCount: rest.length - lim,
   }
 }

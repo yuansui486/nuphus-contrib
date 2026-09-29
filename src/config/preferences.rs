@@ -68,6 +68,13 @@ pub struct UserPreferences {
     /// （见 [`UserPreferences::session_group_limit`]）。
     #[serde(default = "default_session_group_collapsed_limit")]
     pub session_group_collapsed_limit: u32,
+    /// 会话工作台置顶会话 id（组内置顶；数组序即组内展示序）。
+    ///
+    /// 只记 id，不触碰 `sessions` 表与归属（`project_path` 仍在诞生点快照）：置顶
+    /// 会话恒在其所属项目组最上方，不受组内排序键影响。`serde(default)` 保证老配置
+    /// 平滑升级为「无置顶」。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_sessions: Vec<String>,
     /// External browser CDP endpoint (tri-state):
     /// `None` = never configured (leave any servers.yaml env untouched);
     /// `Some("")` = user explicitly switched back to managed Chrome (strip the env);
@@ -131,6 +138,22 @@ pub fn normalize_session_sort_key(raw: &str) -> &'static str {
     }
 }
 
+/// 置顶会话 id 归一：去首尾空白、剔空串、去重（保留首次出现）、保序。
+///
+/// 归一收敛在此：置顶命令写回、`list_shelf_sessions` 下发读数、前端
+/// `normalizePinnedSessions` 三处同源，不各写一套判定。
+pub fn normalize_pinned_sessions(ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in ids {
+        let id = raw.trim();
+        if id.is_empty() || out.iter().any(|kept| kept == id) {
+            continue;
+        }
+        out.push(id.to_string());
+    }
+    out
+}
+
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
@@ -140,6 +163,7 @@ impl Default for UserPreferences {
             session_group_order: default_session_group_order(),
             session_sort_key: default_session_sort_key(),
             session_group_collapsed_limit: DEFAULT_SESSION_GROUP_COLLAPSED_LIMIT,
+            pinned_sessions: Vec::new(),
             browser_cdp_url: None,
             browser_identity: None,
         }
@@ -166,6 +190,15 @@ impl UserPreferences {
     /// 组内排序键读数（归一后）：手改配置的非法值一律回落「更新时间」。
     pub fn session_sort_key(&self) -> &'static str {
         normalize_session_sort_key(&self.session_sort_key)
+    }
+
+    /// 置顶会话 id 读数（归一后）：去空白/去空/去重/保序，数组序即组内展示序。
+    ///
+    /// 「已删除 / 已归档」的**存活过滤**不在此处（配置层看不到会话表）：由
+    /// `list_shelf_sessions` 用当轮可见会话再滤一遍——读取时剔除残留 id、
+    /// 不写回清理，避免每次轮询都重写配置文件。
+    pub fn pinned_sessions(&self) -> Vec<String> {
+        normalize_pinned_sessions(&self.pinned_sessions)
     }
 
     pub fn load() -> Self {
@@ -235,6 +268,10 @@ mod tests {
         assert_eq!(prefs.project_bookmarks[0].name, "A");
         assert_eq!(prefs.session_group_order(), SESSION_GROUP_ORDER_BOOKMARK);
         assert_eq!(prefs.session_sort_key(), SESSION_SORT_KEY_UPDATED);
+        assert!(
+            prefs.pinned_sessions().is_empty(),
+            "老配置无置顶字段 → 空（平滑升级为无置顶）"
+        );
     }
 
     /// 排序偏好落盘往返：合法值序列化保留、反序列化还原（重启后排序不丢）。
@@ -252,6 +289,44 @@ mod tests {
         let back: UserPreferences = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_group_order(), SESSION_GROUP_ORDER_RECENT);
         assert_eq!(back.session_sort_key(), SESSION_SORT_KEY_CREATED);
+    }
+
+    /// 置顶会话落盘往返：数组序序列化保留、反序列化还原（重启后置顶不丢）；
+    /// 空表跳过序列化，老配置反序列化缺字段 → 空。
+    #[test]
+    fn pinned_sessions_roundtrip_through_json() {
+        let prefs = UserPreferences {
+            pinned_sessions: vec!["s-1".to_string(), "s-2".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains("\"pinned_sessions\":[\"s-1\",\"s-2\"]"));
+        let back: UserPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pinned_sessions(), vec!["s-1", "s-2"]);
+
+        // 空表不落键（skip_serializing_if）：配置文件不堆空字段
+        let empty = UserPreferences::default();
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(!json.contains("pinned_sessions"));
+        assert!(empty.pinned_sessions().is_empty());
+    }
+
+    /// 置顶读数清洗：手改配置写进的空串 / 重复 / 带空白 id，读数去重保序，
+    /// 且**不**把脏值当作有效置顶。
+    #[test]
+    fn pinned_sessions_reading_cleans_dirty_ids() {
+        let prefs = UserPreferences {
+            pinned_sessions: vec![
+                " s-1 ".to_string(),
+                String::new(),
+                "s-1".to_string(),
+                "s-2".to_string(),
+                "  ".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prefs.pinned_sessions(), vec!["s-1", "s-2"]);
+        assert_eq!(normalize_pinned_sessions(&[]), Vec::<String>::new());
     }
 
     /// 非法取值归一：手改配置写进的怪值 / 空串 / 大小写变体 / 带空白，

@@ -70,6 +70,7 @@
   gap: var(--space-3);
   max-height: 260px;
   overflow-y: auto;
+  overflow-wrap: anywhere;
 }
 
 .update-changes-group {
@@ -89,10 +90,21 @@
 .update-changes-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: 6px;
   margin: 0;
   padding-left: var(--space-4);
   color: var(--fg-2);
   font-size: var(--fz-sm);
-  line-height: var(--leading-normal);
+  line-height: 1.65;
+}
+
+.update-changes-body strong {
+  color: var(--fg-1);
+  font-weight: var(--fw-semibold);
+}
+
+.update-changes-body .inline-code {
+  overflow-wrap: anywhere;
+  text-transform: none;
+  letter-spacing: normal;
 }

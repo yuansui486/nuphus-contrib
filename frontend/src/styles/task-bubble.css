@@ -142,17 +142,23 @@
   align-items: stretch;
   padding: 6px 8px;
   border-radius: 6px;
-  cursor: default;
-  transition:
-    background 0.2s ease,
-    transform 0.15s ease;
+  /* 整行即详情入口（role=button）：指针给 pointer，否则用户不知道这里能点 */
+  cursor: pointer;
+  transition: background 0.2s ease;
   border: 1px solid transparent;
 }
 
+/* hover 只换底色/描边，不做位移（列表项位移在密集任务列表里是噪声） */
 .task-track-item:hover {
   background: var(--glass-0);
   border-color: var(--glass-1);
-  transform: translateX(-2px);
+}
+
+/* 键盘焦点环用 box-shadow（outline 会挤出布局）；点击态沿用 hover 底色 */
+.task-track-item:focus-visible {
+  background: var(--glass-0);
+  box-shadow: var(--shadow-focus);
+  outline: none;
 }
 
 .task-track-item-row {
@@ -263,4 +269,31 @@
 
 .task-track-item.completed .task-track-name {
   color: var(--spark-muted);
+}
+
+/* ── 任务详情弹窗（TaskDetailModal）─────────────────────────────
+   弹窗的骨架/层级/排版全部来自 planner.css 的 pm-* 类（wrapper / backdrop /
+   content / header / body / req-card…），此处只补 planner.css 没有的两件：
+   ① .pm-header-status 的台账四态配色（planner.css 只为计划态定义了
+      is-active / is-archived 两档；取色全用既有 token，不新造色）；
+   ② summary 里 markdown 块元素的收边（markdown.css 自带块样式，但它的容器
+      预期是消息气泡宽度；这里只调 gap，不动字号字色）。 */
+.pm-header-status.is-running {
+  color: var(--accent);
+}
+.pm-header-status.is-completed {
+  color: var(--success);
+}
+.pm-header-status.is-failed {
+  color: var(--error);
+}
+.pm-header-status.is-interrupted {
+  color: var(--spark-dim);
+}
+
+.task-detail-markdown > *:first-child {
+  margin-top: 0;
+}
+.task-detail-markdown > *:last-child {
+  margin-bottom: 0;
 }

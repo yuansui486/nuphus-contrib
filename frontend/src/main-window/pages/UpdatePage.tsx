@@ -5,6 +5,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { useLanguage } from '../../locales'
 import { Button } from '../../ui/Button'
 import { IconRefresh } from '../../ui/Icons'
+import { MarkdownInline } from '../chat/MarkdownContent'
 import { getChangelog } from '../lib/api'
 import { countSectionItems, parseChangelogSection, type ChangelogSection } from '../lib/changelog'
 import '../../styles/update.css'
@@ -154,10 +155,16 @@ export function UpdatePage() {
           <div className="update-changes-body">
             {changelog.section.groups.map(group => (
               <div className="update-changes-group" key={group.title}>
-                {group.title && <div className="update-changes-group-title">{group.title}</div>}
+                {group.title && (
+                  <div className="update-changes-group-title">
+                    <MarkdownInline text={group.title} />
+                  </div>
+                )}
                 <ul className="update-changes-list">
                   {group.items.map((item, index) => (
-                    <li key={`${group.title}-${index}`}>{item}</li>
+                    <li key={`${group.title}-${index}`}>
+                      <MarkdownInline text={item} />
+                    </li>
                   ))}
                 </ul>
               </div>

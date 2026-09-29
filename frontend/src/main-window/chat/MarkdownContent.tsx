@@ -528,7 +528,7 @@ function applyFilePaths(
   })
 }
 
-function MarkdownInline({
+export function MarkdownInline({
   text,
   onFileClick,
 }: {

@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use tauri::AppHandle;
+use tauri::Manager;
 
 /// done/blocked 自动唤醒用 AppHandle（模式对齐 render/commands.rs 的 APP 静态）
 static APP: OnceLock<AppHandle> = OnceLock::new();
@@ -80,6 +81,14 @@ async fn post_handoff(headers: HeaderMap, Json(payload): Json<HandoffPayload>) -
                 &payload.summary,
                 report_path.as_deref(),
             );
+            // 显示态撤销（前端 UI 跟随应用生命周期）：时刻更晚的新门铃活动 →
+            // 该 agent 从「已移出」回到列表栏。无状态/未移出 → 无操作。
+            if let Some(app) = APP.get() {
+                crate::commands::config::handoff::revive_hidden_ext_agent_on_event(
+                    &app.state::<crate::state::AppState>().signals,
+                    &payload.id,
+                );
+            }
             // 阶段 1（方案 v8 六章）：done/blocked 到达 → Leader 空闲时自动开一轮处理。
             // busy 预检在 try_spawn_leader_round 内；忙碌 → 事件留队列，轮次边界自然消化。
             if payload.status == "done" || payload.status == "blocked" {

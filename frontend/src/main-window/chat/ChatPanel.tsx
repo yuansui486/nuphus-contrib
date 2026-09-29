@@ -13,6 +13,7 @@ import type { SecurityCheck } from '../../core/types'
 import { listen } from '../../core/bridge'
 import { composeAssistantReplies } from '../../core/progressMessages'
 import type { ExecutionStage } from '../../hooks/useExecutionState'
+import { useStickyScroll } from '../../hooks/useStickyScroll'
 import { createSendReceiptHub, type SendReceiptHub } from '../lib/sendReceipt'
 import { isCustomProviderId } from '../lib/customProvider'
 import { setIslandAnchor } from '../../ui/islandChannel'
@@ -40,6 +41,8 @@ import {
 } from '../lib/api'
 import type { ProviderInfo, ModelInfo, ProjectBookmark, ToolPermissions } from '../lib/api'
 import { friendlyIpcError } from '../lib/ipcError'
+import { orderProviderModels, readRecentModels, rememberRecentModel } from './modelPopupOrder'
+import { buildQuoteRef, isSelectableInBubble, truncateQuote } from './messageSelection'
 import { WelcomeScreen } from './WelcomeScreen'
 import { OnboardingModal } from './OnboardingModal'
 import { SessionDivider } from './SessionDivider'
@@ -73,6 +76,8 @@ import {
   IconSettings,
   IconStar,
   IconChartColumn,
+  IconChevronsDown,
+  IconQuote,
 } from '../../ui/Icons'
 import { RatingModal } from '../layout/ExecutionTraceFloating'
 import { MoodFace } from '../../ui/MoodFace'
@@ -90,6 +95,7 @@ import { Button, IconButton } from '../../ui/Button'
 import MarkdownContent from './MarkdownContent'
 import { PreviewOverlay } from './PreviewOverlay'
 import { LiveExecutionActivity } from './LiveExecutionActivity'
+import { AppearancePanel } from '../layout/AppearancePanel'
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k'
@@ -155,6 +161,12 @@ interface ChatPanelProps {
   apiHealth?: ApiHealthState
   onApiHealthRead?: () => void
   onModelChanged?: () => void
+  /** 贴底跟随的 followReset 下行 ref：useEvents 跑在 App 层（本组件之上），其
+   *  execution_started / execution_completed 分支需要「恢复跟随 + 滚底」—— 函数不能
+   *  经 props 上行，改为父层下发 ref、本组件每次渲染回填 useStickyScroll 的
+   *  followReset 最新闭包（useEvents 经 h.refs 同读此 ref）。缺省（未注入）时
+   *  useEvents 侧静默跳过，回底按钮与冻结/宽限语义不受影响。 */
+  followResetRef?: React.MutableRefObject<(() => void) | null>
   refineState?: { usagePercent: number; totalLimit: number } | null
   pendingRefine: { usagePercent: number; totalLimit: number; skippedTurns: number } | null
   setPendingRefine: React.Dispatch<
@@ -198,6 +210,16 @@ interface ChatPanelProps {
   onOpenWorkflowList?: () => void
   /** 输入栏最左端齿轮按钮：打开设置中心全屏覆盖层（状态由 App 层持有） */
   onOpenSettings?: () => void
+  /**
+   * 外观浮窗的外部打开请求（App 层 `useModals.showThemes`：Ctrl+K 命令面板
+   * 「外观」置位）。置 true 即展开外观浮窗；本组件不持有这个全局态。
+   */
+  appearanceOpen?: boolean
+  /**
+   * 外观浮窗收起时回写外部请求。必须有：同值 setState 不触发 effect，
+   * 不回写则「Esc 收起 → 再点 Ctrl+K → 外观」不再是一次 true 跳变，入口失效。
+   */
+  onAppearanceDismiss?: () => void
 }
 
 /**
@@ -280,6 +302,7 @@ export function ChatPanel({
   apiHealth,
   onApiHealthRead,
   onModelChanged,
+  followResetRef,
   refineState,
   pendingRefine,
   setPendingRefine,
@@ -302,6 +325,8 @@ export function ChatPanel({
   onOpenWorkflowCanvas,
   onOpenWorkflowList,
   onOpenSettings,
+  appearanceOpen,
+  onAppearanceDismiss,
   onRate,
   onShowExecTrace,
 }: ChatPanelProps) {
@@ -380,6 +405,9 @@ export function ChatPanel({
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   // Pending resource references (skill/knowledge/workflow) — attached to next user message
   const [pendingReferences, setPendingReferences] = useState<ChatReference[]>([])
+  /** 聊天区选中文字的引用浮条：命中 .message-content 内的非空选区时出现。
+   *  x/y 是选区最后一行的屏幕坐标（fixed 定位，CSS 负责 translate(-50%)）。 */
+  const [quoteBar, setQuoteBar] = useState<{ x: number; y: number; label: string } | null>(null)
 
   // Load tool permissions for WORKFLOW mode check
   const [toolPermissions, setToolPermissions] = useState<ToolPermissions | undefined>()
@@ -586,6 +614,20 @@ export function ChatPanel({
   const [input, setInput] = useState('')
   const [refineSelected, setRefineSelected] = useState(0) // 0=refine, 1=skip
   const [showRefineConfirm, setShowRefineConfirm] = useState(false)
+  /* ── 外观浮窗 ──
+     开关 state 放本组件内：面板常驻保活（打开/关闭不卸载内容），未保存调整跨开合存活。
+     唯一的外部入口是 Ctrl+K 命令面板 —— 它经 App 层把 useModals.showThemes 置 true，
+     这里同步展开；收起时回写，保证「收起 → 再按 Ctrl+K」仍是一次有效跳变。
+     slash 菜单的 /themes 不走外部态，直接本地开（见 executeSlash）。 */
+  const [showAppearance, setShowAppearance] = useState(false)
+  const appearanceToggleRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    if (appearanceOpen) setShowAppearance(true)
+  }, [appearanceOpen])
+  const closeAppearance = useCallback(() => {
+    setShowAppearance(false)
+    onAppearanceDismiss?.()
+  }, [onAppearanceDismiss])
   // 分母缺失（contextLimit 0/未知）→ 保持 0（前端消费端显示 "--"），不伪装 128000
   const [contextTotal, setContextTotal] = useState(contextLimit || 0)
   useEffect(() => {
@@ -924,6 +966,9 @@ export function ChatPanel({
         } catch {
           /* localStorage 写入失败不阻塞切换流程 */
         }
+        // 输入框弹窗子列表排序用：把这次选的模型置顶。只影响展示顺序，
+        // 不参与模型解析/切换/生效判定（后者走 get_provider_context）。
+        rememberRecentModel(localStorage, cfg.provider, cfg.model)
         // 本地同步 savedConfigs（切换后提供商项立即显示新模型名 + ✓）
         setSavedConfigs(prev =>
           prev.map(c =>
@@ -958,7 +1003,27 @@ export function ChatPanel({
     [currentProvider],
   )
 
-  const scrollRef = useRef<HTMLDivElement>(null)
+  // 贴底跟随：默认跟随流式输出滚底；用户上翻则冻结 + 排「滚动驱动」的宽限计时，期间不拽回。
+  // 宽限语义（useStickyScroll）：连续无上滚满 resumeMs 才恢复（向上 scroll 都重置
+  // 计时，用户在读就永不恢复；下滚不冻结不续命，滚回底部才恢复）；仅执行态读秒
+  // （executionStage !== 'idle'）—— 空闲期翻看历史永久冻结不打扰。对话窗有回底按钮
+  // 兜底，宽限放大到 60s 与流式阅读节奏匹配。
+  const { scrollRef, showJumpButton, onScroll, jumpToBottom, followReset } = useStickyScroll(
+    messages,
+    { resumeMs: 60_000, executing: executionStage !== 'idle' },
+  )
+  // followReset 回填：useEvents 在 App 层（本组件之上）监听 nuphus-event，
+  // execution_started（新轮次恢复跟随后续流式）/ execution_completed（完成瞬间补拉）
+  // 都要拉回底部 —— 函数不能经 props 上行，父层下发 followResetRef、本组件把最新闭包
+  // 写进去（useEvents 事件时读 .current，与 useEvents 的 refineStateRef 同一思路）。
+  // 子组件 effect 先于父组件 useEvents 的监听注册执行，挂载即就绪；卸载置空防陈旧调用。
+  useEffect(() => {
+    if (!followResetRef) return
+    followResetRef.current = followReset
+    return () => {
+      followResetRef.current = null
+    }
+  }, [followResetRef, followReset])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
@@ -1033,14 +1098,6 @@ export function ChatPanel({
       textareaRef.current?.focus()
     }
   }, [focusSignal])
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    requestAnimationFrame(() => {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
-    })
-  }, [messages])
 
   const autoResize = useCallback(() => {
     const ta = textareaRef.current
@@ -1243,6 +1300,11 @@ export function ChatPanel({
       return
     }
     setInput('')
+    // 外观面板在本组件内，就地展开（不再绕 App 层的模态入口）
+    if (id === 'themes') {
+      setShowAppearance(true)
+      return
+    }
     onCommand?.(id)
   }
 
@@ -1255,6 +1317,11 @@ export function ChatPanel({
         openResourcePicker(refType)
       } else {
         setInput('')
+        // 同 executeSlash：/themes 就地展开外观浮窗
+        if (item.id === 'themes') {
+          setShowAppearance(true)
+          return
+        }
         onCommand?.(item.id)
       }
     }
@@ -1402,6 +1469,53 @@ export function ChatPanel({
   const removeReference = useCallback((index: number) => {
     setPendingReferences(prev => prev.filter((_, i) => i !== index))
   }, [])
+
+  // ── 选中文字 → 引用（复用 ChatReference 的 quote 分支，不新开注入通道）──
+  /** mouseup 判定选区：非空 + 锚点落在 .message-content 内才弹浮条。
+   *  刻意不用 selectionchange——拖选过程中弹窗会跟着选区跳动，松手才定型。 */
+  const handleMessagesMouseUp = useCallback(() => {
+    const sel = window.getSelection()
+    const raw = sel?.toString() ?? ''
+    if (!raw.trim() || !sel || sel.rangeCount === 0) {
+      setQuoteBar(null)
+      return
+    }
+    // 跨气泡拖选只认锚点所在气泡：多气泡会让浮条定位飘，且引文归属不明
+    if (!isSelectableInBubble(sel.anchorNode)) {
+      setQuoteBar(null)
+      return
+    }
+    // 入 state 前先截断：选区可能误拖到整篇长文，没必要把原文整体存进 React state
+    const { text } = truncateQuote(raw)
+    if (!text) {
+      setQuoteBar(null)
+      return
+    }
+    const rect = sel.getRangeAt(0).getBoundingClientRect()
+    setQuoteBar({ x: rect.left + rect.width / 2, y: rect.bottom, label: text })
+  }, [])
+
+  /** 点击浮条 → 入引用栏。按钮的 mousedown 已 preventDefault（见 JSX 注释）保住
+   *  selection；这里显式清除，免得残留 range 干扰下一次选区判定。 */
+  const handleQuoteCommit = useCallback(() => {
+    if (!quoteBar) return
+    const ref = buildQuoteRef(quoteBar.label)
+    if (ref) addReference(ref)
+    window.getSelection()?.removeAllRanges()
+    setQuoteBar(null)
+  }, [quoteBar, addReference])
+
+  /** 点击浮条之外（消息区空白处 / 输入框 / 按钮）→ 收起，否则浮条会滞留在原处。
+   *  selection 本身交给浏览器处理，这里只管浮条生命周期。 */
+  useEffect(() => {
+    if (!quoteBar) return
+    const onDown = (e: MouseEvent) => {
+      if ((e.target as Element | null)?.closest?.('.quote-float')) return
+      setQuoteBar(null)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [quoteBar])
 
   const removePendingImage = useCallback((index: number) => {
     setPendingImages(prev => prev.filter((_, i) => i !== index))
@@ -1578,7 +1692,9 @@ export function ChatPanel({
           mood={mood}
         />
       )}
-      {/* ── Chat Header：右上角设置入口（全应用唯一设置入口，打开设置中心弹窗）── */}
+      {/* ── Chat Header：右上角按钮列（设置 + 外观）──
+          齿轮 = 全应用唯一设置入口（打开设置中心弹窗）；
+          调色板 = 外观浮窗（主题 / 微调 / 我的主题 / 语言，非模态常驻）。 */}
       <div className="chat-header">
         <div className="chat-header-left" />
         {/* island 落点锚点：左右两组之间的中央留白（几何见 styles/app-pill.css 的
@@ -1587,6 +1703,10 @@ export function ChatPanel({
             AppIsland 经 portal 渲染到这里；锚点不存在时（聊天视图未挂载）岛按
             锚点优先级回落 —— 见 ui/islandChannel.ts 的「落点锚点」。 */}
         <div className="island-slot" ref={setIslandAnchor} />
+        {/* 右侧按钮列：设置（齿轮）→ 外观（调色板）纵向同一 DOM 排布；
+            refine chip 有值时挂在这一列尾部自然下延 —— 它原先 absolute 在
+            header 外（top:50px/right:16px/z-index:20），与 header 内的其它浮层
+            互相抢层级；并入本列后改为 in-flow，z-index 竞争随之消失 */}
         <div className="chat-header-right">
           <button
             className="chat-header-settings-btn"
@@ -1596,308 +1716,374 @@ export function ChatPanel({
           >
             <IconSettings size={15} />
           </button>
-        </div>
-      </div>
-      {/* ── Refine Pending Button ── */}
-      {pendingRefine && !refineState && !refining && (
-        <div className="refine-pending-area">
           <button
-            className="refine-pending-btn"
-            onClick={() => setShowRefineConfirm(true)}
-            title={`${t('refine.pendingBtn')} (${pendingRefine.usagePercent}%)`}
+            ref={appearanceToggleRef}
+            className="chat-header-appearance-btn"
+            aria-label={t('app.appearance')}
+            title={t('app.appearance')}
+            onClick={() => setShowAppearance(o => !o)}
           >
-            <IconChartColumn size={14} />
-            <span className="refine-pending-pct">{pendingRefine.usagePercent}%</span>
-            {pendingRefine.skippedTurns > 0 && (
-              <span className="refine-pending-badge">
-                {pendingRefine.skippedTurns > 99 ? '99+' : pendingRefine.skippedTurns}
-              </span>
-            )}
+            <IconPalette size={15} />
           </button>
+          {pendingRefine && !refineState && !refining && (
+            <div className="refine-pending-area">
+              <button
+                className="refine-pending-btn"
+                onClick={() => setShowRefineConfirm(true)}
+                title={`${t('refine.pendingBtn')} (${pendingRefine.usagePercent}%)`}
+              >
+                <IconChartColumn size={14} />
+                <span className="refine-pending-pct">{pendingRefine.usagePercent}%</span>
+                {pendingRefine.skippedTurns > 0 && (
+                  <span className="refine-pending-badge">
+                    {pendingRefine.skippedTurns > 99 ? '99+' : pendingRefine.skippedTurns}
+                  </span>
+                )}
+              </button>
 
-          {/* ── Confirm dialog when button clicked ── */}
-          {showRefineConfirm && (
-            <div className="refine-pending-confirm">
-              <div className="refine-confirm-body">
-                <div className="item-desc">
-                  {t('refine.pendingDesc', String(pendingRefine.usagePercent))}
+              {/* ── Confirm dialog when button clicked ── */}
+              {showRefineConfirm && (
+                <div className="refine-pending-confirm">
+                  <div className="refine-confirm-body">
+                    <div className="item-desc">
+                      {t('refine.pendingDesc', String(pendingRefine.usagePercent))}
+                    </div>
+                    <div className="refine-confirm-actions">
+                      <button
+                        className="refine-confirm-btn"
+                        onClick={() => {
+                          // 提炼执行中（refining 由另一端/本端刚触发）不重复触发：
+                          // 关闭确认弹窗但不发起第二次 refine
+                          if (refining) {
+                            setShowRefineConfirm(false)
+                            return
+                          }
+                          setShowRefineConfirm(false)
+                          // 与 refine 弹窗路径一致：进入提炼中状态（全屏遮罩由全局
+                          // refining 驱动，refine-pending-btn 路径同样触发）
+                          setRefining?.(true)
+                          onRefine?.()
+                          setPendingRefine(null)
+                        }}
+                      >
+                        {t('refine.action')}
+                      </button>
+                      <button
+                        className="refine-confirm-cancel"
+                        onClick={() => setShowRefineConfirm(false)}
+                      >
+                        {t('common.cancel') || 'Cancel'}
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <div className="refine-confirm-actions">
-                  <button
-                    className="refine-confirm-btn"
-                    onClick={() => {
-                      // 提炼执行中（refining 由另一端/本端刚触发）不重复触发：
-                      // 关闭确认弹窗但不发起第二次 refine
-                      if (refining) {
-                        setShowRefineConfirm(false)
-                        return
-                      }
-                      setShowRefineConfirm(false)
-                      // 与 refine 弹窗路径一致：进入提炼中状态（全屏遮罩由全局
-                      // refining 驱动，refine-pending-btn 路径同样触发）
-                      setRefining?.(true)
-                      onRefine?.()
-                      setPendingRefine(null)
-                    }}
-                  >
-                    {t('refine.action')}
-                  </button>
-                  <button
-                    className="refine-confirm-cancel"
-                    onClick={() => setShowRefineConfirm(false)}
-                  >
-                    {t('common.cancel') || 'Cancel'}
-                  </button>
-                </div>
-              </div>
+              )}
             </div>
           )}
         </div>
-      )}
-      <div className="chat-messages" ref={scrollRef}>
-        {messages.length === 0 ? (
-          <WelcomeScreen
-            onSend={onSend}
-            startupStats={startupStats}
-            onResume={onResumeLast ?? onChatReplaced}
-          />
-        ) : (
-          <div className="chat-messages-inner">
-            {(() => {
-              return (
-                <>
-                  {messages.map((msg, idx) => {
-                    // Refine message → render SessionDivider, skip normal message-row
-                    if (msg.role === 'refine') {
-                      return (
-                        <SessionDivider
-                          key={msg.id}
-                          summary={msg.refineStatus === 'completed' ? msg.content : ''}
-                          messageCount={msg.messageCount ?? 0}
-                          sessionId={msg.sessionId ?? ''}
-                          streamingContent={
-                            msg.refineStatus === 'streaming' ? msg.content || null : null
-                          }
-                        />
-                      )
-                    }
-                    const isCurrentAgent = msg.role === 'assistant' && idx === messages.length - 1
-                    // Avatar settings
-                    const showAvatar = localStorage.getItem('nuphus_show_avatar') === 'true'
-                    // 是否配了皮肤背景：气泡底色（--msg-*-bg）是不透明实色，背景图下
-                    // 会盖住图；`with-skin` 让气泡改用 glass-bg 半透明，让背景透出来
-                    // （见 chat-messages.css 的 .message-bubble.with-skin）。仅此一处消费。
-                    const skinBg = localStorage.getItem('nuphus_skin_bg') || ''
-
-                    // 自定义头像的**可渲染 URL** 由顶层预解析（avatarUrls）—— 异步，
-                    // 不能在消息渲染热路径里同步取；无自定义头像时用字母头像
-                    const AvatarComp =
-                      msg.role === 'user' ? (
-                        avatarUrls.user ? (
-                          <img src={avatarUrls.user} alt="" className="msg-avatar-img" />
-                        ) : (
-                          <LetterAvatar letter="U" size={36} />
+      </div>
+      {/* 外观浮窗：开关 state 在本组件内（保活不卸载），挂在 chat-header 之后、
+          与 refine 列同级；面板自身 fixed，不受父级布局影响 */}
+      <AppearancePanel
+        open={showAppearance}
+        onClose={closeAppearance}
+        toggleRef={appearanceToggleRef}
+      />
+      {/* .chat-messages-wrap 是回底按钮的定位包含块：按钮必须浮在滚动视口上而不是
+          钉进内容坐标（直接给 .chat-messages 加 position:relative 会随滚动消失，
+          原理见 styles/chat-messages.css 的同名规则注释） */}
+      <div className="chat-messages-wrap">
+        <div
+          className="chat-messages"
+          ref={scrollRef}
+          onScroll={() => {
+            // 滚动即选区失效：浮条用屏幕坐标，不收起会飘到别的内容上
+            setQuoteBar(null)
+            onScroll()
+          }}
+          onMouseUp={handleMessagesMouseUp}
+        >
+          {messages.length === 0 ? (
+            <WelcomeScreen
+              onSend={onSend}
+              startupStats={startupStats}
+              onResume={onResumeLast ?? onChatReplaced}
+            />
+          ) : (
+            <div className="chat-messages-inner">
+              {(() => {
+                return (
+                  <>
+                    {messages.map((msg, idx) => {
+                      // Refine message → render SessionDivider, skip normal message-row
+                      if (msg.role === 'refine') {
+                        return (
+                          <SessionDivider
+                            key={msg.id}
+                            summary={msg.refineStatus === 'completed' ? msg.content : ''}
+                            messageCount={msg.messageCount ?? 0}
+                            sessionId={msg.sessionId ?? ''}
+                            streamingContent={
+                              msg.refineStatus === 'streaming' ? msg.content || null : null
+                            }
+                          />
                         )
-                      ) : avatarUrls.nuphus ? (
-                        <img src={avatarUrls.nuphus} alt="" className="msg-avatar-img" />
-                      ) : (
-                        <LetterAvatar letter="A" size={36} />
-                      )
+                      }
+                      const isCurrentAgent = msg.role === 'assistant' && idx === messages.length - 1
+                      // Avatar settings
+                      const showAvatar = localStorage.getItem('nuphus_show_avatar') === 'true'
+                      // 是否配了皮肤背景：气泡底色（--msg-*-bg）是不透明实色，背景图下
+                      // 会盖住图；`with-skin` 让气泡改用 glass-bg 半透明，让背景透出来
+                      // （见 chat-messages.css 的 .message-bubble.with-skin）。仅此一处消费。
+                      const skinBg = localStorage.getItem('nuphus_skin_bg') || ''
 
-                    return (
-                      <React.Fragment key={`row-${msg.id}`}>
-                        <div
-                          key={msg.id}
-                          className={`message-row ${msg.role} ${showAvatar ? 'with-avatar' : ''}`}
-                        >
-                          {msg.role === 'assistant' && showAvatar && (
-                            <div className="message-avatar">{AvatarComp}</div>
-                          )}
+                      // 自定义头像的**可渲染 URL** 由顶层预解析（avatarUrls）—— 异步，
+                      // 不能在消息渲染热路径里同步取；无自定义头像时用字母头像
+                      const AvatarComp =
+                        msg.role === 'user' ? (
+                          avatarUrls.user ? (
+                            <img src={avatarUrls.user} alt="" className="msg-avatar-img" />
+                          ) : (
+                            <LetterAvatar letter="U" size={36} />
+                          )
+                        ) : avatarUrls.nuphus ? (
+                          <img src={avatarUrls.nuphus} alt="" className="msg-avatar-img" />
+                        ) : (
+                          <LetterAvatar letter="A" size={36} />
+                        )
+
+                      return (
+                        <React.Fragment key={`row-${msg.id}`}>
                           <div
-                            className={`message-bubble ${msg.role} ${showAvatar ? 'with-avatar' : ''} ${skinBg ? 'with-skin' : ''}`}
+                            key={msg.id}
+                            className={`message-row ${msg.role} ${showAvatar ? 'with-avatar' : ''}`}
                           >
-                            <div className="message-header">
-                              <span className={`message-label ${msg.role}`}>
-                                {msg.role === 'user' ? (
-                                  relation.userLabel
-                                ) : msg.role === 'assistant' ? (
-                                  relation.assistantName
-                                ) : (
-                                  <span style={{ color: 'var(--warning)' }}>
-                                    {t('chat.systemLabel')}
+                            {msg.role === 'assistant' && showAvatar && (
+                              <div className="message-avatar">{AvatarComp}</div>
+                            )}
+                            <div
+                              className={`message-bubble ${msg.role} ${showAvatar ? 'with-avatar' : ''} ${skinBg ? 'with-skin' : ''}`}
+                            >
+                              <div className="message-header">
+                                <span className={`message-label ${msg.role}`}>
+                                  {msg.role === 'user' ? (
+                                    relation.userLabel
+                                  ) : msg.role === 'assistant' ? (
+                                    relation.assistantName
+                                  ) : (
+                                    <span style={{ color: 'var(--warning)' }}>
+                                      {t('chat.systemLabel')}
+                                    </span>
+                                  )}
+                                </span>
+                                {msg.sourceLabel && (
+                                  <span
+                                    className="message-source-badge"
+                                    title={`来自插件 ${msg.sourceLabel}`}
+                                  >
+                                    {msg.sourceLabel}
                                   </span>
                                 )}
-                              </span>
-                              {msg.sourceLabel && (
-                                <span
-                                  className="message-source-badge"
-                                  title={`来自插件 ${msg.sourceLabel}`}
-                                >
-                                  {msg.sourceLabel}
+                                <span className="message-time">
+                                  {new Date(msg.timestamp).toLocaleTimeString()}
                                 </span>
-                              )}
-                              <span className="message-time">
-                                {new Date(msg.timestamp).toLocaleTimeString()}
-                              </span>
-                            </div>
-                            <div className={`message-content ${msg.role}`}>
-                              {/* ── 图片附件 ── */}
-                              {msg.images && msg.images.length > 0 && (
-                                <div className="msg-images">
-                                  {msg.images.map((img, i) => (
-                                    <img
-                                      key={i}
-                                      src={img}
-                                      alt={`图片 ${i + 1}`}
-                                      className="msg-image"
-                                      onClick={() => setLightboxUrl(img)}
-                                      onError={e => {
-                                        ;(e.target as HTMLImageElement).style.display = 'none'
-                                      }}
-                                    />
-                                  ))}
-                                </div>
-                              )}
-                              {/* ── 截图引用（Ctrl+U 截图：本地文件路径经 asset 协议显示）── */}
-                              {msg.references && msg.references.some(r => r.type === 'capture') && (
-                                <div className="msg-images">
-                                  {msg.references
-                                    .filter(r => r.type === 'capture')
-                                    .map((r, i) => {
-                                      const src = r.meta?.base64 || toAssetUrl(r.id)
-                                      if (!src) return null
-                                      return (
-                                        <img
-                                          key={`cap-${i}`}
-                                          src={src}
-                                          alt={r.label || `截图 ${i + 1}`}
-                                          className="msg-image"
-                                          onClick={() => setLightboxUrl(src)}
-                                          onError={e => {
-                                            ;(e.target as HTMLImageElement).style.display = 'none'
-                                          }}
-                                        />
-                                      )
-                                    })}
-                                </div>
-                              )}
-                              {/* ── 音频附件 ── */}
-                              {msg.audio && msg.audio.length > 0 && (
-                                <div className="msg-audio-list">
-                                  {msg.audio.map((aud, i) => (
-                                    <audio
-                                      key={i}
-                                      controls
-                                      className="msg-audio"
-                                      preload="metadata"
-                                    >
-                                      <source src={aud} />
-                                    </audio>
-                                  ))}
-                                </div>
-                              )}
-                              {/* ── 文本内容 ── */}
-                              {msg.role === 'assistant' ? (
-                                (() => {
-                                  // Normal assistant message
-                                  return isCurrentAgent && isProcessing ? (
-                                    msg.content ? (
-                                      <>
-                                        <MarkdownContent
-                                          content={msg.content}
-                                          onFileClick={setPreviewPath}
-                                          projectBasePath={projectDir}
-                                        />
-                                        <span className="message-thinking-cursor" />
-                                      </>
-                                    ) : (
-                                      <span className="message-thinking-dots">
-                                        <span className="mtd" />
-                                        <span className="mtd" />
-                                        <span className="mtd" />
-                                      </span>
-                                    )
-                                  ) : (
-                                    <MarkdownContent
-                                      content={msg.content}
-                                      onFileClick={setPreviewPath}
-                                      projectBasePath={projectDir}
-                                    />
-                                  )
-                                })()
-                              ) : msg.content ? (
-                                <span className="msg-plain-text">{msg.content}</span>
-                              ) : null}
-                            </div>
-                            {msg.role === 'assistant' && (
-                              <div className="message-actions">
-                                <IconButton
-                                  variant="msg-action"
-                                  label="复制"
-                                  title={copiedMsgId === msg.id ? '已复制' : '复制内容'}
-                                  onClick={() => handleCopy(msg.id, msg.content)}
-                                >
-                                  {copiedMsgId === msg.id ? (
-                                    <IconCheck size={14} />
-                                  ) : (
-                                    <IconCopy size={14} />
+                              </div>
+                              <div className={`message-content ${msg.role}`}>
+                                {/* ── 图片附件 ── */}
+                                {msg.images && msg.images.length > 0 && (
+                                  <div className="msg-images">
+                                    {msg.images.map((img, i) => (
+                                      <img
+                                        key={i}
+                                        src={img}
+                                        alt={`图片 ${i + 1}`}
+                                        className="msg-image"
+                                        onClick={() => setLightboxUrl(img)}
+                                        onError={e => {
+                                          ;(e.target as HTMLImageElement).style.display = 'none'
+                                        }}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
+                                {/* ── 截图引用（Ctrl+U 截图：本地文件路径经 asset 协议显示）── */}
+                                {msg.references &&
+                                  msg.references.some(r => r.type === 'capture') && (
+                                    <div className="msg-images">
+                                      {msg.references
+                                        .filter(r => r.type === 'capture')
+                                        .map((r, i) => {
+                                          const src = r.meta?.base64 || toAssetUrl(r.id)
+                                          if (!src) return null
+                                          return (
+                                            <img
+                                              key={`cap-${i}`}
+                                              src={src}
+                                              alt={r.label || `截图 ${i + 1}`}
+                                              className="msg-image"
+                                              onClick={() => setLightboxUrl(src)}
+                                              onError={e => {
+                                                ;(e.target as HTMLImageElement).style.display =
+                                                  'none'
+                                              }}
+                                            />
+                                          )
+                                        })}
+                                    </div>
                                   )}
-                                </IconButton>
-                                <IconButton
-                                  variant="msg-action"
-                                  label="点评"
-                                  title="点评"
-                                  onClick={() => {
-                                    const userMsg =
-                                      [...messages.slice(0, idx)]
-                                        .reverse()
-                                        .find(m => m.role === 'user')?.content ?? ''
-                                    setRatingMsg({
-                                      id: msg.id,
-                                      content: msg.content,
-                                      userQuestion: userMsg,
-                                    })
-                                  }}
-                                >
-                                  <IconStar size={14} />
-                                </IconButton>
-                                {msg.traceItems && msg.traceItems.length > 0 && (
+                                {/* ── 音频附件 ── */}
+                                {msg.audio && msg.audio.length > 0 && (
+                                  <div className="msg-audio-list">
+                                    {msg.audio.map((aud, i) => (
+                                      <audio
+                                        key={i}
+                                        controls
+                                        className="msg-audio"
+                                        preload="metadata"
+                                      >
+                                        <source src={aud} />
+                                      </audio>
+                                    ))}
+                                  </div>
+                                )}
+                                {/* ── 文本内容 ── */}
+                                {msg.role === 'assistant' ? (
+                                  (() => {
+                                    // Normal assistant message
+                                    return isCurrentAgent && isProcessing ? (
+                                      msg.content ? (
+                                        <>
+                                          <MarkdownContent
+                                            content={msg.content}
+                                            onFileClick={setPreviewPath}
+                                            projectBasePath={projectDir}
+                                          />
+                                          <span className="message-thinking-cursor" />
+                                        </>
+                                      ) : (
+                                        <span className="message-thinking-dots">
+                                          <span className="mtd" />
+                                          <span className="mtd" />
+                                          <span className="mtd" />
+                                        </span>
+                                      )
+                                    ) : (
+                                      <MarkdownContent
+                                        content={msg.content}
+                                        onFileClick={setPreviewPath}
+                                        projectBasePath={projectDir}
+                                      />
+                                    )
+                                  })()
+                                ) : msg.content ? (
+                                  <span className="msg-plain-text">{msg.content}</span>
+                                ) : null}
+                              </div>
+                              {msg.role === 'assistant' && (
+                                <div className="message-actions">
                                   <IconButton
                                     variant="msg-action"
-                                    label="执行回溯"
-                                    title="查看该轮执行过程"
-                                    onClick={() => onShowExecTrace?.(msg.traceItems!)}
+                                    label="复制"
+                                    title={copiedMsgId === msg.id ? '已复制' : '复制内容'}
+                                    onClick={() => handleCopy(msg.id, msg.content)}
                                   >
-                                    <IconHistory size={14} />
+                                    {copiedMsgId === msg.id ? (
+                                      <IconCheck size={14} />
+                                    ) : (
+                                      <IconCopy size={14} />
+                                    )}
                                   </IconButton>
-                                )}
-                              </div>
-                            )}
-                            {/* user 消息首轮 LLM 失败：hover 显示重试（优雅停止气泡无此标记） */}
-                            {msg.role === 'user' && msg.failed && !isProcessing && onRetry && (
-                              <div className="message-retry-user">
-                                <Button variant="ghost" size="sm" onClick={() => handleRetry(msg)}>
-                                  {t('chat.retry')}
-                                </Button>
-                              </div>
+                                  <IconButton
+                                    variant="msg-action"
+                                    label="点评"
+                                    title="点评"
+                                    onClick={() => {
+                                      const userMsg =
+                                        [...messages.slice(0, idx)]
+                                          .reverse()
+                                          .find(m => m.role === 'user')?.content ?? ''
+                                      setRatingMsg({
+                                        id: msg.id,
+                                        content: msg.content,
+                                        userQuestion: userMsg,
+                                      })
+                                    }}
+                                  >
+                                    <IconStar size={14} />
+                                  </IconButton>
+                                  {msg.traceItems && msg.traceItems.length > 0 && (
+                                    <IconButton
+                                      variant="msg-action"
+                                      label="执行回溯"
+                                      title="查看该轮执行过程"
+                                      onClick={() => onShowExecTrace?.(msg.traceItems!)}
+                                    >
+                                      <IconHistory size={14} />
+                                    </IconButton>
+                                  )}
+                                </div>
+                              )}
+                              {/* user 消息首轮 LLM 失败：hover 显示重试（优雅停止气泡无此标记） */}
+                              {msg.role === 'user' && msg.failed && !isProcessing && onRetry && (
+                                <div className="message-retry-user">
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => handleRetry(msg)}
+                                  >
+                                    {t('chat.retry')}
+                                  </Button>
+                                </div>
+                              )}
+                            </div>
+                            {msg.role === 'user' && showAvatar && (
+                              <div className="message-avatar user-side">{AvatarComp}</div>
                             )}
                           </div>
-                          {msg.role === 'user' && showAvatar && (
-                            <div className="message-avatar user-side">{AvatarComp}</div>
-                          )}
-                        </div>
-                      </React.Fragment>
-                    )
-                  })}
-                  <LiveExecutionActivity
-                    active={isProcessing && mode === 'workflow' && !refining}
-                  />
-                </>
-              )
-            })()}
-          </div>
-        )}
+                        </React.Fragment>
+                      )
+                    })}
+                    <LiveExecutionActivity
+                      active={isProcessing && mode === 'workflow' && !refining}
+                    />
+                  </>
+                )
+              })()}
+            </div>
+          )}
+          {/* ── 回底按钮：冻结跟随时显示，点击立即滚底（定位几何见 .chat-messages-wrap）── */}
+          {showJumpButton && (
+            <button
+              type="button"
+              className="chat-jump-bottom"
+              onClick={jumpToBottom}
+              aria-label={t('chat.jumpToBottom')}
+              title={t('chat.jumpToBottom')}
+            >
+              <IconChevronsDown size={16} />
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* ── 选中文字引用浮条：fixed + portal（避开 .chat-messages 的滚动裁剪）── */}
+      {quoteBar &&
+        createPortal(
+          <button
+            type="button"
+            className="quote-float"
+            style={{ left: quoteBar.x, top: quoteBar.y }}
+            /* 必须拦住 mousedown：焦点移到按钮会清掉 selection，点击时就取不到原文 */
+            onMouseDown={e => e.preventDefault()}
+            onClick={handleQuoteCommit}
+            aria-label={t('chat.quoteSelection')}
+            title={t('chat.quoteSelection')}
+          >
+            <IconQuote size={13} />
+            {t('chat.quoteSelection')}
+          </button>,
+          document.body,
+        )}
 
       {/* ── Pause Modal ── */}
       <PauseOverlay
@@ -2299,7 +2485,12 @@ export function ChatPanel({
                     <div className="model-provider-picker">
                       <div className="model-provider-list">
                         {savedConfigs.map(cfg => {
-                          const providerModels = allModels.filter(m => m.provider === cfg.provider)
+                          // 子列表按「最近切换顺序」排：模型多的 provider 不必每次
+                          // 都在长列表里找。只用展示顺序，不参与模型解析/切换。
+                          const providerModels = orderProviderModels(
+                            allModels.filter(m => m.provider === cfg.provider),
+                            readRecentModels(localStorage, cfg.provider),
+                          )
                           // 勾选态 = (provider, model) 双全等：官方厂商与 opencode-go 存在同 id
                           // 模型（deepseek-v4-flash 等），仅比 id 会让两 provider 卡片同时打勾。
                           // currentProvider 来自 get_provider_context（mode 感知的生效模型

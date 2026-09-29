@@ -14,7 +14,7 @@ import { Contrast, schemeFromSeed } from './color'
 /* ---------- geometry ---------- */
 export const H = 56 // M3 medium button height (dp)
 export const GAP = 3 // connected group spacing
-export const R_FULL = 28 // outer corner of a connected run
+const R_FULL = 28 // outer corner of a connected run
 export const R_INNER = 8 // inner corner when connected (M3 small)
 
 /** magnetic field size, along the run and across it */
@@ -32,9 +32,9 @@ export const PHONE_H = 892
 export const PHONE_R = 40
 export const DESKTOP_W = 1280
 export const DESKTOP_H = 800
-export const DESKTOP_R = 28
+const DESKTOP_R = 28
 /** M3 window size classes: a screen this wide is "expanded", where the navigation bar becomes a rail */
-export const EXPANDED_W = 840
+const EXPANDED_W = 840
 export const isExpanded = (w: number) => w >= EXPANDED_W
 /** navigation rail: width, top inset and the pitch of one destination (56×32 indicator, label, gap) */
 export const RAIL_W = 80
@@ -54,9 +54,9 @@ export const CONTENT_W = contentWidth(PHONE_W)
 /** width of one of two parts sharing a row, with a margin-sized gutter between them */
 export const HALF_W = halfWidth(PHONE_W)
 /** width presets offered in the inspector: two columns, with margins, edge-to-edge */
-export const WIDTH_PRESETS = [HALF_W, CONTENT_W, PHONE_W]
+const WIDTH_PRESETS = [HALF_W, CONTENT_W, PHONE_W]
 /** height presets for free-form boxes: half the screen, the whole screen */
-export const HEIGHT_PRESETS = [PHONE_H / 2, PHONE_H]
+const HEIGHT_PRESETS = [PHONE_H / 2, PHONE_H]
 /** bezel around the screen and the label above it */
 export const BEZEL = 10
 export const FRAME_LABEL_H = 44
@@ -406,7 +406,6 @@ let curShape: ShapeScale = 'rounded'
 export const setGlobalShape = (s: ShapeScale) => {
   curShape = s
 }
-export const getShape = () => curShape
 
 /** a default corner radius under the document's shape scale */
 export function scaleR(r: number): number {
@@ -1588,7 +1587,7 @@ export function explodeGroup(g: Group, widths: Record<string, number>): Group[] 
 }
 
 /** corners of one part of a run: round outside, small where it meets a neighbour */
-export function runCorners(
+function runCorners(
   axis: Axis,
   first: boolean,
   last: boolean,
@@ -1653,7 +1652,7 @@ export type FrameMode = 'blank' | 'phone'
 
 /** where the generated prompt asks for the app to be built */
 export type Platform = 'android' | 'web'
-export const DEFAULT_PLATFORM: Platform = 'android'
+const DEFAULT_PLATFORM: Platform = 'android'
 export const isPlatform = (v: unknown): v is Platform => v === 'android' || v === 'web'
 /** The target the prompt assumes when the author has not picked one: the web as
  *  soon as a desktop screen exists, Android otherwise. */
@@ -1855,7 +1854,7 @@ export function baseRadii(it: Item): Radii {
 export const FAB_MENU_ITEM_H = 56
 export const FAB_MENU_GAP = 8
 /** a toolbar hugs its icon buttons: 48dp each with 4dp between, 8dp at the ends */
-export const toolbarWidth = (it: Item) => {
+const toolbarWidth = (it: Item) => {
   const n = Math.max(1, it.tabs?.length ?? 0)
   return 16 + n * 48 + (n - 1) * 4
 }

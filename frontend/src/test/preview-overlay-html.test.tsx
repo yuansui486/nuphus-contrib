@@ -1,8 +1,8 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { FilePreviewContent } from '../main-window/chat/PreviewOverlay'
+import { FilePreviewContent, PreviewOverlay } from '../main-window/chat/PreviewOverlay'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { openPath, readFile, readFileBase64 } from '../main-window/lib/api'
+import { openPath, readFile, readFileBase64, revealPath } from '../main-window/lib/api'
 
 // 回归背景（2026-09-20）：html/htm 曾被「非文本类型 → 系统默认程序打开」的早退分支
 // 截走——从 preview:// 沙箱底座上线起，本文件末尾的 iframe 分支就不可达，点 HTML 交付物
@@ -52,5 +52,48 @@ describe('FilePreviewContent 类型分流', () => {
 
     expect(openPath).toHaveBeenCalledWith(path)
     expect(screen.getByText('已请求系统默认程序打开')).toBeInTheDocument()
+  })
+})
+
+// 回归背景（issue #85）：PreviewOverlay 工具栏的「系统打开 / 在文件夹显示」此前用
+// `.catch(() => undefined)` 把 revealPath / openPath 的错误静默吞掉，用户看到的是
+// 「点了没反应」；.pv-open-error 横幅样式自上线起没有 .tsx 引用。这两条钉住两个入口
+// 都会把后端给出的中文错误显示出来。
+describe('PreviewOverlay 工具栏：系统打开/定位失败必须可见', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('「在文件夹显示」失败 → 渲染 .pv-open-error 横幅与后端错误文案', async () => {
+    vi.mocked(revealPath).mockRejectedValueOnce('路径不存在，无法定位：/tmp/nope/a.txt')
+    render(<PreviewOverlay path="/tmp/nope/a.txt" onClose={() => undefined} />)
+
+    fireEvent.click(screen.getByTitle('在文件管理器中定位'))
+
+    expect(await screen.findByText('路径不存在，无法定位：/tmp/nope/a.txt')).toBeInTheDocument()
+    expect(document.querySelector('.pv-open-error')).not.toBeNull()
+  })
+
+  it('「系统打开」失败 → 同一横幅承接 openPath 错误', async () => {
+    vi.mocked(openPath).mockRejectedValueOnce('系统打开失败：拒绝访问')
+    render(<PreviewOverlay path="/tmp/nope/a.txt" onClose={() => undefined} />)
+
+    fireEvent.click(screen.getByTitle('用系统默认程序打开'))
+
+    expect(await screen.findByText('系统打开失败：拒绝访问')).toBeInTheDocument()
+  })
+
+  it('再次尝试前先清掉上一条失败，不叠出两条横幅', async () => {
+    vi.mocked(revealPath)
+      .mockRejectedValueOnce('路径不存在，无法定位：/tmp/nope/a.txt')
+      .mockResolvedValueOnce(undefined)
+    render(<PreviewOverlay path="/tmp/nope/a.txt" onClose={() => undefined} />)
+    const btn = screen.getByTitle('在文件管理器中定位')
+
+    fireEvent.click(btn)
+    expect(await screen.findByText('路径不存在，无法定位：/tmp/nope/a.txt')).toBeInTheDocument()
+
+    fireEvent.click(btn)
+    expect(document.querySelector('.pv-open-error')).toBeNull()
   })
 })

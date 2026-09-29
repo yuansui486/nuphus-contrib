@@ -25,28 +25,7 @@
 }
 
 /* ── 拖拽把手 ── */
-
-.desktop-toolbar-grip {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 28px;
-  cursor: grab;
-  color: var(--spark-dim, var(--fg-5));
-  flex-shrink: 0;
-  border-radius: 6px;
-  transition:
-    background 0.12s,
-    color 0.12s;
-}
-.desktop-toolbar-grip:hover {
-  background: var(--glass-1, rgba(255, 255, 255, 0.05));
-  color: var(--spark-tertiary, var(--fg-3));
-}
-.desktop-toolbar-grip:active {
-  cursor: grabbing;
-}
+/* 共享实现见 styles/panel-drag.css 的 .panel-grip（单一实现点，此处不再保留副本） */
 
 /* ── 工具按钮 ── */
 

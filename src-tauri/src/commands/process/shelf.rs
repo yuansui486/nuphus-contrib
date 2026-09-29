@@ -17,7 +17,7 @@ use crate::state::AppState;
 use nuphus::agent::events::{EventEmitter, NuphusEvent};
 use nuphus::session::{MessageRole, Session};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tauri::State;
 
@@ -1169,6 +1169,14 @@ pub(crate) fn list_shelf_sessions_inner(state: &AppState) -> Result<serde_json::
     let (projects, archived_projects) =
         build_project_groups(&prefs.project_bookmarks, &prefs.project_dir, &session_paths);
     let collapsed_limit = prefs.session_group_limit();
+    // 置顶会话（组内置顶，数组序即展示序）：**惰性存活过滤**——已删除/已归档会话的
+    // 残留 id 在此按当轮可见会话剔除，不写回配置文件（否则每次轮询都重写 prefs）。
+    let visible_ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let pinned_sessions: Vec<String> = prefs
+        .pinned_sessions()
+        .into_iter()
+        .filter(|id| visible_ids.contains(id.as_str()))
+        .collect();
 
     Ok(serde_json::json!({
         "can_switch": can_switch,
@@ -1207,6 +1215,9 @@ pub(crate) fn list_shelf_sessions_inner(state: &AppState) -> Result<serde_json::
             "group_order": prefs.session_group_order(),
             "sort_key": prefs.session_sort_key(),
         },
+        // 置顶会话（组内置顶，数组序即展示序）：桌面 SessionRail 与移动端 NavBar 共用读数，
+        // 已清洗 + 按当轮可见会话剔除残留（已删除/已归档的 id 不会漏到前端）。
+        "pinned_sessions": pinned_sessions,
     }))
 }
 

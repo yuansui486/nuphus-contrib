@@ -261,7 +261,7 @@ describe('共享胶囊 CSS 契约', () => {
       position: 'absolute',
       inset: '0',
       display: 'flex',
-      'align-items': 'center',
+      'align-items': 'flex-start',
       'justify-content': 'center',
       padding: '0 40px',
       'pointer-events': 'none',

@@ -5,6 +5,8 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke as bridgeInvoke } from '../../core/bridge'
+import { usePanelDrag } from '../../hooks/usePanelDrag'
+import '../../styles/panel-drag.css'
 
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   try {
@@ -85,9 +87,15 @@ const TOOLS: ToolBtn[] = [
 ]
 
 export function DesktopToolbar({ visible, onClose }: DesktopToolbarProps) {
-  const [pos, setPos] = useState(() => {
-    const saved = localStorage.getItem('desktop_toolbar_pos')
-    return saved ? JSON.parse(saved) : { x: 669, y: 60 }
+  // ── 拖拽（共享实现 usePanelDrag；storageKey = desktop_toolbar_pos、默认 {x:669,y:60}，
+  //    与抽取前逐字一致；不传 clampOnResize → 无窗口缩放钳制，行为零变化）──
+  const {
+    pos,
+    panelRef: barRef,
+    handleMouseDown,
+  } = usePanelDrag('desktop_toolbar_pos', {
+    fallback: { x: 669, y: 60 },
+    enabled: visible,
   })
 
   // ── Pin (always on top) state ──
@@ -106,9 +114,6 @@ export function DesktopToolbar({ visible, onClose }: DesktopToolbarProps) {
       localStorage.setItem('desktop_toolbar_pinned', String(newState))
     }
   }, [pinned])
-  const dragging = useRef(false)
-  const dragOffset = useRef({ x: 0, y: 0 })
-  const barRef = useRef<HTMLDivElement>(null)
 
   // Sub-panel state
   const [activeTool, setActiveTool] = useState<ToolMode>(null)
@@ -154,44 +159,6 @@ export function DesktopToolbar({ visible, onClose }: DesktopToolbarProps) {
       if (cursorInterval.current) clearInterval(cursorInterval.current)
     }
   }, [activeTool])
-
-  // ── Drag logic ──
-  const savePos = useCallback((x: number, y: number) => {
-    localStorage.setItem('desktop_toolbar_pos', JSON.stringify({ x, y }))
-  }, [])
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (!barRef.current) return
-    const rect = barRef.current.getBoundingClientRect()
-    dragging.current = true
-    dragOffset.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
-  }
-
-  useEffect(() => {
-    if (!visible) return
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!dragging.current) return
-      const w = barRef.current?.offsetWidth || 200
-      const h = barRef.current?.offsetHeight || 40
-      const maxX = Math.max(0, window.innerWidth - w)
-      const maxY = Math.max(0, window.innerHeight - h)
-      const newX = Math.max(0, Math.min(maxX, e.clientX - dragOffset.current.x))
-      const newY = Math.max(0, Math.min(maxY, e.clientY - dragOffset.current.y))
-      setPos({ x: newX, y: newY })
-    }
-    const handleMouseUp = () => {
-      if (dragging.current) {
-        dragging.current = false
-        savePos(pos.x, pos.y)
-      }
-    }
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', handleMouseUp)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', handleMouseUp)
-    }
-  }, [visible, pos, savePos])
 
   // ── Stop polling ──
   const stopPolling = useCallback(() => {
@@ -388,7 +355,7 @@ export function DesktopToolbar({ visible, onClose }: DesktopToolbarProps) {
       {/* ── Main toolbar ── */}
       <div ref={barRef} className="desktop-toolbar" style={{ left: pos.x, top: pos.y }}>
         {/* Drag handle */}
-        <div className="desktop-toolbar-grip" onMouseDown={handleMouseDown} title="拖拽移动">
+        <div className="panel-grip" onMouseDown={handleMouseDown} title="拖拽移动">
           <IconGrip size={14} />
         </div>
 

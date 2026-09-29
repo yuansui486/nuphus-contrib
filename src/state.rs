@@ -122,6 +122,15 @@ pub struct SignalState {
     /// user 消息带出，既不会丢失也不会重复注入。
     pub pending_notices: Vec<String>,
 
+    // ── 外部 Agent 显示态（应用生命周期所有，重启即净）──
+    /// 用户从列表栏移出的外部 Agent（agent → 移出时刻 epoch ms）。
+    ///
+    /// 设计原则（大王定）：**前端 UI 显示跟随应用生命周期**——本集合只在进程内有效，
+    /// 重启即净（与 status.json 的启动清零同拍，不落 WebView 存储）；**「从列表移除」
+    /// 遵循用户选择**——跨前端重载保持，仅两种显式动作可撤销：① 时刻更晚的新门铃活动
+    /// （= 新一轮真实调用，用户/Leader 的新选择）；② 配置中心保存（用户主动纳入）。
+    pub hidden_ext_agents: HashMap<String, i64>,
+
     // ── Security 子系统 ──
     pub security: SecurityState,
 
@@ -173,6 +182,36 @@ impl SignalState {
         Self::write(signals).pending_notices.push(text);
     }
 
+    // ── 外部 Agent 显示态（「从列表栏移出」= 用户选择，应用生命周期内保持）──
+
+    /// 记录一次移出（覆盖旧时间戳；幂等）。
+    pub fn hide_ext_agent(signals: &SharedSignals, agent: &str, now_ms: i64) {
+        Self::write(signals)
+            .hidden_ext_agents
+            .insert(agent.to_string(), now_ms);
+    }
+
+    /// 撤销移出（配置中心保存 / 时刻更晚的新门铃活动时调用）；未移出则无害。
+    pub fn unhide_ext_agent(signals: &SharedSignals, agent: &str) {
+        Self::write(signals).hidden_ext_agents.remove(agent);
+    }
+
+    /// 查询移出时刻（epoch ms）；未移出 → None。
+    pub fn hidden_ext_agent_since(signals: &SharedSignals, agent: &str) -> Option<i64> {
+        Self::read(signals).hidden_ext_agents.get(agent).copied()
+    }
+
+    /// 全量快照（供 list_agent_statuses 批量标注 `hidden`）。
+    pub fn hidden_ext_agents(signals: &SharedSignals) -> HashMap<String, i64> {
+        Self::read(signals).hidden_ext_agents.clone()
+    }
+
+    /// 「新门铃活动是否应撤销移出」纯判定：事件时刻**严格晚于**移出时刻才撤销
+    /// （同刻/更早的迟到事件不撤销——用户刚移出，不能被旧事件打脸）。
+    pub fn event_revives_hidden(hidden_since_ms: i64, event_ts_ms: i64) -> bool {
+        event_ts_ms > hidden_since_ms
+    }
+
     /// 读取当前执行阶段（唯一真相源）。
     pub fn execution_stage(signals: &SharedSignals) -> ExecutionStage {
         Self::read(signals).execution_stage
@@ -212,6 +251,52 @@ impl SignalState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 外部 Agent 显示态：移出/撤销/快照 + 撤销判定的时刻纪律。
+    /// 原则钉死：显示跟随应用生命周期（实例内有效、重建即净）；
+    /// 移除遵循用户选择（仅更新的门铃活动或配置中心保存可撤销）。
+    #[test]
+    fn hidden_ext_agents_lifecycle_and_revive_rule() {
+        let signals = new_shared_signals();
+
+        // 移出 → 可查询、进快照；重复移出覆盖时间戳（幂等）
+        SignalState::hide_ext_agent(&signals, "opencode", 1_000);
+        assert_eq!(
+            SignalState::hidden_ext_agent_since(&signals, "opencode"),
+            Some(1_000)
+        );
+        SignalState::hide_ext_agent(&signals, "opencode", 2_000);
+        assert_eq!(
+            SignalState::hidden_ext_agent_since(&signals, "opencode"),
+            Some(2_000)
+        );
+        assert!(SignalState::hidden_ext_agents(&signals).contains_key("opencode"));
+
+        // 撤销判定：严格更晚的门铃事件才撤销；同刻/更早不撤销
+        assert!(SignalState::event_revives_hidden(2_000, 2_001));
+        assert!(
+            !SignalState::event_revives_hidden(2_000, 2_000),
+            "同刻不撤销"
+        );
+        assert!(
+            !SignalState::event_revives_hidden(2_000, 1_999),
+            "迟到事件不撤销"
+        );
+
+        // 配置中心保存 → 撤销移出
+        SignalState::unhide_ext_agent(&signals, "opencode");
+        assert_eq!(
+            SignalState::hidden_ext_agent_since(&signals, "opencode"),
+            None
+        );
+        assert!(SignalState::hidden_ext_agents(&signals).is_empty());
+        // 撤销未移出的 agent 无害
+        SignalState::unhide_ext_agent(&signals, "never-hidden");
+
+        // 重建句柄（= 应用重启）→ 显示态清零，与 status.json 启动清零同拍
+        let fresh = new_shared_signals();
+        assert!(SignalState::hidden_ext_agents(&fresh).is_empty());
+    }
 
     /// 执行阶段转换 + 语义：Idle → Running → Finalizing → Idle，
     /// 覆盖「Finalizing 拒收追加」「Running/Finalizing 都算占用」两条核心约束。

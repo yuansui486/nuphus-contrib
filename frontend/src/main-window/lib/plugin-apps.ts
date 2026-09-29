@@ -40,7 +40,7 @@ export interface ThemeSnapshot {
   overrides: Record<string, string>
 }
 
-/** 与 useInit Toast 一致的 toast 函数形状（ThemesPage 同款局部类型） */
+/** 与 useInit Toast 一致的 toast 函数形状（AppearancePanel 同款局部类型） */
 export type PluginToastFn = (
   message: string,
   type?: 'info' | 'success' | 'warning' | 'error',

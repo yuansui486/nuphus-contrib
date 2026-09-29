@@ -6,14 +6,17 @@
  *   ② `README.md`「致谢」段 —— 贡献者 GitHub 用户名与主页链接；
  *   ③ `git log` —— `Merge PR #NN` 合并提交及其分支内提交作者（把 PR 归属到人）。
  *
- * 用户名可信度（三者均经 GitHub API `/users/<login>` 200 校验，2026-09-20）：
+ * 用户名可信度（均经 GitHub API `/users/<login>` 200 校验）：
  *   - yuansui486：README 致谢 #23 / #26 / #28 的链接用户名，且这些合并提交的作者名相同；
  *   - zhoupeiyu515-ui：README 致谢 #31 的链接用户名；#32 分支提交作者邮箱与 #31 完全一致（同一人）；
  *   - jiangdingwei123-afk：#21 分支提交作者名即 GitHub 用户名（README 未收录该轮次）。
+ *   - Steooenwolf-666：2026-09-28 经 `/contributors` API 确认该账号真实存在且已有 21 次提交，
+ *     本轮 PR #67 / #70~#75 的作者均为该账号，头像 u/156271754——新增提交者，按发版铁律
+ *     补入头像墙与轮次表。
  *   未收录 PR 归属：fouyzjl（#13~#19 / #20 轮次）——当时提交作者名无法确认为 GitHub 用户名，
  *   按「缺证不写」略去，宁缺勿造。2026-09-22 经 `/contributors` API 确认该账号真实存在
  *   且有 12 次提交，已并入头像墙（见 REPO_COMMITTERS）；轮次表内的贡献记录仍待
- *   CHANGELOG / README 出处再补，不凭印象回填。
+ *   CHANGELOG / README 出处再补，不凭印象回填。#79（0.2.23）已按同一出处补入。
  *
  * ⛔ 新增记录前必须先在上面的三处找到出处；不得凭印象补充贡献者或贡献内容。
  */
@@ -61,6 +64,39 @@ export interface GithubRound {
 
 /** 轮次倒序（最新在前），轮内按贡献时间先后 */
 export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
+  {
+    version: '0.2.23',
+    date: '2026-09-28',
+    contributors: [
+      {
+        user: 'Steooenwolf-666',
+        contributions: [
+          { pr: 67, summary: '保留重新编辑时每月 29–31 日的定时规则' },
+          { pr: 70, summary: '手机端图片解码失败时显示原始路径' },
+          { pr: 71, summary: '修正移动画布步骤时的循环变量作用域判断' },
+          { pr: 72, summary: '稳定画布草稿与会话快照测试' },
+          { pr: 73, summary: '保护外部 Agent 任务状态并支持最近上报报告预览' },
+          { pr: 74, summary: '工作流新增非敏感运行参数方案' },
+          { pr: 75, summary: '手机端支持失败图片就地重新加载' },
+        ],
+      },
+      {
+        user: 'fouyzjl',
+        contributions: [
+          { pr: 79, summary: 'switch_model 持久化 base_url，修复"改了调用地址又回退"' },
+        ],
+      },
+      {
+        user: 'zhoupeiyu515-ui',
+        contributions: [
+          {
+            pr: 80,
+            summary: '会话工作台启动只展开上次对话所在文件夹，并修好子菜单被抽屉裁切',
+          },
+        ],
+      },
+    ],
+  },
   {
     version: '0.2.22',
     date: '2026-09-26',
@@ -252,7 +288,7 @@ export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
 ]
 
 /**
- * 仓库全部贡献者（GitHub `/contributors` API 快照，2026-09-26 拉取，按提交数降序）。
+ * 仓库全部贡献者（GitHub `/contributors` API 快照，2026-09-28 拉取，按提交数降序）。
  *
  * 与 CONTRIBUTOR_ROUNDS 互补，二者取并集才是完整的「历史贡献者」：
  *   - 轮次表按 **PR 归属**记录（覆盖 GitHub 未把 commit 关联到账号的人，如 zhoupeiyu515-ui）；
@@ -264,6 +300,7 @@ export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
  */
 export const REPO_COMMITTERS: string[] = [
   'yuansui486', // 76 commits
+  'Steooenwolf-666', // 21 commits
   'fouyzjl', // 12 commits
   'mrpulor-gh', // 3 commits（仓库所有者）
   'jiangdingwei123-afk', // 1 commit

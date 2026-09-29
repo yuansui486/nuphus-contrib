@@ -1,0 +1,239 @@
+// useStickyScroll — 消息流「贴底跟随」滚动语义（ChatPanel 的 .chat-messages、执行追踪
+// 面板的步骤树容器共用）
+//
+// 背景：旧实现在 `useEffect(..., [messages])` 里无条件 scrollTo(scrollHeight)，流式每来
+// 一个 delta 都会触发一次，用户一旦上翻读历史就被反复拽回底部。本 hook 把语义收敛为：
+//   1. 贴底跟随：followKey 变化（新消息 / 流式 delta / 执行步骤更新）且处于跟随态
+//      → smooth 滚底；
+//   2. 上翻冻结：向上滚动（delta < -2px）= 查看历史 → 冻结跟随 + 续命；
+//   3. 向下滚动（delta > +2px）= 朝底部回走：不冻结、不续命 —— 用户在往回走、不是
+//      读历史；且中途恢复等于把用户弹回底部（只能上滚不能下滚），只有滚回底部才恢复；
+//   4. 恢复路径：
+//      a. atBottom（80px 容差内）：用户自己滚回底部 / 向下或静止滚动贴底 / 近底微滚
+//         （容差内不判离开，防抖动误冻结）—— 立即恢复 + 按钮隐藏；
+//      b. 静默宽限满 resumeMs —— 语义是「连续无上滚操作」的上限而非读死表：冻结态
+//         下的向上 scroll 都清旧建新重置计时，用户在读就永不恢复；且仅 executing=true
+//         才排计时，executing=false（空闲翻看）不排 —— 永久冻结直到 followReset /
+//         用户滚回底部；
+//      c. 程序调 followReset（新轮次 execution_started / 任务完成瞬间补拉）。
+//
+// 进场宽限（执行追踪面板入场专用）：enterPanel(guardMs) 先 followReset 立即滚底展示
+// 最新执行态，再开宽限窗口 —— 窗口内 scroll 事件一律不判定，防进场瞬间的鼠标滚动 /
+// 触控板惯性 / 渲染抖动把机制打乱。对话窗无「进入」语义，不调用本方法。
+//
+// 实现要点（成败点）：hook 自己发起的 smooth 滚动会连续触发 scroll 事件，中途态 scrollTop
+// 并未到底，若 onScroll 无脑判定会把「程序滚动」误判成「用户上拉」⇒ 冻结 + 按钮闪现。
+// 故程序滚动前置 400ms 屏蔽窗（programScrollRef）：窗内向下 / 静止的 delta 一律忽略；
+// 向上的 delta 只可能来自用户操作（抢滚动条 / 滚轮反向），立即退出屏蔽态并按用户分支
+// 处理 —— 不吞用户输入。
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+
+/** 距底容差：80px 内视为贴底（与 mobile MessageList 同一阈值，跨端语义一致） */
+const BOTTOM_TOLERANCE_PX = 80
+/** 恢复静默宽限缺省值：连续无上滚操作 15s 后恢复跟随（对话窗传 60_000、执行面板传 15_000） */
+const DEFAULT_RESUME_MS = 15_000
+/** 程序滚动屏蔽窗：smooth 动画通常 <400ms；超窗即使未滚完也不再拦截（见 onScroll） */
+const PROGRAM_SCROLL_GUARD_MS = 400
+/** 进场宽限缺省值：enterPanel 后该窗口内的 scroll 事件一律不判定（防进场惯性/抖动误判） */
+const ENTRY_GUARD_MS = 3000
+/** scrollTop 方向判定阈值：|delta| <= 2px 视为静止，抹掉亚像素 / 布局抖动 */
+const SCROLL_DELTA_EPS_PX = 2
+
+export interface StickyScroll {
+  /** 绑到滚动容器（ChatPanel 的 .chat-messages / 执行面板的步骤树容器） */
+  scrollRef: RefObject<HTMLDivElement>
+  /** 是否显示「回到底部」按钮：已冻结跟随且未回底时为 true */
+  showJumpButton: boolean
+  /** 绑到滚动容器的 onScroll：识别用户滚动，程序滚动自动豁免 */
+  onScroll: () => void
+  /** 点击回底按钮：立即恢复跟随并 smooth 滚底 */
+  jumpToBottom: () => void
+  /** 立即恢复跟随并 smooth 滚底：新轮次 execution_started / 任务完成瞬间补拉（程序调用方） */
+  followReset: () => void
+  /**
+   * 进入面板（执行追踪面板专用）：先 followReset 立即滚底展示最新执行态，再开 guardMs
+   * （缺省 3000）进场宽限 —— 窗口内 scroll 事件一律不判定，防进场瞬间的鼠标滚动 /
+   * 触控板惯性 / 渲染抖动把机制打乱。对话窗无「进入」语义，不调用本方法。
+   */
+  enterPanel: (guardMs?: number) => void
+}
+
+export interface StickyScrollOptions {
+  /**
+   * 无滚动操作的宽限上限（ms）：到点且仍在冻结态才恢复跟随。
+   * 对话窗 60_000 / 执行追踪面板 15_000；缺省 15_000（保持原值）。
+   */
+  resumeMs?: number
+  /**
+   * 仅执行态读秒：false 时上翻冻结后不排恢复计时（空闲翻看不打扰，永久冻结直到
+   * followReset / 用户滚回底部）；true（缺省，维持旧行为）才排 resumeMs 宽限。
+   */
+  executing?: boolean
+}
+
+export function useStickyScroll(followKey: unknown, opts?: StickyScrollOptions): StickyScroll {
+  const { resumeMs = DEFAULT_RESUME_MS, executing = true } = opts ?? {}
+  const scrollRef = useRef<HTMLDivElement>(null)
+  /** true = 贴底跟随中；false = 用户上翻后冻结（按钮显示） */
+  const [following, setFollowing] = useState(true)
+  /** following 的 ref 镜像：effect / handler 闭包里读最新值，又不想把 state 拖进 deps */
+  const followingRef = useRef(true)
+  const showJumpButton = !following
+  /** 最近一次 scrollTop：屏蔽窗内做方向判定用 */
+  const lastScrollTopRef = useRef<number | null>(null)
+  /** true = 正处于 hook 自己发起的 smooth 滚动中 */
+  const programScrollRef = useRef(false)
+  const programTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** 进场宽限截止时间戳（ms）：窗口内 scroll 事件一律不判定（见 enterPanel） */
+  const entryGuardUntilRef = useRef(0)
+  const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  /** 切换跟随态：state 与 ref 同步置位（单一入口，防两处漂移） */
+  const setFollowingMode = useCallback((next: boolean) => {
+    followingRef.current = next
+    setFollowing(next)
+  }, [])
+
+  const clearProgramGuard = useCallback(() => {
+    if (programTimerRef.current) {
+      clearTimeout(programTimerRef.current)
+      programTimerRef.current = null
+    }
+    programScrollRef.current = false
+  }, [])
+
+  const clearResumeTimer = useCallback(() => {
+    if (resumeTimerRef.current) {
+      clearTimeout(resumeTimerRef.current)
+      resumeTimerRef.current = null
+    }
+  }, [])
+
+  /** 程序滚动到底：smooth + 前置屏蔽窗（原理见文件头） */
+  const scrollToBottom = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    programScrollRef.current = true
+    lastScrollTopRef.current = el.scrollTop
+    if (programTimerRef.current) clearTimeout(programTimerRef.current)
+    programTimerRef.current = setTimeout(() => {
+      programTimerRef.current = null
+      programScrollRef.current = false
+    }, PROGRAM_SCROLL_GUARD_MS)
+    // rAF 不能丢：同步调用会量到尚未布局的高度（沿用旧实现的取舍）
+    requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    })
+  }, [])
+
+  /**
+   * 冻结 + 排恢复计时（滚动驱动的宽限，主判定，不是读死表）：
+   * - executing=true：清旧建新排 resumeMs —— 冻结态下的向上 scroll（离开底部后的
+   *   上滚，即 onScroll 判为「查看历史」的滚动）都走这里，计时随之清零；用户持续
+   *   读就永不恢复，停手满 resumeMs 才 setFollowingMode(true) + 滚底（恢复路径之一，
+   *   见文件头 4b；向下 / 静止滚动不冻结不续命，不经过这里）；
+   * - executing=false：只清旧、不排新 —— 空闲期翻看历史不排恢复计时（避免把正在读
+   *   历史的用户闪回底部），永久冻结直到 followReset / 用户自己滚回底部。
+   */
+  const freezeWithResumeTimer = useCallback(() => {
+    if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current)
+    resumeTimerRef.current = null
+    if (!executing) return
+    resumeTimerRef.current = setTimeout(() => {
+      resumeTimerRef.current = null
+      // 静默宽限满：视为用户已离开阅读，主动滚回底部（与「默认自动下拉」语义一致）
+      setFollowingMode(true)
+      scrollToBottom()
+    }, resumeMs)
+  }, [executing, resumeMs, scrollToBottom, setFollowingMode])
+
+  // followKey 变化（新消息 / 流式 delta / 执行步骤更新）：仅跟随态滚底，冻结态不拽回
+  useEffect(() => {
+    if (!followingRef.current) return
+    scrollToBottom()
+  }, [followKey, scrollToBottom])
+
+  // 卸载清理：恢复计时与屏蔽窗都由 hook 自管，消费方无感
+  useEffect(() => {
+    return () => {
+      if (resumeTimerRef.current) clearTimeout(resumeTimerRef.current)
+      if (programTimerRef.current) clearTimeout(programTimerRef.current)
+    }
+  }, [])
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const current = el.scrollTop
+    const last = lastScrollTopRef.current
+    lastScrollTopRef.current = current
+
+    // 进场宽限（enterPanel）：窗口内的滚动一律不判定 —— 进场瞬间的鼠标滚动 / 触控板
+    // 惯性 / 渲染抖动都可能触发 scroll，此时判定必错。lastScrollTopRef 仍随每个事件
+    // 持续更新：宽限结束后的首个事件才能拿到干净的方向增量（否则进场期间的惯性序列
+    // 会把方向判反）。
+    if (Date.now() < entryGuardUntilRef.current) return
+
+    if (programScrollRef.current) {
+      // 程序滚动中：向下 / 静止都是 smooth 动画的中间态，一律忽略；向上 delta 只可能
+      // 来自用户操作，立即退出屏蔽态改走用户分支（不吞用户输入）
+      if (last !== null && current - last < -SCROLL_DELTA_EPS_PX) {
+        clearProgramGuard()
+      } else {
+        return
+      }
+    }
+
+    // atBottom 兜底（先于方向判定）：贴底（80px 容差内）即恢复跟随、按钮隐藏 —— 覆盖
+    // 用户自己滚回底部、向下 / 静止滚动贴底，以及近底微滚（容差内不判离开，防布局
+    // 抖动把贴底态误冻结）
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_TOLERANCE_PX) {
+      if (!followingRef.current) {
+        clearResumeTimer()
+        setFollowingMode(true)
+      }
+      return
+    }
+
+    // 离开底部后再判方向，方向即意图：
+    // 向上（< -2px）= 查看历史 → 冻结 + 重置宽限计时（用户在读就永不恢复）；
+    // 向下（> +2px）= 朝底部回走 → 不冻结、不续命：用户在往回走、不是读历史，且
+    //   中途恢复等于把用户弹回底部（只能上滚不能下滚）—— 回到上面的 atBottom 才算回底；
+    // |delta| <= 2px = 静止 / 亚像素抖动 → 忽略（atBottom 已兜底贴底态）。
+    const delta = current - (last ?? current)
+    if (delta < -SCROLL_DELTA_EPS_PX) {
+      if (followingRef.current) {
+        setFollowingMode(false)
+      }
+      freezeWithResumeTimer()
+    }
+  }, [clearProgramGuard, clearResumeTimer, freezeWithResumeTimer, setFollowingMode])
+
+  /**
+   * 立即恢复跟随并 smooth 滚底 —— 恢复路径之三（程序调用方）：
+   * 新轮次 execution_started（恢复跟随后续流式）/ 任务完成瞬间补拉（下拉展示成果）/
+   * 面板 terminal/card 模式切换。与回底按钮 jumpToBottom 同语义，同一实现两个名字：
+   * 前者是事件驱动，后者是点击驱动，谁也别复制谁的逻辑。
+   */
+  const followReset = useCallback(() => {
+    clearResumeTimer()
+    setFollowingMode(true)
+    scrollToBottom()
+  }, [clearResumeTimer, scrollToBottom, setFollowingMode])
+
+  /**
+   * 进入面板（执行追踪面板 open / 可见态变化时调用）：先 followReset 立即滚底 —
+   * 进场展示最新执行态是默认预期；再置进场宽限截止时间戳，此后 guardMs（缺省
+   * ENTRY_GUARD_MS=3000）内 onScroll 一律不判定 —— 进场瞬间的鼠标滚动 / 触控板
+   * 惯性 / 渲染抖动都可能触发 scroll，此时判定必错。对话窗无「进入」语义，不调用。
+   */
+  const enterPanel = useCallback(
+    (guardMs: number = ENTRY_GUARD_MS) => {
+      entryGuardUntilRef.current = Date.now() + guardMs
+      followReset()
+    },
+    [followReset],
+  )
+
+  return { scrollRef, showJumpButton, onScroll, jumpToBottom: followReset, followReset, enterPanel }
+}

@@ -13,8 +13,8 @@ use super::toml_ops::{
     read_provider_display_name, read_provider_reasoning_effort_from_config_toml,
     remove_provider_segment, sanitize_extra_headers, sync_provider_models, update_config_toml,
     update_custom_provider_segment, update_model_context_window, update_model_reasoning_efforts,
-    update_model_supports_vision, update_reasoning_effort, CapabilityOverride, CapabilitySource,
-    SyncReport,
+    update_model_supports_vision, update_provider_base_url, update_reasoning_effort,
+    CapabilityOverride, CapabilitySource, SyncReport,
 };
 use crate::emitter::CompoundEmitter;
 use crate::models::aggregator as or_agg;
@@ -672,6 +672,14 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
         resolved_model,
         resolved_base_url
     );
+
+    // 持久化用户显式改过的接口地址：switch_model 此前只把地址写进运行时内存，
+    // 磁盘 providers.toml 仍保留旧值 → 重启后「改了地址又回退」的根因。空/未传
+    // = 交回 resolve_effective_base_url 已解析的已存地址，无需写盘。
+    if let Some(explicit_url) = base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        update_provider_base_url(&state.llm_config_path, &resolved_provider, explicit_url)
+            .map_err(|e| format!("保存接口地址失败: {e}"))?;
+    }
 
     // Check if model/provider actually changed (same-named model may switch provider)
     let prev_binding = state.runtime.lock().ok().and_then(|g| {

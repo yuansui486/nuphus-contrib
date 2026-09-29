@@ -83,17 +83,13 @@ export async function listen<T>(event: string, handler: (payload: T) => void) {
 // ── Backend health check (disabled: Gateway HTTP removed) ──
 // Gateway axum server deleted (P1), no HTTP endpoint to poll.
 // Tauri IPC health is checked via invoke return value.
-export async function checkBackendAlive(_timeoutMs = 3000): Promise<boolean> {
-  return false
-}
-
 // ── Mock Registry ──
 
 type MockFn = (args?: Record<string, unknown>) => unknown
 
 const MOCKS: Record<string, MockFn> = {}
 
-export function registerMock(cmd: string, fn: MockFn) {
+function registerMock(cmd: string, fn: MockFn) {
   MOCKS[cmd] = fn
 }
 
@@ -191,7 +187,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
 
 // ── Raw body invoke —— 用于传输二进制数据（绕过 base64 + JSON 编码开销）──
 
-export async function invokeRaw<T>(cmd: string, body: Uint8Array): Promise<T | null> {
+async function invokeRaw<T>(cmd: string, body: Uint8Array): Promise<T | null> {
   const tauriAvail = isTauriAvailable()
   if (!tauriAvail) {
     console.warn(`[Bridge] invokeRaw ${cmd} — Tauri not available`)

@@ -5,7 +5,7 @@ import { CompactModal } from '../layout/CompactModal'
 import './create-project-modal.css'
 
 /** 项目名称长度上限（UI 稿：最多 80 个字符，输入框内直接截断，不报错） */
-export const PROJECT_NAME_MAX_LENGTH = 80
+const PROJECT_NAME_MAX_LENGTH = 80
 
 interface CreateProjectModalProps {
   open: boolean

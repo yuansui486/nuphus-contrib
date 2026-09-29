@@ -24,7 +24,7 @@ describe('SendMask', () => {
   })
 
   it('层级取值高于画布全屏壳（2500）与工作台宿主（100）', () => {
-    // 依据：canvases.css `.canvas-hub` / `.canvas-page-host` 为 fixed + z-index:2500；
+    // 依据：canvases.css `.canvas-page-host` 为 fixed + z-index:2500；
     // components.css `.canvas-workbench-host` 为 fixed + z-index:100。
     expect(SEND_MASK_Z).toBeGreaterThan(2500)
     expect(SEND_MASK_Z).toBeGreaterThan(100)

@@ -20,7 +20,7 @@ export const CORE_TOKEN_KEYS: readonly CoreTokenKey[] = [
 ]
 
 /** 选择 --accent 时一并派生的关联变量 */
-export const ACCENT_DERIVED_KEYS = [
+const ACCENT_DERIVED_KEYS = [
   '--accent-rgb',
   '--accent-hover',
   '--accent-dim',
@@ -33,6 +33,13 @@ export interface CustomTheme {
   name: string
   base: ThemeId
   overrides: Record<string, string>
+  /**
+   * 该主题的皮肤背景快照（本地图片路径，形态同 `ui/skinBg.ts` 的 LS_SKIN 值）。
+   * 缺省 / 空 = 无皮肤：激活这类主题时全局背景被清空（不继承上一个主题的图）。
+   * 边界：LS_SKIN 仍是「系统预设态的背景」；激活自定义主题以本快照为准，
+   * 未激活（停用 / 删除激活项 / 切内置主题）时回 LS_SKIN —— 见 useTheme.tsx 顶部注释。
+   */
+  skin?: string
 }
 
 /** 生成自定义主题 id（非安全上下文兼容：不用 crypto.randomUUID） */
@@ -73,7 +80,7 @@ export function rgbToHex(r: number, g: number, b: number): string {
 }
 
 /** 向白色混合 ratio（0~1）得到亮阶变体（用于 --accent-hover） */
-export function lightenHex(hex: string, ratio = ACCENT_HOVER_MIX): string {
+function lightenHex(hex: string, ratio = ACCENT_HOVER_MIX): string {
   const rgb = hexToRgb(hex)
   if (!rgb) return hex
   return rgbToHex(
@@ -84,7 +91,7 @@ export function lightenHex(hex: string, ratio = ACCENT_HOVER_MIX): string {
 }
 
 /** 由强调色派生 --accent-rgb / --accent-hover / --accent-dim / --accent-glow */
-export function deriveAccentOverrides(accentHex: string): Record<string, string> {
+function deriveAccentOverrides(accentHex: string): Record<string, string> {
   const rgb = hexToRgb(accentHex)
   if (!rgb) return {}
   return {
@@ -132,7 +139,7 @@ export const OPACITY_COLOR_KEYS = [
 /** 皮肤背景图不透明度 token（数值型覆盖，非 rgba 派生） */
 export const SKIN_OPACITY_KEY = '--skin-bg-opacity'
 
-/** 不透明度滑块的通道名（与 ThemesPage 的 OpacityAlphas 一一对应） */
+/** 不透明度滑块的通道名（与 AppearancePanel 的 OpacityAlphas 一一对应） */
 export type OpacityChannel = 'bubbles' | 'input' | 'panel' | 'modal' | 'skin'
 
 /**
@@ -153,15 +160,15 @@ export const OPACITY_INTENT_KEY_ORDER: readonly OpacityChannel[] = [
 /**
  * 用户「显式拖过的滑块通道」的持久化位置。
  *
- * 为什么必须持久化而不是只放组件 ref：`ThemesPage` 被
- * `<CompactModal open={s.showThemes}>` 包裹，而 CompactModal 在 open=false 时
- * `return null`（见 ui/skinBg.ts 的同一条注释）—— 关闭主题弹窗即卸载 ThemesPage，
- * 组件内 ref 随之归零。归零后切主题，`:dirty` 门槛判定「用户没拖过」，
- * 于是把 `--input-bg` 等派生色整个丢弃、回落基底实色 → 用户设定的透明度丢失，
- * 而滑块读数仍显示旧值（读数来自 overrides），画面与滑块彻底脱钩。
- * 这正是「输入框背景不跟透明度变化」的确定性成因。
+ * 为什么必须持久化而不是只放组件 ref：维护这份意图的组件（外观浮窗
+ * `AppearancePanel`）随会话生灭 —— 早先它是被 `<CompactModal open={s.showThemes}>`
+ * 包裹的 `ThemesPage`，关一次弹窗就卸载、ref 归零；现在浮窗已保活（开合不卸载），
+ * 但刷新页面 / 重启应用仍会让 ref 归零。归零后切主题，`:dirty` 门槛判定
+ * 「用户没拖过」，于是把 `--input-bg` 等派生色整个丢弃、回落基底实色 →
+ * 用户设定的透明度丢失，而滑块读数仍显示旧值（读数来自 overrides），
+ * 画面与滑块彻底脱钩。这正是「输入框背景不跟透明度变化」的确定性成因。
  */
-export const LS_OPACITY_INTENT = 'nuphus_opacity_intent'
+const LS_OPACITY_INTENT = 'nuphus_opacity_intent'
 
 const EMPTY_INTENT: Record<OpacityChannel, boolean> = {
   bubbles: false,
@@ -284,5 +291,7 @@ export function parseCustomThemeJSON(text: string): CustomThemeParseResult {
   }
   const name = typeof obj.name === 'string' ? obj.name.trim() : ''
   const id = typeof obj.id === 'string' && obj.id ? obj.id : undefined
-  return { ok: true, theme: { id, name, base: base as ThemeId, overrides: ov } }
+  // skin 缺省按无皮肤处理（schema 不强制）：旧导出/旧存储没有该字段，导入后主题即无皮肤
+  const skin = typeof obj.skin === 'string' && obj.skin ? obj.skin : undefined
+  return { ok: true, theme: { id, name, base: base as ThemeId, overrides: ov, skin } }
 }

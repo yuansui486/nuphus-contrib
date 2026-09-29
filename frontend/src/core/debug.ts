@@ -15,7 +15,7 @@
    ═══════════════════════════════════════════ */
 
 /** localStorage 键：置为 '1' 即开启高频调试日志 */
-export const DEBUG_LOG_KEY = 'nuphus:debug'
+const DEBUG_LOG_KEY = 'nuphus:debug'
 
 /** 模块加载时读一次（刷新后生效，避免热路径上反复读 localStorage） */
 const enabled = (() => {

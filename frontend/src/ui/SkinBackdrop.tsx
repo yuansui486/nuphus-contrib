@@ -67,7 +67,7 @@ export function SkinBackdrop() {
       releaseSkinBg(prev)
     }
     window.addEventListener(SKIN_CHANGE_EVENT, onSkinChange)
-    // App 层与 ThemesPage 都会调 applySkinBg（常见为同一路径被应用两次）：
+    // App 层与 AppearancePanel 都会调 applySkinBg（常见为同一路径被应用两次）：
     // 重复解析无副作用，这里补一次可确定地覆盖"本组件挂载晚于 App 层 effect"的时序。
     void applySkinBg(readSkinBg())
 

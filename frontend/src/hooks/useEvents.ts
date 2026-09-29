@@ -65,6 +65,8 @@ export interface EventHandlers {
     toolCallCountRef: MutableRefObject<number>
     /** 用户已点击强制中断；置位后迟到的 tool_call 事件不再把 mood 打回执行中 */
     interruptedRef: MutableRefObject<boolean>
+    /** ChatPanel 贴底跟随的 followReset 回填位：execution_started / execution_completed 调 */
+    stickyFollowResetRef: MutableRefObject<(() => void) | null>
   }
 
   // State setters
@@ -535,6 +537,9 @@ export function useEvents(h: EventHandlers) {
           h.setDismissThinking(false)
           h.setRefineState(null)
           h.setExecutionStage('running')
+          // 新轮次开始：恢复贴底跟随（用户可能停在上一轮的上翻位置），后续流式 delta
+          // 继续下拉。refine 分支不建流式气泡（上方已 break），无需 reset。
+          h.refs.stickyFollowResetRef.current?.()
           h.setExecutionCounter((c: number) => c + 1)
           h.setStepIndex(event.step_index)
           h.setGoal(event.goal)
@@ -860,6 +865,12 @@ export function useEvents(h: EventHandlers) {
           }
           h.refs.toolCallCountRef.current = 0
           h.setCompleted(true)
+          // 完成任务瞬间补拉一次（非执行态唯一的自动下拉）：成果落地即下拉展示——
+          // 用户上翻+空闲不会被拉，两样和睦共处。refine 内部子执行不产 chat 气泡，
+          // 跳过以免把正在翻历史的用户拽回底部。
+          if (!refineActiveRef.current) {
+            h.refs.stickyFollowResetRef.current?.()
+          }
           getCurrentWindow().setFocus()
           // 最终回复已到达，但后端随即进入收尾（记忆落盘 / 自动提炼）——
           // 阶段为 Finalizing 而非 idle：收尾期提交必须被拒收退回输入框，

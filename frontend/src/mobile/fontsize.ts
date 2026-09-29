@@ -21,7 +21,7 @@ export function getFontSize(): MobileFontSize {
 }
 
 /** 应用字号到 <html data-fontsize>（标准可不写属性，默认 :root 即标准） */
-export function applyFontSize(size: MobileFontSize): void {
+function applyFontSize(size: MobileFontSize): void {
   const root = document.documentElement
   if (size === 'standard') root.removeAttribute('data-fontsize')
   else root.setAttribute('data-fontsize', size)

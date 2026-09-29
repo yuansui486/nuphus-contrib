@@ -7,15 +7,17 @@ import type { ExternalAgentStatus } from '../lib/api'
 /**
  * 回归钉：外部 Agent 列表栏（.ext-agents-hover-zone 所属胶囊）的移出语义。
  *
- * 旧实现的两处错误（本轮修复）：
- *  1. 「从状态栏移除」写 localStorage 后把头像折叠成数字入口，重启仍在；
- *  2. 点数字入口「恢复显示」时，因 pin 集合启动清零 + idle 不渲染，视觉效果是
- *     「恢复即消失／被删掉」——恢复链路本身不可自证。
+ * 2026-09-27 重构前的两处错误（本轮修复）：
+ *  1. 「从列表栏移除」只写 React 内存态——前端任何重载即复活，用户的选择被静默遗忘；
+ *  2. 「配置中心删除」只删 team.toml 段、不清 status.json——列表栏唯一边据是
+ *     status.json，删了配置芯片照显，直到 app 重启才被 idle 规则遮掉。
  *
  * 新语义（本文件的断言基线）：
- *  - 移出 = 头像从 DOM 真移除，且仅本轮会话内存态（不落盘，重启不残留）；
- *  - 移出必须向用户反馈（调用方注入的 onNotice → HUD 轻提示，**不进 messages 数组**）；
- *  - 该 agent 再次被调用（门铃新上报，updated_at 更新）→ 自动回到列表栏；
+ *  - 移除 = 后端共享态（SignalState.hidden_ext_agents）：**应用生命周期内保持、
+ *    重启即净**（前端 UI 显示跟随应用生命周期）；前端重载不丢（遵循用户选择）；
+ *  - 撤销只有两条显式路径且均由后端判定：① 时刻更晚的新门铃活动（被再次调用）；
+ *    ② 配置中心保存（用户主动纳入）；
+ *  - 前端纯投影：隐显只看 listAgentStatuses 每项的 hidden 标注；
  *  - 列表栏只显示「被调用过的（非 idle）」或「本轮配置中心保存过的（pin）」agent。
  */
 
@@ -56,42 +58,50 @@ afterEach(() => {
   cleanup()
 })
 
-describe('外部 Agent 列表栏 · 移出语义', () => {
-  it('移出 = 头像从 DOM 真移除 + 一句提示反馈，且不写 localStorage', async () => {
+describe('外部 Agent 列表栏 · 移出语义（后端共享态，应用生命周期）', () => {
+  it('移除 = 通知后端 + 一句提示；下一轮 poll 带回 hidden 后头像真消失', async () => {
     const onNotice = mountBar()
     // 「被调用过」（state=done）的 agent 常驻显示
     fireEvent.click(await screen.findByRole('button', { name: AVATAR_LABEL }))
 
-    const removeBtn = await screen.findByRole('button', { name: '从列表栏移除' })
-    fireEvent.click(removeBtn)
+    fireEvent.click(await screen.findByRole('button', { name: '从列表栏移除' }))
 
-    // DOM 真移除（不是折叠成数字入口）
-    await waitFor(() => expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull())
-    expect(screen.queryByText(/已隐藏/)).toBeNull()
-
-    // 用户面反馈：只提示「被移出」这一件事（不夹带实现细节，不解释规则）
-    expect(onNotice).toHaveBeenCalledTimes(1)
-    expect(onNotice.mock.calls[0][0]).toBe('已从列表栏移出「opencode」')
-
-    // 同时通知 agent（后续需用户显式指定才可调用）
+    // 指令发给后端（写共享显示态 + prompt 提示）；用户面一句 HUD 反馈，不说实现细节
     expect(api.notifyExtAgentRemoved).toHaveBeenCalledWith('opencode')
+    expect(onNotice).toHaveBeenCalledTimes(1)
+    expect(onNotice.mock.calls[0][0]).toBe('已从列表栏移出「opencode」（重启前保持移出）')
 
-    // 移出为内存态：不得留下任何持久化痕迹
-    expect(localStorage.getItem('nuphus.extAgents.hiddenAgents')).toBeNull()
+    // 后端共享态落定 → 下一轮 poll hidden=true → 头像从 DOM 真移除
+    vi.mocked(api.listAgentStatuses).mockResolvedValue([status({ hidden: true })])
+    await waitFor(() => expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull(), {
+      timeout: 6000,
+    })
+  }, 10_000)
+
+  it('后端 hidden=true 的头像不渲染（前端重载后移除依然有效）', async () => {
+    // 模拟「用户已移出 + 前端重新挂载」：poll 第一批即带 hidden
+    vi.mocked(api.listAgentStatuses).mockResolvedValue([status({ hidden: true })])
+    mountBar()
+
+    await waitFor(() => expect(api.listAgentStatuses).toHaveBeenCalled())
+    expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull()
   })
 
-  it('移出后该 agent 再次被调用（门铃新上报）→ 自动回到列表栏', async () => {
+  it('被再次调用（后端撤销 hidden）→ 自动回到列表栏', async () => {
+    vi.mocked(api.listAgentStatuses).mockResolvedValue([status({ hidden: true })])
     mountBar()
-    fireEvent.click(await screen.findByRole('button', { name: AVATAR_LABEL }))
-    fireEvent.click(await screen.findByRole('button', { name: '从列表栏移除' }))
-    await waitFor(() => expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull())
+    await waitFor(() => expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull(), {
+      timeout: 6000,
+    })
 
-    // 门铃新上报：updated_at 晚于移出时刻
+    // 时刻更晚的新门铃活动 → 后端撤销 hidden → poll 带回 hidden:false + 新状态
     vi.mocked(api.listAgentStatuses).mockResolvedValue([
-      status({ state: 'in_progress', updated_at: new Date(Date.now() + 3_600_000).toISOString() }),
+      status({
+        state: 'in_progress',
+        updated_at: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
     ])
 
-    // 轮询周期 3s：等待自动回归
     await waitFor(() => expect(screen.getByRole('button', { name: AVATAR_LABEL })).toBeTruthy(), {
       timeout: 6000,
     })
@@ -116,7 +126,7 @@ describe('外部 Agent 列表栏 · 移出语义', () => {
     await waitFor(() => expect(api.listExternalAgents).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: AVATAR_LABEL })).toBeNull()
 
-    // 配置中心保存 → pin → 立即出现在列表栏
+    // 配置中心保存 → pin → 立即出现在列表栏（后端同步撤销 hidden）
     fireEvent(window, new CustomEvent(EXT_AGENT_PINNED_EVENT, { detail: 'opencode' }))
     expect(await screen.findByRole('button', { name: AVATAR_LABEL })).toBeTruthy()
   })

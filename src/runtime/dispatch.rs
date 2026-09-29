@@ -237,7 +237,8 @@ pub(crate) async fn handle_task_dispatch(
                 compressed.len()
             );
         }
-        agent_ref.session.push_user(dynamic_msg);
+        // clone：同一份派发正文还要进台账 task 字段（任务面板点开要看它）
+        agent_ref.session.push_user(dynamic_msg.clone());
         agent_ref
     } else {
         tracing::info!(
@@ -247,7 +248,8 @@ pub(crate) async fn handle_task_dispatch(
         );
         let mut new_agent =
             SubTaskRunner::new_free(exec_llm.clone(), exec_tools, system_prompt, brief.clone());
-        new_agent.session.push_user(dynamic_msg);
+        // clone：同一份派发正文还要进台账 task 字段（任务面板点开要看它）
+        new_agent.session.push_user(dynamic_msg.clone());
         new_agent.set_context_window(goal_types::get_context_window_of(exec_llm.as_ref()));
         new_agent.set_goal_type(goal_type);
         // Inject goal-type warmup reminders (subtask quality guardrails)
@@ -286,7 +288,7 @@ pub(crate) async fn handle_task_dispatch(
         task_no,
     });
     let mut run_guard = run_registry.as_ref().map(|reg| {
-        let id = reg.open(&title, goal_type_str, run_origin.clone());
+        let id = reg.open(&title, &dynamic_msg, goal_type_str, run_origin.clone());
         crate::agent::task_run::emit_snapshot(reg, run_emitter.as_deref());
         crate::agent::task_run::RunGuard::new(reg, id, run_emitter.clone())
     });

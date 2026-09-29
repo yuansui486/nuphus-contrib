@@ -64,6 +64,9 @@ function desktop() {
     processingRef: { current: false },
     toolCallCountRef: { current: 0 },
     interruptedRef: { current: false },
+    // 贴底跟随 followReset 回填位（useEvents execution_started / execution_completed 调）；
+    // 本桩不渲染 ChatPanel，置 null = 无人回填，useEvents 侧 ?.() 静默跳过
+    stickyFollowResetRef: { current: null },
   }
   const handlers = new Proxy(
     {

@@ -33,6 +33,7 @@ vi.mock('../main-window/lib/api', () => ({
   setProjectBookmarks: vi.fn(),
   setProjectFolderArchived: vi.fn(),
   setSessionSortPrefs: vi.fn(),
+  setPinnedSessions: vi.fn(),
   SESSION_GROUP_LIMIT_CHANGED_EVENT: 'nuphus:session-group-limit-changed',
 }))
 

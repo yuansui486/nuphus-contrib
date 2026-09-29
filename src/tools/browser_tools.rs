@@ -208,9 +208,9 @@ impl ToolRegistry {
         let timeout_secs: u64 = match tool_name {
             "browser_navigate" | "browser_back" | "browser_forward" => 30,
             "browser_exec" => 15, // internal 10s eval timeout + buffer
-            // 效果验证会给 click/type 追加等待窗口——工具超时必须在其之上，否则验证
+            // 效果验证会给 click/type/press 追加等待窗口——工具超时必须在其之上，否则验证
             // 窗口会把整个调用拖进超时（而超时对写工具等于"可能已执行"的模糊错误）。
-            "browser_click" | "browser_type" => effect_verify_ms() / 1000 + 15,
+            "browser_click" | "browser_type" | "browser_press" => effect_verify_ms() / 1000 + 15,
             "browser_wait_for" => {
                 params
                     .get("timeout_ms")
@@ -500,19 +500,35 @@ async fn run_browser_op(
                 .and_then(|v| v.as_str())
                 .filter(|k| !k.trim().is_empty())
                 .ok_or_else(|| "browser_press: key parameter is required".to_string())?;
+            // 效果验证与 click/type 同一套设施：布防失败不阻断按键。
+            let verify_ms = effect_verify_ms();
+            if verify_ms > 0 {
+                if let Err(e) = client.arm_change_detector().await {
+                    tracing::debug!("[browser_press] arm_change_detector failed: {}", e);
+                }
+            }
             let result = client.press_key(key).await.map_err(|e| e.to_string())?;
+            let mut output = result;
+            if verify_ms > 0 && !client.wait_for_change(verify_ms).await.unwrap_or(true) {
+                output.push_str(&no_change_note(
+                    &format!("pressing '{key}'"),
+                    verify_ms,
+                    "an inert key on this page, or a tab that is not the focused/visible one \
+                     (CDP input is dropped while the document has no focus, so nothing happens \
+                     at all — use browser_switch_tab / browser_new_tab to bring it to the front)",
+                ));
+            }
             let include_snapshot = params
                 .get("snapshot")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if !include_snapshot {
-                return Ok(result);
+                return Ok(output);
             }
             match client.snapshot(false, None).await {
-                Ok(snap) => Ok(format!("{}\n\n── Page state ──\n{}", result, snap)),
+                Ok(snap) => Ok(format!("{output}\n\n── Page state ──\n{snap}")),
                 Err(e) => Ok(format!(
-                    "{}\n\n── Note: post-action snapshot failed; page state unavailable for the next step: {} ──",
-                    result, e
+                    "{output}\n\n── Note: post-action snapshot failed; page state unavailable for the next step: {e} ──"
                 )),
             }
         }

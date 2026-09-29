@@ -1,7 +1,7 @@
 /**
  * toAssetUrl — 文件系统路径 → 浏览器可访问 URL（Tauri asset protocol）
  *
- * 单一实现点：ChatPanel / UserInputPrompt / ThemesPage 原先各写了一份逐字
+ * 单一实现点：ChatPanel / UserInputPrompt / 主题与头像的选图链路原先各写了一份逐字
  * 相同的私有副本，抽到这里共用（三份必然漂移，改一处漏两处）。
  *
  * 语义：
@@ -134,7 +134,7 @@ export function toAssetUrl(path: string | null | undefined): string | null {
 }
 
 /** 按扩展名推 MIME（含 gif/webp/svg）。 */
-export function guessImageMime(path: string): string {
+function guessImageMime(path: string): string {
   const ext = (path.split('.').pop() || '').toLowerCase()
   switch (ext) {
     case 'jpg':
@@ -153,6 +153,88 @@ export function guessImageMime(path: string): string {
     default:
       return 'image/png'
   }
+}
+
+/** 缩略图最大边长（px）：卡面约 170×64 @1x、340×128 @2x，320 覆盖高 DPI */
+const THUMB_MAX_EDGE = 320
+/** 缩略图 JPEG 质量（0-1）：卡面本来就是小图预览，0.75 已无可见劣化而文件小一个量级 */
+const THUMB_QUALITY = 0.75
+
+/**
+ * 主题卡缩略图专用：把皮肤图路径解析成**缩小版**的可渲染 URL。
+ *
+ * 「我的主题」卡片网格不能直接渲染原图（大王 2026-09-28 定：缩略图要缩小尺寸
+ * 也缩小文件大小）：皮肤图是用户选的全屏图，动辄数 MB / 4K 像素，而卡面只有
+ * ~170×64 —— 逐张渲染原图既费内存又卡。这里先把原图字节取成**同源 blob**
+ * （我们自己创建的，canvas 不会被 taint），解码后画到 canvas 缩到 THUMB_MAX_EDGE
+ * 内，再以 JPEG 重编码成一个小文件（object URL）—— 卡面渲染的是这个缩小版。
+ *
+ * - 已是 URL 的值（data:/asset:/http…，存量 dataURL 皮肤）没有本地文件可缩，
+ *   原样返回；
+ * - 取字节 / 解码 / 编码任一环失败返回 **null** —— 调用方回落到色板兜底，
+ *   不拿原图充数。
+ *
+ * 全局背景不走这里：那儿的图就是要铺满全屏的原图（`skinBg.applySkinBg`）。
+ */
+export async function resolveSkinThumbnailUrl(
+  path: string | null | undefined,
+): Promise<string | null> {
+  if (!path) return null
+  if (/^(https?:\/\/|data:|blob:|asset:\/\/|tauri:\/\/)/i.test(path)) return path
+  try {
+    // ① 原图字节 → 同源 blob URL（仅作解码输入，函数末尾即释放）
+    const sourceUrl = await readImageAsBlobUrl(path)
+    if (!sourceUrl) return null
+    // ② 解码 → canvas 缩小 → JPEG 重编码（jsdom 无 canvas，测试用 __setThumbEncoder 注入）
+    const thumb = await (thumbEncoder ?? encodeThumbWithCanvas)(sourceUrl)
+    releaseSkinImageUrl(sourceUrl)
+    return thumb
+  } catch (e) {
+    // 缩略图失败只影响卡片预览：不静默（排查要看这条），也不回落原图
+    console.error('[assetUrl] 生成皮肤缩略图失败，卡片将回落到色板兜底：', path, e)
+    return null
+  }
+}
+
+/**
+ * 缩略图编码器替身（**仅测试**注入；生产永远走 canvas 真实缩放）。
+ * 与 `__setSkinImageProbe` 同一思路：jsdom 没有 canvas / 图片解码，不注入就只能
+ * 靠"等 onload 超时"碰运气。生产代码不调用它。
+ */
+type ThumbEncoder = (sourceUrl: string) => Promise<string | null>
+let thumbEncoder: ThumbEncoder | null = null
+export function __setThumbEncoder(fn: ThumbEncoder | null): void {
+  thumbEncoder = fn
+}
+
+/** canvas 缩小 + JPEG 重编码（生产路径）。失败抛错，由调用方统一兜底。 */
+async function encodeThumbWithCanvas(sourceUrl: string): Promise<string | null> {
+  const img = await loadImage(sourceUrl)
+  const w = img.naturalWidth
+  const h = img.naturalHeight
+  if (!w || !h) return null
+  // 保纵横比缩到 THUMB_MAX_EDGE 内（不放大）
+  const scale = Math.min(1, THUMB_MAX_EDGE / Math.max(w, h))
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(w * scale))
+  canvas.height = Math.max(1, Math.round(h * scale))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  const blob = await new Promise<Blob | null>(resolve => {
+    canvas.toBlob(resolve, 'image/jpeg', THUMB_QUALITY)
+  })
+  return blob ? URL.createObjectURL(blob) : null
+}
+
+/** 等一张图解码完成（onload 且确有像素）；失败 reject。 */
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error(`图片解码失败：${url}`))
+    img.src = url
+  })
 }
 
 /**

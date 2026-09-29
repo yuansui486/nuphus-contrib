@@ -58,7 +58,7 @@ export function isActiveFeedback(type: AppFeedback): boolean {
 /** 跟踪器就绪前保持 false → 走 HUD，与改造前行为一致 */
 let appFocused = false
 
-export function isAppFocused(): boolean {
+function isAppFocused(): boolean {
   return appFocused
 }
 

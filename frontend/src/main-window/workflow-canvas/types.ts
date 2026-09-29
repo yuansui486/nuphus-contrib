@@ -185,10 +185,6 @@ export const SYNTH = {
 } as const
 
 /** 判断 id 是否为合成 id */
-export function isSyntheticId(id: string): boolean {
-  return id.includes('::')
-}
-
 // ── 布局 sidecar（1.7）──
 
 export interface CanvasLayoutSidecar {

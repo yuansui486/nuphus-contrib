@@ -30,12 +30,6 @@ function loadPinnedAgents(): string[] {
   return []
 }
 
-/** 门铃上报时刻（RFC3339）→ epoch ms；缺失/非法返回 0（视为「无活动」） */
-function updatedAtMs(a?: ExternalAgentStatus): number {
-  const t = a?.updated_at ? Date.parse(a.updated_at) : NaN
-  return Number.isNaN(t) ? 0 : t
-}
-
 /** 后端 state 原值 → 展示样式 class（未知状态统一 is-unknown，不拦截新状态） */
 const STATE_CLASS: Record<string, string> = {
   idle: 'is-idle',
@@ -96,10 +90,10 @@ interface ExternalAgentsStatusBarProps {
  *   切后台自动暂停，回前台立即刷新（门铃事件由后端落 status.json，轮询兜底覆盖）。
  * - 每个处于「被调用」状态的 agent 渲染为圆形头像按钮：点击弹出该 agent 的交付物列表弹窗，
  *   条目点击走 PreviewOverlay 内联预览；hover 出 tooltip 看详情。
- * - 「从列表栏移除」= 把该 agent 的头像从 DOM 真移除（本轮会话内存态，不落盘、
- *   不动后端配置与 team.toml），并以 HUD 轻提示反馈一句（`onNotice` → showToast，
- *   **不进会话消息数组**）；该 agent 再次被调用（门铃有新上报）或用户在配置中心
- *   重新保存时，自动回到列表栏。
+ * - 「从列表栏移除」= 把该 agent 的头像从 DOM 真移除（**显示态由后端共享态持有：
+ *   应用生命周期内保持、重启即净**，遵循用户选择），并以 HUD 轻提示反馈一句
+ *   （`onNotice` → showToast，**不进会话消息数组**）；撤销只有两条显式路径——
+ *   时刻更晚的新门铃活动（被再次调用）或配置中心保存（用户主动纳入），均由后端判定。
  * - 末尾固定一个 "+" 配置入口，点击打开外部 Agent 配置中心（空列表时入口仍可见）。
  * - 状态值来自 status.json 原样映射，前端只加显示层。
  *
@@ -107,10 +101,11 @@ interface ExternalAgentsStatusBarProps {
  * - 后端启动清零 status.json：跨生命周期的陈旧 agent 不复存在；
  *   本轮内只有真实启动并经门铃上报验证的 agent 才有非 idle 状态。
  * - 列表栏内容 =（本轮被调用过的 agent：非 idle）∪（用户在本轮配置中心保存过的 agent：pin）
- *   −（用户已从列表栏移出的 agent）。有内容 → 整条胶囊常驻，不随 hover 隐藏；
- *   无内容 → 默认隐藏，鼠标悬停感应区临时浮现 "+" 配置入口。
- * - 配置中心是唯一配置源：本面板的移除只影响显示，删除配置一律由配置中心发起
- *   （写 team.toml），二者互不越权。
+ *   −（用户已从列表栏移出的 agent：后端 hidden 标注）。有内容 → 整条胶囊常驻，
+ *   不随 hover 隐藏；无内容 → 默认隐藏，鼠标悬停感应区临时浮现 "+" 配置入口。
+ * - 配置中心是唯一配置源：本面板的移除只影响显示态（后端共享集，重启即净）；
+ *   持久删除由配置中心发起（删 team.toml 段 + 联动清 status.json），删除后条目
+ *   立即从列表消失且重启不复活（briefs/report 追溯链保留）。
  */
 export default function ExternalAgentsStatusBar({
   visible = true,
@@ -119,9 +114,9 @@ export default function ExternalAgentsStatusBar({
 }: ExternalAgentsStatusBarProps) {
   const { t } = useLanguage()
   const [agents, setAgents] = useState<ExternalAgentStatus[]>([])
-  /** 用户已从列表栏移出的 agent（agent → 移出时刻 ms）。仅本轮会话内存态：
-   *  不落盘、不影响后端配置/team.toml；该 agent 有新门铃活动即自动回归 */
-  const [removed, setRemoved] = useState<Record<string, number>>({})
+  /** 「从列表栏移出」由后端共享态标注（listAgentStatuses 每项带 hidden）：
+   *  前端不自持移出状态——应用生命周期内保持、重启即净（显示跟随应用生命周期），
+   *  撤销只有后端两条显式路径（时刻更晚的新门铃活动 / 配置中心保存） */
   const [pins, setPins] = useState<string[]>(loadPinnedAgents)
   /** hover 展开：额外（非常驻）agent 可见 */
   const [revealed, setRevealed] = useState(false)
@@ -153,23 +148,8 @@ export default function ExternalAgentsStatusBar({
       try {
         const list = await listAgentStatuses()
         if (!stoppedRef.current) {
+          // hidden 由后端共享态标注（移出/撤销/重启清零全在服务侧），前端纯投影
           setAgents(list || [])
-          // 移出后又有新的门铃上报（= 被再次调用）→ 该 agent 自动回到列表栏
-          setRemoved(prev => {
-            const keys = Object.keys(prev)
-            if (keys.length === 0) return prev
-            const next: Record<string, number> = {}
-            let changed = false
-            for (const k of keys) {
-              const ts = updatedAtMs((list || []).find(a => a.agent === k))
-              if (ts > prev[k]) {
-                changed = true // 新活动 → 撤销移出
-              } else {
-                next[k] = prev[k]
-              }
-            }
-            return changed ? next : prev
-          })
         }
       } catch {
         /* 后端不可达：保留当前数据，下轮重试 */
@@ -218,13 +198,8 @@ export default function ExternalAgentsStatusBar({
     const onPinned = (e: Event) => {
       const key = (e as CustomEvent<string>).detail
       if (!key) return
-      // 配置中心显式保存 = 用户主动纳入 → 撤销该 agent 的「已移出」标记
-      setRemoved(prev => {
-        if (!(key in prev)) return prev
-        const next = { ...prev }
-        delete next[key]
-        return next
-      })
+      // 配置中心显式保存 = 用户主动纳入 → 后端已同步撤销「已移出」共享态；
+      // 前端只需立即 pin 入列（下一轮 poll 的 hidden=false 会跟上）
       setPins(prev => (prev.includes(key) ? prev : [...prev, key]))
       refreshCfg()
     }
@@ -322,15 +297,14 @@ export default function ExternalAgentsStatusBar({
       })
   }, [])
 
-  /** 从列表栏移除该 agent：本轮会话内不再渲染其头像（内存态，不落盘），
-   *  不动后端配置与 team.toml。该 agent 再次被调用（门铃新上报）或在配置中心
-   *  重新保存时自动回归。
+  /** 从列表栏移除该 agent：后端写共享态（应用生命周期内保持、重启即净；被再次
+   *  调用或配置中心保存时由后端撤销），前端纯发指令 + 提示，不自持状态。
+   *  不动后端配置与 team.toml——持久删除走配置中心。
    *
    *  用户面反馈走 `onNotice`（HUD 轻提示）——⛔ 绝不可用 addMessage 写会话消息：
    *  执行期 messages 末尾是正在流式的 agent 气泡，插入消息会隔断输出。 */
   const removeAgent = useCallback(
     (name: string) => {
-      setRemoved(prev => ({ ...prev, [name]: Date.now() }))
       if (openAgentRef.current === name) {
         openAgentRef.current = null
         setOpenAgent(null)
@@ -339,7 +313,7 @@ export default function ExternalAgentsStatusBar({
       setDelError(null)
       onNotice?.(t('extAgents.removedNotice', name))
       // 通知 agent：该外部 Agent 已被移出，后续需用户显式指定才可调用
-      // （后端写一句提示，下一轮带进上下文；失败不阻断 UI）
+      // （后端写共享显示态 + 一句提示，下一轮带进上下文；失败不阻断 UI）
       notifyExtAgentRemoved(name).catch(() => {})
     },
     [onNotice, t],
@@ -356,7 +330,8 @@ export default function ExternalAgentsStatusBar({
 
   const known = agents.filter(
     a =>
-      !(a.agent in removed) &&
+      // 移出态由后端共享态标注（遵循用户选择：仅更新的门铃活动/配置中心保存可撤销）
+      !a.hidden &&
       // idle 且未 pin = 本轮未经门铃验证的历史残留（启动清零只重置为 idle 骨架，
       // 目录仍在），不渲染——列表栏只出现被调用过的 agent 或用户 pin 的配置
       ((a.state && a.state !== 'idle') || pins.includes(a.agent)),

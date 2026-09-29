@@ -82,7 +82,7 @@ describe('① 滑块键集合必须包含输入框 / 面板 / 弹窗', () => {
     // 否则该域重开页面后丢透明度。
     //
     // 关系不是 1:1：`--msg-user-bg` / `--msg-assistant-bg` 两个键由同一个 `bubbles`
-    // 通道驱动（一次拖动同时改两者，见 ThemesPage.handleBubbleOpacity），
+    // 通道驱动（一次拖动同时改两者，见 AppearancePanel.handleBubbleOpacity），
     // 其余三个键各占一个通道。故颜色键数 = 通道数 + 1。这个 +1 是**被断言锚定的常量**：
     // 若有人新增一个独立语义域却忘了加 intent 通道，或把气泡拆成两个通道，这里立刻失败。
     const colorChannels = OPACITY_INTENT_KEY_ORDER.filter(c => c !== 'skin')
@@ -187,5 +187,22 @@ describe('③ user / assistant 气泡一律无 border', () => {
       ruleBody(settingsCss, '.settings-center-panel'),
     ]
     for (const block of blocks) expect(block).not.toContain('!important')
+  })
+
+  it('聊天头部设置按钮磨砂透明且基准色跟随控制面板不透明度（--panel-bg）', () => {
+    // 与 .settings-center-panel 同支弹窗族语义键派生：滑块拖到任何值都遍历得到它。
+    // 2026-09-27：原为不透明硬色 --bg-tertiary（滑块无效）→ 先改 var(--panel-bg)
+    // → 按大王要求做磨砂透明：color-mix 兑透明 + backdrop blur，链路不断。
+    const block = ruleBody(chatMessagesCss, '.chat-header-settings-btn')
+    expect(block).toMatch(/background:\s*color-mix\(in srgb, var\(--panel-bg\) \d+%, transparent\)/)
+    expect(block).toMatch(/backdrop-filter:\s*blur\(/)
+  })
+
+  it('提炼待处理按钮与设置按钮同款磨砂配方（--panel-bg 派生 + blur）', () => {
+    // 大王 2026-09-27 追加：.refine-pending-btn background 跟随设置按钮效果。
+    // 两个消费方同支键、同混合比族——断言钉住「派生 --panel-bg + 有 blur」。
+    const block = ruleBody(chatMessagesCss, '.refine-pending-btn')
+    expect(block).toMatch(/background:\s*color-mix\(in srgb, var\(--panel-bg\) \d+%, transparent\)/)
+    expect(block).toMatch(/backdrop-filter:\s*blur\(/)
   })
 })

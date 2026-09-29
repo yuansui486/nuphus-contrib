@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import * as pdfjsLib from 'pdfjs-dist'
-import { X, FolderOpen, ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react'
+import { X, FolderOpen, ExternalLink, ChevronLeft, ChevronRight, TriangleAlert } from 'lucide-react'
 import MarkdownContent from './MarkdownContent'
 import { readFile, readFileBase64, openPath, revealPath } from '../lib/api'
 import './preview-overlay.css'
@@ -374,11 +374,19 @@ export function PreviewOverlay({ path, onClose }: { path: string; onClose: () =>
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
 
+  /** 工具栏「系统打开 / 在文件夹显示」的失败反馈：此前 `.catch(() => undefined)`
+   *  静默吞错，表现为「点了没反应」。内容区那侧（FilePreviewContent 的 openErr）
+   *  早有反馈，这里补同一语义；横幅复用 preview-overlay.css 的 `.pv-open-error`
+   *  ——该样式自上线起没有 .tsx 引用，正是这半边修复漏接的。 */
+  const [openErr, setOpenErr] = useState<string | null>(null)
+
   const handleReveal = () => {
-    revealPath(path).catch(() => undefined)
+    setOpenErr(null)
+    revealPath(path).catch(e => setOpenErr(typeof e === 'string' ? e : String(e)))
   }
   const handleOpen = () => {
-    openPath(path).catch(() => undefined)
+    setOpenErr(null)
+    openPath(path).catch(e => setOpenErr(typeof e === 'string' ? e : String(e)))
   }
 
   return createPortal(
@@ -399,6 +407,16 @@ export function PreviewOverlay({ path, onClose }: { path: string; onClose: () =>
           <ExternalLink size={13} /> 系统打开
         </button>
       </div>
+
+      {openErr && (
+        <div className="pv-open-error" role="alert">
+          <TriangleAlert size={13} />
+          <span className="pv-open-error-msg">{openErr}</span>
+          <button type="button" className="pv-btn" onClick={() => setOpenErr(null)}>
+            知道了
+          </button>
+        </div>
+      )}
 
       <FilePreviewContent path={path} />
     </div>,

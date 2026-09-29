@@ -1394,6 +1394,15 @@ function ToolDetail({ ability, onBack }: { ability: AbilityDef; onBack: () => vo
   const [resultText, setResultText] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [previewPath, setPreviewPath] = useState<string | null>(null)
+  /** 结果区「打开目录 / 定位文件」的失败反馈：此前 `.catch(() => undefined)` 把
+   *  revealPath 的错误静默吞掉，用户看到的是「点了没反应」（issue #85）。 */
+  const [revealErr, setRevealErr] = useState<string | null>(null)
+
+  /** 每次尝试前先清掉上一条失败，修好路径再点不会叠出两条横幅。 */
+  const revealResult = (p: string) => {
+    setRevealErr(null)
+    revealPath(p).catch(e => setRevealErr(typeof e === 'string' ? e : String(e)))
+  }
 
   const pickInputs = async () => {
     const sel = await open({
@@ -1656,11 +1665,7 @@ function ToolDetail({ ability, onBack }: { ability: AbilityDef; onBack: () => vo
                 {result && resultPath && (
                   <div className="tools-result-actions">
                     {ability.outputIsDir ? (
-                      <Button
-                        variant="default"
-                        size="sm"
-                        onClick={() => void revealPath(resultPath!).catch(() => undefined)}
-                      >
+                      <Button variant="default" size="sm" onClick={() => revealResult(resultPath!)}>
                         <IconFolder size={13} /> {t('tools.openDir')}
                       </Button>
                     ) : (
@@ -1675,12 +1680,17 @@ function ToolDetail({ ability, onBack }: { ability: AbilityDef; onBack: () => vo
                         <Button
                           variant="default"
                           size="sm"
-                          onClick={() => void revealPath(resultPath!).catch(() => undefined)}
+                          onClick={() => revealResult(resultPath!)}
                         >
                           <IconFolder size={13} /> {t('tools.reveal')}
                         </Button>
                       </>
                     )}
+                  </div>
+                )}
+                {revealErr && (
+                  <div className="tools-result tools-result--error">
+                    <div className="tools-result-msg">{revealErr}</div>
                   </div>
                 )}
                 {previewPath && (
@@ -1934,11 +1944,7 @@ function ToolDetail({ ability, onBack }: { ability: AbilityDef; onBack: () => vo
             {result && resultPath && (
               <div className="tools-result-actions">
                 {ability.outputIsDir ? (
-                  <Button
-                    variant="default"
-                    size="sm"
-                    onClick={() => void revealPath(resultPath!).catch(() => undefined)}
-                  >
+                  <Button variant="default" size="sm" onClick={() => revealResult(resultPath!)}>
                     <IconFolder size={13} /> {t('tools.openDir')}
                   </Button>
                 ) : (
@@ -1946,15 +1952,16 @@ function ToolDetail({ ability, onBack }: { ability: AbilityDef; onBack: () => vo
                     <Button variant="default" size="sm" onClick={() => setPreviewPath(resultPath!)}>
                       <IconEye size={13} /> {t('tools.preview')}
                     </Button>
-                    <Button
-                      variant="default"
-                      size="sm"
-                      onClick={() => void revealPath(resultPath!).catch(() => undefined)}
-                    >
+                    <Button variant="default" size="sm" onClick={() => revealResult(resultPath!)}>
                       <IconFolder size={13} /> {t('tools.reveal')}
                     </Button>
                   </>
                 )}
+              </div>
+            )}
+            {revealErr && (
+              <div className="tools-result tools-result--error">
+                <div className="tools-result-msg">{revealErr}</div>
               </div>
             )}
           </div>

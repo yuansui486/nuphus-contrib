@@ -309,6 +309,11 @@ export interface SessionAPI {
     messagesRestoredRef: React.MutableRefObject<boolean>
     /** 用户已点击强制中断；置位后迟到的 tool_call 事件不再把 mood 打回执行中 */
     interruptedRef: React.MutableRefObject<boolean>
+    /** ChatPanel 贴底跟随的 followReset 回填位：useEvents 在 execution_started /
+     *  execution_completed 调用（新轮次恢复跟随 / 完成瞬间补拉）。ChatPanel 在本 hook
+     *  之下、useEvents 之上隔着一层，函数不能经 props 上行 —— 父层下发 ref、ChatPanel
+     *  回填最新闭包（见 ChatPanel 的 followResetRef prop） */
+    stickyFollowResetRef: React.MutableRefObject<(() => void) | null>
   }
 
   // ── Computed ──
@@ -413,6 +418,10 @@ export function useSession(): SessionAPI {
   const toolCallCountRef = useRef(0)
   /** 用户已点击强制中断（interrupt）：置位后迟到的 tool_call 事件不再把 mood 打回执行中 */
   const interruptedRef = useRef(false)
+  /** ChatPanel useStickyScroll 的 followReset 回填位：App 层 useEvents 与新轮次 /
+   *  完成事件之间隔着 React 树上下级，函数不能经 props 上行 —— 经此 ref 中转，
+   *  ChatPanel 每次渲染回填最新闭包（见其 followResetRef prop 与 useEvents 调用点） */
+  const stickyFollowResetRef = useRef<(() => void) | null>(null)
 
   // ── 执行态（唯一来源）──
   // 后端 `SignalState::execution_stage` 为权威（拉：get_execution_state；推：nuphus-event），
@@ -828,23 +837,27 @@ export function useSession(): SessionAPI {
   // ── Command palette items ──
   // 注：命令面板不再提供「新建会话」——入口已收敛到 Ctrl+N / TitleBar / 会话栏 + /
   // 输入栏 `/new` 斜杠命令（ChatPanel 自有 slash 清单，不经此处）
+  // 注：category 与设置中心左导航五组同一组键（cmd.category.*）——两侧措辞天然一致；
+  //     条目集合固定 17 项（面板没有的分区不在此新增）。CmdPalette 按 category
+  //     「先到先得」聚合成组，故数组序 = 组序 + 组内序，必须与设置中心五组一致，
+  //     否则同组条目会被拆到多节里（曾出现六组交错的乱序）。
   const cmdItems = useMemo(
     () => [
       {
-        id: 'memories',
-        label: t('cmd.memories'),
-        desc: t('cmd.memoriesDesc'),
-        category: t('cmd.category.browse'),
+        id: 'models',
+        label: t('cmd.models'),
+        desc: t('cmd.modelsDesc'),
+        category: t('cmd.category.shortcuts'),
         action: () => {
           setCmdPaletteOpen(false)
-          modals.setShowMemories(true)
+          modals.setShowModels(true)
         },
       },
       {
         id: 'canvas',
         label: t('cmd.canvas'),
         desc: t('cmd.canvasDesc'),
-        category: t('cmd.category.browse'),
+        category: t('cmd.category.shortcuts'),
         action: () => {
           setCmdPaletteOpen(false)
           // 命令面板的「画布」不带指定工作流：显式传空 → 由工作台自选，
@@ -853,20 +866,30 @@ export function useSession(): SessionAPI {
         },
       },
       {
-        id: 'workflows',
-        label: t('cmd.workflows'),
-        desc: t('cmd.workflowsDesc'),
-        category: t('cmd.category.browse'),
+        id: 'soul',
+        label: t('cmd.soul'),
+        desc: t('cmd.soulDesc'),
+        category: t('cmd.category.ai'),
         action: () => {
           setCmdPaletteOpen(false)
-          modals.setShowWorkflow(true)
+          modals.setShowSoul(true)
+        },
+      },
+      {
+        id: 'memories',
+        label: t('cmd.memories'),
+        desc: t('cmd.memoriesDesc'),
+        category: t('cmd.category.ai'),
+        action: () => {
+          setCmdPaletteOpen(false)
+          modals.setShowMemories(true)
         },
       },
       {
         id: 'skills',
         label: t('cmd.skills'),
         desc: t('cmd.skillsDesc'),
-        category: t('cmd.category.browse'),
+        category: t('cmd.category.ai'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowSkills(true)
@@ -876,59 +899,17 @@ export function useSession(): SessionAPI {
         id: 'knowledge',
         label: t('cmd.knowledge'),
         desc: t('cmd.knowledgeDesc'),
-        category: t('cmd.category.browse'),
+        category: t('cmd.category.ai'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowKnowledge(true)
         },
       },
       {
-        id: 'mcp',
-        label: t('cmd.mcp'),
-        desc: t('cmd.mcpDesc'),
-        category: t('cmd.category.browse'),
-        action: () => {
-          setCmdPaletteOpen(false)
-          modals.setShowMcp(true)
-        },
-      },
-      {
-        id: 'plugins',
-        label: t('cmd.plugins'),
-        desc: t('cmd.pluginsDesc'),
-        category: t('cmd.category.browse'),
-        action: () => {
-          setCmdPaletteOpen(false)
-          // 与开发者中心互斥（全窗口覆盖层不双层堆叠）
-          modals.setShowPluginDev(false)
-          modals.setShowPlugins(true)
-        },
-      },
-      {
-        id: 'models',
-        label: t('cmd.models'),
-        desc: t('cmd.modelsDesc'),
-        category: t('cmd.category.settings'),
-        action: () => {
-          setCmdPaletteOpen(false)
-          modals.setShowModels(true)
-        },
-      },
-      {
-        id: 'soul',
-        label: t('cmd.soul'),
-        desc: t('cmd.soulDesc'),
-        category: t('cmd.category.settings'),
-        action: () => {
-          setCmdPaletteOpen(false)
-          modals.setShowSoul(true)
-        },
-      },
-      {
         id: 'mobile',
         label: t('cmd.mobile'),
         desc: t('cmd.mobileDesc'),
-        category: t('cmd.category.settings'),
+        category: t('cmd.category.connect'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowMobile(true)
@@ -938,27 +919,37 @@ export function useSession(): SessionAPI {
         id: 'browser',
         label: t('cmd.browser'),
         desc: t('cmd.browserDesc'),
-        category: t('cmd.category.settings'),
+        category: t('cmd.category.connect'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowBrowser(true)
         },
       },
       {
-        id: 'themes',
-        label: t('cmd.themes'),
-        desc: t('cmd.themesDesc'),
-        category: t('cmd.category.settings'),
+        id: 'mcp',
+        label: t('cmd.mcp'),
+        desc: t('cmd.mcpDesc'),
+        category: t('cmd.category.connect'),
         action: () => {
           setCmdPaletteOpen(false)
-          modals.setShowThemes(true)
+          modals.setShowMcp(true)
+        },
+      },
+      {
+        id: 'workflows',
+        label: t('cmd.workflows'),
+        desc: t('cmd.workflowsDesc'),
+        category: t('cmd.category.workbench'),
+        action: () => {
+          setCmdPaletteOpen(false)
+          modals.setShowWorkflow(true)
         },
       },
       {
         id: 'external-agents',
         label: t('cmd.externalAgents'),
         desc: t('cmd.externalAgentsDesc'),
-        category: t('cmd.category.settings'),
+        category: t('cmd.category.workbench'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowExternalAgents(true)
@@ -968,17 +959,41 @@ export function useSession(): SessionAPI {
         id: 'security',
         label: t('cmd.security'),
         desc: t('cmd.securityDesc'),
-        category: t('cmd.category.management'),
+        category: t('cmd.category.workbench'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowSecurity(true)
         },
       },
       {
+        id: 'plugins',
+        label: t('cmd.plugins'),
+        desc: t('cmd.pluginsDesc'),
+        category: t('cmd.category.system'),
+        action: () => {
+          setCmdPaletteOpen(false)
+          // 与开发者中心互斥（全窗口覆盖层不双层堆叠）
+          modals.setShowPluginDev(false)
+          modals.setShowPlugins(true)
+        },
+      },
+      {
+        id: 'themes',
+        label: t('cmd.themes'),
+        desc: t('cmd.themesDesc'),
+        category: t('cmd.category.system'),
+        action: () => {
+          setCmdPaletteOpen(false)
+          /* 外观浮窗（非模态，常驻于 ChatPanel）：这个全局态只是"打开请求"，
+             ChatPanel 收到即展开；不再有 themes 模态 */
+          modals.setShowThemes(true)
+        },
+      },
+      {
         id: 'check-update',
         label: t('cmd.checkUpdate'),
         desc: t('cmd.checkUpdateDesc'),
-        category: t('cmd.category.management'),
+        category: t('cmd.category.system'),
         action: () => {
           setCmdPaletteOpen(false)
           modals.setShowUpdate(true)
@@ -988,7 +1003,7 @@ export function useSession(): SessionAPI {
         id: 'force-reset',
         label: t('cmd.forceReset'),
         desc: t('cmd.forceResetDesc'),
-        category: t('cmd.category.management'),
+        category: t('cmd.category.system'),
         action: agentControl.forceReset,
       },
       {
@@ -1189,6 +1204,7 @@ export function useSession(): SessionAPI {
       toolCallCountRef,
       messagesRestoredRef,
       interruptedRef,
+      stickyFollowResetRef,
     },
 
     // Computed

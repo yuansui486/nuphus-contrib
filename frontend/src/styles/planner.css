@@ -96,8 +96,15 @@
 }
 
 /* ── Body ── */
+/* min-height:0 是高度链的关键一环：pm-content 是 flex column + max-height:75vh
+   + overflow:hidden，而 flex 子项的 min-height 默认为 auto —— 不显式归零时内容会
+   把 body 撑破 max-height，超出部分被 content 裁掉，且 body 自身永不出现滚动条
+   （flex:1 无法收缩 → overflow-y:auto 无滚动空间可用）。
+   2026-09-28 修：任务详情弹窗的长 markdown 摘要「能看到开头、无法下拉、无滚动条」。
+   该缺陷同时影响 PlannerModal（两者共用本类）。 */
 .planner-body {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 16px 20px 20px;
   display: flex;

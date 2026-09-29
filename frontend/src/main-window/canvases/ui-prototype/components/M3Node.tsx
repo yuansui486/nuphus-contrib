@@ -85,7 +85,7 @@ const NO_BOX: Kind[] = [
 ]
 
 /** Padding follows M3: icon+label is tighter than label alone. */
-export function ButtonContent({ item }: { item: Item }) {
+function ButtonContent({ item }: { item: Item }) {
   const w = useWeight()
   const hasIcon = !!item.icon
   const hasLabel = item.label.trim().length > 0

@@ -50,7 +50,7 @@ function parsePipes(rest: string): string[] {
 }
 
 /** 扫描单个字符串中的 {{var}} 引用（外部环境变量 ENV:* 不会被正则捕获） */
-export function scanTemplateRefs(text: string, out: VarConsumption[]): void {
+function scanTemplateRefs(text: string, out: VarConsumption[]): void {
   for (const span of templateSpans(text)) {
     const root = referenceRoot(span.body)
     if (!root) continue

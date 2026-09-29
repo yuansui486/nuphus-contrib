@@ -7,6 +7,7 @@ import {
   dirDisplayName,
   normalizeGroupLimit,
   normalizePathKey,
+  normalizePinnedSessions,
   normalizeSessionSortPrefs,
   visibleGroupSessions,
   type GroupProjectLike,
@@ -322,5 +323,127 @@ describe('sessionGroups 排序偏好（组序维度 × 组内键）', () => {
     expect(normalizeSessionSortPrefs({ group_order: 'newest', sort_key: 42 })).toEqual(
       DEFAULT_SESSION_SORT_PREFS,
     )
+  })
+})
+
+/**
+ * 组内置顶（issue #83 第一期）：置顶会话恒在其**所属组**最上方，优先于组内排序键；
+ * 置顶内部按 pinned 数组序；置顶项不占折叠额度。参数缺省 = 无置顶（移动端契约）。
+ *
+ * 夹具刻意让两个排序键的未置顶次序相反（a-x updated 最新但 created 最晚），
+ * 否则「换了排序却看不出变化」，等于没测。
+ */
+describe('sessionGroups 组内置顶', () => {
+  const items = [
+    session('a-x', 'E:\\A', 900, 900),
+    session('a-y', 'E:\\A', 500, 100),
+    session('a-z', 'E:\\A', 100, 500),
+    session('b-1', 'E:\\B', 300, 300),
+    session('n-1', null, 700, 700),
+  ]
+  const projects = [project('E:\\A', '一号'), project('E:\\B', '二号')]
+  const idsIn = (groups: SessionGroup<GroupSessionLike>[], name: string) =>
+    groups.find(g => g.name === name)!.sessions.map(s => s.id)
+  const build = (sortKey: 'updated' | 'created', pinned: string[]) =>
+    buildSessionGroups(items, projects, [], { groupOrder: 'bookmark', sortKey }, pinned)
+
+  it('置顶优先于组内排序键：置顶会话恒在组最上方，其余仍按 sortKey', () => {
+    expect(idsIn(build('updated', ['a-z']), '一号')).toEqual(['a-z', 'a-x', 'a-y'])
+    expect(idsIn(build('created', ['a-z']), '一号')).toEqual(['a-z', 'a-y', 'a-x'])
+    // 未置顶会话在两个排序键下的次序不受置顶影响
+    expect(idsIn(build('updated', []), '一号')).toEqual(['a-x', 'a-y', 'a-z'])
+    expect(idsIn(build('created', []), '一号')).toEqual(['a-y', 'a-z', 'a-x'])
+  })
+
+  it('置顶只作用于所在组（含「未分组」），别组顺序不变', () => {
+    const groups = build('updated', ['a-z', 'b-1', 'n-1'])
+    expect(idsIn(groups, '一号')).toEqual(['a-z', 'a-x', 'a-y'])
+    expect(idsIn(groups, '二号')).toEqual(['b-1'])
+    // 无归属会话同样可置顶：「未分组」兜底组内置顶在最上方
+    expect(idsIn(groups, '')).toEqual(['n-1'])
+    const ungrouped = groups.find(g => g.key === UNGROUPED_GROUP_KEY)!
+    expect(ungrouped.pinnedCount).toBe(1)
+  })
+
+  it('置顶内部按 pinned 数组序（不是按时间；后置顶的排在后）', () => {
+    // a-z 比 a-x 旧，但 pinned 数组里 a-x 在前 → a-x 先展示
+    expect(idsIn(build('updated', ['a-x', 'a-z']), '一号')).toEqual(['a-x', 'a-z', 'a-y'])
+    // 数组序翻转 → 展示序跟随翻转（证明序来自 pinned 数组而非 updated_at）
+    expect(idsIn(build('updated', ['a-z', 'a-x']), '一号')).toEqual(['a-z', 'a-x', 'a-y'])
+  })
+
+  it('pinned 缺省 / 空数组 / 未知 id：与现状逐项一致（移动端不传参不变）', () => {
+    const implicit = buildSessionGroups(items, projects, [])
+    const explicitEmpty = build('updated', [])
+    expect(implicit.map(g => g.sessions.map(s => s.id))).toEqual(
+      explicitEmpty.map(g => g.sessions.map(s => s.id)),
+    )
+    expect(implicit.every(g => g.pinnedCount === 0)).toBe(true)
+    // pinned 里混入不存在（已删除/已归档）的 id 与空串：不产生空位、不影响排序
+    expect(idsIn(build('updated', ['ghost', '', 'a-z']), '一号')).toEqual(['a-z', 'a-x', 'a-y'])
+  })
+
+  it('normalizePinnedSessions：去空/去重/保序，非数组与脏元素不抛错', () => {
+    expect(normalizePinnedSessions(undefined)).toEqual([])
+    expect(normalizePinnedSessions(null)).toEqual([])
+    expect(normalizePinnedSessions('a,b')).toEqual([])
+    expect(normalizePinnedSessions([1, {}, null, undefined])).toEqual([])
+    expect(normalizePinnedSessions([' a ', '', 'a', 'b', '  ', 'b'])).toEqual(['a', 'b'])
+  })
+
+  it('pinnedCount = 组内真实存在的置顶数（未知 id 不计入）', () => {
+    const groups = build('updated', ['a-z', 'ghost'])
+    expect(groups.find(g => g.name === '一号')!.pinnedCount).toBe(1)
+    expect(groups.find(g => g.name === '二号')!.pinnedCount).toBe(0)
+  })
+})
+
+/** 置顶项**不占**折叠额度：恒可见，未置顶部分仍按 limit 折叠。 */
+describe('sessionGroups 置顶与折叠额度', () => {
+  // 12 条会话：3 条置顶 + 9 条未置顶（updated 倒序 p0 最新 … p11 最旧）
+  const items = Array.from({ length: 12 }, (_, i) => session(`p${i}`, 'E:\\P', 12_000 - i * 100))
+  const group = buildSessionGroups(items, [project('E:\\P', 'P')], [], DEFAULT_SESSION_SORT_PREFS, [
+    'p11',
+    'p10',
+    'p9',
+  ])[0]
+
+  it('置顶恒可见且不占折叠额度：未置顶部分仍按 limit 折叠', () => {
+    expect(group.pinnedCount).toBe(3)
+    const slice = visibleGroupSessions(group, 6, false)
+    // 置顶区（按 pinned 数组序）+ 未置顶前 6 条（updated 倒序 p0…p5）
+    expect(slice.sessions.map(s => s.id)).toEqual([
+      'p11',
+      'p10',
+      'p9',
+      'p0',
+      'p1',
+      'p2',
+      'p3',
+      'p4',
+      'p5',
+    ])
+    // 隐藏条数只数未置顶部分（p6/p7/p8）
+    expect(slice.hiddenCount).toBe(3)
+  })
+
+  it('展开后全显（置顶 + 未置顶）、hiddenCount 归零', () => {
+    const slice = visibleGroupSessions(group, 6, true)
+    expect(slice.sessions).toHaveLength(12)
+    expect(slice.sessions.map(s => s.id)).toEqual(group.sessions.map(s => s.id))
+    expect(slice.hiddenCount).toBe(0)
+  })
+
+  it('未置顶数未超上限时不折叠（与无置顶时的折叠行为一致）', () => {
+    const few = buildSessionGroups(
+      [session('x-1', 'E:\\P', 300), session('x-2', 'E:\\P', 200), session('x-3', 'E:\\P', 100)],
+      [project('E:\\P', 'P')],
+      [],
+      DEFAULT_SESSION_SORT_PREFS,
+      ['x-2'],
+    )[0]
+    const slice = visibleGroupSessions(few, 6, false)
+    expect(slice.sessions.map(s => s.id)).toEqual(['x-2', 'x-1', 'x-3'])
+    expect(slice.hiddenCount).toBe(0)
   })
 })

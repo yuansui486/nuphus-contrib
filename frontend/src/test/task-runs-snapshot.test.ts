@@ -14,6 +14,7 @@ function run(over: Partial<TaskRun> = {}): TaskRun {
   return {
     run_id: 'run-1',
     title: '任务A',
+    task: '## 任务\n任务A 的派发正文',
     goal_type: 'file_operation',
     origin: null,
     attempt: 1,

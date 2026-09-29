@@ -71,7 +71,7 @@ export async function probeLanDirect(lanUrl: string, token: string): Promise<Lan
 }
 
 /** 中继配置 localStorage 键（局域网配对时缓存，外网页面兜底取桌面局域网地址） */
-export const RELAY_STORAGE_KEY = 'nuphus_relay_cfg'
+const RELAY_STORAGE_KEY = 'nuphus_relay_cfg'
 
 /** 缓存有效期：桌面 IP 可能随 WiFi 重连变化（DHCP），超过 TTL 视为过期，读取时自动丢弃。 */
 const RELAY_CACHE_TTL_MS = 24 * 60 * 60 * 1000
@@ -114,14 +114,6 @@ export function saveRelayCache(patch: RelayCache): void {
 }
 
 /** 主动清除中继缓存：局域网探测连续失败（桌面 IP 已变）时调用，避免旧地址反复拖慢切换 */
-export function clearRelayCache(): void {
-  try {
-    localStorage.removeItem(RELAY_STORAGE_KEY)
-  } catch {
-    /* ignore */
-  }
-}
-
 /** 读缓存的桌面局域网直连地址（无则 null）。外网页面用它探测「是否已回到同一 WiFi」 */
 export function getCachedLanUrl(): string | null {
   return readCache()?.lan_url || null
@@ -133,7 +125,7 @@ export function getCachedRelayUrl(): string | null {
 }
 
 /** 读缓存的 device_id（无则 null）：wan 基址拼接 ?device= 用，显式标记本机归属 */
-export function getCachedDeviceId(): string | null {
+function getCachedDeviceId(): string | null {
   return readCache()?.device_id || null
 }
 
@@ -141,7 +133,7 @@ export function getCachedDeviceId(): string | null {
  *  配对期 localStorage 尚无缓存（首次扫码/重置后）——扫码入口本身携带标记，
  *  POST /pair 等请求必须沿用，否则公共中继多设备在线时配对请求被 Ambiguous
  *  拒成引导页，用户怎么重扫都失败（实测死循环）。 */
-export function deviceIdFromLocation(): string | null {
+function deviceIdFromLocation(): string | null {
   try {
     const q = new URLSearchParams(window.location.search)
     const v = (q.get('device') || q.get('device_id') || '').trim()
@@ -155,7 +147,7 @@ export function deviceIdFromLocation(): string | null {
  *  相对 manifest 解析成 /d/<device_id>/mobile.html，**query 无 device**）→ 从路径段取。
  *  2026-08-26 实测：PWA 打开无 query 归属 → 配对/API 请求无 X-Tunnel-Device 头 →
  *  中继 Ambiguous 或桌面路由错位 → 「网络错误请重试」。 */
-export function deviceIdFromPath(): string | null {
+function deviceIdFromPath(): string | null {
   try {
     const m = window.location.pathname.match(/^\/d\/([^/]+)\//)
     if (!m) return null
@@ -173,8 +165,3 @@ export function resolveTunnelDeviceId(): string | null {
 
 /** 故障转移基址 + 显式设备标记：https://r.example.com → https://r.example.com/?device=<id>。
  *  中继多租户下无标记请求无法确定归属；已有 query/fragment 的 URL 原样返回。 */
-export function withDeviceMarker(relayUrl: string, deviceId: string | null): string {
-  const base = relayUrl.trim().replace(/\/+$/, '')
-  if (!deviceId || base.includes('?') || base.includes('#')) return base
-  return `${base}/?device=${deviceId}`
-}

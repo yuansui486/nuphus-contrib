@@ -43,12 +43,34 @@ describe('parseChangelogSection 版本段落切分', () => {
     expect(flat).not.toContain('上一轮的旧改动')
   })
 
-  it('去掉 Markdown 粗体标记（纯文本展示不留 ** 噪声）', () => {
+  it('保留 Markdown 粗体标记，交由页面渲染', () => {
     const section = parseChangelogSection(CHANGELOG, '0.2.16')
     const flat = section?.groups.flatMap(g => g.items).join('\n') ?? ''
 
-    expect(flat).not.toContain('**')
-    expect(flat).toContain('模型刷新与官方清单同步：点「刷新」后对齐官方 /v1/models。')
+    expect(flat).toContain('**模型刷新与官方清单同步**：点「刷新」后对齐官方 /v1/models。')
+  })
+
+  it.each(['\n', '\r\n'])('小节和续行保留行内标记，兼容 %j 换行', newline => {
+    const raw = [
+      '## [1.0.0]',
+      '### **修复** `task_id`',
+      '- **派发状态**：`agent_dispatch` 不再停在',
+      '  `dispatched`；保留代码 `**literal**` 与 *说明*、~~旧行为~~。',
+      '  参见 [文档](https://example.com/docs)。',
+      '## [0.9.0]',
+      '- 旧内容',
+    ].join(newline)
+
+    const section = parseChangelogSection(raw, '1.0.0')!
+    expect(section.groups).toEqual([
+      {
+        title: '**修复** `task_id`',
+        items: [
+          '**派发状态**：`agent_dispatch` 不再停在 `dispatched`；保留代码 `**literal**` 与 *说明*、~~旧行为~~。 参见 [文档](https://example.com/docs)。',
+        ],
+      },
+    ])
+    expect(countSectionItems(section)).toBe(1)
   })
 
   it('版本不存在 → null（调用方据此展示空态，而不是抛错）', () => {

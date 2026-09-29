@@ -409,7 +409,7 @@ export class IrEditHistory {
 
 const BASE36 = '0123456789abcdefghijklmnopqrstuvwxyz'
 
-export function genStepId(kind: string, existing: Set<string>): string {
+function genStepId(kind: string, existing: Set<string>): string {
   for (let i = 0; i < 64; i++) {
     let suffix = ''
     for (let j = 0; j < 6; j++) suffix += BASE36[Math.floor(Math.random() * 36)]

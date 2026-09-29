@@ -112,7 +112,7 @@
 /* ── 落点锚点几何（island 的挂载点）──────────────────────────────
    使用方：聊天区 .chat-header、设置中心 .settings-center-bar、模型页 .models-page-bar
    —— 三者都是「标题栏」：父容器设 position: relative，锚点铺满其 padding box，
-   flex 居中且**不参与**父容器的 space-between / flex 排布（否则会被左右两组的宽度推偏）。
+   纵向贴顶、水平居中且**不参与**父容器的 space-between / flex 排布（否则会被左右两组的宽度推偏）。
 
    安全区 40px（左右对称）的依据：三处标题栏的横向中心都等于容器中心，胶囊自身
    max-width ≤ min(62vw, 420px)；窗口最小宽 900（tauri.conf.json minWidth），
@@ -125,7 +125,7 @@
   position: absolute;
   inset: 0;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   padding: 0 40px;
   pointer-events: none;

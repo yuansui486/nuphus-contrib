@@ -3,11 +3,15 @@
  *
  * # 为什么必须由 App 层调用
  *
- * 早先恢复逻辑写在 `ThemesPage` 的挂载 effect 里 —— 那是错的：ThemesPage 被
+ * 早先恢复逻辑写在主题 UI（`ThemesPage`）的挂载 effect 里 —— 那是错的：它被
  * `<CompactModal open={s.showThemes}>` 包裹，而 CompactModal 在 `open=false` 时
- * `return null`（CompactModal.tsx），**关闭状态下 ThemesPage 根本不在树上**。
- * 于是用户在聊天界面刷新 / Vite HMR 时，ThemesPage 不挂载 → 没人恢复背景 →
- * 背景必丢。（打开一次主题弹窗它反倒"出现"，正是这个层级错位的症状。）
+ * `return null`（CompactModal.tsx），**关闭状态下它根本不在树上**。
+ * 于是用户在聊天界面刷新 / Vite HMR 时没人恢复背景 → 背景必丢。
+ * （打开一次主题弹窗它反倒"出现"，正是这个层级错位的症状。）
+ *
+ * 现在的主题 UI 是常驻保活的外观浮窗（`AppearancePanel`，开合不卸载），
+ * 但「恢复放在 App 层」这条边界不变：浮窗有"是否打开过"的前置条件，
+ * 而背景必须在任何人打开它之前就已经在。
  *
  * 因此：恢复必须放在始终挂载的 App 层；本模块只提供幂等的 apply 函数，
  * 保存 / 清除 / 恢复三条路径共用同一实现，避免各写一半。

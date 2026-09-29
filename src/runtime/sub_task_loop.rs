@@ -277,14 +277,27 @@ impl super::SubTaskRunner {
                 // When only XML tags were present (e.g. <invoke>/<parameter> that got
                 // stripped), fall back to a sensible summary so the caller never receives
                 // an empty string.
-                let result_msg = if result_msg.is_empty() && self.tool_call_total_count > 0 {
-                    format!("任务完成，共执行 {} 次工具调用", self.tool_call_total_count)
+                // 空回复兜底：无论有无工具调用都不能让空串往上冒（否则台账 summary 落空、
+                // 前端只剩「无摘要」）。两种文案区分「干过活但没写总结」与「什么都没产出」，
+                // 让 Leader 与用户能指认现象，而不是对着一片空白猜。
+                let result_msg = if result_msg.is_empty() {
+                    if self.tool_call_total_count > 0 {
+                        format!(
+                            "任务完成，共执行 {} 次工具调用（执行过程未产出文字交付）",
+                            self.tool_call_total_count
+                        )
+                    } else {
+                        "执行器未产出任何文本回复（模型空响应 / 仅输出思考 / 输出被长度限制截断），无交付内容。".to_string()
+                    }
                 } else {
                     result_msg
                 };
                 let total_duration = self.execution_started_at.elapsed().as_millis() as u64;
-                // learn_from_success (含 StateChecker) 必须在 ExecutionCompleted 之前完成，
-                // 否则前端提前释放 isProcessing 后用户发消息会被 busy 标志拦截
+                // 记忆落盘为 fire-and-forget（learn_from_success 内部对 insert_entry
+                // 做 tokio::spawn），不再阻塞 ExecutionCompleted。历史上「必须在
+                // ExecutionCompleted 之前完成」的约束源于函数体内的 StateChecker，
+                // 该依赖当前实现中已不存在；busy 语义改由 ExecutionStage 承载
+                // （TaskBusyGuard 收敛 Finalizing→Idle），与此处无先后耦合。
                 if let Err(e) = self.learn_from_success(total_duration, &result_msg).await {
                     tracing::warn!("Failed to learn from success: {}", e);
                 }
@@ -941,6 +954,10 @@ impl super::SubTaskRunner {
     }
 
     /// Learn from successful execution
+    ///
+    /// steps 构建与 entry 构造为同步段；落盘（`insert_entry`，内部含 embedding
+    /// 前向 + DB 事务）经 `tokio::spawn` fire-and-forget，不阻塞调用方进入
+    /// ExecutionCompleted。entry id 为 REPLACE 幂等，后台迟到不与下一轮冲突。
     async fn learn_from_success(
         &mut self,
         _total_duration_ms: u64,
@@ -1006,15 +1023,29 @@ impl super::SubTaskRunner {
             entry.summary = format!("Executed {} tools: {}", step_number, tools_desc);
         }
 
-        if let Err(e) = crate::store::memory::insert_entry(&entry) {
-            tracing::warn!("Failed to save exec success entry: {}", e);
-        }
-
-        tracing::info!(
-            "learn_from_success: recorded {} tool steps from session {}",
-            entry.tools_used.len(),
-            entry.session_id
-        );
+        // Fire-and-forget 落盘：insert_entry 内部含 bge-small-zh embedding 前向
+        // （debug 构建单线程 CPU 下秒级）+ DB 事务，不能再压在 Finalizing 关键
+        // 路径上阻塞 busy 解锁。entry id 为 REPLACE 幂等，后台迟到不与下一轮
+        // 写入冲突；db pool 为自建 Mutex 池，并发写靠池排队串行化。
+        // 日志带 step 数与 entry id，供事后复测观测。
+        let step_count = step_number;
+        let entry_id = entry.id.clone();
+        tokio::spawn(async move {
+            match crate::store::memory::insert_entry(&entry) {
+                Ok(()) => tracing::info!(
+                    "learn_from_success: recorded {} tool steps from session {} (entry {})",
+                    entry.tools_used.len(),
+                    entry.session_id,
+                    entry_id
+                ),
+                Err(e) => tracing::warn!(
+                    "Failed to save exec success entry {} ({} steps): {}",
+                    entry_id,
+                    step_count,
+                    e
+                ),
+            }
+        });
 
         Ok(())
     }

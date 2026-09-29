@@ -6,6 +6,7 @@ import { wfStop, wfPause, wfResume, wfRun, getToolPermissions, openExternal } fr
 import { handleExternalAnchorClick } from './lib/externalLink'
 import { scheduleIdle } from './lib/idle'
 import { applySkinBg, readSkinBg } from '../ui/skinBg'
+import { skinRestoreSource, useTheme } from '../hooks/useTheme'
 import { SkinBackdrop } from '../ui/SkinBackdrop'
 import { TenetsDialog } from './dialogs/TenetsDialog'
 import { AnnotationsDialog } from './dialogs/AnnotationsDialog'
@@ -73,7 +74,6 @@ const KnowledgePage = lazy(() =>
 const SkillsPage = lazy(() => import('./pages/SkillsPage').then(m => ({ default: m.SkillsPage })))
 const ModelsPage = lazy(() => import('./pages/ModelsPage').then(m => ({ default: m.ModelsPage })))
 type ModelsInitialView = 'provider' | 'jev'
-const ThemesPage = lazy(() => import('./pages/ThemesPage').then(m => ({ default: m.ThemesPage })))
 const SecurityPage = lazy(() =>
   import('./pages/SecurityPage').then(m => ({ default: m.SecurityPage })),
 )
@@ -186,6 +186,11 @@ export default function App() {
   }, [])
 
   const { dismissRefine } = useEvents(s)
+  /**
+   * 当前激活的自定义主题（null = 系统预设态）。启动恢复皮肤背景时要用它的 skin
+   * 快照 —— 只读 LS_SKIN 是不够的，见下方 effect 注释。
+   */
+  const { customTheme } = useTheme()
 
   // ── Keyboard shortcuts (Ctrl+K opens cmd palette from s.cmdItems) ──
   const [runWorkflow, setRunWorkflow] = useState<WorkflowItem | null>(null)
@@ -194,19 +199,30 @@ export default function App() {
   /**
    * 皮肤背景恢复（必须在 App 层做）。
    *
-   * ThemesPage 被 `<CompactModal open={s.showThemes}>` 包着，而 CompactModal 在
-   * open=false 时 `return null` —— 关闭状态下 ThemesPage 根本不在组件树上。
-   * 把恢复写在它的挂载 effect 里，等价于「只有打开过主题弹窗的人才配有背景」：
-   * 在聊天界面刷新 / Vite HMR 时没人恢复，背景必丢（偶尔又出现，正是因为打开过弹窗）。
+   * 恢复职责不能落在主题 UI 上：早先它写在 ThemesPage 的挂载 effect 里，而
+   * ThemesPage 被 `<CompactModal open={s.showThemes}>` 包着，CompactModal 在
+   * open=false 时 `return null` —— 关闭状态下它根本不在组件树上，刷新 / HMR 时
+   * 没人恢复背景。（现在的外观浮窗 AppearancePanel 已常驻保活，但「App 层负责
+   * 恢复」这条边界不变：它只有一个挂载时点，浮窗有"是否打开过"这个前置条件。）
    *
    * App 常驻，是唯一可靠的恢复位置：这里解析出可渲染 URL 并广播，
    * 由 `<SkinBackdrop>`（:397，根层的唯一背景绘制点）消费。
    * 详见 `ui/skinBg.ts` 的模块说明。
+   *
+   * **恢复源按激活态二选一（2026-09-28 修）**：
+   * - 激活自定义主题 → 该主题的 `skin` 快照（`useTheme.activateCustom` 写入的那张）
+   * - 系统预设态 → LS_SKIN
+   * 此前这里只读 LS_SKIN：激活自定义主题的用户刷新后，背景被 LS_SKIN 覆盖
+   * （LS_SKIN 为空 → 背景整个消失），而 `activateCustom` 写的快照**没有任何启动
+   * 路径会重放**——这正是「自定义主题刷新后背景图不显示」的根因。
+   * useTheme 的 layout effect 只恢复 overrides、不碰皮肤，两边分工不变。
    */
   useEffect(() => {
     // 异步：解析本机路径可能要经 Rust 读文件；忽略 Promise（失败已在内部报告并保留现状）
-    void applySkinBg(readSkinBg())
-    // 仅挂载时恢复一次；此后由 ThemesPage 的保存/清除路径即时写入
+    void applySkinBg(skinRestoreSource(customTheme, readSkinBg()))
+    // 仅挂载时恢复一次；此后由 AppearancePanel 的保存/清除路径即时写入。
+    // customTheme 在挂载时已是终值（ThemeProvider 的 state 同步初始化 + 其
+    // layout effect 先于本 passive effect 执行），故无需列入依赖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   // ── 输入栏 workflow 扳手菜单「工作流画布」直达（2026-09-03 大王定稿）：
@@ -483,6 +499,10 @@ export default function App() {
               contextLimit={s.contextLimit}
               apiHealth={s.apiHealth}
               onModelChanged={s.refreshModelInfo}
+              /* 贴底跟随 followReset 的下行 ref：useEvents 在本组件之上，execution_started /
+                 execution_completed 要拉回底部就得经它回填 ChatPanel 内 useStickyScroll 的
+                 followReset（见 useSession.refs.stickyFollowResetRef） */
+              followResetRef={s.refs.stickyFollowResetRef}
               mode={s.mode}
               onSetMode={s.handleSetMode}
               onManageCustomAgents={() => s.setShowCustomAgents(true)}
@@ -507,6 +527,10 @@ export default function App() {
               onOpenWorkflowCanvas={() => void handleWorkflowCanvasDirect()}
               onOpenWorkflowList={handleOpenWorkflowList}
               onOpenSettings={() => setShowSettingsCenter(true)}
+              /* 外观浮窗的全局打开请求（Ctrl+K → 外观）：开关 state 在
+                 ChatPanel 内，这里只喂请求 + 在收起时收回 */
+              appearanceOpen={s.showThemes}
+              onAppearanceDismiss={() => s.setShowThemes(false)}
               onRate={s.handleRate}
               onShowExecTrace={trace => {
                 s.setExecTraceOverride(trace)
@@ -539,6 +563,8 @@ export default function App() {
                     s.setShowModels(true)
                     break
                   case 'themes':
+                    /* 外观浮窗（非模态、常驻于 ChatPanel）—— 这里只置位全局打开
+                       请求，由 ChatPanel 同步展开；不再开任何模态 */
                     s.setShowThemes(true)
                     break
                   case 'security':
@@ -860,17 +886,8 @@ export default function App() {
               </div>
             </Suspense>
           )}
-          <CompactModal
-            open={s.showThemes}
-            onClose={() => s.setShowThemes(false)}
-            title={t('app.themes')}
-            icon={<IconPalette size={14} />}
-            size="auto"
-          >
-            <Suspense fallback={null}>
-              <ThemesPage onClose={() => s.setShowThemes(false)} showToast={s.showToast} />
-            </Suspense>
-          </CompactModal>
+          {/* 外观浮窗不再有模态入口：它由 ChatPanel 常驻（非模态），
+              Ctrl+K / slash 两条入口都经 useModals.showThemes 打开它 */}
           <CompactModal
             open={s.showUpdate}
             onClose={() => s.setShowUpdate(false)}
@@ -1043,7 +1060,6 @@ export default function App() {
             <Suspense fallback={null}>
               <SettingsCenter
                 onClose={() => setShowSettingsCenter(false)}
-                showToast={s.showToast}
                 onRunWorkflow={wf => {
                   // 运行确认弹窗（wcf-wrapper z-index 100）低于设置中心宿主（2500）→
                   // 先退出设置中心再弹，与「Ctrl+K → 工作流 → 运行」原链路表现一致

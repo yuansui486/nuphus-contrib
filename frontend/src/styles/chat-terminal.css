@@ -190,8 +190,9 @@
   cursor: pointer;
   transition: background var(--dur-fast) ease;
 }
+/* hover 去掉底色：与 .term-call-agent:hover（transparent）保持面板内一致 */
 .term-call:hover {
-  background: var(--surface-hover);
+  background: transparent;
 }
 .term-call + .term-call {
   margin-top: 0;

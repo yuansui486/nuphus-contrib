@@ -51,7 +51,7 @@ function relTime(ts: number): string {
  *  ③ CSS 按 `transform-origin: 8px 8px; transform-box: view-box` 在**运行时改写**
  *     子元素（.api-health-arc / -arc-inner / -break，见 api-health.css:75），
  *     lucide 的 iconNode 无法承载可被外部 CSS 选中的稳定类名。 */
-export function ApiSignalIcon({ status, size = 13 }: { status: ApiHealthStatus; size?: number }) {
+function ApiSignalIcon({ status, size = 13 }: { status: ApiHealthStatus; size?: number }) {
   return (
     <svg
       className={`api-health-icon api-health-${status}`}
@@ -157,7 +157,7 @@ export function apiHealthRailLabel(state: ApiHealthState): string | null {
  * - 其余直接沿用 status 中的可见态（offline / connecting / degraded）；
  * - 正常态（stable / unknown 且无 retry）由调用方判空不渲染，这里回落到 stable（弹窗内可复用）。
  */
-export function apiHealthSignalStatus(state: ApiHealthState): ApiHealthStatus {
+function apiHealthSignalStatus(state: ApiHealthState): ApiHealthStatus {
   if (state.status === 'offline') return 'offline'
   if (state.status === 'connecting') return 'connecting'
   if (state.retry) return 'connecting'

@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { readBaseTheme, ThemeProvider, useTheme, type ThemeId } from './useTheme'
+import { readBaseTheme, skinRestoreSource, ThemeProvider, useTheme, type ThemeId } from './useTheme'
 
 vi.mock('../main-window/lib/plugin-apps', () => ({ themeSnapshotSave: vi.fn(async () => {}) }))
 
@@ -47,6 +47,32 @@ it('keeps the original edition default unchanged', () => {
   )
   expect(screen.getByText('dark')).toBeInTheDocument()
 })
+
+it.each([undefined, 'C:/theme/skin.png'])(
+  'preserves an active custom theme and its skin with the light edition default (%s)',
+  skin => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([{ id: 'saved', name: 'Saved', base: 'tech', overrides: {}, skin }]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'saved')
+    function RestoredTheme() {
+      const { theme, customTheme } = useTheme()
+      return (
+        <output data-testid="restored" data-skin={skinRestoreSource(customTheme, 'preset.png')}>
+          {theme}
+        </output>
+      )
+    }
+    render(
+      <ThemeProvider defaultTheme="light">
+        <RestoredTheme />
+      </ThemeProvider>,
+    )
+    expect(screen.getByTestId('restored')).toHaveTextContent('tech')
+    expect(screen.getByTestId('restored')).toHaveAttribute('data-skin', skin ?? '')
+  },
+)
 
 it('uses the edition fallback for invalid or unavailable storage', () => {
   localStorage.setItem('nuphus_theme', 'invalid')

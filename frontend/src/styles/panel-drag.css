@@ -1,0 +1,26 @@
+/* panel-drag.css — 应用内面板拖拽把手的**唯一样式实现点** */
+/* 声明逐字平移自 DesktopToolbar 浮窗条的旧把手规则（battle-tested，原处副本已删除）；
+   DesktopToolbar / TaskBubble / WorkflowRunModal 三处把手共用本类，
+   视觉三态（默认 / hover / active）完全一致，不允许出现第二份拷贝。 */
+
+.panel-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 28px;
+  cursor: grab;
+  color: var(--spark-dim, var(--fg-5));
+  flex-shrink: 0;
+  border-radius: 6px;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+.panel-grip:hover {
+  background: var(--glass-1, rgba(255, 255, 255, 0.05));
+  color: var(--spark-tertiary, var(--fg-3));
+}
+.panel-grip:active {
+  cursor: grabbing;
+}

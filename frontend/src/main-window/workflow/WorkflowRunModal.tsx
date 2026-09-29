@@ -82,6 +82,7 @@ export function WorkflowRunModal({
       title={`工作流 · ${workflow.steps.length} 步`}
       icon={<IconWorkflow size={14} />}
       size="auto"
+      dragKey="workflow_run_pos"
       footer={
         <>
           <div className="wcf-footer-left">

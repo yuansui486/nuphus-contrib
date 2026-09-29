@@ -19,6 +19,7 @@ import MarkdownContent from '../chat/MarkdownContent'
 import type { TimelineEntry } from '../../core/types'
 import { desktopActionResult } from '../lib/desktopActionResult'
 import { DesktopActionStatus } from './DesktopActionStatus'
+import { useStickyScroll } from '../../hooks/useStickyScroll'
 
 interface ExecutionTraceProps {
   timeline: TimelineEntry[]
@@ -612,14 +613,6 @@ export function ExecutionTraceFloating({
   const [collapsedThinking, setCollapsedThinking] = useState<Set<string>>(new Set())
   // Card/UI mode: thinking default collapsed (expanded = user manually expanded)
   const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set())
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const scrollRafRef = useRef(0)
-  const userScrolledRef = useRef(false)
-  const scrollDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Track each tool_call entry's output length, detect streaming append
-  const outputSizesRef = useRef<Map<string, number>>(new Map())
-  // Track each thinking entry's text length, detect streaming reasoning
-  const thinkingSizesRef = useRef<Map<string, number>>(new Map())
   // Track render count per output line, for new-line animation (terminal mode)
   const lineRenderCountRef = useRef<Map<string, number>>(new Map())
 
@@ -637,117 +630,32 @@ export function ExecutionTraceFloating({
     }
   }, [hasRunning, isOpen, isProcessing, visible])
 
-  // Scroll anti-hijack: auto-resume follow when user scrolls to bottom, lock for 3s when scrolling up
-  const resetAutoScroll = useCallback(() => {
-    userScrolledRef.current = false
-  }, [])
+  // 贴底跟随：执行步骤（displayTimeline）变化即滚底；用户上翻冻结 + 15s 静默宽限兜底
+  // —— 本面板没有回底按钮，宽限必须保持 15s 封顶值（不得加大）；空闲（!isProcessing）
+  // 翻看历史不排恢复计时。取代旧的自有滚动 state（userScrolledRef + 3s debounce
+  // 强制滚底）——那套「停手 3s 即闪回底部」无论用户在读什么都会被打断（语义与
+  // 程序滚动屏蔽窗见 useStickyScroll 头注）。
+  const { scrollRef, onScroll, followReset, enterPanel } = useStickyScroll(displayTimeline, {
+    resumeMs: 15_000,
+    executing: isProcessing,
+  })
 
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return
-    // Check if scrolled to bottom → auto-resume follow, no manual trigger needed
-    const isAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 2
-    if (isAtBottom && userScrolledRef.current) {
-      userScrolledRef.current = false
-      if (scrollDebounceRef.current) {
-        clearTimeout(scrollDebounceRef.current)
-        scrollDebounceRef.current = null
-      }
-    }
-  }, [])
-
-  // Only lock auto-scroll on active wheel/trackpad scrolling, not on hover/layout shifts
-  const handleWheel = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return
-    const isAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 2
-    if (!isAtBottom) {
-      if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-      userScrolledRef.current = true
-      scrollDebounceRef.current = setTimeout(resetAutoScroll, 3000)
-    }
-  }, [resetAutoScroll])
-
-  // Auto-scroll to bottom when new items added or existing content grows (streaming output/thinking)
-  const prevTimelineLen = useRef(0)
+  // 进场防误判：面板打开瞬间 enterPanel —— 先立即滚底展示最新执行态，再开 3s 宽限，
+  // 进场瞬间的鼠标滚动 / 触控板惯性 / 渲染抖动不参与判定（详见 useStickyScroll 头注）。
+  // open 来源：受控 visible（App.tsx 的 showExecTrace）优先，未传时回落内部 isOpen。
   useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
+    if (isVisible) enterPanel()
+  }, [isVisible, enterPanel])
 
-    const len = displayTimeline.length
-    let hasNewContent = len > prevTimelineLen.current
-
-    // Check if existing tool_call's output grew (streaming append)
-    if (!hasNewContent) {
-      for (const tc of displayTimeline) {
-        if (tc.kind === 'tool_call') {
-          const prevSize = outputSizesRef.current.get(tc.id) ?? 0
-          const currSize = tc.output?.length ?? 0
-          if (currSize > prevSize) {
-            hasNewContent = true
-            break
-          }
-        }
-      }
-    }
-
-    // Check if existing thinking entry's text grew (streaming reasoning)
-    if (!hasNewContent) {
-      for (const tc of displayTimeline) {
-        if (tc.kind === 'thinking') {
-          const prevSize = thinkingSizesRef.current.get(tc.id) ?? 0
-          const currSize = tc.text?.length ?? 0
-          if (currSize > prevSize) {
-            hasNewContent = true
-            break
-          }
-        }
-      }
-    }
-
-    // 更新追踪记录
-    for (const tc of displayTimeline) {
-      if (tc.kind === 'tool_call') {
-        outputSizesRef.current.set(tc.id, tc.output?.length ?? 0)
-      }
-      if (tc.kind === 'thinking') {
-        thinkingSizesRef.current.set(tc.id, tc.text?.length ?? 0)
-      }
-    }
-    prevTimelineLen.current = len
-
-    // 流式尾随：用 rAF 合并滚动，而不是 setTimeout 防抖。
-    // 快速流式时 delta 间隔常 <100ms，防抖定时器会被不断清除、永不触发 →
-    // 新内容一直留在视野之外，用户误以为「没有流式」。rAF 每帧至多滚一次，不会被饿死。
-    if (hasNewContent && !userScrolledRef.current && scrollRafRef.current === 0) {
-      scrollRafRef.current = requestAnimationFrame(() => {
-        scrollRafRef.current = 0
-        const node = scrollRef.current
-        if (!node || userScrolledRef.current) return
-        // instant：每帧滚动本身即连续；且不会被 smooth 动画在持续重定向下拖着滞后，
-        // 保证最新行永不滞留在视野之外（这正是「看不到流式」的症结）。
-        node.scrollTo({ top: node.scrollHeight, behavior: 'instant' as ScrollBehavior })
-      })
-    }
-  }, [displayTimeline])
-
-  // Cleanup
+  // Auto-scroll to bottom when switching terminal/card mode. 必须走 followReset 出口
+  // （而非裸 scrollTo）：裸滚不恢复跟随态也不装甲程序滚动屏蔽窗，其 smooth 动画触发
+  // 的 scroll 事件会建立在错误的前提上被判定。
   useEffect(() => {
-    return () => {
-      if (scrollDebounceRef.current) clearTimeout(scrollDebounceRef.current)
-      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
-    }
-  }, [])
-
-  // Auto-scroll to bottom when switching terminal/card mode
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
     const timer = setTimeout(() => {
-      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' as ScrollBehavior })
+      followReset()
     }, 50)
     return () => clearTimeout(timer)
-  }, [terminalMode])
+  }, [terminalMode, followReset])
 
   // Reset rating state
   useEffect(() => {
@@ -899,12 +807,7 @@ export function ExecutionTraceFloating({
 
         {/* ── Timeline Body ── */}
         {terminalMode ? (
-          <div
-            className="execution-terminal-body"
-            ref={scrollRef}
-            onScroll={handleScroll}
-            onWheel={handleWheel}
-          >
+          <div className="execution-terminal-body" ref={scrollRef} onScroll={onScroll}>
             {displayTimeline.length === 0 && isProcessing && (
               <div className="execution-trace-placeholder">等待执行...</div>
             )}
@@ -1235,12 +1138,7 @@ export function ExecutionTraceFloating({
             </div>
           </div>
         ) : (
-          <div
-            className="execution-trace-body"
-            ref={scrollRef}
-            onScroll={handleScroll}
-            onWheel={handleWheel}
-          >
+          <div className="execution-trace-body" ref={scrollRef} onScroll={onScroll}>
             {displayTimeline.length === 0 && isProcessing && (
               <div className="execution-trace-placeholder">等待执行...</div>
             )}

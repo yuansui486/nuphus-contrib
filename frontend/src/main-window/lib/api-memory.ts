@@ -13,16 +13,8 @@ export function listMemories(filter: MemoryFilter) {
   return invoke<MemoryListResult>('list_memories', { filter })
 }
 
-export function updateMemory(id: string, updates: MemoryUpdates) {
-  return invoke<UserMemory>('update_memory', { id, updates })
-}
-
 export function deleteMemory(id: string) {
   return invoke<void>('delete_memory', { id })
-}
-
-export function toggleMark(id: string) {
-  return invoke<UserMemory>('toggle_mark_memory', { id })
 }
 
 // ── Annotation API ──

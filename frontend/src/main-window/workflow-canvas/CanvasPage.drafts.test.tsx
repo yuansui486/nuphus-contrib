@@ -201,7 +201,7 @@ describe('Canvas save coordination', () => {
       </CanvasBackendContext.Provider>,
     )
     await screen.findByRole('button', { name: '打开 first' })
-    fireEvent.click(screen.getByText('更多'))
+    expect(screen.getAllByRole('button', { name: '意图表单' })).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: '意图表单' }))
     expect(screen.getByTestId('intent-form')).toHaveAttribute(
       'data-draft-scope',
@@ -213,6 +213,31 @@ describe('Canvas save coordination', () => {
     expect(receiveIntent.mock.calls[0][0]).not.toContain('plugin/workflows/')
     expect(mocks.run).not.toHaveBeenCalled()
     expect(close).not.toHaveBeenCalled()
+  })
+
+  it('keeps the promoted intent button disabled for external-only canvases', async () => {
+    const receiveIntent = vi.fn()
+    await renderCanvas(
+      <CanvasBackendContext.Provider value={{ ...legacyCanvasBackend, generation: false }}>
+        <CanvasPage workflowId="wf" onClose={() => {}} onGenerateIntent={receiveIntent} />
+      </CanvasBackendContext.Provider>,
+    )
+    const buttons = screen.getAllByRole('button', { name: '意图表单' })
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]).toBeDisabled()
+    fireEvent.click(buttons[0])
+    expect(screen.queryByTestId('intent-form')).not.toBeInTheDocument()
+    expect(receiveIntent).not.toHaveBeenCalled()
+    expect(mocks.run).not.toHaveBeenCalled()
+  })
+
+  it('opens the original edition intent form directly from the toolbar', async () => {
+    await renderCanvas()
+    const buttons = screen.getAllByRole('button', { name: '意图表单' })
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]).toBeEnabled()
+    fireEvent.click(buttons[0])
+    expect(screen.getByTestId('intent-form')).toBeInTheDocument()
   })
 
   it('revalidates references when an input declaration changes without editing nodes', async () => {

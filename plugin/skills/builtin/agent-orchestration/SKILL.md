@@ -311,7 +311,7 @@ Nuphus 重启（有在途任务）→ 令牌已轮换（旧令牌 403，契约�
 | `error` | 出错 | 介入：查终端报错 |
 | `idle` / `ready` | 空闲/就绪 | 无在途任务 |
 
-注意：状态栏**只读不写**，state 由外部 Agent 门铃 POST 驱动（`progress`/`done`/`blocked`）；Leader 不要试图直接改 status.json。状态栏与门铃同源（status.json），门铃已响则状态栏必同步，二者互证。例外：`agent_dispatch` 派发失败（上板前未登记 / 上板或投递失败）会由后端写 `error` 并把人类可读原因落在 `error_reason`——此时按原因判断是进程没起来、窗口没捕获还是输入没进去，照 §5 接管 SOP 处置，不要当成 agent 自己出的错。工具返回里的 `submitted=true` 只表示 brief 已上板、不代表指令已送达外部 Agent——是否补投以终端实况为准（§5 第 6 条），勿据该字段直接重投。
+注意：状态栏**只读不写**，state 由外部 Agent 门铃 POST 驱动（`progress`/`done`/`blocked`）；Leader 不要试图直接改 status.json。状态栏与门铃同源（status.json），门铃已响则状态栏必同步，二者互证。列表栏的「从列表栏移除」是**后端共享显示态**（应用生命周期内保持、重启即净；被再次调用或配置中心保存时撤销）——Leader 不要据此判断 agent 已注销，注销以配置中心删除为准（删除联动清 status.json，列表立即消失且重启不复活）。例外：`agent_dispatch` 派发失败（上板前未登记 / 上板或投递失败）会由后端写 `error` 并把人类可读原因落在 `error_reason`——此时按原因判断是进程没起来、窗口没捕获还是输入没进去，照 §5 接管 SOP 处置，不要当成 agent 自己出的错。工具返回里的 `submitted=true` 只表示 brief 已上板、不代表指令已送达外部 Agent——是否补投以终端实况为准（§5 第 6 条），勿据该字段直接重投。
 
 **重启重置（设计意图）**：应用重启会把 status.json 重置为 idle/空 task_id（运行时态不跨重启）。在途任务经重启后，验收依据 = brief/report 文件（`.nuphus/handoff/`），状态栏只反映重启后的新事件；续派需重新 dispatch。
 

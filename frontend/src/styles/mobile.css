@@ -105,6 +105,11 @@
     min-height: 0 !important;
   }
 
+  /* 回底按钮：右缘留白收窄到 12px，与 .chat-messages-inner 的移动端节奏一致 */
+  .chat-jump-bottom {
+    right: 12px;
+  }
+
   /* ── WelcomeScreen 表情表演：居中 + 上移避开底部输入框 ── */
   .welcome-screen {
     padding: 24px 16px 120px !important;

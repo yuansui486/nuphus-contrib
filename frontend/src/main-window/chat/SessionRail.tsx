@@ -14,6 +14,8 @@ import {
   IconFolderPlus,
   IconInfo,
   IconMoreHorizontal,
+  IconPin,
+  IconPinOff,
   IconPlus,
   IconTrash2,
   IconX,
@@ -31,6 +33,7 @@ import {
   setProjectBookmarks,
   setProjectFolderArchived,
   setSessionSortPrefs,
+  setPinnedSessions,
   createProjectChat,
   SESSION_GROUP_LIMIT_CHANGED_EVENT,
   type ProjectBookmark,
@@ -43,6 +46,7 @@ import {
   buildSessionGroups,
   normalizeGroupLimit,
   normalizePathKey,
+  normalizePinnedSessions,
   normalizeSessionSortPrefs,
   visibleGroupSessions,
   type SessionGroup,
@@ -53,6 +57,15 @@ import '../../styles/session-rail.css'
 const POLL_INTERVAL_MS = 5000
 /** 会话变更去抖：2s 内只触发一次 onSessionChanged，防轮询翻转连续触发风暴 */
 const SWITCH_NOTICE_THROTTLE_MS = 2000
+
+/**
+ * localStorage 键：会话工作台「上次对话」的归属项目（`normalizePathKey` 归一后的路径，
+ * 空串 = 无归属）。用途：软件重启后只展开**上次关闭前停留的那个对话**所在的项目文件夹。
+ *
+ * 为什么不用后端 active 会话做判据：active 只活在内存（`state.runtime`），重启即空，
+ * `list_shelf_sessions` 首轮没有任何 `is_active` 条目 —— 拿它判断必然落空。
+ */
+const RAIL_LAST_PROJECT_KEY = 'nuphus:rail-last-project'
 
 /** updated_at（Unix 毫秒）→ 行尾相对时间（刚刚 / N分钟 / N小时 / N天） */
 function relativeTime(ms: number, t: (key: string, ...args: string[]) => string): string {
@@ -165,6 +178,7 @@ function codeToI18n(code: string): string | null {
   if (code === 'archiveFailGeneric') return 'sessionRail.archiveFailGeneric'
   if (code === 'restoreFailGeneric') return 'sessionRail.restoreFailGeneric'
   if (code === 'sortPrefsFailGeneric') return 'sessionRail.sortPrefsFailGeneric'
+  if (code === 'pinFailGeneric') return 'sessionRail.pinFailGeneric'
   if (code === 'newChatSwitchFail') return 'sessionRail.newChatSwitchFail'
   if (code === 'browseDirFail') return 'sessionRail.newChatBrowseFail'
   if (code === 'no_project_dir') return 'sessionRail.createProjectFail'
@@ -557,6 +571,12 @@ export default function SessionRail({
    * 用「值相等则复用旧对象」避免每次轮询都触发重绘。
    */
   const [sortPrefs, setSortPrefs] = useState<SessionSortPrefs>(DEFAULT_SESSION_SORT_PREFS)
+  /**
+   * 置顶会话 id（组内置顶）：**唯一权威是后端 `pinned_sessions`**（落 preferences，
+   * 数组序即展示序，重启保持）；本地只在点击瞬间乐观更新，成功后以后端返回的
+   * 归一值为准。用「值相等则复用旧对象」避免每次轮询都触发重绘。
+   */
+  const [pinnedIds, setPinnedIds] = useState<string[]>([])
   const [canSwitch, setCanSwitch] = useState(true)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draftTitle, setDraftTitle] = useState('')
@@ -703,6 +723,14 @@ export default function SessionRail({
             ? prev
             : nextPrefs,
         )
+        // 置顶会话同款处理：后端是唯一权威（数组序即展示序），读数变化立即重排；
+        // 值未变则复用旧对象不重绘（推进 groups 纯函数重算，不依赖列表签名）
+        const nextPinned = normalizePinnedSessions(r.pinned_sessions)
+        setPinnedIds(prev =>
+          prev.length === nextPinned.length && prev.every((id, i) => id === nextPinned[i])
+            ? prev
+            : nextPinned,
+        )
         // 签名守卫：id+active+标题+分钟桶/分组/上限未变则不 setItems——提炼/追加等后台写入只改
         // 消息内容与 updated_at，列表视图零重绘（消除轮询期闪动）；activeId 检测
         // 仍基于本轮新数据，不受影响。签名含顺序（数组序）与分组数据，新建/归档/改归属必然变化。
@@ -844,13 +872,62 @@ export default function SessionRail({
   )
 
   /**
-   * 分组视图：全部由返回体字段派生（组序维度 / 组内排序键 / 归档隐藏 / 未分组末位）。
+   * 分组视图：全部由返回体字段派生（组序维度 / 组内排序键 / 置顶 / 归档隐藏 / 未分组末位）。
    * 排序语义**只在 sessionGroups 纯函数里**（移动端 NavBar 复用同一实现），组件不重算。
    */
   const groups = useMemo(
-    () => buildSessionGroups(items, projects, archivedProjects, sortPrefs),
-    [items, projects, archivedProjects, sortPrefs],
+    () => buildSessionGroups(items, projects, archivedProjects, sortPrefs, pinnedIds),
+    [items, projects, archivedProjects, sortPrefs, pinnedIds],
   )
+
+  /**
+   * 启动折叠策略：首次拿到列表数据时，**只展开「上次对话」所在的项目组**，其余整组收起 ——
+   * 关闭软件前停在哪个对话，下次打开就落在哪一栏，不必挨个手点（ZPY 2026-09-27 反馈）。
+   *
+   * 「上次对话」的判据是 localStorage 里的归属路径（见 RAIL_LAST_PROJECT_KEY），不是当轮的
+   * active 会话：后端 active 只活在内存，重启即空，首轮没有任何 is_active 条目。
+   *
+   * 只跑一次：之后用户的手工折叠、「整理侧边栏」的全部展开 / 全部关闭、5s 轮询刷新一概不得
+   * 覆盖（否则就是「我的操作被系统改回去」）。
+   *
+   * 边界：库里没有任何会话 → 不猜，保持默认全展开；无记录（首次使用 / 存储被清）或记录里的
+   * 文件夹已不在当前列表（归档 / 删书签 / 改名）→ 同样保持全展开，宁可多显示也不给一个
+   * 「全部收起」的空视角。
+   */
+  const collapseInitializedRef = useRef(false)
+  useEffect(() => {
+    if (collapseInitializedRef.current || items.length === 0) return
+    collapseInitializedRef.current = true
+    let key: string | null = null
+    try {
+      key = localStorage.getItem(RAIL_LAST_PROJECT_KEY)
+    } catch {
+      key = null
+    }
+    if (key === null || !groups.some(g => g.key === key)) return
+    setCollapsedGroups(
+      Object.fromEntries(groups.filter(g => g.key !== key).map(g => [g.key, true])),
+    )
+  }, [items, groups])
+
+  /**
+   * 记录「上次对话」归属：当前会话每次变化（点击切换 / 手机端遥控切换 / 新建对话 / 切 mode）
+   * 各落一次盘，供下次启动决定展开哪一组 —— 它记的是「软件关闭前最后停留的那个对话」。
+   *
+   * ⚠️ 无 active 会话时不写：刚重启时列表里本就没有 active，此时若覆盖成空值，
+   * 「关软件 → 再打开」会先把自己的记录抹掉，折叠策略当场失效。
+   * ⚠️ 定义在启动折叠 effect **之后**：同一轮 items 变更里两个 effect 按定义顺序执行，
+   * 首轮必须先用旧记录定位，再谈刷新记录。
+   */
+  useEffect(() => {
+    const active = items.find(i => i.is_active)
+    if (!active) return
+    try {
+      localStorage.setItem(RAIL_LAST_PROJECT_KEY, normalizePathKey(active.project_path))
+    } catch {
+      /* 存储不可用（隐私模式 / 配额）：只影响启动展开偏好，不阻断列表 */
+    }
+  }, [items])
 
   /**
    * 整理侧边栏 · 全部展开：清空整组折叠表。
@@ -881,6 +958,30 @@ export default function SessionRail({
       }
     },
     [sortPrefs, refresh, flashNotice],
+  )
+
+  /**
+   * 置顶 / 取消置顶（组内置顶）：乐观更新（该会话立即顶到所在组最上方，追加在置顶区
+   * 末位）→ 落盘 → 以后端返回的归一值为准。失败回滚并给出可感知提示。
+   *
+   * 不加确认弹窗：置顶可逆、无副作用（只写 preferences，不碰会话数据/归属）。
+   * 执行中也不禁用：它不依赖 agent 槽，与归档/切换的守卫域不同。
+   */
+  const handleTogglePin = useCallback(
+    async (id: string) => {
+      const prev = pinnedIds
+      const next = prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+      setPinnedIds(next)
+      try {
+        const applied = await setPinnedSessions(next)
+        setPinnedIds(normalizePinnedSessions(applied))
+        void refresh()
+      } catch {
+        setPinnedIds(prev)
+        flashNotice('pinFailGeneric')
+      }
+    },
+    [pinnedIds, refresh, flashNotice],
   )
 
   /**
@@ -1229,11 +1330,12 @@ export default function SessionRail({
     setCollapsedGroups(m => ({ ...m, [key]: !m[key] }))
   }, [])
 
-  /** 渲染单条会话行（组内复用：L/W/C 标识 + 标题 + 相对时间 + 行内重命名/归档） */
+  /** 渲染单条会话行（组内复用：L/W/C 标识 + 标题 + 相对时间 + 行内重命名/归档/置顶） */
   const renderSessionItem = (it: ShelfSessionItem, dirAlreadyCurrent: boolean) => {
     // 草稿对话（新建项目文件夹后尚未开说的那条）：标题文案固定为「新建对话」，
     // 且不提供行内重命名/归档——重命名会写 sessions 行，违反「草稿不落库」。
     const titleText = it.draft ? t('sessionRail.newChat') : it.title || t('sessionRail.untitled')
+    const pinned = pinnedIds.includes(it.id)
     const modeText =
       it.mode === 'workflow'
         ? t('input.mode.workflow')
@@ -1322,11 +1424,27 @@ export default function SessionRail({
                 {t('sessionRail.current')}
               </span>
             )}
+            {/* 置顶标记（组内置顶，恒在组最上方）：复用中性弱标签样式，与「当前」
+                的 accent 徽标区分——一个是状态位置，一个是会话高亮 */}
+            {pinned && (
+              <span className="sr-group-tag" title={t('sessionRail.pinnedHint')}>
+                {t('sessionRail.pinnedTag')}
+              </span>
+            )}
             {/* 行尾相对时间：hover 时淡出让位给操作按钮，避免按钮挤动布局 */}
             <span className="sr-time">{relativeTime(it.updated_at, t)}</span>
             {/* 草稿对话无行内操作：重命名会写 sessions 行（违反不落库），归档对内存态无意义 */}
             {!it.draft && (
               <span className="sr-actions">
+                <button
+                  type="button"
+                  className="sr-edit-btn sr-pin-btn"
+                  onClick={() => void handleTogglePin(it.id)}
+                  title={pinned ? t('sessionRail.unpin') : t('sessionRail.pin')}
+                  aria-label={pinned ? t('sessionRail.unpin') : t('sessionRail.pin')}
+                >
+                  {pinned ? <IconPin size={12} /> : <IconPinOff size={12} />}
+                </button>
                 <button
                   type="button"
                   className="sr-edit-btn"

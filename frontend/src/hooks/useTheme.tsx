@@ -9,8 +9,22 @@ import {
   type ReactNode,
 } from 'react'
 import { newCustomThemeId, parseCustomThemeJSON, type CustomTheme } from './customTheme'
+import { applySkinBg } from '../ui/skinBg'
 
 export type ThemeId = 'dark' | 'light' | 'tech'
+
+/**
+ * 皮肤背景的两层归属（2026-09-28 per-card skin 定稿，改前先读）：
+ *
+ * - **系统预设态**（未激活任何自定义主题）的背景 = `ui/skinBg.ts` 的 LS_SKIN，
+ *   由外观浮窗的「皮肤背景」区写入；启动恢复也走它（App 层 + SkinBackdrop 挂载时）。
+ * - **激活自定义主题时**以该主题的 `skin` 快照为准：`activateCustom` 按快照写回
+ *   全局背景（`target.skin ?? ''` —— 无皮肤即清空，不继承上一个主题的图）。
+ * - 回到预设态（停用自定义 / 删除激活项 / 点内置主题卡）→ 背景回 LS_SKIN。
+ *   这三条交互都在 AppearancePanel 内发起，故由面板在对应 handler 里补
+ *   `applySkinBg(readSkinBg())`；本文件只负责「激活即恢复快照」这一步，
+ *   save/activate/delete 的数据语义与 skinBg 的广播/渲染链路均未改动。
+ */
 
 interface ThemeContextType {
   theme: ThemeId
@@ -57,12 +71,21 @@ function readCustomThemes(): { themes: CustomTheme[]; activeId: string | null } 
         for (const item of arr) {
           const res = parseCustomThemeJSON(JSON.stringify(item))
           if (res.ok) themes.push({ ...res.theme, id: res.theme.id ?? newCustomThemeId() })
+          // 解析失败不能静默跳过：若被跳过的正是激活项，启动就会整体回落默认主题，
+          // 而现场无迹可寻（2026-09-28：用户报「刷新后回默认主题」时的取证缺口）
+          else
+            console.error(
+              '[theme] 自定义主题条目解析失败已跳过；若它是激活项，本次启动会回落默认主题：',
+              res.reason,
+              item,
+            )
         }
         const activeId = localStorage.getItem(LS_CUSTOM_ACTIVE)
-        return {
-          themes,
-          activeId: activeId && themes.some(t => t.id === activeId) ? activeId : null,
+        const validActive = activeId && themes.some(t => t.id === activeId) ? activeId : null
+        if (activeId && !validActive) {
+          console.error('[theme] 激活 id 不在已解析列表内，本次启动回落系统预设主题：', activeId)
         }
+        return { themes, activeId: validActive }
       }
     }
     // 迁移：旧版单主题
@@ -88,6 +111,23 @@ export function readBaseTheme(defaultTheme: ThemeId = 'dark'): ThemeId {
     if (saved === 'dark' || saved === 'light' || saved === 'tech') return saved
   } catch {}
   return defaultTheme
+}
+
+/**
+ * 启动时皮肤背景的**恢复源**（必须与 `activateCustom` 的写入语义逐字一致）：
+ * - 激活自定义主题 → 该主题的 `skin` 快照；**无皮肤 = 空串（清空）**，
+ *   不继承上一个主题/系统预设的图（`activateCustom` 里就是 `target.skin ?? ''`）
+ * - 系统预设态（未激活）→ LS_SKIN（`presetSkin`）
+ *
+ * 为什么单独抽成纯函数：这条二选一曾经直接写在 App 层的 effect 里且只读了
+ * LS_SKIN，导致激活自定义主题的用户刷新后背景被预设值覆盖（快照无人重放）。
+ * 抽出来后①App 层只是它的一个调用点；②语义被测试钉住，回归会立刻红。
+ *
+ * 注意 `customTheme ? … : …` 不能图省事写成 `customTheme?.skin ?? presetSkin`：
+ * 那会让「激活但无皮肤」错落回预设图——与手动激活时的清空语义自相矛盾。
+ */
+export function skinRestoreSource(customTheme: CustomTheme | null, presetSkin: string): string {
+  return customTheme ? (customTheme.skin ?? '') : presetSkin
 }
 
 export function ThemeProvider({
@@ -238,6 +278,10 @@ export function ThemeProvider({
         persistCustomStore(prev.themes, id)
         setPreviewOverrides(null)
         setThemeState(target.base)
+        // 皮肤快照恢复（本文件唯一允许的结构新增，见顶部边界注释）：
+        // 激活哪个主题，全局背景就回到哪个主题存的样子；无皮肤 = 清空。
+        // 写入点仍只有 skinBg.applySkinBg 一个，广播 / SkinBackdrop 渲染链路不动。
+        void applySkinBg(target.skin ?? '')
         try {
           localStorage.setItem(LS_THEME, target.base)
         } catch {}

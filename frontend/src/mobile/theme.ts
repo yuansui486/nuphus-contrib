@@ -18,7 +18,7 @@ export function getTheme(): MobileTheme {
 }
 
 /** 应用主题到 <html data-theme>（亮色可不写属性，默认 :root 即亮色） */
-export function applyTheme(theme: MobileTheme): void {
+function applyTheme(theme: MobileTheme): void {
   const root = document.documentElement
   if (theme === 'dark') root.setAttribute('data-theme', 'dark')
   else root.removeAttribute('data-theme')

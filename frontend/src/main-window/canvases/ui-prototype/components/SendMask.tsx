@@ -1,7 +1,7 @@
 import { createPortal } from 'react-dom'
 import { Palette } from '../lib/tokens'
 
-/** 遮罩层级：画布全屏壳（.canvas-hub / .canvas-page-host）= 2500，工作台宿主层 = 100，
+/** 遮罩层级：画布全屏壳（.canvas-page-host）= 2500，工作台宿主层 = 100，
  *  取 2600 稳压画布与工作台（含工作台 header 的 tab 切换）。
  *  仍低于应用级全局层（右键菜单 3000 / 引用条 3100 / 错误横幅 9998+ / 桌面工具条 9999）：
  *  那些不属于画布作用域，遮罩期间保持可达——盖住它们反而会在出错时堵死退路。 */

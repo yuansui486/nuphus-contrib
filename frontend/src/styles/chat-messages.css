@@ -69,9 +69,16 @@
   gap: 4px;
   pointer-events: auto;
 }
+/* 右侧是**纵向按钮列**：设置（齿轮）→ 外观（调色板）→ refine chip（有值时）。
+   三者在同一 DOM 父子下自然下延，chip 因此不再需要 absolute 到 header 外
+   （原先 top:50px/right:16px/z-index:20 与 header 内的浮层互抢层级）。 */
+.chat-header-right {
+  flex-direction: column;
+  align-items: flex-end;
+}
 /* ── island 落点锚点 ──
-   几何（.island-slot：铺满 padding box + flex 居中 + 左右 40px 安全区）在共享层
-   styles/app-pill.css，与设置中心 / 模型页标题栏的锚点同一份实现。 */
+    几何（.island-slot：铺满 padding box + flex 居中 + 左右 40px 安全区）在共享层
+    styles/app-pill.css，与设置中心 / 模型页标题栏的锚点同一份实现。 */
 .chat-header-settings-btn {
   display: flex;
   align-items: center;
@@ -79,14 +86,44 @@
   width: 30px;
   height: 30px;
   border: 1px solid var(--border);
-  background: var(--bg-tertiary);
+  /* 磨砂透明：底由「控制面板不透明度」滑块派生的 --panel-bg 按磨砂比例兑透明，
+     再叠 blur(8px) saturate(1.2)（小芯片档位，同 api-health 芯片配方）——
+     滑块拖低基准 α 时 Frost 仍可读，拖高时更实；不用不透明硬色。 */
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
   color: var(--spark-secondary);
   cursor: pointer;
   border-radius: 8px;
   transition: all var(--transition-fast);
 }
 .chat-header-settings-btn:hover {
-  background: var(--void-hover);
+  /* hover 抬高实度（同一支键的更高混合比），不是换不透明色 */
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  border-color: var(--glass-3);
+  color: var(--spark-primary);
+}
+/* 外观（调色板）按钮：与上一块逐字同款磨砂配方（--panel-bg 62% + blur(8px)
+   saturate(1.2) + 30×30 + radius 8 + hover 85% 档），不引新审美。
+   两条规则分开写而不合并选择器：opacity-system.test.ts 按单选择器取
+   .chat-header-settings-btn 的声明块，合并会让那条回归断言静默落空。 */
+.chat-header-appearance-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: all var(--transition-fast);
+}
+.chat-header-appearance-btn:hover {
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
   border-color: var(--glass-3);
   color: var(--spark-primary);
 }
@@ -1659,11 +1696,11 @@
   }
 }
 /* ── Refine Pending Button ── */
+/* 随聊天 header 右侧按钮列（column）内排布：设置 → 外观 → 本 chip 自然下延。
+   position:relative = 给 .refine-pending-confirm 做定位基准（它 top:100%/right:0），
+   弹窗仍出现在 chip 正下方、且不再被 header 的层叠上下文裁掉。 */
 .refine-pending-area {
-  position: absolute;
-  top: 50px;
-  right: 16px;
-  z-index: 20;
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -1674,7 +1711,12 @@
   gap: 6px;
   padding: 5px 10px;
   border: 1px solid var(--border);
-  background: var(--bg-tertiary);
+  /* 磨砂透明：与 .chat-header-settings-btn 同配方——--panel-bg 派生兑透明 +
+     小芯片 blur(8px) 档；基准 α 跟随「控制面板不透明度」滑块（原 --bg-tertiary
+     为不透明硬色，滑块遍历不到） */
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
   color: var(--warning);
   border-radius: 8px;
   cursor: pointer;
@@ -1684,7 +1726,8 @@
   position: relative;
 }
 .refine-pending-btn:hover {
-  background: var(--void-hover);
+  /* hover 抬高实度（同一支键的更高混合比），不是换不透明色 */
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
   border-color: var(--glass-3);
   color: var(--spark-primary);
 }
@@ -1818,4 +1861,103 @@
 .message-retry-user .compact-btn.ghost-btn:hover {
   color: var(--accent);
   background: var(--void-hover);
+}
+
+/* ── 回底按钮（useStickyScroll 冻结态显示）──
+   .chat-messages-wrap：承接 .chat-messages 原先在 .chat-panel 纵向 flex 链中的 item
+   角色（flex:1 + min-height:0），自身 overflow 保持默认 visible —— 不新增滚动容器、
+   不改 overflow 链。**它必须存在的原因**：回底按钮用 absolute 定位，其包含块必须落在
+   「滚动容器的视口」上。若包含块是 .chat-messages 自身（给它加 position:relative），
+   Chromium 实测按钮会被钉在内容坐标 clientHeight-16-32 处并随内容滚出视口（仅在
+   scrollTop=0 可见）—— 那正是本按钮要救的场景。overflow 默认 visible 时，按钮作为
+   .chat-messages 的子元素并不属于它的可滚动溢出区（包含块在滚动容器之外），故浮在
+   视口右下角、不随滚动移动。 */
+.chat-messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* 磨砂配方逐字复用 .chat-header-settings-btn（--panel-bg 派生兑透明 + blur(8px)
+   saturate(1.2) 小芯片档）：控制面板不透明度滑块遍历得到，不用不透明硬色。 */
+.chat-jump-bottom {
+  position: absolute;
+  right: 20px;
+  bottom: 88px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--glass-3);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+  animation: chat-jump-bottom-in 160ms ease both;
+}
+.chat-jump-bottom:hover {
+  /* hover 抬高实度（同一支键的更高混合比），不是换不透明色 */
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  color: var(--spark-primary);
+}
+@keyframes chat-jump-bottom-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── 选中文字 → 引用浮条（固定定位，z-index 高于 .chat-jump-bottom 的 30）──
+   位置由 JS 按选区最后一行内联给定（left/top + translate(-50%) 居中），
+   这里只管外观与指针事件：mousedown 必须 preventDefault，
+   否则焦点转移会清掉 selection，点击时已读不到原文。 */
+.quote-float {
+  position: fixed;
+  z-index: 40;
+  transform: translate(-50%, 8px);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--glass-3);
+  border-radius: var(--radius-1);
+  background: color-mix(in srgb, var(--panel-bg) 88%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+  color: var(--spark-secondary);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  animation: quote-float-in 120ms ease both;
+}
+
+.quote-float:hover {
+  color: var(--spark-primary);
+  border-color: var(--accent);
+}
+
+@keyframes quote-float-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 2px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 8px);
+  }
 }

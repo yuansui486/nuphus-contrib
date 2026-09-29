@@ -446,22 +446,6 @@ export interface BootPayload {
 /** 中继模式启动聚合：一次往返拿 identity+agentStatus+relayHint。
  *  仅中继（wan）路径使用——局域网保持原分请求模式（合并不影响局域网即时性）。
  *  超时 15s：载荷小（无 history），比 relay-hint 略宽以容忍丢包重传。 */
-export async function fetchBoot(token: string): Promise<BootPayload | null> {
-  try {
-    const res = await checkAuth(
-      await fetchWithTimeout(
-        resolveApi('./boot'),
-        { headers: { 'X-Mobile-Token': token, ...tunnelDeviceHeaders() } },
-        15000,
-      ),
-    )
-    if (!res.ok) return null
-    return (await res.json()) as BootPayload
-  } catch {
-    return null
-  }
-}
-
 /** 桌面展示台会话条目（/sessions 与 /boot.sessions 同源，只读镜像投影） */
 export interface ShelfSessionItem {
   id: string
@@ -844,10 +828,6 @@ export function pauseExecution(token: string): Promise<ControlResult> {
 }
 
 /** 继续执行（回传暂停时的 action_id） */
-export function resumeExecution(token: string, actionId: string): Promise<ControlResult> {
-  return postControl(token, './resume', { action_id: actionId })
-}
-
 /** 终止执行（回传暂停时的 action_id） */
 export function terminateExecution(token: string, actionId: string): Promise<ControlResult> {
   return postControl(token, './terminate', { action_id: actionId })

@@ -14,19 +14,28 @@
  *     高度不足是裁切而非滚动 → 走 `.canvas-workbench-host` 全屏宿主（openCanvas 链路）。
  *   - 模型：双栏后主区仅 566px，需在 844px 内重排信息（服务商列表 / 密钥表单 / 模型表格），
  *     样式层解决不了宿主上限 → 走 `.models-page-host` 全屏整页（Ctrl+K → 模型 链路）。
- *   其余 14 项在 844px 下信息完整、导航切换的价值正在这一档，保持弹窗内嵌。
+ *   其余 17 项在 844px 下信息完整、导航切换的价值正在这一档，保持弹窗内嵌。
  *
  * 复用原则：右侧内容一律复用现有页面组件，本文件只做「导航 → 分区切换」，
  * 不复制任何子页实现；子页的 lazy 说明符与 App.tsx 各入口保持一致，
  * 命中同一 chunk（不产生重复打包）。
  *
- * 分区 ↔ 子页映射（共 16 项，见 NAV_GROUPS）：
+ * 分区 ↔ 子页映射（共 19 项，见 NAV_GROUPS；按用户目的分五组）：
  *   快捷入口：**模型 → 全屏宿主** / **画布 → 全屏宿主**
- *   浏览：记忆 MemoriesPage / 工作流 WorkflowPage / 技能 SkillsPage /
- *         知识库 KnowledgePage / MCP McpPage
- *   设置：灵魂 SoulPage / 移动端 MobilePage / 浏览器 BrowserPage /
- *         主题与语言 ThemesPage / 会话工作台 SessionGroupsPage / 外部 Agent ExternalAgentsPage
- *   管理：权限与安全 SecurityPage / GitHub GithubPage / 版本与更新 UpdatePage
+ *   AI 能力：灵魂 SoulPage（头像 + 称呼单模块）/ 记忆 MemoriesPage /
+ *            技能 SkillsPage / 知识库 KnowledgePage
+ *   连接：移动端 MobilePage / 浏览器 BrowserPage / MCP McpPage
+ *   工作台：会话 SessionGroupsPage / 工作流 WorkflowPage /
+ *          定时任务 ScheduleHistoryPage（静态 import）/ 外部 Agent ExternalAgentsPage /
+ *          权限与安全 SecurityPage / 数据目录 DataDirsPage
+ *   系统：语言 LanguagePage / 帮助 HelpPage / 版本与更新 UpdatePage /
+ *         GitHub GithubPage（内部 id 仍为 'plugins'）
+ *
+ * 主题不在这里：它是非模态的外观浮窗（layout/AppearancePanel.tsx，由聊天 header
+ * 调色板按钮展开）—— 价值就在"改完立刻看见主界面"，放进 fixed inset:0 的本面板
+ * 会把主界面盖死，与它的存在意义相反。语言分区则相反：全局偏好、无「即时看见」
+ * 的诉求，2026-09-28 从外观浮窗迁入（现居系统组，language → LanguagePage）；
+ * 与主题无关的头像设置随灵魂分区承载（SoulPage 内第二个 Section，原独立分区已并入）。
  *
  * 子页 onClose 语义：子页自身没有「页壳」（外壳由 CompactModal / 本组件提供），
  * 其中仅「外部 Agent」表单底部的「取消」按钮会用到 onClose → 统一接设置中心关闭
@@ -42,6 +51,7 @@ import {
   IconExternalLink,
   IconFile,
   IconFolder,
+  IconGlobe,
   IconHardDrive,
   IconHistory,
   IconPalette,
@@ -57,7 +67,7 @@ import {
   IconX,
 } from '../../ui/Icons'
 import { useLanguage } from '../../locales'
-import { Clock3 } from 'lucide-react'
+import { CircleHelp as IconHelp, Clock3 } from 'lucide-react'
 import { ScheduleHistoryPage } from '../workflow/ScheduleHistoryPage'
 import { useIslandHostAnchor } from '../../ui/islandChannel'
 import '../../styles/settings-center.css'
@@ -80,7 +90,13 @@ const GithubPage = lazy(() => import('./GithubPage').then(m => ({ default: m.Git
 const SoulPage = lazy(() => import('./SoulPage').then(m => ({ default: m.SoulPage })))
 const MobilePage = lazy(() => import('./MobilePage').then(m => ({ default: m.MobilePage })))
 const BrowserPage = lazy(() => import('./BrowserPage').then(m => ({ default: m.BrowserPage })))
-const ThemesPage = lazy(() => import('./ThemesPage').then(m => ({ default: m.ThemesPage })))
+/* 主题不在本面板：它是聊天 header 调色板按钮展开的外观浮窗
+   （layout/AppearancePanel.tsx，非模态常驻）—— 放进 fixed inset:0 的设置中心会把
+   主界面盖死，"主题即时生效却看不见"。与主题无关的头像设置随灵魂分区承载
+   （SoulPage 单模块：开关 + 两条身份行）。语言分区在这里（language → LanguagePage）：
+   全局偏好，无「即时看见」的诉求。 */
+const HelpPage = lazy(() => import('./HelpPage').then(m => ({ default: m.HelpPage })))
+const LanguagePage = lazy(() => import('./LanguagePage').then(m => ({ default: m.LanguagePage })))
 const ExternalAgentsPage = lazy(() =>
   import('./ExternalAgentsPage').then(m => ({ default: m.ExternalAgentsPage })),
 )
@@ -104,7 +120,8 @@ export type SettingsSectionId =
   | 'soul'
   | 'mobile'
   | 'browser'
-  | 'themes'
+  | 'help'
+  | 'language'
   | 'session-groups'
   | 'external-agents'
   | 'security'
@@ -131,10 +148,14 @@ interface SettingsNavItem {
 }
 
 /**
- * 左侧导航分组：原三档分组名复用 Ctrl+K 命令面板的 category 键（措辞天然一致）；
- * 最上方的「快捷入口」是本面板独有分组（不来自命令面板），只收走整页宿主的两项
- * —— 它们点击后面板关闭、由 App 层全屏承载，与其余「面板内直接打开」的项性质不同，
- * 故置于最前并带外链标识（见下方渲染处的 .settings-center-nav-item-hosted）。
+ * 左侧导航分组：按「用户目的」分五组（组序 = 入口 → 能力 → 连接 → 工作台 → 系统）。
+ * 分组标题复用 Ctrl+K 命令面板的 category 键（措辞天然一致；CmdPalette 按
+ * category 聚合，改键即同步两侧措辞）：
+ *   - shortcuts 快捷入口：本面板独有分组，只收走整页宿主的两项 —— 它们点击后
+ *     面板关闭、由 App 层全屏承载，与其余「面板内直接打开」的项性质不同，
+ *     故置于最前并带外链标识（见下方渲染处的 .settings-center-nav-item-hosted）；
+ *   - ai / connect / workbench / system：2026-09-28 由旧的「浏览 / 设置 / 管理」
+ *     三档（按入口性质）重组为按目的分组，组序与组内序固定。
  */
 const NAV_GROUPS: { titleKey: string; items: SettingsNavItem[] }[] = [
   {
@@ -145,41 +166,53 @@ const NAV_GROUPS: { titleKey: string; items: SettingsNavItem[] }[] = [
     ],
   },
   {
-    titleKey: 'cmd.category.browse',
+    titleKey: 'cmd.category.ai',
     items: [
+      /* 灵魂：头像（点击即上传）与称呼（assistantName / userLabel）合成单模块 ——
+         头像原为独立分区，2026-09-28 并入本页（落库链路零改动） */
+      { id: 'soul', labelKey: 'app.soul', icon: <IconSparkles size={14} /> },
       { id: 'memories', labelKey: 'app.memories', icon: <IconHistory size={14} /> },
-      { id: 'workflows', labelKey: 'app.workflows', icon: <IconWorkflow size={14} /> },
-      { id: 'schedules', labelKey: 'app.scheduleHistory', icon: <Clock3 size={14} /> },
       { id: 'skills', labelKey: 'app.skills', icon: <IconWrench size={14} /> },
       { id: 'knowledge', labelKey: 'app.knowledge', icon: <IconFile size={14} /> },
+    ],
+  },
+  {
+    titleKey: 'cmd.category.connect',
+    items: [
+      { id: 'mobile', labelKey: 'app.mobile', icon: <IconSmartphone size={14} /> },
+      { id: 'browser', labelKey: 'app.browser', icon: <IconBrowser size={14} /> },
       { id: 'mcp', labelKey: 'cmd.mcp', icon: <IconPlug size={14} /> },
     ],
   },
   {
-    titleKey: 'cmd.category.settings',
+    titleKey: 'cmd.category.workbench',
     items: [
-      { id: 'soul', labelKey: 'app.soul', icon: <IconSparkles size={14} /> },
-      { id: 'mobile', labelKey: 'app.mobile', icon: <IconSmartphone size={14} /> },
-      { id: 'browser', labelKey: 'app.browser', icon: <IconBrowser size={14} /> },
-      { id: 'themes', labelKey: 'app.themes', icon: <IconPalette size={14} /> },
       { id: 'session-groups', labelKey: 'app.sessionGroups', icon: <IconFolder size={14} /> },
+      { id: 'workflows', labelKey: 'app.workflows', icon: <IconWorkflow size={14} /> },
+      { id: 'schedules', labelKey: 'app.scheduleHistory', icon: <Clock3 size={14} /> },
       {
         id: 'external-agents',
         labelKey: 'cmd.externalAgents',
         icon: <IconCpu size={14} />,
       },
-    ],
-  },
-  {
-    titleKey: 'cmd.category.management',
-    items: [
       { id: 'security', labelKey: 'app.security', icon: <IconShield size={14} /> },
       /* 数据目录：只读展示各数据目录真实路径（排障 / 备份入口，不做修改与迁移） */
       { id: 'data-dirs', labelKey: 'app.dataDirs', icon: <IconHardDrive size={14} /> },
-      /* 原「插件」（付费市场筹备页）改造为 GitHub 贡献者页，随之下移到管理组：
+    ],
+  },
+  {
+    titleKey: 'cmd.category.system',
+    items: [
+      /* 语言：2026-09-28 从外观浮窗迁入（分区 id 'language'，现居系统组）。
+         内容是 zh/en segmented + getLanguage/apiSetLanguage 原链路（LanguagePage）。 */
+      { id: 'language', labelKey: 'app.language', icon: <IconGlobe size={14} /> },
+      /* 帮助：与 App 层 CompactModal 同一个 HelpPage（同一 chunk，不重复打包），
+         面板内嵌打开（不关面板） */
+      { id: 'help', labelKey: 'cmd.help', icon: <IconHelp size={14} /> },
+      { id: 'update', labelKey: 'app.update', icon: <IconRefresh size={14} /> },
+      /* 原「插件」（付费市场筹备页）改造为 GitHub 贡献者页：
          内部 id 保持 'plugins'（renderSection / 命令面板 / App.showPlugins 链路不受影响） */
       { id: 'plugins', labelKey: 'app.github', icon: <IconPuzzle size={14} /> },
-      { id: 'update', labelKey: 'app.update', icon: <IconRefresh size={14} /> },
     ],
   },
 ]
@@ -190,8 +223,6 @@ const NAV_ITEMS: SettingsNavItem[] = NAV_GROUPS.flatMap(g => g.items)
 export interface SettingsCenterProps {
   /** 右上角关闭 → 返回聊天 */
   onClose: () => void
-  /** HUD 提示通道（ThemesPage 需要；沿用 App 的 showToast） */
-  showToast: (message: string, type?: 'info' | 'success' | 'warning' | 'error') => void
   /**
    * 工作流列表「运行」：交给 App 层弹运行确认框。
    * ⚠️ 运行确认弹窗（wcf-wrapper z-index 100）低于设置中心宿主（2500），
@@ -212,14 +243,14 @@ export interface SettingsCenterProps {
 
 export function SettingsCenter({
   onClose,
-  showToast,
   onRunWorkflow,
   onOpenCanvas,
   onOpenModels,
   onOpenScheduleReplay,
 }: SettingsCenterProps) {
   const { t } = useLanguage()
-  const [section, setSection] = useState<EmbeddedSectionId>('memories')
+  // 默认分区 = 灵魂（AI 能力组首项）：身份设置每轮对话都生效，是五组里最高频的落点
+  const [section, setSection] = useState<EmbeddedSectionId>('soul')
   // island 落点锚点：设置中心压住聊天区时，岛改挂到本面板标题栏（优先级见 islandChannel）
   const settingsIslandAnchor = useIslandHostAnchor('settings-center')
 
@@ -314,8 +345,8 @@ export function SettingsCenter({
         return <MobilePage />
       case 'browser':
         return <BrowserPage onClose={onClose} />
-      case 'themes':
-        return <ThemesPage onClose={onClose} showToast={showToast} />
+      case 'language':
+        return <LanguagePage />
       case 'session-groups':
         return <SessionGroupsPage />
       case 'external-agents':
@@ -326,6 +357,9 @@ export function SettingsCenter({
         return <DataDirsPage />
       case 'update':
         return <UpdatePage />
+      /* 帮助：与 App 层 CompactModal 同一个 HelpPage（无 props），面板内嵌渲染 */
+      case 'help':
+        return <HelpPage />
     }
   }
 

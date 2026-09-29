@@ -63,6 +63,12 @@ describe('githubContributors 数据契约', () => {
 
   it('用户名集合与已核对的仓库记录一致（新增须同步更新溯源注释）', () => {
     const users = [...new Set(rounds.flatMap(r => r.contributors.map(c => c.user)))].sort()
-    expect(users).toEqual(['jiangdingwei123-afk', 'yuansui486', 'zhoupeiyu515-ui'])
+    expect(users).toEqual([
+      'Steooenwolf-666',
+      'fouyzjl',
+      'jiangdingwei123-afk',
+      'yuansui486',
+      'zhoupeiyu515-ui',
+    ])
   })
 })

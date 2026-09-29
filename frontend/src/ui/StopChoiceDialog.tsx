@@ -15,7 +15,7 @@ import { createPortal } from 'react-dom'
 import { useLanguage } from '../locales'
 
 /** 终止方式选项（文案 key 唯一来源；两端共用，禁止在端内复制） */
-export const STOP_CHOICES = [
+const STOP_CHOICES = [
   { id: 'continue', textKey: 'input.stopContinue', descKey: 'input.stopContinueDesc' },
   { id: 'graceful', textKey: 'input.stopGraceful', descKey: 'input.stopGracefulDesc' },
   { id: 'force', textKey: 'input.stopForce', descKey: 'input.stopForceDesc' },

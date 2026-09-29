@@ -60,6 +60,8 @@ pub struct TaskRun {
     pub run_id: String,
     /// 任务标题（短，面板显示用；由 Leader 的 `title` 参数提供）
     pub title: String,
+    /// 派发正文**全文**（给 Exec 的那份动态消息：任务定义/上下文等；点开任务要看它）
+    pub task: String,
     /// 派发时声明的 goal_type
     pub goal_type: String,
     /// 归属标签（有计划时才有）
@@ -73,7 +75,7 @@ pub struct TaskRun {
     pub duration_ms: Option<u64>,
     /// 终态才有：true=Completed，false=Failed
     pub ok: Option<bool>,
-    /// 终态才有：ExecAgent 交付摘要（截断到 300 字符）
+    /// 终态才有：ExecAgent 交付内容**全文**（不截断；展示侧是全屏弹窗）
     pub summary: Option<String>,
 }
 
@@ -218,7 +220,14 @@ impl TaskRunRegistry {
 
     /// 开一次执行：下发 `run_id`，状态置 Running，返回身份。
     /// `attempt` 按「同归属（无归属时同标题）」的历史次数递增。
-    pub fn open(&self, title: &str, goal_type: &str, origin: Option<RunOrigin>) -> String {
+    /// `task` = 派发正文全文（给 Exec 的那份，含任务定义/上下文），面板点开要看它。
+    pub fn open(
+        &self,
+        title: &str,
+        task: &str,
+        goal_type: &str,
+        origin: Option<RunOrigin>,
+    ) -> String {
         let mut seq = self.seq.lock().expect("task_run seq 锁中毒");
         *seq += 1;
         let run_id = format!("run-{}", *seq);
@@ -238,6 +247,7 @@ impl TaskRunRegistry {
         runs.push(TaskRun {
             run_id: run_id.clone(),
             title: title.to_string(),
+            task: task.to_string(),
             goal_type: goal_type.to_string(),
             origin,
             attempt,
@@ -268,7 +278,9 @@ impl TaskRunRegistry {
                 r.settled_at = Some(now);
                 r.duration_ms = Some(now.saturating_sub(r.started_at));
                 r.ok = Some(ok);
-                r.summary = Some(summary.chars().take(300).collect());
+                // 交付内容**全文入库，不截断**：这是 ExecAgent 交给 Leader/用户的完整结果，
+                // 不是给单行预览用的摘要。展示侧是全屏弹窗（可滚动），不需要 preview 语义。
+                r.summary = Some(summary.to_string());
                 drop(runs);
                 self.flush();
                 return true;
@@ -288,7 +300,8 @@ impl TaskRunRegistry {
                 r.settled_at = Some(now);
                 r.duration_ms = Some(now.saturating_sub(r.started_at));
                 r.ok = Some(false);
-                r.summary = Some(reason.chars().take(300).collect());
+                // 与 settle 同口径：全文，不截断（中断理由是完整一句话）
+                r.summary = Some(reason.to_string());
                 drop(runs);
                 self.flush();
                 return true;
@@ -418,7 +431,7 @@ mod tests {
     #[test]
     fn open_settles_running_to_terminal() {
         let reg = TaskRunRegistry::new();
-        let id = reg.open("任务A", "file_operation", None);
+        let id = reg.open("任务A", "派发正文", "file_operation", None);
         assert_eq!(reg.running_count(), 1);
         assert!(reg.settle(&id, true, "做完了"));
         assert_eq!(reg.running_count(), 0);
@@ -431,7 +444,7 @@ mod tests {
     #[test]
     fn settle_is_idempotent() {
         let reg = TaskRunRegistry::new();
-        let id = reg.open("任务A", "general", None);
+        let id = reg.open("任务A", "派发正文", "general", None);
         assert!(reg.settle(&id, true, "第一次"));
         assert!(!reg.settle(&id, false, "重复结算必须被忽略"));
         assert_eq!(reg.snapshot()[0].state, RunState::Completed);
@@ -446,8 +459,8 @@ mod tests {
                 task_no: Some(1),
             })
         };
-        let a = reg.open("任务1", "general", o());
-        let b = reg.open("任务1", "general", o());
+        let a = reg.open("任务1", "派发正文", "general", o());
+        let b = reg.open("任务1", "派发正文", "general", o());
         assert_eq!(reg.snapshot()[0].attempt, 1);
         assert_eq!(reg.snapshot()[1].attempt, 2);
         assert_ne!(a, b);
@@ -456,8 +469,8 @@ mod tests {
     #[test]
     fn sweep_never_leaves_running() {
         let reg = TaskRunRegistry::new();
-        let _ = reg.open("任务A", "general", None);
-        let _ = reg.open("任务B", "general", None);
+        let _ = reg.open("任务A", "派发正文", "general", None);
+        let _ = reg.open("任务B", "派发正文", "general", None);
         assert_eq!(reg.sweep_unsettled(), 2);
         assert_eq!(reg.running_count(), 0);
         assert!(reg.snapshot().iter().all(|r| r.state.is_terminal()));
@@ -466,7 +479,7 @@ mod tests {
     #[test]
     fn guard_settles_on_early_return() {
         let reg = TaskRunRegistry::new();
-        let id = reg.open("任务A", "general", None);
+        let id = reg.open("任务A", "派发正文", "general", None);
         {
             // 未显式 settle，作用域结束即触发 Drop —— 模拟 `?` / return 早退
             let _g = RunGuard::new(&reg, id.clone(), None);
@@ -480,8 +493,8 @@ mod tests {
     #[test]
     fn interrupted_is_distinct_from_failed() {
         let reg = TaskRunRegistry::new();
-        let biz = reg.open("任务A", "general", None);
-        let abn = reg.open("任务B", "general", None);
+        let biz = reg.open("任务A", "派发正文", "general", None);
+        let abn = reg.open("任务B", "派发正文", "general", None);
         assert!(reg.settle(&biz, false, "安全检查未通过"));
         assert!(reg.settle_interrupted(&abn, "panic"));
         let snap = reg.snapshot();
@@ -493,11 +506,11 @@ mod tests {
     #[test]
     fn generation_reset_never_mixes_rounds() {
         let reg = TaskRunRegistry::new();
-        let old = reg.open("上一轮的任务", "general", None);
+        let old = reg.open("上一轮的任务", "派发正文", "general", None);
         assert!(reg.settle(&old, true, "完成"));
         reg.start_generation();
         assert!(reg.snapshot().is_empty(), "新一轮必须是空墙");
-        let fresh = reg.open("本轮的任务", "general", None);
+        let fresh = reg.open("本轮的任务", "派发正文", "general", None);
         assert_eq!(reg.snapshot().len(), 1);
         assert_eq!(reg.snapshot()[0].run_id, fresh);
     }

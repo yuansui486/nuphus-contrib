@@ -63,8 +63,11 @@ export interface SendOutcome {
 }
 
 export interface ChatReference {
-  type: 'skill' | 'knowledge' | 'workflow' | 'capture'
-  id: string // skill name / knowledge rel_path / workflow id / capture file path
+  /** quote = 聊天区选中文字引用。label 承载选中原文**全文**（显示侧由
+   *  .ref-chip-label 的 ellipsis 截断，后端注入用的是完整 label，两个长度不同但同源）。
+   *  刻意不另开 text 字段：mobile_server 复用同一 Rust 结构体，多一个协议位就要双端同步。 */
+  type: 'skill' | 'knowledge' | 'workflow' | 'capture' | 'quote'
+  id: string // skill name / knowledge rel_path / workflow id / capture file path / quote 内容哈希
   label: string // 显示文本
   meta?: CaptureMeta // extra data for capture type
 }
@@ -138,7 +141,7 @@ export interface ChatMessage {
   images?: string[]
   /** 音频附件（base64 data URL 或文件路径） */
   audio?: string[]
-  /** skill/knowledge/workflow 引用 */
+  /** skill/knowledge/workflow 引用 + 聊天区选中文字引用（type='quote'）*/
   references?: ChatReference[]
   /** 拖入的文件路径 */
   files?: string[]
@@ -743,6 +746,8 @@ export interface TaskRun {
   /** 服务端下发的唯一身份（进程内单调 */
   run_id: string
   title: string
+  /** 派发正文全文（给 Exec 的那份：任务定义 / 上下文等） */
+  task: string
   goal_type: string
   origin: TaskRunOrigin | null
   /** 同标题/同归属的第几次执行（重试计数，从 1 开始） */

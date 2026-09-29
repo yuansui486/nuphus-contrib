@@ -1994,6 +1994,24 @@ function CanvasInner({
             </div>
 
             <button
+              type="button"
+              className="wfc-btn"
+              onClick={() => {
+                playUiSound('switch')
+                setIntentFormOpen(true)
+              }}
+              disabled={readOnly || !backend.generation}
+              title={
+                readOnly
+                  ? snapshot.running
+                    ? editorText('运行中 · 画布只读', t)
+                    : editorText('只读画布，不可发起意图', t)
+                  : editorText('用阶段 + 子步骤描述要做的事，交给 AI 整理为工作流', t)
+              }
+            >
+              <ListChecks size={13} /> {editorText('意图表单', t)}
+            </button>
+            <button
               className="wfc-btn"
               disabled={
                 !backend.debugging ||
@@ -2143,25 +2161,6 @@ function CanvasInner({
                 {ir.schedule && (
                   <span className={`wfc-schedule-dot${ir.schedule.enabled ? ' is-enabled' : ''}`} />
                 )}
-              </button>
-
-              <button
-                type="button"
-                className="wfc-btn"
-                onClick={() => {
-                  playUiSound('switch')
-                  setIntentFormOpen(true)
-                }}
-                disabled={readOnly || !backend.generation}
-                title={
-                  readOnly
-                    ? snapshot.running
-                      ? editorText('运行中 · 画布只读', t)
-                      : editorText('只读画布，不可发起意图', t)
-                    : editorText('用阶段 + 子步骤描述要做的事，交给 AI 整理为工作流', t)
-                }
-              >
-                <ListChecks size={13} /> {editorText('意图表单', t)}
               </button>
             </ToolbarOverflow>
           </div>

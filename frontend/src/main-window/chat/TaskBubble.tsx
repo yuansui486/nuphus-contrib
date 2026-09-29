@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState } from 'react'
 import type { TaskRun, TaskRunState } from '../../core/types'
 import { useLanguage } from '../../locales'
 import { MorphIcon } from 'morphicons/react'
@@ -10,8 +10,12 @@ import {
   CircleAlert as AlertIcon,
   Loader2 as LoaderIcon,
 } from 'lucide'
-import { IconX } from '../../ui/Icons'
+import { IconX, IconGrip } from '../../ui/Icons'
+import { TaskDetailModal } from './TaskDetailModal'
+import { fmtDuration } from './taskRunFormat'
+import { usePanelDrag } from '../../hooks/usePanelDrag'
 import '../../styles/task-bubble.css'
+import '../../styles/panel-drag.css'
 
 interface TaskBubbleProps {
   visible: boolean
@@ -42,14 +46,6 @@ function stateIcon(state: TaskRunState) {
   }
 }
 
-function fmtDuration(ms: number | null): string {
-  if (ms == null) return ''
-  if (ms < 1000) return `${ms}ms`
-  const s = ms / 1000
-  if (s < 60) return `${s.toFixed(1)}s`
-  return `${Math.floor(s / 60)}m${Math.round(s % 60)}s`
-}
-
 /**
  * 任务面板 —— ExecAgent 执行生命周期的**只读投影**（一轮一面墙）。
  *
@@ -63,9 +59,18 @@ function fmtDuration(ms: number | null): string {
  * 刻意**不**展示 ExecAgent 的交付摘要：那是 Exec 给 Leader 的汇报，不是给用户的；
  * 过程与结论细节由执行面板（时间线 + task_dispatch 展开）承载，小面板只回答
  * 「这一轮在跑什么、跑到第几笔、快慢如何」。
+ *
+ * 台账自带的每笔 `summary`（≤300 字）另有入口：点列表任一行弹出 TaskDetailModal
+ * （样式复用 planner 弹窗），需要逐笔看结论时再展开，不占面板常驻空间。
  */
 export const TaskBubble: React.FC<TaskBubbleProps> = ({ visible, runs, onClose }) => {
   const { t } = useLanguage()
+  /** 当前展开详情的条目；null = 弹窗关闭（关严后清空，退场动画期间仍持有内容） */
+  const [detailRun, setDetailRun] = useState<TaskRun | null>(null)
+  // 应用内拖拽（共享 usePanelDrag；key task_track_pos，与 DesktopToolbar / 工作流面板各自独立）：
+  // 未拖拽过（pos=null）不写 inline 坐标——保持 planner.css 里 right/bottom 的现有定位；
+  // 拖过一次后才切 inline left/top（并内联清掉 right/bottom，避免 over-constrained 歧义）
+  const drag = usePanelDrag('task_track_pos', { enabled: visible, clampOnResize: true })
 
   if (!visible || runs.length === 0) return null
 
@@ -75,8 +80,18 @@ export const TaskBubble: React.FC<TaskBubbleProps> = ({ visible, runs, onClose }
   const interrupted = runs.filter(r => r.state === 'interrupted').length
 
   return (
-    <div className="task-track">
+    <div
+      className="task-track"
+      ref={drag.panelRef}
+      style={
+        drag.pos ? { left: drag.pos.x, top: drag.pos.y, right: 'auto', bottom: 'auto' } : undefined
+      }
+    >
       <div className="task-track-header">
+        {/* 拖拽把手：与 DesktopToolbar 同一份实现（.panel-grip + usePanelDrag），标题左侧 */}
+        <div className="panel-grip" onMouseDown={drag.handleMouseDown} title="拖拽移动">
+          <IconGrip size={14} />
+        </div>
         <div className="task-track-title">
           {running.length > 0 ? (
             <>
@@ -117,7 +132,22 @@ export const TaskBubble: React.FC<TaskBubbleProps> = ({ visible, runs, onClose }
         {runs.map(run => {
           const cls = STATE_CLASS[run.state]
           return (
-            <div key={run.run_id} className={`task-track-item ${cls}`}>
+            // 整行即详情入口（role/tabIndex/键盘三件套：不是 button 套 button，
+            // 行内仍是 span，鼠标与键盘走同一条 openDetail）
+            <div
+              key={run.run_id}
+              className={`task-track-item ${cls}`}
+              role="button"
+              tabIndex={0}
+              aria-label={run.title}
+              onClick={() => setDetailRun(run)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  setDetailRun(run)
+                }
+              }}
+            >
               <div className="task-track-item-row">
                 {/* 同一 MorphIcon 常驻、只切 icon prop —— 分支条件渲染会重挂导致形变失效 */}
                 <span className={`task-track-dot ${cls}`}>
@@ -141,6 +171,12 @@ export const TaskBubble: React.FC<TaskBubbleProps> = ({ visible, runs, onClose }
           )
         })}
       </div>
+
+      <TaskDetailModal
+        open={detailRun !== null}
+        run={detailRun}
+        onClose={() => setDetailRun(null)}
+      />
     </div>
   )
 }

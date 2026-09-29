@@ -30,7 +30,7 @@
 interface LetterAvatarProps {
   /** 角色字母：用户侧 'U'，智能体侧 'A' */
   letter: 'U' | 'A'
-  /** 铺满尺寸，传容器尺寸（ThemesPage 34 / ChatPanel 36） */
+  /** 铺满尺寸，传容器尺寸（SoulPage 头像区 34 / ChatPanel 36） */
   size?: number
 }
 

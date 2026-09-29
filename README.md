@@ -8,7 +8,7 @@
 
 **中文** | [English](README.en.md)
 
-> **版本**: 0.2.22 · **状态**: Alpha（积极开发中） · **平台**: Windows / macOS / Linux
+> **版本**: 0.2.23 · **状态**: Alpha（积极开发中） · **平台**: Windows / macOS / Linux
 > **技术栈**: Tauri v2 · Rust · React 18 · TypeScript
 
 <p align="center">
@@ -282,6 +282,22 @@ Nuphus 是一个社区驱动的开源项目。除了代码贡献，你还可以�
 ---
 
 ## 致谢
+
+### v0.2.23 贡献者
+
+感谢本版本提交 Pull Request 的社区贡献者：
+
+| 贡献者 | PR | 内容 |
+|--------|-----|------|
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#67](https://github.com/mrpulor-gh/nuphus/pull/67) | 保留重新编辑时每月 29–31 日的定时规则 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#70](https://github.com/mrpulor-gh/nuphus/pull/70) | 手机端图片解码失败时显示原始路径 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#71](https://github.com/mrpulor-gh/nuphus/pull/71) | 修正移动画布步骤时的循环变量作用域判断 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#72](https://github.com/mrpulor-gh/nuphus/pull/72) | 稳定画布草稿与会话快照测试 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#73](https://github.com/mrpulor-gh/nuphus/pull/73) | 保护外部 Agent 任务状态并支持最近上报报告预览 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#74](https://github.com/mrpulor-gh/nuphus/pull/74) | 工作流新增非敏感运行参数方案 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#75](https://github.com/mrpulor-gh/nuphus/pull/75) | 手机端支持失败图片就地重新加载 |
+| [@fouyzjl](https://github.com/fouyzjl) | [#79](https://github.com/mrpulor-gh/nuphus/pull/79) | switch_model 持久化 base_url，修复"改了调用地址又回退" |
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#80](https://github.com/mrpulor-gh/nuphus/pull/80) | 会话工作台启动只展开上次对话所在文件夹，并修好子菜单被抽屉裁切 |
 
 ### v0.2.22 贡献者
 

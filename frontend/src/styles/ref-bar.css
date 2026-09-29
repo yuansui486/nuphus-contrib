@@ -62,6 +62,14 @@
   border: 1px solid rgba(139, 92, 246, 0.25);
 }
 
+/* 引述既有四种语义色之外的第五类：刻意取 slate 中性色——引用的是「别处的一段话」，
+   不是一类资源，用低饱和避免与 skill/knowledge/workflow/capture 抢语义。 */
+.ref-chip--quote {
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+}
+
 .ref-chip-icon {
   font-size: 11px;
   line-height: 1;

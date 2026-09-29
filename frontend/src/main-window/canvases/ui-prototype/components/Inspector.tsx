@@ -183,7 +183,7 @@ export function VariantSwatch({
 const MAX_IMAGE_PX = 1200
 
 /** hover text for a width preset derived from the selected frame */
-export const widthPresetLabel = (v: number, frameWidth = PHONE_W): string | undefined =>
+const widthPresetLabel = (v: number, frameWidth = PHONE_W): string | undefined =>
   v === frameWidth
     ? t('screenWidth')
     : v === contentWidth(frameWidth)

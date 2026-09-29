@@ -68,6 +68,44 @@ const HF_MODEL_ID: &str = "BAAI/bge-small-zh";
 /// 下载镜像（按优先级顺序：国内镜像优先，国外直连兜底）
 const MIRRORS: &[&str] = &["https://hf-mirror.com", "https://huggingface.co"];
 
+/// 单条文本进入 BertModel 前向的最大 token 数（token 级截断，非字符级）。
+///
+/// 推导：模型 config.json 的 `max_position_embeddings=512` 是 position
+/// embedding 索引的硬上限——序列超限会在索引处 panic，而该 panic 被
+/// `store/memory.rs` 中 `embed_passage(...).ok()` 静默吞掉，表现为
+/// 「长回复永远拿不到向量且无任何日志」。取 256 留足余量：
+/// intent(100字)+summary(300字) 截到 256 token 对 CLS 语义无损，
+/// 同时前向计算量约降 36%。
+const MAX_SEQ_LEN: usize = 256;
+
+/// 将 token 序列（ids 与 attention mask 同步）截断到 `max` 个 token。
+///
+/// 纯函数（无 IO、无模型依赖），便于单测。语义：
+/// - 未超长（`ids.len() <= max`）时原样透传，不引入额外拷贝语义差异；
+/// - 超长时保留首 `ceil(max/2)` 与尾 `floor(max/2)` 个 token，中间段丢弃。
+///
+/// 保留首尾而非仅保留头部：ids[0]/末位分别是 [CLS]/[SEP]，首尾各留一半
+/// 可维持 BertModel 期望的特殊 token 结构；语义上 intent（任务目标，位于
+/// 头部）与结论（位于尾部）恰是检索权重最高的两段。
+///
+/// 前置条件：`ids` 与 `mask` 来自同一次 `Encoding`（tokenizers crate 保证
+/// 两者等长）；违反该前置条件时切片越界会直接 panic，而非静默产出错配张量。
+fn clamp_seq(ids: &[u32], mask: &[u32], max: usize) -> (Vec<u32>, Vec<u32>) {
+    if ids.len() <= max {
+        return (ids.to_vec(), mask.to_vec());
+    }
+    let head = max - max / 2;
+    let tail = max / 2;
+    let split = ids.len() - tail;
+    let mut out_ids = Vec::with_capacity(max);
+    out_ids.extend_from_slice(&ids[..head]);
+    out_ids.extend_from_slice(&ids[split..]);
+    let mut out_mask = Vec::with_capacity(max);
+    out_mask.extend_from_slice(&mask[..head]);
+    out_mask.extend_from_slice(&mask[split..]);
+    (out_ids, out_mask)
+}
+
 impl Embedder {
     fn model_dir() -> PathBuf {
         std::env::var("NUPHUS_EMBED_MODEL_DIR")
@@ -413,15 +451,21 @@ impl Embedder {
             .encode(input, false)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
 
-        let ids = encoding.get_ids();
-        let mask = encoding.get_attention_mask();
+        // token 级截断到 MAX_SEQ_LEN（构造 Tensor 之前）：超 max_position_embeddings
+        // 时 candle 会在 position embedding 索引处 panic，且该 panic 会被调用链的
+        // `.ok()` 静默吞掉（长文本表现为「永远拿不到向量」），必须在入口掐断
+        let (ids, mask) = clamp_seq(
+            encoding.get_ids(),
+            encoding.get_attention_mask(),
+            MAX_SEQ_LEN,
+        );
         let ids_len = ids.len();
 
-        let input_ids = Tensor::from_slice(ids, (1, ids_len), &self.device)
+        let input_ids = Tensor::from_slice(&ids, (1, ids_len), &self.device)
             .map_err(|e| format!("创建 input_ids tensor 失败: {}", e))?;
         let token_type_ids = Tensor::zeros((1, ids_len), candle_core::DType::I64, &self.device)
             .map_err(|e| format!("创建 token_type_ids tensor 失败: {}", e))?;
-        let attention_mask = Tensor::from_slice(mask, (1, ids_len), &self.device)
+        let attention_mask = Tensor::from_slice(&mask, (1, ids_len), &self.device)
             .map_err(|e| format!("创建 attention_mask tensor 失败: {}", e))?;
 
         let output = self
@@ -468,5 +512,48 @@ impl Embedder {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_seq_passes_through_within_limit() {
+        // 未超长（含恰好等于上限）时原样透传，ids/mask 逐元素相等
+        let short: Vec<u32> = (1..=10).collect();
+        let (ids_out, mask_out) = clamp_seq(&short, &[1; 10], MAX_SEQ_LEN);
+        assert_eq!(ids_out, short);
+        assert_eq!(mask_out, vec![1; 10]);
+
+        let exact: Vec<u32> = (1..=MAX_SEQ_LEN as u32).collect();
+        let (ids_out, mask_out) = clamp_seq(&exact, &[1; MAX_SEQ_LEN], MAX_SEQ_LEN);
+        assert_eq!(ids_out, exact);
+        assert_eq!(mask_out, vec![1; MAX_SEQ_LEN]);
+    }
+
+    #[test]
+    fn clamp_seq_keeps_head_and_tail_when_over_limit() {
+        let len = 600usize;
+        let ids: Vec<u32> = (1..=len as u32).collect();
+        let mask = vec![1u32; len];
+        let (ids_out, mask_out) = clamp_seq(&ids, &mask, MAX_SEQ_LEN);
+
+        // 超长输入被截且总长 == MAX_SEQ_LEN，ids 与 mask 同步截断
+        assert_eq!(ids_out.len(), MAX_SEQ_LEN);
+        assert_eq!(mask_out.len(), MAX_SEQ_LEN);
+
+        // 保留首 128（含 [CLS] 与 intent 段）与尾 128（含 [SEP] 与结论段）
+        let head = MAX_SEQ_LEN - MAX_SEQ_LEN / 2;
+        assert_eq!(&ids_out[..head], &ids[..head], "头部 token 应原样保留");
+        assert_eq!(
+            &ids_out[head..],
+            &ids[len - MAX_SEQ_LEN / 2..],
+            "尾部 token 应原样保留"
+        );
+
+        // 中间段被丢弃：token 值 300 位于索引 299，落在 128..472 的截断区
+        assert!(!ids_out.contains(&300), "中间段 token 不应残留");
     }
 }

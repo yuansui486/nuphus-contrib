@@ -17,6 +17,7 @@ const archiveSession = vi.fn()
 const setProjectBookmarks = vi.fn()
 const setProjectFolderArchived = vi.fn()
 const setSessionSortPrefs = vi.fn()
+const setPinnedSessions = vi.fn()
 
 vi.mock('../main-window/lib/api', () => ({
   listShelfSessions: () => listShelfSessions(),
@@ -26,6 +27,7 @@ vi.mock('../main-window/lib/api', () => ({
   setProjectBookmarks: (...args: unknown[]) => setProjectBookmarks(...args),
   setProjectFolderArchived: (...args: unknown[]) => setProjectFolderArchived(...args),
   setSessionSortPrefs: (...args: unknown[]) => setSessionSortPrefs(...args),
+  setPinnedSessions: (...args: unknown[]) => setPinnedSessions(...args),
   SESSION_GROUP_LIMIT_CHANGED_EVENT: 'nuphus:session-group-limit-changed',
 }))
 

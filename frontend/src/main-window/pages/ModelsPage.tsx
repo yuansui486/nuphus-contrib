@@ -2087,6 +2087,9 @@ export function ModelsPage({
         } else {
           await switchModelCmd(name, provider, resolvedBaseUrl, addCtxArg, 'global')
         }
+        // 地址已落盘：同步 loadedBaseUrl，否则「接口地址已变更」警示条在地址
+        // 持久化成功后仍残留，误导用户以为没生效
+        if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
         setCurrentModel(name)
         persistCurrentProvider(name)
         onModelChanged?.()
@@ -2258,6 +2261,7 @@ export function ModelsPage({
       isLocal && localCtxWindow != null && !hasExplicitCtx(name) ? localCtxWindow : undefined
     try {
       await switchModelCmd(name, provider, resolvedBaseUrl, ctxArg, 'default')
+      if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
       setCurrentModel(name)
       persistCurrentProvider(name)
       onModelChanged?.()
@@ -2911,6 +2915,7 @@ export function ModelsPage({
                                           'default',
                                         )
                                       }
+                                      if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
                                       setCurrentModel(name)
                                       persistCurrentProvider(name)
                                       onModelChanged?.()

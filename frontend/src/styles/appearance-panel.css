@@ -1,0 +1,544 @@
+/* ═══════════════════════════════════════════
+   appearance-panel.css — 外观浮窗（AppearancePanel）样式
+
+   规格源：chat-terminal.css 的 `.wfst-panel`（acrylic 浮层家族）——
+   fixed 定位 / glass-bg / blur(24px) saturate(1.2) / border-divider /
+   radius 10 / shadow-elevated / 进出曲线逐字复用，**不引入新色值、新圆角、
+   新动效曲线**。与 wfst 的差异只有两处，都由本面板的职责决定：
+   ① top:56px 锚定而非 bottom:160（本面板从聊天 header 下方展开，
+      要避开 wfst 的 bottom:160 占位与底部输入 dock，放到底部会被 dock 压住）；
+   ② 不设 user-select:none —— 面板内有名称 / hex 输入与滑块，
+      禁选会让这些控件难以操作（wfst 是只读步骤树，才敢全局禁选）。
+
+   类名一律独立 `apnp-*`：外观面板不是工作流面板，共用 `wfst-*` 改一处
+   就会误伤另一处。
+
+   面板是**一页流**（不翻页 / 不 Tab / 不折叠 / 不浮出操作条），因此本文件
+   只描述「一条纵向优先级流」的外壳件：预设大卡、我的主题卡片网格、磨砂小按钮、
+   紧凑保存行、「⋯ 更多」浮层。
+
+   浮层**内部**复用的既有件不在本文件：theme-swatch / custom-theme-badge /
+   color-token-* / opacity-*（themes.css）、
+   segmented / btn-row / form-row（ui-primitives.css / page-layout.css）。
+   磨砂小按钮是对 `.chat-header-settings-btn` 配方的逐字复用（同色键同混合比），
+   不是新审美。本文件只放浮层自身，以及 380px 窄窗下对上述既有件宽度的收敛。
+   ═══════════════════════════════════════════ */
+
+/* ── 浮层容器 ── */
+.apnp-panel {
+  position: fixed;
+  top: 56px;
+  right: 20px;
+  z-index: 60;
+  width: 380px;
+  /* 底部预留 200px：输入 dock +  refine  chip 一列 header 之下的可视余量，
+     即「顶 56 + 底 200」把浮层锁在视口中部可用带内，dvh 随窗口高度变化。 */
+  max-height: calc(100dvh - 56px - 200px);
+  display: flex;
+  flex-direction: column;
+  background: var(--glass-bg);
+  backdrop-filter: blur(24px) saturate(1.2);
+  -webkit-backdrop-filter: blur(24px) saturate(1.2);
+  border: var(--border-divider);
+  border-radius: 10px;
+  box-shadow: var(--shadow-elevated);
+  padding: 10px 0 0;
+  animation: apnp-in 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  overflow: hidden;
+}
+
+/* 收起 = **保活不卸载**：内容组件与它的本地 state（名称输入、色板草稿）
+   始终挂在树上，只把浮层从渲染树里摘掉 —— 否则关闭再打开就丢未保存调整
+   （旧 ThemesPage 被 CompactModal 关一次即卸载，正是那里的痛点）。
+   `[hidden]` 的 UA 规则（display:none）优先级低于作者的 display:flex，
+   必须显式压回来，否则收起态仍占位、且遮住点击。 */
+.apnp-panel[hidden] {
+  display: none;
+}
+
+@keyframes apnp-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ── Header（图标 + 标题 + 收起）── */
+.apnp-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 8px;
+  border-bottom: 1px solid var(--glass-2);
+}
+
+.apnp-header-icon {
+  display: flex;
+  color: var(--spark-tertiary);
+  opacity: 0.6;
+}
+
+.apnp-header-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fz-xs);
+  font-weight: 600;
+  color: var(--spark-secondary);
+  letter-spacing: 0.3px;
+}
+
+.apnp-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--spark-dim);
+  cursor: pointer;
+  border-radius: 5px;
+  transition: all 0.12s ease;
+}
+
+.apnp-close-btn:hover {
+  background: var(--glass-3);
+  color: var(--spark-primary);
+}
+
+/* ── 滚动内容区（一页流，自上而下按优先级排）── */
+.apnp-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: 10px 12px 12px;
+}
+
+.apnp-body::-webkit-scrollbar {
+  width: 3px;
+}
+
+.apnp-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.apnp-body::-webkit-scrollbar-thumb {
+  background: var(--glass-2);
+}
+
+/* ── 分区（一页流的分区外壳；标题用降级小字条，不抢内容）── */
+.apnp-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.apnp-zone-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fz-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-3);
+}
+
+/* ── 「我的主题」卡片网格（与预设主题大卡同款式：surface-1 底 + radius-3 + 描边）──
+   末位是固定的「＋ 新建」卡；主题卡按「最新保存在前」展示（展示层排序，
+   存储顺序不变，见 AppearancePanel 的 displayThemes）。 */
+.apnp-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-2);
+}
+
+.apnp-theme-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-3);
+  background: var(--surface-1);
+  overflow: hidden;
+  transition: border-color var(--transition-fast);
+}
+.apnp-theme-card:hover {
+  border-color: var(--line-3);
+}
+/* 激活：accent 描边 + 外环（与预设大卡 active 同支语义键，不引新色） */
+.apnp-theme-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+/* 卡面媒体区：皮肤缩略图 + hover 上传浮钮 + 激活勾选 + 删除小钮。
+   ⚠️ 高度必须写死：内嵌缩略图是 <span>（内联元素不认 width/height），
+   父链任一层高度为 auto，整张卡面就会塌成 0 —— 缩略图看不见、上传钮错位。 */
+.apnp-theme-media {
+  position: relative;
+  display: block;
+  height: 64px;
+}
+.apnp-theme-face {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+/* 缩略图铺满卡面（display:block + 100% 才能在内联 span 上生效；
+   0,2,0 压过 themes.css .theme-swatch 的 32px 方块） */
+.apnp-theme-media .apnp-theme-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 0;
+}
+.apnp-theme-media .apnp-theme-thumb--img {
+  background-size: cover;
+  background-position: center;
+}
+/* 有皮肤图时不画强调点（照片上的色点是噪音；色板兜底时才显示） */
+.apnp-theme-thumb--img::after {
+  display: none;
+}
+
+/* hover：缩略图变暗 + 中央浮出上传钮（键盘 focus 同样可见） */
+.apnp-theme-media:hover .apnp-theme-thumb,
+.apnp-theme-media:focus-within .apnp-theme-thumb {
+  filter: brightness(0.55);
+}
+.apnp-theme-upload {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--glass-3);
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--panel-bg) 72%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--fg-1);
+  font-family: inherit;
+  font-size: var(--fz-xs);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
+}
+.apnp-theme-media:hover .apnp-theme-upload,
+.apnp-theme-upload:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 激活勾选标（卡面左上，避开右上删除钮） */
+.apnp-theme-check {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* 删除小钮：卡片右上角，常驻可见（磨砂底保证压在图上也看得清） */
+.apnp-theme-delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--panel-bg) 72%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: var(--fg-2);
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+.apnp-theme-delete:hover {
+  color: var(--error, #ef4444);
+}
+
+/* 卡底：主题名 + 铅笔（行内改名） */
+.apnp-theme-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+.apnp-theme-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fz-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.apnp-theme-edit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.apnp-theme-edit:hover {
+  background: var(--surface-hover);
+  color: var(--fg-1);
+}
+.apnp-theme-rename {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  font-size: var(--fz-xs);
+}
+
+/* 首张固定「＋ 新建」卡：虚线框 + 加号 + 文案（同样式，点击即建新主题）。
+   min-height = 媒体区 64 + 卡底 30，与主题卡总高对齐（网格行不错位）。 */
+.apnp-theme-card-new {
+  align-items: center;
+  justify-content: center;
+  min-height: 94px;
+  border-style: dashed;
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--fz-xs);
+}
+.apnp-theme-card-new:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--fg-1);
+}
+.apnp-theme-new-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── 预设主题大卡（3 卡横排：色板占卡面主体 + 主题名 + 激活勾选标）── */
+.apnp-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-2);
+}
+
+.apnp-preset-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-3);
+  background: var(--surface-1);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  transition: border-color var(--transition-fast);
+}
+
+.apnp-preset-card:hover {
+  border-color: var(--line-3);
+}
+
+/* 激活：accent 描边 + 右上勾选标（与紧凑卡 active 同支语义键，不引新色） */
+.apnp-preset-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim);
+}
+
+/* 色板铺满卡面：复用 .theme-swatch（含 --swatch-accent 强调点伪元素），
+   只把 32px 方块撑成卡内主体块（0,2,0 选择器压过 themes.css 的 0,1,0） */
+.apnp-preset-card .theme-swatch {
+  width: 100%;
+  height: 46px;
+}
+
+.apnp-preset-name {
+  font-size: var(--fz-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.apnp-preset-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* ── 磨砂小按钮（皮肤背景 更换 / 清除）──
+   配方逐字复用 `.chat-header-settings-btn`：--panel-bg 62% 兑透明 +
+   blur(8px) saturate(1.2) + 30px 高 + radius 8 + hover 85% 档。
+   同一条 knob 键（--panel-bg 由「控制面板不透明度」滑块派生），滑块拖到任何
+   值按钮都跟着同变奏；hover 只抬混合比，不换不透明硬色。 */
+.apnp-glass-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
+  cursor: pointer;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: var(--fz-xs);
+  transition: all var(--transition-fast);
+}
+
+.apnp-glass-btn:hover {
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  border-color: var(--glass-3);
+  color: var(--spark-primary);
+}
+
+/* ── 紧凑保存行：放弃修改（仅有无保存调整时）+ ⋯ 更多 + 「保存」──
+    布局语义：次要动作在左、主操作「保存」恒为行内最后一个子元素并以
+    margin-left:auto 贴浮窗右缘（大王 2026-09-28：保存放最右侧）；
+    窄窗换行时保存仍落在末行末端。 */
+.apnp-save-control {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.apnp-save-control > :last-child {
+  margin-left: auto;
+}
+
+.apnp-more-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.apnp-more-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: var(--fz-xs);
+  white-space: nowrap;
+  transition: all var(--transition-fast);
+}
+
+.apnp-more-trigger:hover,
+.apnp-more-trigger[aria-expanded='true'] {
+  background: var(--glass-3);
+  color: var(--fg-1);
+}
+
+/* ── 「⋯ 更多」浮层 ──
+   portal 到 body + fixed 定位（.apnp-panel 的 overflow:hidden 会裁掉向下的
+   内联浮层），视觉沿用 .ctx-menu 家族：悬浮底 + 常规边框 + 细圆角 + 投影。 */
+.apnp-more-menu {
+  position: fixed;
+  z-index: 70;
+  min-width: 152px;
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-2);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  font-size: var(--fz-sm);
+  color: var(--fg-2);
+}
+
+.apnp-more-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.apnp-more-item:hover,
+.apnp-more-item:focus-visible {
+  background: var(--surface-hover);
+  color: var(--fg-1);
+  outline: none;
+}
+
+.apnp-more-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--line-1);
+}
+
+/* ── 380px 窄窗适配 ──
+   下列宽度都是为整页 / 宽模态定的，在 380px 里会把 label 挤出可视区；
+   只收窄占用宽度，不改任何视觉语言（配色 / 圆角 / 字号均沿用原规则）。 */
+.apnp-body .opacity-control {
+  width: 128px;
+}
+
+.apnp-body .color-token-hex {
+  width: 76px;
+}

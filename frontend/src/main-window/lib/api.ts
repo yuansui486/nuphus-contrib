@@ -459,6 +459,8 @@ export interface ExternalAgentStatus {
     ts?: string
   } | null
   updated_at?: string
+  /** 用户已从列表栏移出（后端共享态标注：应用生命周期内保持、重启即净） */
+  hidden?: boolean
 }
 
 /** 列出所有已初始化外部 agent 的运行时态（按 agent 名排序） */
@@ -563,6 +565,11 @@ export interface ShelfListResponse {
   collapsed_limit: number
   /** 排序偏好（组序维度 + 组内键）：桌面与移动端共用同一读数 */
   sort_prefs: ShelfSortPrefs
+  /**
+   * 置顶会话 id（组内置顶，数组序即组内展示序）。
+   * 可选：老后端 / mock 缺失该字段 = 无置顶（与 `draft?` 同款降级）。
+   */
+  pinned_sessions?: string[]
 }
 
 /** 展示台列表：active 置顶 + newest-first */
@@ -1240,6 +1247,20 @@ export async function setSessionSortPrefs(
     group_order: applied?.group_order ?? groupOrder,
     sort_key: applied?.sort_key ?? sortKey,
   }
+}
+
+/**
+ * 设置会话工作台置顶会话（组内置顶，数组序即展示序）。
+ *
+ * 后端把脏 id 归一（去空白/去空/去重/保序）并**返回归一后的结果**，调用方据此校准
+ * 本地状态（避免「界面显示 A、落盘 B」）。生效无需额外广播：会话工作台 5s 轮询
+ * `list_shelf_sessions` 即读到新值，移动端同源返回体一并跟随。
+ */
+export async function setPinnedSessions(ids: string[]): Promise<string[]> {
+  const applied = await invoke<string[]>('set_pinned_sessions', { ids })
+  // bridge 无 Tauri 通道（浏览器回退链路）时返回 null → 回落到请求值；
+  // 后端失败会 throw，不走这里
+  return Array.isArray(applied) ? applied : ids
 }
 
 // ── Session Refine ──

@@ -8,6 +8,7 @@ import {
   IconWrench,
   IconBrain,
   IconWorkflow,
+  IconQuote,
 } from '../../ui/Icons'
 import '../../styles/ref-bar.css'
 
@@ -34,6 +35,8 @@ function RefIcon({ type }: { type: ChatReference['type'] }) {
       return <IconBrain size={ICON_SIZE} />
     case 'workflow':
       return <IconWorkflow size={ICON_SIZE} />
+    case 'quote':
+      return <IconQuote size={ICON_SIZE} />
   }
 }
 
@@ -130,7 +133,7 @@ export default function ReferenceBar({
             <span
               key={`${ref.type}-${ref.id}-${i}`}
               className={`ref-chip ref-chip--${ref.type}`}
-              title={ref.id}
+              title={ref.type === 'quote' ? ref.label : ref.id}
             >
               <span className="ref-chip-icon" aria-hidden="true">
                 <RefIcon type={ref.type} />

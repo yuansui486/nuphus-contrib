@@ -3,8 +3,8 @@
  *
  * 输入是后端 `get_changelog` 返回的 Markdown 全文（编译期嵌入，离线可读）。
  * 只做「切出目标版本段落 → 拆小节 → 拆条目」这一件事：
- *   - 不引 Markdown 渲染依赖（更新页只需要层级与条目，不需要排版能力）；
- *   - 不改写文案语义，仅去掉 `**` 粗体标记（纯文本展示时它们只是噪声）。
+ *   - 不引 Markdown 渲染依赖，排版交给调用方；
+ *   - 保留行内 Markdown 标记，避免破坏粗体、代码等内容。
  *
  * 段落边界：`## [版本]` 起，到下一个 `## [` 行为止（与 Keep a Changelog 的层级一致）。
  */
@@ -29,9 +29,6 @@ const GROUP_RE = /^\s*#{3,}\s+(.+?)\s*$/
 const ITEM_RE = /^\s*[-*]\s+(.+?)\s*$/
 /** 分隔线（`---`）之类的装饰行：不并入条目 */
 const RULE_RE = /^\s*([-*_]\s*){3,}$/
-
-/** 纯文本化：去掉 Markdown 粗体标记（`**`），其余原样保留 */
-const plainText = (text: string) => text.replace(/\*\*/g, '').trim()
 
 /**
  * 从 CHANGELOG 全文切出 `version` 对应段落。
@@ -68,14 +65,14 @@ export function parseChangelogSection(text: string, version: string): ChangelogS
 
     const group = GROUP_RE.exec(line)
     if (group) {
-      groups.push({ title: plainText(group[1]), items: [] })
+      groups.push({ title: group[1].trim(), items: [] })
       continue
     }
 
     const item = ITEM_RE.exec(line)
     if (item) {
       if (groups.length === 0) groups.push({ title: '', items: [] })
-      groups[groups.length - 1].items.push(plainText(item[1]))
+      groups[groups.length - 1].items.push(item[1].trim())
       continue
     }
 
@@ -83,7 +80,7 @@ export function parseChangelogSection(text: string, version: string): ChangelogS
     if (line.trim() && groups.length > 0) {
       const last = groups[groups.length - 1]
       const lastIndex = last.items.length - 1
-      if (lastIndex >= 0) last.items[lastIndex] = `${last.items[lastIndex]} ${plainText(line)}`
+      if (lastIndex >= 0) last.items[lastIndex] = `${last.items[lastIndex]} ${line.trim()}`
     }
   }
 
