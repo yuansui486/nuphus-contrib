@@ -327,6 +327,11 @@ mod tests {
         };
         assert_eq!(prefs.pinned_sessions(), vec!["s-1", "s-2"]);
         assert_eq!(normalize_pinned_sessions(&[]), Vec::<String>::new());
+        // Desktop commands consume the public config facade, not this submodule.
+        assert_eq!(
+            crate::config::normalize_pinned_sessions(&prefs.pinned_sessions),
+            prefs.pinned_sessions()
+        );
     }
 
     /// 非法取值归一：手改配置写进的怪值 / 空串 / 大小写变体 / 带空白，
