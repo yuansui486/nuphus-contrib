@@ -16,6 +16,48 @@ pub use preferences::{
 
 use std::path::PathBuf;
 
+/// Serializes in-process providers.toml read/modify/write transactions across
+/// desktop commands, OAuth refresh and background capability discovery.
+/// Never hold this guard across network I/O, await, or another config writer.
+static PROVIDER_CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn lock_provider_config() -> std::sync::MutexGuard<'static, ()> {
+    PROVIDER_CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Replace a complete providers config without exposing a truncated document to
+/// lock-free readers. Callers must hold lock_provider_config for the whole
+/// read/modify/write transaction. Preserve existing permissions; new Unix files
+/// are private because providers config may contain credentials.
+pub fn write_provider_config(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut created = false;
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        created = true;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.write_all(content.as_bytes())?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if created && result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// 桌面端注入的规范配置路径（最高优先级）。
 /// 防止 cwd / exe_dir 下无关的 config.toml 劫持模型注册表。
 /// CLI 不调用 set_config_override，搜索行为保持不变。

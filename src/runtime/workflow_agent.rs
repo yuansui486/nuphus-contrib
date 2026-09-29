@@ -525,6 +525,9 @@ impl WorkflowAgent {
                     retryable: false,
                     from_subtask: false,
                 });
+                // 封口未配对的 ToolUse 再落记忆：下一轮模型据此知道手停在哪一步、
+                // 那一步没有产出，不会在「我做过但历史上没有」的错位上继续推理。
+                self.session.seal_interrupted_tools();
                 self.store_turn_memory(input, "任务已被用户中断", false);
                 return Ok(AgentOutput {
                     success: false,

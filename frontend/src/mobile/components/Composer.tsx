@@ -226,7 +226,6 @@ export default function Composer({
     // 导致「已选图却静默 return」——这是此前所有版本无反应的真正根因。
     const pickedAll = Array.from(e.target.files ?? [])
     const count = pickedAll.length
-    console.log('[mobile] files selected:', count)
     e.target.value = '' // 允许重复选择同一文件（清空不再影响已拷贝的 File 数组）
     if (count === 0) {
       onToast?.(t('mobile.noImagePicked'))

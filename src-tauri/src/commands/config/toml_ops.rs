@@ -71,6 +71,7 @@ pub fn update_model_context_window(
     model_id: &str,
     context_window: usize,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // If file doesn't exist yet, silently skip — creating it is update_config_toml's job
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -104,9 +105,11 @@ pub fn update_model_context_window(
                                             toml::to_string_pretty(&doc).map_err(|e| {
                                                 format!("serialize config.toml failed: {}", e)
                                             })?;
-                                        std::fs::write(config_path, new_content).map_err(|e| {
-                                            format!("write config.toml failed: {}", e)
-                                        })?;
+                                        nuphus::config::write_provider_config(
+                                            config_path,
+                                            &new_content,
+                                        )
+                                        .map_err(|e| format!("write config.toml failed: {}", e))?;
                                         tracing::info!(
                                             "Updated context_window for {}/{}: {}",
                                             provider_name,
@@ -157,86 +160,10 @@ pub fn read_model_context_window(
     None
 }
 
-/// Update model reasoning-effort metadata in config.toml model entry
-/// (discovered from the provider's /models response at configure time).
-pub fn update_model_reasoning_efforts(
-    config_path: &std::path::Path,
-    provider_name: &str,
-    model_id: &str,
-    efforts: &[String],
-    default_effort: Option<&str>,
-) -> Result<(), String> {
-    if efforts.is_empty() {
-        return Ok(());
-    }
-    // If file doesn't exist yet, silently skip — creating it is update_config_toml's job
-    let content = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
-    };
-    let mut doc: toml::Value = match content.parse() {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-
-    let providers = match doc.get_mut("providers").and_then(|p| p.as_array_mut()) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    for provider in providers.iter_mut() {
-        if let Some(name) = provider.get("name").and_then(|n| n.as_str()) {
-            if name == provider_name {
-                if let Some(map) = provider.as_table_mut() {
-                    if let Some(models) = map.get_mut("models").and_then(|m| m.as_array_mut()) {
-                        for model in models.iter_mut() {
-                            if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
-                                if id == model_id {
-                                    if let Some(map) = model.as_table_mut() {
-                                        map.insert(
-                                            "reasoning_efforts".to_string(),
-                                            toml::Value::Array(
-                                                efforts
-                                                    .iter()
-                                                    .map(|e| toml::Value::String(e.clone()))
-                                                    .collect(),
-                                            ),
-                                        );
-                                        if let Some(d) = default_effort {
-                                            map.insert(
-                                                "default_effort".to_string(),
-                                                toml::Value::String(d.to_string()),
-                                            );
-                                        }
-                                        nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
-                                        let new_content =
-                                            toml::to_string_pretty(&doc).map_err(|e| {
-                                                format!("serialize config.toml failed: {}", e)
-                                            })?;
-                                        std::fs::write(config_path, new_content).map_err(|e| {
-                                            format!("write config.toml failed: {}", e)
-                                        })?;
-                                        tracing::info!(
-                                            "Updated reasoning_efforts for {}/{}: {:?} (default {:?})",
-                                            provider_name, model_id, efforts, default_effort
-                                        );
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Update model supports_vision in config.toml model entry.
 ///
 /// `source` 记录该值的来源：`Some("user")` = 用户在模型行内手动设定，
-/// 探测链路（post_configure 的 metadata/HTTP probe）必须让位于用户意图，
+/// 探测链路（model_metadata 后台发现的 metadata/HTTP probe）必须让位于用户意图，
 /// 否则用户今天勾上的视觉能力会在下次连接时被探测结果覆盖掉。
 /// `None` = 自动探测结果，不改动已有的来源标记。
 pub fn update_model_supports_vision(
@@ -246,6 +173,7 @@ pub fn update_model_supports_vision(
     supports_vision: bool,
     source: Option<&str>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // If file doesn't exist yet, silently skip
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -270,6 +198,12 @@ pub fn update_model_supports_vision(
                             if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
                                 if id == model_id {
                                     if let Some(map) = model.as_table_mut() {
+                                        if source != Some("user")
+                                            && map.get(VISION_SOURCE_KEY).and_then(|v| v.as_str())
+                                                == Some("user")
+                                        {
+                                            return Ok(());
+                                        }
                                         map.insert(
                                             "supports_vision".to_string(),
                                             toml::Value::Boolean(supports_vision),
@@ -285,9 +219,11 @@ pub fn update_model_supports_vision(
                                             toml::to_string_pretty(&doc).map_err(|e| {
                                                 format!("serialize config.toml failed: {}", e)
                                             })?;
-                                        std::fs::write(config_path, new_content).map_err(|e| {
-                                            format!("write config.toml failed: {}", e)
-                                        })?;
+                                        nuphus::config::write_provider_config(
+                                            config_path,
+                                            &new_content,
+                                        )
+                                        .map_err(|e| format!("write config.toml failed: {}", e))?;
                                         tracing::info!(
                                             "Updated supports_vision for {}/{}: {}",
                                             provider_name,
@@ -373,6 +309,7 @@ pub fn set_capability_in_config_toml(
     model_id: &str,
     provider_name: &str,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config.toml: {}", e))?;
     let mut doc: toml::Value = content
@@ -405,7 +342,7 @@ pub fn set_capability_in_config_toml(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("Failed to serialize config: {}", e))?;
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("Failed to write config.toml: {}", e))?;
     Ok(())
 }
@@ -564,6 +501,7 @@ fn sync_provider_models_inner(
     remove_missing: bool,
     mark_manual: bool,
 ) -> Result<SyncReport, String> {
+    let _config_write = nuphus::config::lock_provider_config();
     let mut report = SyncReport::default();
     // 空清单 = 异常（接口抖动/解析失败）：不删不清，避免整段模型列表被抹掉。
     if incoming_ids.is_empty() {
@@ -627,7 +565,7 @@ fn sync_provider_models_inner(
         nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
         let new_content = toml::to_string_pretty(&doc)
             .map_err(|e| format!("serialize config.toml failed: {}", e))?;
-        std::fs::write(config_path, new_content)
+        nuphus::config::write_provider_config(config_path, &new_content)
             .map_err(|e| format!("write config.toml failed: {}", e))?;
         tracing::info!(
             "sync_provider_models: provider={} added={} updated={} removed={} kept_manual={}",
@@ -839,6 +777,7 @@ pub fn clear_provider_models_in_config_toml(
     config_path: &std::path::Path,
     provider_name: &str,
 ) -> Result<usize, String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // If file doesn't exist yet, nothing to clear — silently skip
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -872,7 +811,7 @@ pub fn clear_provider_models_in_config_toml(
         nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
         let new_content = toml::to_string_pretty(&doc)
             .map_err(|e| format!("serialize config.toml failed: {}", e))?;
-        std::fs::write(config_path, new_content)
+        nuphus::config::write_provider_config(config_path, &new_content)
             .map_err(|e| format!("write config.toml failed: {}", e))?;
         tracing::info!(
             "clear_provider_models: cleared {} models for provider={}",
@@ -899,6 +838,7 @@ pub fn remove_provider_segment(
     config_path: &std::path::Path,
     provider_name: &str,
 ) -> Result<bool, String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // 文件不存在 = 没什么可删
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -926,7 +866,7 @@ pub fn remove_provider_segment(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {}", e))?;
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write config.toml failed: {}", e))?;
     tracing::info!(
         "remove_provider_segment: removed {} segment(s) for provider={}",
@@ -944,6 +884,7 @@ pub fn update_reasoning_effort(
     provider_name: &str,
     effort: Option<&str>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // If file doesn't exist yet, silently skip — creating it is update_config_toml's job
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -977,7 +918,7 @@ pub fn update_reasoning_effort(
                     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
                     let new_content = toml::to_string_pretty(&doc)
                         .map_err(|e| format!("serialize config.toml failed: {}", e))?;
-                    std::fs::write(config_path, new_content)
+                    nuphus::config::write_provider_config(config_path, &new_content)
                         .map_err(|e| format!("write config.toml failed: {}", e))?;
                     tracing::info!(
                         "Updated reasoning_effort for {}: {:?}",
@@ -1002,6 +943,7 @@ pub fn clear_provider_api_key_in_config_toml(
     config_path: &std::path::Path,
     provider_name: &str,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // If file doesn't exist yet, nothing to clear — silently skip
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
@@ -1025,7 +967,7 @@ pub fn clear_provider_api_key_in_config_toml(
                     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
                     let new_content = toml::to_string_pretty(&doc)
                         .map_err(|e| format!("serialize config.toml failed: {}", e))?;
-                    std::fs::write(config_path, new_content)
+                    nuphus::config::write_provider_config(config_path, &new_content)
                         .map_err(|e| format!("write config.toml failed: {}", e))?;
                     tracing::info!("Cleared api_key for provider {}", provider_name);
                     return Ok(());
@@ -1051,6 +993,7 @@ pub fn update_config_toml(
     base_url: Option<&str>,
     provider_type: Option<&str>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // Read existing config, or start fresh if file doesn't exist yet
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
     let mut doc: toml::Value = content.parse().unwrap_or_else(|_| {
@@ -1185,7 +1128,7 @@ pub fn update_config_toml(
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {}", e))?;
 
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write config.toml failed: {}", e))?;
 
     tracing::info!(
@@ -1364,6 +1307,7 @@ pub fn create_custom_provider_segment(
     headers: &[(String, String)],
     oauth: Option<&super::oauth::OauthConfigDto>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     validate_custom_provider_name(name)?;
     if !CUSTOM_PROVIDER_TYPES.contains(&provider_type) {
         return Err(format!(
@@ -1496,7 +1440,7 @@ pub fn create_custom_provider_segment(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {}", e))?;
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write config.toml failed: {}", e))?;
 
     tracing::info!(
@@ -1530,6 +1474,7 @@ pub fn update_custom_provider_segment(
     headers: &[(String, String)],
     oauth: Option<&super::oauth::OauthConfigDto>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     validate_custom_provider_name(name)?;
     if !CUSTOM_PROVIDER_TYPES.contains(&provider_type) {
         return Err(format!(
@@ -1609,7 +1554,7 @@ pub fn update_custom_provider_segment(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {}", e))?;
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write config.toml failed: {}", e))?;
 
     tracing::info!(
@@ -1688,6 +1633,7 @@ pub fn update_provider_base_url(
     provider_name: &str,
     base_url: &str,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     let url = base_url.trim();
     // 空地址 = 未改：不写盘（与「空值交给后端解析已存配置」的调用方口径一致）。
     if url.is_empty() {
@@ -1732,7 +1678,7 @@ pub fn update_provider_base_url(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("serialize config.toml failed: {e}"))?;
-    std::fs::write(config_path, new_content)
+    nuphus::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write config.toml failed: {e}"))?;
     tracing::info!("Updated base_url for provider {}", provider_name);
     Ok(())
@@ -3397,8 +3343,12 @@ id = "gpt-4o"
             "gpt-4o"
         ));
 
-        // 自动探测写入（source = None）不得清除 user 标记
-        update_model_supports_vision(&path, "custom-team-a", "gpt-4o", true, None).unwrap();
+        // 自动探测不仅不能清除来源，也不能改掉用户设定的值。
+        update_model_supports_vision(&path, "custom-team-a", "gpt-4o", false, None).unwrap();
+        assert_eq!(
+            read_model_supports_vision(&path, "custom-team-a", "gpt-4o"),
+            Some(true)
+        );
         assert!(
             model_has_user_vision_override(&path, "custom-team-a", "gpt-4o"),
             "自动探测不得清除 user 标记"

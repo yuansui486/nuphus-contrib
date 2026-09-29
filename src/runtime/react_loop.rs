@@ -331,6 +331,10 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         error: "任务已被用户中断".into(),
                     });
                 }
+                // 封口未配对的 ToolUse（写为「用户强制中断」的 ToolResult）——必须在返回前：
+                // 下一轮迭代起点会跑 strip_incomplete_tools，若不先封口，痕迹会被删掉，
+                // 模型就不知道自己动过手、以及手停在哪一步。
+                self.agent.session.seal_interrupted_tools();
                 return Ok(crate::AgentOutput {
                     success: false,
                     message: "任务已被用户中断".to_string(),
@@ -573,7 +577,9 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         // 含状态码与错误体。截断防刷屏（服务端可能回整页 HTML）。
                         let err_detail = crate::utils::truncate_output(&err_str, 400);
                         if cancel_flag.load(Ordering::SeqCst) {
-                            self.agent.session.strip_incomplete_tools();
+                            // 中断优先于错误归因：封口 ToolUse 让「用户叫停」写进历史，
+                            // 不要把这一轮记成 LLM 失败。
+                            self.agent.session.seal_interrupted_tools();
                             let session_json =
                                 serde_json::to_string(&self.agent.session).unwrap_or_default();
                             return Ok(crate::AgentOutput {
@@ -1443,9 +1449,11 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                     );
                     // assistant 消息（含本批次全部 tool_use）已在工具循环前落库
                     // （L822 push_assistant），此处跳过 tool_result 会留下悬挂工具对
-                    // → 与 L294 / L489 / L504 中断路径一致地清理，避免下次 LLM
-                    // 调用因 tool_use/tool_result 不配对而失败。
-                    self.agent.session.strip_incomplete_tools();
+                    // → 与 L294 / L489 / L504 中断路径一致地封口而非删除：
+                    // 封口保留「这个 tool_use 发过、被用户叫停」的事实，下次 LLM
+                    // 调用既不会因 tool_use/tool_result 不配对而失败，模型也知道
+                    // 自己的手停在哪一步。删除会把副作用痕迹一并抹掉。
+                    self.agent.session.seal_interrupted_tools();
                     self.agent.emit_exec("// interrupted");
                     if let Some(ref emitter) = self.agent.exec_emitter {
                         emitter.emit(NuphusEvent::ExecutionError {

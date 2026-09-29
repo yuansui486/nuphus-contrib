@@ -15,6 +15,7 @@ pub fn set_capability(
     value: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     // Use providers.toml as canonical location (same as get_capabilities)
     let config_path = {
         let providers_path = state.llm_config_path.with_file_name("providers.toml");
@@ -59,7 +60,7 @@ pub fn set_capability(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content =
         toml::to_string_pretty(&doc).map_err(|e| format!("Failed to serialize config: {}", e))?;
-    std::fs::write(&config_path, new_content)
+    nuphus::config::write_provider_config(&config_path, &new_content)
         .map_err(|e| format!("Failed to write config.toml: {}", e))?;
 
     Ok(())

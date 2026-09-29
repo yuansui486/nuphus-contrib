@@ -358,6 +358,142 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // seal_interrupted_tools：中断后封口未配对 ToolUse（2026-09-29 大王决策）
+    // 原则：ToolUse 已发出的副作用不会随中断消失，必须把「被用户强制中断、
+    // 该调用无结果」写进历史，否则下一轮模型在失真的世界状态上继续推理。
+    // ════════════════════════════════════════════════════════════════
+
+    /// 封口必须补 ToolResult，且 ToolUse 本身不能被删
+    #[test]
+    fn test_seal_interrupted_tools_keeps_use_and_adds_result() {
+        let mut session = Session::new();
+        session.push_user("删掉 /tmp/a".to_string());
+        session.push_assistant(vec![ContentBlock::ToolUse {
+            id: "call-write-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"cmd": "rm /tmp/a"}),
+        }]);
+
+        session.seal_interrupted_tools();
+
+        assert_eq!(
+            session.len(),
+            3,
+            "user + assistant(tool_use) + sealed tool_result"
+        );
+        // ToolUse 仍在原地
+        match &session.messages()[1].content[0] {
+            ContentBlock::ToolUse { id, .. } => assert_eq!(id, "call-write-1"),
+            other => panic!("ToolUse 应保留，得到 {other:?}"),
+        }
+        // 紧跟其后的 tool result 指向同一个 id，且声明中断
+        assert_eq!(session.messages()[2].role, MessageRole::Tool);
+        match &session.messages()[2].content[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call-write-1");
+                assert!(is_error, "无结果的调用应标记为 error");
+                assert!(
+                    content.contains("用户强制中断"),
+                    "必须写明中断事实: {content}"
+                );
+            }
+            other => panic!("应补 ToolResult，得到 {other:?}"),
+        }
+    }
+
+    /// 封口后 API 消息必须配对合法（这是封口存在的主要理由）
+    #[test]
+    fn test_seal_interrupted_tools_makes_api_messages_paired() {
+        let mut session = Session::new();
+        session.push_user("task".to_string());
+        session.push_assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"cmd": "ls"}),
+        }]);
+        session.seal_interrupted_tools();
+
+        let api = session.to_api_messages(true);
+        assert_eq!(api.len(), 3);
+        assert_eq!(api[1]["role"], "assistant");
+        assert!(api[1]["tool_calls"].is_array());
+        assert_eq!(api[2]["role"], "tool");
+        assert_eq!(api[2]["tool_call_id"], "call-1");
+    }
+
+    /// 已配对的 ToolUse 不得被重复封口（幂等）
+    #[test]
+    fn test_seal_interrupted_tools_is_idempotent() {
+        let mut session = Session::new();
+        session.push_user("task".to_string());
+        session.push_assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"cmd": "ls"}),
+        }]);
+        session.push_tool_result("call-1".to_string(), "real output".to_string(), false);
+
+        session.seal_interrupted_tools();
+        let len_after_first = session.len();
+        session.seal_interrupted_tools();
+
+        assert_eq!(
+            session.len(),
+            len_after_first,
+            "已配对的 ToolUse 不应被重复封口"
+        );
+        // 原始 tool result 内容必须保持不被覆盖
+        match &session.messages()[2].content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "real output", "不得覆盖已有真实结果");
+            }
+            other => panic!("得到 {other:?}"),
+        }
+    }
+
+    /// 干净会话封口应为 no-op
+    #[test]
+    fn test_seal_interrupted_tools_noop_on_clean_session() {
+        let mut session = Session::new();
+        session.push_user("task".to_string());
+        session.push_assistant(vec![ContentBlock::Text {
+            text: "done".to_string(),
+            reasoning: None,
+        }]);
+        let before = session.len();
+        session.seal_interrupted_tools();
+        assert_eq!(session.len(), before);
+    }
+
+    /// 封口与 strip 的分工：strip 仍用于错误场景（删除脏数据），
+    /// seal 用于中断场景（保留痕迹）。两者对同一会话结果不同。
+    #[test]
+    fn test_seal_vs_strip_division_of_labour() {
+        let build = || {
+            let mut s = Session::new();
+            s.push_user("task".to_string());
+            s.push_assistant(vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({"cmd": "ls"}),
+            }]);
+            s
+        };
+
+        let mut stripped = build();
+        stripped.strip_incomplete_tools();
+        assert_eq!(stripped.len(), 1, "strip 删除痕迹：只剩 user");
+
+        let mut sealed = build();
+        sealed.seal_interrupted_tools();
+        assert_eq!(sealed.len(), 3, "seal 保留痕迹并补中断说明");
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // 图片处理矩阵：to_api_messages 行为（2026-08-08 大王决策：去自动 vision）
     //  ① Main（supports_vision=true）→ image_url 直发主模型
     //  ② Fallback（supports_vision=false，无论是否配置视觉模型）→ 保存临时 BMP + 路径占位，

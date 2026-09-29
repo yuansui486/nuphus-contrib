@@ -85,6 +85,20 @@
 }
 
 /* 鈹€鈹€ 妫€娴嬮敊璇彁绀?鈹€鈹€ */
+.model-operation-status {
+  margin-top: var(--space-2);
+  color: var(--accent);
+  font-size: var(--fz-xs);
+  line-height: 1.4;
+}
+.model-list-item[aria-disabled='true'] {
+  cursor: progress;
+}
+.model-list-item[aria-busy='true'] {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 .detect-error {
   margin-top: var(--space-2);
   font-size: var(--fz-xs);

@@ -1273,7 +1273,6 @@ export function ChatPanel({
   }, [refineState, refining, onRefine, onSkipRefine, refineSelected, setRefining])
 
   const handleInputChange = useCallback((v: string) => {
-    console.log('[ChatPanel] handleInputChange called, v:', v)
     setInput(v)
     if (v.startsWith('/') && !v.includes(' ')) {
       setCmdQuery(v)
@@ -1956,7 +1955,6 @@ export function ChatPanel({
                                           <MarkdownContent
                                             content={msg.content}
                                             onFileClick={setPreviewPath}
-                                            projectBasePath={projectDir}
                                           />
                                           <span className="message-thinking-cursor" />
                                         </>
@@ -1971,7 +1969,6 @@ export function ChatPanel({
                                       <MarkdownContent
                                         content={msg.content}
                                         onFileClick={setPreviewPath}
-                                        projectBasePath={projectDir}
                                       />
                                     )
                                   })()

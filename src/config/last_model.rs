@@ -19,6 +19,7 @@ pub fn record_last_model(
     model: &str,
     provider: &str,
 ) -> Result<(), String> {
+    let _config_write = crate::config::lock_provider_config();
     if model.is_empty() || provider.is_empty() {
         return Ok(());
     }
@@ -39,7 +40,7 @@ pub fn record_last_model(
     crate::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content = toml::to_string_pretty(&doc)
         .map_err(|e| format!("serialize providers.toml failed: {e}"))?;
-    std::fs::write(providers_path, new_content)
+    crate::config::write_provider_config(providers_path, &new_content)
         .map_err(|e| format!("write providers.toml failed: {e}"))?;
     tracing::info!("[last_model] {model} = {provider}");
     Ok(())

@@ -253,6 +253,7 @@ fn update_jev_table(
     max_retries: Option<u32>,
     fallback_to_primary_model: Option<bool>,
 ) -> Result<nuphus::config::JevConfigStatus, String> {
+    let _config_write = nuphus::config::lock_provider_config();
     if let Some(parent) = state.llm_config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败: {error}"))?;
     }
@@ -304,7 +305,7 @@ fn update_jev_table(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let serialized = toml::to_string_pretty(&doc)
         .map_err(|error| format!("序列化 providers.toml 失败: {error}"))?;
-    std::fs::write(&state.llm_config_path, serialized)
+    nuphus::config::write_provider_config(&state.llm_config_path, &serialized)
         .map_err(|error| format!("写入 providers.toml 失败: {error}"))?;
     Ok(load_jev(state)?.status())
 }

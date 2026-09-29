@@ -190,6 +190,9 @@ pub struct RuntimeContext {
     pub leader_agent: Option<Runtime>,
     pub workflow_agent: Option<WorkflowAgent>,
     pub model_context_window: usize,
+    pub model_generation: u64,
+    pub model_context_explicit: Option<usize>,
+    pub metadata_tasks: crate::commands::config::model_metadata::MetadataTasks,
     pub refine_threshold: f64,
 }
 
@@ -201,6 +204,9 @@ impl Default for RuntimeContext {
             leader_agent: None,
             workflow_agent: None,
             model_context_window: 0,
+            model_generation: 0,
+            model_context_explicit: None,
+            metadata_tasks: Default::default(),
             refine_threshold: 0.5,
         }
     }

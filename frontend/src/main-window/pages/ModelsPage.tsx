@@ -1257,7 +1257,23 @@ export function ModelsPage({
   const [inputVal, setInputVal] = useState('')
   const [models, setModels] = useState<string[]>([])
   const [baseUrl, setBaseUrl] = useState('')
-  const [feedback, setFeedback] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [feedback, setFeedback] = useState<{ ok: boolean; msg: string; kind?: 'detect' } | null>(
+    null,
+  )
+  useEffect(() => {
+    if (!feedback) return
+    const timer = window.setTimeout(() => setFeedback(null), 2500)
+    return () => window.clearTimeout(timer)
+  }, [feedback])
+  const [switchingModel, setSwitchingModel] = useState('')
+  const switchingRef = useRef(false)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
   const [visionModel, setVisionModel] = useState('')
   const [visionProvider, setVisionProvider] = useState('')
   const [visionSaving, setVisionSaving] = useState(false)
@@ -1307,6 +1323,15 @@ export function ModelsPage({
   const [detectedModels, setDetectedModels] = useState<ProviderModelBrief[]>([])
   const [filterInput, setFilterInput] = useState('')
   const [detectError, setDetectError] = useState<string | null>(null)
+  const [detectSuccess, setDetectSuccess] = useState<string | null>(null)
+  const detectRequestRef = useRef(0)
+  useEffect(() => {
+    detectRequestRef.current += 1
+    setDetecting(false)
+    setDetectError(null)
+    setDetectSuccess(null)
+    setFeedback(current => (current?.kind === 'detect' ? null : current))
+  }, [provider, apiKey, baseUrl])
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [addOpen, setAddOpen] = useState(false)
@@ -1446,9 +1471,43 @@ export function ModelsPage({
   // 网络失败静默降级（保留 localStorage 检测缓存 + 磁盘段）；本地段跳过（无远程）。
   const autoSyncedRef = useRef<Set<string>>(new Set())
   const providerRef = useRef(provider)
+  const viewGenerationRef = useRef(0)
   useEffect(() => {
     providerRef.current = provider
+    viewGenerationRef.current += 1
   }, [provider])
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    let refreshRequest = 0
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen<{ provider: string; model: string }>('model-metadata-updated', ({ payload }) => {
+          if (disposed || payload.provider !== providerRef.current) return
+          const request = ++refreshRequest
+          void listModels()
+            .then(list => {
+              if (
+                !disposed &&
+                request === refreshRequest &&
+                payload.provider === providerRef.current &&
+                Array.isArray(list)
+              )
+                setAllModels(list)
+            })
+            .catch(() => {})
+        }),
+      )
+      .then(stop => {
+        if (disposed) stop()
+        else unlisten = stop
+      })
+      .catch(() => {})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
   useEffect(() => {
     if (activeView !== 'provider') return
     if (!provider || provider === 'local') return
@@ -1667,7 +1726,6 @@ export function ModelsPage({
         handleProviderChange('')
       }
       setFeedback({ ok: true, msg: TXT.removeSuccess(instanceLabel(target)) })
-      setTimeout(() => setFeedback(null), 2500)
       setPendingRemove(null)
       onModelChanged?.()
     } catch (e) {
@@ -1734,7 +1792,6 @@ export function ModelsPage({
       if (configured) setConfiguredProviders(configured)
       // 表单字段无需手工清空：进入实例后表单卸载（formOpen=false），下次展开是全新一份
       setFeedback({ ok: true, msg: TXT.createSuccess })
-      setTimeout(() => setFeedback(null), 2500)
       openProviderView(created?.id || id, configured)
     } catch (e: any) {
       setFormError(friendlyIpcError(e, TXT.createFail))
@@ -1791,7 +1848,6 @@ export function ModelsPage({
     } finally {
       setEditSaving(false)
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   /**
@@ -1852,22 +1908,28 @@ export function ModelsPage({
    * 如 Ollama / llama-swap / 无 key 中转）允许空 key 直连探测。
    */
   const detectModels = async () => {
-    // 空 key 直接交给后端：fetch_provider_models 空 key 时回落该段已存密钥
-    // （编辑表单不回显 key，改地址/标��后点「连接」不该被要求重贴密钥）；
-    // 段里也无 key 且该端点要求鉴权时，由后端返回「API Key 不能为空」。
+    const request = ++detectRequestRef.current
+    const target = provider
+    const isCurrent = () =>
+      mountedRef.current && detectRequestRef.current === request && providerRef.current === target
     setDetecting(true)
     setDetectError(null)
+    setDetectSuccess(null)
+    setFeedback(null)
     setDetectedModels([])
     try {
-      // 只下发用户填写的地址；空值交给后端按「显式参数 → 已存配置 → 内置默认」解析，
-      // 避免内置默认（自定义端点为文档占位示例）被当作有效地址。
-      const models = await listProviderModels(apiKey.trim(), provider, baseUrl.trim() || undefined)
-      setDetectedModels(models ?? [])
-      saveDetectedModels(provider, models ?? [])
-    } catch (e: any) {
-      setDetectError(friendlyIpcError(e, '检测失败'))
+      const models = await listProviderModels(apiKey.trim(), target, baseUrl.trim() || undefined)
+      if (!isCurrent()) return
+      if (!models?.length) throw new Error('API 未返回任何可用模型')
+      setDetectedModels(models)
+      saveDetectedModels(target, models)
+      const msg = `已获取到 ${models.length} 个模型`
+      setDetectSuccess(msg)
+      setFeedback({ ok: true, msg, kind: 'detect' })
+    } catch (e: unknown) {
+      if (isCurrent()) setDetectError(friendlyIpcError(e, '检测失败'))
     } finally {
-      setDetecting(false)
+      if (isCurrent()) setDetecting(false)
     }
   }
 
@@ -1913,7 +1975,6 @@ export function ModelsPage({
       setAddOpen(false)
       setAddInput('')
       setFeedback({ ok: true, msg: TXT.addModelSuccess(id) })
-      setTimeout(() => setFeedback(null), 2500)
       // 后端已并入 config.toml → list_models 重新读取即含新条目（configured 并集）
       listModels()
         .then(list => {
@@ -1954,7 +2015,6 @@ export function ModelsPage({
     } finally {
       setClearingModels(false)
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   /** 清除当前 provider 已存储的 API Key（仅清 key，保留 provider/model 配置） */
@@ -1983,7 +2043,6 @@ export function ModelsPage({
     } finally {
       setClearingKey(false)
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   /**
@@ -2040,7 +2099,6 @@ export function ModelsPage({
     } finally {
       setSavingKey(false)
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   // ── 手动添加模型（仅 local 列表使用；basic 模型的真正添加走「连接后点击模型」）──
@@ -2050,7 +2108,6 @@ export function ModelsPage({
     const list = loadModels(provider)
     if (list.includes(name)) {
       setFeedback({ ok: false, msg: `模型「${name}」已在列表中` })
-      setTimeout(() => setFeedback(null), 1800)
       return
     }
     list.push(name)
@@ -2061,7 +2118,6 @@ export function ModelsPage({
     const effectiveKey = apiKey.trim() ? apiKey : ''
     if (!isLocal && !effectiveKey.trim() && !hasKey) {
       setFeedback({ ok: false, msg: TXT.apiKeyRequired })
-      setTimeout(() => setFeedback(null), 2500)
       return
     }
     const p = providers.find(x => x.id === provider)
@@ -2102,7 +2158,6 @@ export function ModelsPage({
       } catch (e: any) {
         setFeedback({ ok: false, msg: friendlyIpcError(e, '切换失败') })
       }
-      setTimeout(() => setFeedback(null), 2500)
     }
   }
 
@@ -2192,13 +2247,11 @@ export function ModelsPage({
     const k = Number(raw)
     if (!Number.isFinite(k) || k <= 0) {
       setFeedback({ ok: false, msg: '上下文窗口需为大于 0 的数字（单位 K）' })
-      setTimeout(() => setFeedback(null), 2500)
       return
     }
     const v = Math.round(k * 1000)
     if (v < 1 || v > 10000000) {
       setFeedback({ ok: false, msg: '上下文窗口需在 1 ~ 10,000,000K 之间' })
-      setTimeout(() => setFeedback(null), 2500)
       return
     }
     const p = providers.find(x => x.id === provider)
@@ -2215,7 +2268,6 @@ export function ModelsPage({
     } catch (e: any) {
       setFeedback({ ok: false, msg: friendlyIpcError(e, '保存失败') })
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   /**
@@ -2239,37 +2291,49 @@ export function ModelsPage({
     } finally {
       setVisionToggling('')
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   const switchModel = async (name: string) => {
-    if (providersLoading || providers.length === 0) {
+    if (switchingRef.current || editingCtxModel === name) return
+    if (providersLoading || !providers.some(p => p.id === provider)) {
       setFeedback({ ok: false, msg: '服务商列表尚未加载完成' })
-      setTimeout(() => setFeedback(null), 2500)
       return
     }
-    const p = providers.find(x => x.id === provider)
-    if (!p) {
-      setFeedback({ ok: false, msg: '切换失败：未找到服务商' })
-      setTimeout(() => setFeedback(null), 2500)
-      return
-    }
-    setFeedback(null)
-    // 不下发内置默认地址（自定义端点为文档占位示例），空值交给后端解析已存配置
+    const target = provider
+    const viewGeneration = viewGenerationRef.current
+    const isCurrent = () =>
+      mountedRef.current &&
+      providerRef.current === target &&
+      viewGenerationRef.current === viewGeneration
     const resolvedBaseUrl = baseUrl.trim() || undefined
     const ctxArg =
       isLocal && localCtxWindow != null && !hasExplicitCtx(name) ? localCtxWindow : undefined
+    switchingRef.current = true
+    setSwitchingModel(name)
+    setFeedback(null)
     try {
-      await switchModelCmd(name, provider, resolvedBaseUrl, ctxArg, 'default')
-      if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
-      setCurrentModel(name)
+      if (apiKey.trim()) {
+        await configureLlm(apiKey.trim(), name, target, resolvedBaseUrl, ctxArg)
+      } else {
+        await switchModelCmd(name, target, resolvedBaseUrl, ctxArg, 'default')
+      }
       persistCurrentProvider(name)
       onModelChanged?.()
+      if (!isCurrent()) return
+      if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
+      setCurrentModel(name)
       setFeedback({ ok: true, msg: `已切换到 ${name}` })
-    } catch (e: any) {
-      setFeedback({ ok: false, msg: friendlyIpcError(e, '切换失败') })
+      void listModels()
+        .then(list => {
+          if (isCurrent() && Array.isArray(list)) setAllModels(list)
+        })
+        .catch(() => {})
+    } catch (e: unknown) {
+      if (isCurrent()) setFeedback({ ok: false, msg: friendlyIpcError(e, '切换失败') })
+    } finally {
+      switchingRef.current = false
+      if (mountedRef.current) setSwitchingModel('')
     }
-    setTimeout(() => setFeedback(null), 2500)
   }
 
   // ── 页面渲染 ──
@@ -2657,7 +2721,21 @@ export function ModelsPage({
                       </>
                     )}
 
-                    {detectError && <div className="detect-error">{detectError}</div>}
+                    {detectSuccess && (
+                      <div className="model-operation-status" role="status">
+                        {detectSuccess}
+                      </div>
+                    )}
+                    {detectError && (
+                      <div className="detect-error" role="alert">
+                        {detectError}
+                      </div>
+                    )}
+                    {switchingModel && (
+                      <div className="model-operation-status" role="status">
+                        正在切换到 {switchingModel}…
+                      </div>
+                    )}
 
                     {isAnthropicInstance && (
                       <div className="text-caption hint-text">{TXT.anthropicNoModelList}</div>
@@ -2880,60 +2958,17 @@ export function ModelsPage({
                                   info?.supports_image_generation ||
                                   false,
                               }
-                              const rowCtxArg =
-                                isLocal && localCtxWindow != null && !hasExplicitCtx(name)
-                                  ? localCtxWindow
-                                  : undefined
                               return (
                                 <div
                                   key={name}
                                   className={'model-list-item' + (isActive ? ' active' : '')}
                                   role="button"
                                   tabIndex={0}
-                                  onClick={async () => {
-                                    if (editingCtxModel === name) return
-                                    const p = providers.find(x => x.id === provider)
-                                    if (!p) return
-                                    try {
-                                      const effectiveKey = apiKey.trim()
-                                      // 不下发内置默认地址：自定义端点为文档占位示例，
-                                      // 空值交给后端解析已存配置/内置默认。
-                                      const resolvedBaseUrl = baseUrl.trim() || undefined
-                                      if (effectiveKey) {
-                                        await configureLlm(
-                                          effectiveKey,
-                                          name,
-                                          provider,
-                                          resolvedBaseUrl,
-                                        )
-                                      } else {
-                                        await switchModelCmd(
-                                          name,
-                                          provider,
-                                          resolvedBaseUrl,
-                                          rowCtxArg,
-                                          'default',
-                                        )
-                                      }
-                                      if (resolvedBaseUrl) setLoadedBaseUrl(resolvedBaseUrl)
-                                      setCurrentModel(name)
-                                      persistCurrentProvider(name)
-                                      onModelChanged?.()
-                                      listModels()
-                                        .then(list => {
-                                          if (Array.isArray(list)) setAllModels(list)
-                                        })
-                                        .catch(() => {})
-                                      setFeedback({ ok: true, msg: `已切换到 ${name}` })
-                                    } catch (e: any) {
-                                      setFeedback({
-                                        ok: false,
-                                        msg: friendlyIpcError(e, '切换失败'),
-                                      })
-                                    }
-                                    setTimeout(() => setFeedback(null), 2500)
-                                  }}
+                                  aria-disabled={!!switchingModel}
+                                  aria-busy={switchingModel === name}
+                                  onClick={() => void switchModel(name)}
                                   onKeyDown={e => {
+                                    if (e.target !== e.currentTarget) return
                                     if (e.key === 'Enter' || e.key === ' ') {
                                       e.preventDefault()
                                       ;(e.currentTarget as HTMLElement).click()
@@ -3021,9 +3056,15 @@ export function ModelsPage({
                               className={'model-list-item' + (isActive ? ' active' : '')}
                               role="button"
                               tabIndex={0}
-                              onClick={() => {
-                                if (editingCtxModel === m) return
-                                void switchModel(m)
+                              aria-disabled={!!switchingModel}
+                              aria-busy={switchingModel === m}
+                              onClick={() => void switchModel(m)}
+                              onKeyDown={e => {
+                                if (e.target !== e.currentTarget) return
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault()
+                                  void switchModel(m)
+                                }
                               }}
                             >
                               <div className="model-list-name">{m}</div>

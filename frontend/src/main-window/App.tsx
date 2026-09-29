@@ -339,6 +339,24 @@ export default function App() {
   // ref 镜像避免 once-registered 监听捕获陈旧闭包。
   const reloadFromBackendRef = useRef(s.reloadChatFromBackend)
   reloadFromBackendRef.current = s.reloadChatFromBackend
+  const refreshModelInfoRef = useRef(s.refreshModelInfo)
+  refreshModelInfoRef.current = s.refreshModelInfo
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void listen('model-metadata-updated', () => {
+      if (!disposed) void refreshModelInfoRef.current()
+    })
+      .then(stop => {
+        if (disposed) stop()
+        else unlisten = stop
+      })
+      .catch(() => {})
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [])
   // 从设置中心进入 模型 / 画布 后，二者关闭时应回到设置中心。
   // 只对「设置中心」这一个入口置位：Ctrl+K、标题栏快捷入口等其它入口关闭后
   // 仍回到原界面，不会被意外拉起设置弹窗。

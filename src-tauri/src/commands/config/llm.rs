@@ -7,14 +7,14 @@
 use super::toml_ops::{
     add_provider_model_entry, builtin_capability, clear_provider_api_key_in_config_toml,
     clear_provider_models_in_config_toml, create_custom_provider_segment, get_config_path,
-    is_custom_segment_name, list_configured_providers, model_has_user_vision_override,
-    provider_segment_exists, read_model_context_window, read_model_supports_vision,
-    read_provider_api_key_from_config_toml, read_provider_base_url_from_config_toml,
-    read_provider_display_name, read_provider_reasoning_effort_from_config_toml,
-    remove_provider_segment, sanitize_extra_headers, sync_provider_models, update_config_toml,
-    update_custom_provider_segment, update_model_context_window, update_model_reasoning_efforts,
-    update_model_supports_vision, update_provider_base_url, update_reasoning_effort,
-    CapabilityOverride, CapabilitySource, SyncReport,
+    is_custom_segment_name, list_configured_providers, provider_segment_exists,
+    read_model_context_window, read_model_supports_vision, read_provider_api_key_from_config_toml,
+    read_provider_base_url_from_config_toml, read_provider_display_name,
+    read_provider_reasoning_effort_from_config_toml, remove_provider_segment,
+    sanitize_extra_headers, sync_provider_models, update_config_toml,
+    update_custom_provider_segment, update_model_context_window, update_model_supports_vision,
+    update_provider_base_url, update_reasoning_effort, CapabilityOverride, CapabilitySource,
+    SyncReport,
 };
 use crate::emitter::CompoundEmitter;
 use crate::models::aggregator as or_agg;
@@ -284,6 +284,7 @@ fn save_agent_model(
     model: &str,
     provider: Option<&str>,
 ) -> Result<(), String> {
+    let _config_write = nuphus::config::lock_provider_config();
     if !AgentModels::AGENTS.contains(&agent) {
         return Err(format!("未知 agent: {agent}"));
     }
@@ -310,7 +311,7 @@ fn save_agent_model(
     nuphus::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content = toml::to_string_pretty(&doc)
         .map_err(|e| format!("serialize providers.toml failed: {e}"))?;
-    std::fs::write(providers_path, new_content)
+    nuphus::config::write_provider_config(providers_path, &new_content)
         .map_err(|e| format!("write providers.toml failed: {e}"))?;
     tracing::info!("[agent_models] {agent} = {model}");
     Ok(())
@@ -717,27 +718,19 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
         parameters: None,
         reasoning_effort,
     };
-    {
-        let mut config = state.runtime.lock().map_err(|e| e.to_string())?;
-        config.llm_config = Some(cfg.clone());
-    }
-
     // Agent 级模型：前端按当前 mode 切换 → 落盘写对应 agent（leader/workflow/custom）。
     // mode 缺省/未知 → 默认写 leader（锚点）。default/exec 由高级设置页配置。
-    let _ = save_agent_model(
+    save_agent_model(
         &state.llm_config_path,
         agent_key,
         &resolved_model,
         Some(&resolved_provider),
-    );
+    )?;
 
     // provider 归属磁盘记录：[agent_models] 只存 model id，同 id 跨 provider
     // （官方 deepseek vs opencode-go）时 get_provider_context 靠本表回查归属。
-    let _ = nuphus::config::record_last_model(
-        &state.llm_config_path,
-        &resolved_model,
-        &resolved_provider,
-    );
+    nuphus::config::record_last_model(&state.llm_config_path, &resolved_model, &resolved_provider)?;
+    let generation = super::model_metadata::activate(&state, &cfg, context_window)?;
 
     // 写盘后诊断一次绑定健康（含旧版半绑定遗留）：命中 B 类静默降级 → HUD 提示。
     // 只在用户主动切换模型这一自然时机做，不引入定时器/轮询。
@@ -760,7 +753,7 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
     // 退化为纯 Tauri 推送，桌面端零回归）。
     // 后端是模型选择的唯一权威源：桌面 switch_model 与手机 /switch-model 共用此命令，
     // 切换后双端（手机自身 + 桌面端实时一致）同步「当前模型」。
-    let emitter = CompoundEmitter::new(app, &state);
+    let emitter = CompoundEmitter::new(app.clone(), &state);
     emitter.emit(NuphusEvent::SessionInfo {
         session_id: uuid::Uuid::new_v4().to_string(),
         model: resolved_model.clone(),
@@ -770,16 +763,7 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
             .as_secs(),
     });
 
-    // Post-config: context window, vision probe
-    post_configure(
-        &state,
-        &resolved_provider,
-        &resolved_model,
-        &api_key,
-        &resolved_base_url,
-        context_window,
-    )
-    .await;
+    super::model_metadata::schedule(app, cfg, generation);
 
     Ok(format!(
         "Switched to: provider={}, model={}",
@@ -806,6 +790,7 @@ pub async fn switch_model(
 /// For model switching, frontend passes the existing API key from its config state.
 #[tauri::command]
 pub async fn configure_llm(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     api_key: String,
     model: Option<String>,
@@ -880,10 +865,6 @@ pub async fn configure_llm(
         // Preserve any reasoning-effort already configured for this provider.
         reasoning_effort: read_provider_reasoning_effort_from_config_toml(&resolved_provider),
     };
-    {
-        let mut config = state.runtime.lock().map_err(|e| e.to_string())?;
-        config.llm_config = Some(cfg.clone());
-    }
 
     // Write API key to config.toml
     if let Some(ref config_path) = toml_config_path {
@@ -908,9 +889,19 @@ pub async fn configure_llm(
             &resolved_model,
             Some(&resolved_provider),
         ) {
-            tracing::error!("[configure_llm] Failed to write agent_models.leader: {}", e);
+            return Err(format!("保存当前模型失败: {e}"));
         }
     }
+
+    {
+        let mut runtime = state.runtime.lock().map_err(|e| e.to_string())?;
+        if let Some(agent) = runtime.leader_agent.as_mut() {
+            agent
+                .switch_model(&resolved_provider, &resolved_model)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    let generation = super::model_metadata::activate(&state, &cfg, context_window)?;
 
     // Push system notification if model actually changed (re-config, not initial setup)
     if let Some(prev) = prev_model {
@@ -925,16 +916,7 @@ pub async fn configure_llm(
         }
     }
 
-    // Post-config: context window, vision probe
-    post_configure(
-        &state,
-        &resolved_provider,
-        &resolved_model,
-        &api_key,
-        &resolved_base_url,
-        context_window,
-    )
-    .await;
+    super::model_metadata::schedule(app, cfg, generation);
 
     Ok(format!(
         "LLM configured: provider={}, model={}",
@@ -1011,6 +993,7 @@ pub fn set_model_context_window(
         if let Some(cfg) = guard.llm_config.as_ref() {
             if cfg.provider == provider && cfg.model == model {
                 guard.model_context_window = context_window;
+                guard.model_context_explicit = Some(context_window);
                 tracing::info!(
                     "[set_model_context_window] runtime updated: {}/{} = {}",
                     provider,
@@ -1082,191 +1065,6 @@ pub fn set_model_supports_vision(
             "不支持"
         }
     ))
-}
-
-/// Post-config steps: query context window from API + probe vision support.
-async fn post_configure(
-    state: &State<'_, AppState>,
-    resolved_provider: &str,
-    resolved_model: &str,
-    api_key: &str,
-    resolved_base_url: &str,
-    context_window: Option<usize>,
-) {
-    // 鉴权方案按**协议类型**解析：自定义中转站实例名（custom-xxx）不是内置 id，
-    // 直接 get(实例名) 会查不到；统一走 provider_kind_for_segment 折回 custom。
-    let (auth_header, auth_prefix) = ProviderRegistry::builtin()
-        .get(provider_kind_for_segment(resolved_provider).as_str())
-        .map(|p| (p.auth_header(), p.auth_prefix()))
-        .unwrap_or(("authorization", "Bearer "));
-
-    let toml_config_path =
-        get_config_path().unwrap_or_else(|| state.llm_config_path.with_file_name("providers.toml"));
-
-    // ── context_window 信任链解析（不再有 128_000 伪默认）──
-    // ① 前端显式值（任何 provider，含 custom/local）—— ModelsPage 行内/全局手动校准，
-    //    尊重用户意图，为最高信任级：运行时 + 写盘均用该值
-    // ② providers.toml existing_ctx（用户手写/历史记录，保留不动）
-    // ③ API 实测（query_model_metadata_from_api 返回 Some 且带 context_length）
-    // ④ OpenRouter 聚合库 lookup（权威源）
-    // ⑤ builtin ProviderRegistry 表（仅运行时，禁止落盘）
-    // ⑥ None → 未知（runtime 0，禁止落盘）
-    //
-    // 写入纪律：
-    // - 前端显式传值（来源①，任意 provider）→ 写盘（local 原有行为扩展至 custom 等，
-    //   根治「custom 中转 API 探测不到 context_length → refine 阈值错位」的缺配置通道）
-    // - existing_ctx 为 None 且来源为 ③④（实测/权威）→ 写盘
-    // - 来源 ⑤⑥ 只进运行时，禁止落盘（根治「兜底猜测值固化」缺陷：
-    //   探测失败 → 128_000 猜测值被 update_model_context_window 写盘 → 永不自愈）
-    let existing_ctx =
-        read_model_context_window(&toml_config_path, resolved_provider, resolved_model);
-
-    let (runtime_ctx, persist_ctx): (Option<usize>, Option<usize>) =
-        if let Some(ctx) = context_window {
-            // ① 用户显式值（任何 provider）：尊重用户意图，运行时 + 写盘一致
-            (Some(ctx), Some(ctx))
-        } else if resolved_provider == "local" {
-            // local 无显式值 → 保留本地记录（历史/手写）；都无 → 未知(0)，不写盘
-            (existing_ctx, None)
-        } else if let Some(ctx) = existing_ctx {
-            // ② 用户手写/历史记录：保留不动（API/权威值不覆盖），运行时直接用
-            (Some(ctx), None)
-        } else {
-            // ③ API 实测（spawn_blocking，原逻辑保留 reasoning-effort 持久化）
-            let api_ctx = {
-                let base_url = resolved_base_url.to_string();
-                let model = resolved_model.to_string();
-                let key = api_key.to_string();
-                let hdr = auth_header.to_string();
-                let prefix = auth_prefix.to_string();
-                match tokio::task::spawn_blocking(move || {
-                    query_model_metadata_from_api(&base_url, &model, &key, &hdr, &prefix)
-                })
-                .await
-                {
-                    Ok(Some(meta)) => {
-                        // Persist discovered effort capability into the model entry so
-                        // list_models can serve it without a builtin-registry hit.
-                        if !meta.reasoning_efforts.is_empty() {
-                            let _ = update_model_reasoning_efforts(
-                                &toml_config_path,
-                                resolved_provider,
-                                resolved_model,
-                                &meta.reasoning_efforts,
-                                meta.default_effort.as_deref(),
-                            );
-                        }
-                        meta.context_length
-                    }
-                    _ => None,
-                }
-            };
-            // ④ OpenRouter 聚合库（stale-while-revalidate：缓存新鲜直接查，过期拉一次）
-            // custom/local 无 vendor 映射 → 不触发网络，直接 None
-            let agg_ctx = if or_agg::has_vendor(resolved_provider) {
-                let cache_path = toml_config_path
-                    .parent()
-                    .map(or_agg::cache_path)
-                    .unwrap_or_else(openrouter_cache_path);
-                let entries = or_agg::ensure_cache(&cache_path).await;
-                or_agg::lookup(&entries, resolved_provider, resolved_model)
-                    .and_then(|e| e.context_length)
-                    .map(|v| v as usize)
-            } else {
-                None
-            };
-            // ⑤ builtin ProviderRegistry 表（仅运行时）
-            let builtin_ctx = ProviderRegistry::builtin()
-                .find_model(resolved_model)
-                .map(|(_, m)| m.context_window as usize);
-            // ③④ = 权威，可落盘；⑤ 仅运行时；⑥ 全 None → 未知
-            let authoritative = api_ctx.or(agg_ctx);
-            (authoritative.or(builtin_ctx), authoritative)
-        };
-
-    {
-        let mut cw = state.runtime.lock().ok();
-        if let Some(ref mut cw) = cw {
-            // 0 = 未知语义（get_context_limit 与前端据此隐藏百分比，而非显示假数）
-            cw.model_context_window = runtime_ctx.unwrap_or(0);
-        }
-    }
-
-    if let Some(ctx) = persist_ctx {
-        let _ =
-            update_model_context_window(&toml_config_path, resolved_provider, resolved_model, ctx);
-    }
-    // 来源②用户手写 / ⑤⑥猜测或未知：不落盘
-
-    // Vision probe — provider-driven: prefer metadata from ProviderRegistry over HTTP probing.
-    // Only HTTP-probe when metadata doesn't have a definitive answer (e.g. custom / new models).
-    let metadata_vision = ProviderRegistry::builtin()
-        .get(resolved_provider)
-        .and_then(|p| p.models().iter().find(|m| m.id == resolved_model))
-        .map(|m| m.supports_vision);
-
-    // 用户手动设定优先：探测结果不得覆盖用户意图。否则用户在模型行内勾上的
-    // 视觉能力，会在下次「连接/刷新」时被探测结果抹掉（表现为「今天能用，明天
-    // 又选不到了」）。
-    if model_has_user_vision_override(&toml_config_path, resolved_provider, resolved_model) {
-        tracing::info!(
-            "[vision-probe] skip: {}/{} 的视觉能力由用户手动设定，不覆盖",
-            resolved_provider,
-            resolved_model
-        );
-        return;
-    }
-
-    match metadata_vision {
-        Some(true) => {
-            tracing::info!(
-                "[vision-probe] metadata: model={} supports vision ✓",
-                resolved_model
-            );
-            let _ = update_model_supports_vision(
-                &toml_config_path,
-                resolved_provider,
-                resolved_model,
-                true,
-                None,
-            );
-        }
-        Some(false) => {
-            tracing::info!(
-                "[vision-probe] metadata: model={} does NOT support vision",
-                resolved_model
-            );
-            let _ = update_model_supports_vision(
-                &toml_config_path,
-                resolved_provider,
-                resolved_model,
-                false,
-                None,
-            );
-        }
-        None if resolved_provider != "local" => {
-            // No metadata — fall back to HTTP probe for custom models
-            let base_url = resolved_base_url.to_string();
-            let model = resolved_model.to_string();
-            let key = api_key.to_string();
-            let hdr = auth_header.to_string();
-            let prefix = auth_prefix.to_string();
-            if let Ok(Some(supports_vision)) = tokio::task::spawn_blocking(move || {
-                probe_vision(&base_url, &model, &key, &hdr, &prefix)
-            })
-            .await
-            {
-                let _ = update_model_supports_vision(
-                    &toml_config_path,
-                    resolved_provider,
-                    resolved_model,
-                    supports_vision,
-                    None,
-                );
-            }
-        }
-        _ => {} // local or unknown provider — skip
-    }
 }
 
 #[tauri::command]
@@ -2483,10 +2281,10 @@ pub fn get_capabilities(state: State<'_, AppState>) -> Result<serde_json::Value,
 /// Kimi additionally exposes per-model reasoning-effort capability
 /// (`think_efforts { valid_efforts, default_effort }`); providers that return
 /// bare id lists (DeepSeek/MiniMax) simply yield empty efforts.
-struct ModelApiMetadata {
-    context_length: Option<usize>,
-    reasoning_efforts: Vec<String>,
-    default_effort: Option<String>,
+pub(super) struct ModelApiMetadata {
+    pub context_length: Option<usize>,
+    pub reasoning_efforts: Vec<String>,
+    pub default_effort: Option<String>,
 }
 
 /// Extract reasoning-effort capability from a /models model entry.
@@ -2526,7 +2324,7 @@ fn find_model_entry<'a>(
     })
 }
 
-fn query_model_metadata_from_api(
+pub(super) fn query_model_metadata_from_api(
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -2668,7 +2466,7 @@ fn query_model_metadata_from_api(
 /// - `Some(true)` — API returned 200, model accepts image input
 /// - `Some(false)` — API returned 400+ (likely doesn't support vision)
 /// - `None` — network/auth error, indeterminate — don't touch config
-fn probe_vision(
+pub(super) fn probe_vision(
     base_url: &str,
     model: &str,
     api_key: &str,
@@ -2726,11 +2524,13 @@ fn probe_vision(
         Some(true)
     } else {
         tracing::info!(
-            "[vision-probe] model={} returned HTTP {}, likely no vision support",
+            "[vision-probe] model={} returned HTTP {}, vision capability remains unknown",
             model,
             status
         );
-        Some(false)
+        // An HTTP failure is not evidence that the model lacks vision.
+        // Gateways use 400/401/429/5xx for many unrelated failures.
+        None
     }
 }
 
@@ -2761,146 +2561,17 @@ pub fn get_context_limit(state: State<'_, AppState>) -> Result<usize, String> {
     Ok(0)
 }
 
-/// B3 启动后台校准：stale-while-revalidate 拉取 OpenRouter 聚合库，用权威
-/// context_window 校准当前激活模型的运行时值；变化时广播 SessionInfo 让前端
-/// 刷新。全程静默失败（tracing::warn），绝不在启动同步路径上做网络等待。
-///
-/// 信任链①用户手写值（providers.toml 显式 context_window）优先——已存在显式值
-/// 时跳过校准，不覆盖用户意图（kimi k3=1048576 等合法显式值保持不动）。
+/// Startup discovery shares the switch path's generation and manual-override guards.
 pub async fn startup_model_calibration(app: &tauri::AppHandle) {
-    let state = app.state::<crate::state::AppState>();
-    let (provider, model, base_url, api_key) = {
-        let guard = match state.runtime.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!("[startup-calibration] runtime lock failed: {e}");
-                return;
-            }
-        };
-        match guard.llm_config.as_ref() {
-            Some(cfg) if !cfg.model.is_empty() => (
-                cfg.provider.clone(),
-                cfg.model.clone(),
-                cfg.base_url.clone(),
-                cfg.api_key.clone(),
-            ),
-            _ => return, // 未配置 LLM
-        }
-    };
-
-    // ① 用户手写/历史显式值（信任链最高层）→ 不覆盖
-    if read_model_context_window(&state.llm_config_path, &provider, &model).is_some() {
-        return;
-    }
-
-    // ② OpenRouter 聚合库权威值（vendor provider 专属；custom/中转等无 vendor 映射）
-    let mut window: Option<usize> = None;
-    if or_agg::has_vendor(&provider) {
-        let config_dir = state
-            .llm_config_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        let cache_path = or_agg::cache_path(&config_dir);
-        let entries = or_agg::ensure_cache(&cache_path).await;
-        window = or_agg::lookup(&entries, &provider, &model)
-            .and_then(|e| e.context_length)
-            .map(|v| v as usize);
-        // OR 权威值命中 → 写盘显式 context_window：下次启动直接命中信任链①，
-        // 不再依赖 OR 缓存可用性（离线/缓存过期也能拿到正确窗口）。
-        if let Some(ctx) = window {
-            let _ = update_model_context_window(&state.llm_config_path, &provider, &model, ctx);
-            tracing::info!(
-                "[startup-calibration] provider={}, model={}, context_window → {} (OpenRouter 权威值，已写盘)",
-                provider,
-                model,
-                ctx
-            );
-        }
-    }
-
-    // ③ OR miss 或非 vendor（custom / 本地中转等）→ 官方 /models 探测兜底：
-    //    严格遵守「首次连接官方返回」数据源（用户手写值除外），命中后写盘
-    //    providers.toml 显式 context_window → 下次启动命中信任链①，自愈持久化。
-    //    全程 spawn_blocking（blocking reqwest），不阻塞校准任务。
-    if window.is_none() && !api_key.is_empty() {
-        let (auth_header, auth_prefix) = ProviderRegistry::builtin()
-            .get(&provider)
-            .map(|p| (p.auth_header().to_string(), p.auth_prefix().to_string()))
-            .unwrap_or(("authorization".to_string(), "Bearer ".to_string()));
-        let (bu, m, key, hdr, prefix) = (
-            base_url.clone(),
-            model.clone(),
-            api_key,
-            auth_header,
-            auth_prefix,
-        );
-        let probed = tokio::task::spawn_blocking(move || {
-            query_model_metadata_from_api(&bu, &m, &key, &hdr, &prefix)
-        })
-        .await
-        .ok()
-        .flatten();
-        if let Some(meta) = probed {
-            if let Some(ctx) = meta.context_length {
-                window = Some(ctx);
-                let _ = update_model_context_window(&state.llm_config_path, &provider, &model, ctx);
-                tracing::info!(
-                    "[startup-calibration] provider={}, model={}, context_window → {} (官方 /models 探测，已写盘)",
-                    provider,
-                    model,
-                    ctx
-                );
-            }
-        }
-    }
-
-    let Some(window) = window else {
-        return;
-    };
-
-    let changed = {
-        let mut cw = match state.runtime.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if cw.model_context_window == window {
-            false
-        } else {
-            // 运行时为猜测/未知（0 或 builtin 值）且聚合库有权威值 → 校准
-            cw.model_context_window = window;
-            true
-        }
-    };
-
-    if changed {
-        tracing::info!(
-            "[startup-calibration] provider={}, model={}, context_window → {} (OpenRouter 或官方探测权威值)",
-            provider,
-            model,
-            window
-        );
-        // 广播 model 用「当前生效模型」（effective_model 单一入口，与桌面输入框同源）：
-        // 此前用 runtime llm_config 的模型（可能是 config.toml 根模型 glm），校准广播
-        // 会在启动时把手机端 store.model 覆盖为根模型，与输入框不一致（2026-08-31 修复）。
-        let mode_now = state
-            .current_mode
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_else(|_| "leader".to_string());
-        let effective = nuphus::config::load_registry()
-            .ok()
-            .map(|reg| effective_model(&state.llm_config_path, &reg, &mode_now))
-            .unwrap_or_else(|| model.clone());
-        let emitter = CompoundEmitter::new(app.clone(), &state);
-        emitter.emit(NuphusEvent::SessionInfo {
-            session_id: uuid::Uuid::new_v4().to_string(),
-            model: effective,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        });
+    let state = app.state::<AppState>();
+    let binding = state.runtime.lock().ok().and_then(|runtime| {
+        runtime
+            .llm_config
+            .clone()
+            .map(|cfg| (cfg, runtime.model_generation))
+    });
+    if let Some((cfg, generation)) = binding {
+        super::model_metadata::schedule_context_calibration(app.clone(), cfg, generation);
     }
 }
 

@@ -119,6 +119,7 @@ pub fn write_oauth_tokens(
     refresh_token: &str,
     expires_at: Option<i64>,
 ) -> Result<(), String> {
+    let _config_write = crate::config::lock_provider_config();
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
     let mut doc: toml::Value = content
         .parse()
@@ -157,7 +158,7 @@ pub fn write_oauth_tokens(
     crate::cookies::encrypt_plaintext_provider_keys(&mut doc);
     let new_content = toml::to_string_pretty(&doc)
         .map_err(|e| format!("serialize providers.toml failed: {e}"))?;
-    std::fs::write(config_path, new_content)
+    crate::config::write_provider_config(config_path, &new_content)
         .map_err(|e| format!("write providers.toml failed: {e}"))?;
     Ok(())
 }

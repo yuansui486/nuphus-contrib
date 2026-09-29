@@ -2,6 +2,9 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { listen } from '@tauri-apps/api/event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  configureLlm,
+  listProviderModels,
+  switchModel,
   createCustomProvider,
   getSupportedProviders,
   oauthBegin,
@@ -116,6 +119,9 @@ let providerList: ProviderInfoStub[] = []
 
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.mocked(listProviderModels).mockReset()
+  vi.mocked(configureLlm).mockReset()
+  vi.mocked(switchModel).mockReset()
   providerList = [
     provider({ id: 'deepseek', name: 'DeepSeek', base_url: 'https://api.deepseek.com' }),
   ]
@@ -823,5 +829,151 @@ describe('ModelsPage 删除自定义模型实例', () => {
     await waitFor(() =>
       expect(screen.queryByDisplayValue('https://relay-a.example/v1')).not.toBeInTheDocument(),
     )
+  })
+})
+
+describe('ModelsPage 连接反馈与快速切换', () => {
+  const brief = (id: string) => ({
+    id,
+    supports_streaming: true,
+    supports_vision: false,
+    supports_audio: false,
+    supports_image_generation: false,
+  })
+  function deferred<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (reason: Error) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+  async function openModels(onModelChanged = vi.fn()) {
+    localStorage.clear()
+    providerList.push(
+      provider({
+        id: 'custom-fast',
+        name: '快速中转站',
+        display_name: '快速中转站',
+        provider_type: 'custom',
+        base_url: 'https://relay.example/v1',
+      }),
+    )
+    vi.mocked(getProviderBaseUrl).mockImplementation(async id =>
+      id === 'custom-fast' ? 'https://relay.example/v1' : null,
+    )
+    const result = render(<ModelsPage onClose={() => {}} onModelChanged={onModelChanged} />)
+    fireEvent.click(await screen.findByRole('button', { name: '快速中转站' }))
+    await waitFor(() =>
+      expect(screen.getByLabelText('模型 API URL')).toHaveValue('https://relay.example/v1'),
+    )
+    return result
+  }
+  async function detect() {
+    vi.mocked(listProviderModels).mockResolvedValue([brief('model-one'), brief('model-two')])
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    await screen.findByText('model-two')
+  }
+  const row = (name: string) => screen.getByText(name).closest('[role="button"]') as HTMLElement
+
+  it('连接成功明确提示数量，并在修改参数后清除过时提示', async () => {
+    await openModels()
+    await detect()
+    expect(screen.getByRole('status')).toHaveTextContent('已获取到 2 个模型')
+    fireEvent.change(screen.getByLabelText('模型 API URL'), {
+      target: { value: 'https://new.example/v1' },
+    })
+    expect(screen.queryByText('已获取到 2 个模型')).not.toBeInTheDocument()
+  })
+
+  it.each(['empty', 'error'])('连接结果为 %s 时不显示成功', async kind => {
+    await openModels()
+    if (kind === 'empty') vi.mocked(listProviderModels).mockResolvedValue([])
+    else vi.mocked(listProviderModels).mockRejectedValue(new Error('无法连接服务商'))
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      kind === 'empty' ? 'API 未返回任何可用模型' : '无法连接服务商',
+    )
+    expect(screen.queryByText(/已获取到/)).not.toBeInTheDocument()
+  })
+
+  it('切换配置后忽略迟到的连接结果', async () => {
+    await openModels()
+    const pending = deferred<ReturnType<typeof brief>[]>()
+    vi.mocked(listProviderModels).mockReturnValue(pending.promise)
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
+    await act(async () => pending.resolve([brief('stale-model')]))
+    expect(screen.queryByText('stale-model')).not.toBeInTheDocument()
+    expect(screen.queryByText(/已获取到/)).not.toBeInTheDocument()
+  })
+
+  it('切换立即显示状态，保存期间阻止重复提交，成功后更新选择', async () => {
+    const onChanged = vi.fn()
+    await openModels(onChanged)
+    await detect()
+    const pending = deferred<string>()
+    vi.mocked(switchModel).mockReturnValue(pending.promise)
+    fireEvent.click(row('model-two'))
+    expect(screen.getByText('正在切换到 model-two…')).toBeInTheDocument()
+    expect(row('model-two')).toHaveAttribute('aria-busy', 'true')
+    expect(row('model-two')).not.toHaveClass('active')
+    fireEvent.click(row('model-one'))
+    expect(switchModel).toHaveBeenCalledTimes(1)
+    await act(async () => pending.resolve('ok'))
+    expect(row('model-two')).toHaveClass('active')
+    expect(screen.getByText('已切换到 model-two')).toBeInTheDocument()
+    expect(onChanged).toHaveBeenCalledTimes(1)
+  })
+
+  it('切换失败保留原选择，支持 Enter 和空格切换', async () => {
+    await openModels()
+    await detect()
+    vi.mocked(switchModel).mockResolvedValueOnce('ok')
+    fireEvent.keyDown(row('model-one'), { key: 'Enter' })
+    await waitFor(() => expect(row('model-one')).toHaveClass('active'))
+    vi.mocked(switchModel).mockRejectedValueOnce(new Error('保存失败'))
+    fireEvent.keyDown(row('model-two'), { key: ' ' })
+    await screen.findByText('保存失败')
+    expect(row('model-one')).toHaveClass('active')
+    expect(row('model-two')).not.toHaveClass('active')
+  })
+
+  it('输入密钥时复用 configureLlm，重复选择仍可保存修改后的连接参数', async () => {
+    await openModels()
+    await detect()
+    vi.mocked(configureLlm).mockResolvedValue('ok')
+    fireEvent.change(screen.getByLabelText('模型 API Key'), { target: { value: 'test-key' } })
+    fireEvent.click(row('model-two'))
+    await waitFor(() => expect(row('model-two')).toHaveClass('active'))
+    fireEvent.change(screen.getByLabelText('模型 API URL'), {
+      target: { value: 'https://new.example/v1' },
+    })
+    fireEvent.click(row('model-two'))
+    await waitFor(() => expect(configureLlm).toHaveBeenCalledTimes(2))
+    expect(configureLlm).toHaveBeenLastCalledWith(
+      'test-key',
+      'model-two',
+      'custom-fast',
+      'https://new.example/v1',
+      undefined,
+    )
+    expect(switchModel).not.toHaveBeenCalled()
+  })
+
+  it('后台能力更新会刷新模型列表，卸载后释放监听', async () => {
+    const { unmount } = await openModels()
+    await waitFor(() =>
+      expect(vi.mocked(listen).mock.calls.some(c => c[0] === 'model-metadata-updated')).toBe(true),
+    )
+    const handler = vi.mocked(listen).mock.calls.find(c => c[0] === 'model-metadata-updated')![1]
+    const before = vi.mocked(listModels).mock.calls.length
+    await act(async () => {
+      handler({ payload: { provider: 'custom-fast', model: 'model-two' } } as never)
+    })
+    expect(listModels).toHaveBeenCalledTimes(before + 1)
+    unmount()
+    expect(unlistenMock).toHaveBeenCalled()
   })
 })

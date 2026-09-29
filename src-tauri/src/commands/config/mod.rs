@@ -15,6 +15,7 @@ pub mod handoff;
 pub mod jev;
 pub mod laya;
 pub mod llm;
+pub(crate) mod model_metadata;
 pub mod oauth;
 pub mod preferences;
 pub mod relation;

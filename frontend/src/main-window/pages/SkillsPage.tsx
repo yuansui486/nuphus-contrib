@@ -50,7 +50,6 @@ export function SkillsPage() {
       if (!selected) return
       setInstalling(true)
       const result = await invoke<string>('skill_install', { path: selected })
-      console.log('Skill installed:', result)
       await load()
     } catch (e: any) {
       console.error('Install failed:', e)

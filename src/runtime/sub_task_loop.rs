@@ -79,6 +79,9 @@ impl super::SubTaskRunner {
                     });
                 }
                 let total_duration = self.execution_started_at.elapsed().as_millis() as u64;
+                // 封口未配对的 ToolUse：写为「用户强制中断」的 ToolResult 再落记忆，
+                // 让下一轮模型知道自己动过手、且那一步没有产出（副作用不会随中断消失）。
+                self.session.seal_interrupted_tools();
                 // Record memory before cancellation return
                 if let Err(e) = self
                     .learn_from_success(total_duration, "任务已被用户中断")

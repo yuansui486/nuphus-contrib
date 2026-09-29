@@ -8,6 +8,10 @@
 use crate::session::session::Session;
 use crate::session::types::*;
 
+/// 用户强制中断时，为未配对的 ToolUse 补写的 ToolResult 内容。
+/// 明确三件事：被叫停的是用户、该调用没有产出、不要假设它成功。
+const INTERRUPTED_TOOL_NOTICE: &str = "[中断] 用户强制中断了本次执行，该工具调用未产生任何结果。请等待用户的下一步指令，不要假设此调用已成功。";
+
 impl Session {
     /// 清理不完整的工具调用对，确保 API 格式合法
     ///
@@ -59,6 +63,55 @@ impl Session {
 
         // 移除变空的消息
         self.messages.retain(|msg| !msg.content.is_empty());
+    }
+
+    /// 用户强制中断后的工具调用封口：为每个未配对的 ToolUse 补一条 ToolResult，
+    /// 把「被强制中断、该调用无结果」写进会话历史。
+    ///
+    /// 与 `strip_incomplete_tools` 的分工（有意不同，勿合并）：
+    /// - `strip_incomplete_tools` **删除**痕迹，用于 LLM 报错 / 异常场景——那里的
+    ///   未配对 ToolUse 是脏数据，写任何具体原因都是编造；
+    /// - 本方法**保留痕迹并注入真实原因**，专用于用户主动中断。
+    ///
+    /// 为什么中断场景必须保留：ToolUse 一旦发出，对应的副作用（文件已写、命令已跑）
+    /// 不会因为中断而消失。若把 ToolUse 从历史里抹掉，下一轮模型会遇到
+    /// 「我发起过这个调用」与「历史上没有这个调用」的认知错位——它不知道自己
+    /// 已经动过手，会在失真的世界状态上继续推理。补一条明确的 ToolResult 让
+    /// 模型知道走到哪一步被叫停、且那一步没有产出。
+    ///
+    /// 幂等：已配对的 ToolUse 不重复补；无未配对 ToolUse 时为 no-op。
+    pub fn seal_interrupted_tools(&mut self) {
+        use std::collections::HashSet;
+        let mut result_ids: HashSet<&str> = HashSet::new();
+        for msg in &self.messages {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                    result_ids.insert(tool_use_id.as_str());
+                }
+            }
+        }
+        // 先只读地收集「哪条 assistant 消息之后要补哪个 id」，再统一插入。
+        // 不可在同一轮里既借 self.messages 又 insert（E0502）。
+        let mut pending: Vec<(usize, String)> = Vec::new();
+        for (i, msg) in self.messages.iter().enumerate() {
+            if msg.role != MessageRole::Assistant {
+                continue;
+            }
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    if !result_ids.contains(id.as_str()) {
+                        pending.push((i, id.clone()));
+                    }
+                }
+            }
+        }
+        // 逆序插入，避免 insert 造成 index 漂移
+        for (i, id) in pending.into_iter().rev() {
+            self.messages.insert(
+                i + 1,
+                Message::tool_result(id, INTERRUPTED_TOOL_NOTICE.to_string(), true),
+            );
+        }
     }
 
     /// 转换为 API 格式消息列表（完全扁平结构）
