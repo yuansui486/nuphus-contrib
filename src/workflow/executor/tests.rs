@@ -1355,8 +1355,8 @@ async fn wait_prompt_is_variable_substituted() {
         Ok("5 门课未完成".to_string())
     }
 
-    let tmp = std::env::temp_dir().join("nuphus_test_wait_vars");
-    let _ = std::fs::create_dir_all(&tmp);
+    let tmp = std::env::temp_dir().join(format!("nuphus_test_wait_vars_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
     let store = WorkflowStore::with_root(tmp.clone());
     let events = EventBus::new();
     let mut rx = events.subscribe();
@@ -1383,32 +1383,39 @@ async fn wait_prompt_is_variable_substituted() {
     store.save(&wf).await.unwrap();
 
     let tool_exec = |tool: String, params: serde_json::Value| pending_tool_exec(tool, params);
-    // wait 步骤会一直等"继续"：StepRunPaused 在进入等待轮询**之前**就已发出，
-    // 所以用超时掐掉即可断言事件，不需要真的 resume（否则测试要挂到 30 分钟超时）。
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(900),
-        executor.execute_v2(
-            &wf_id, &store, &events, tool_exec, None, None, None, None, false,
-        ),
-    )
-    .await;
-
-    let mut reasons: Vec<String> = Vec::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let WorkflowEvent::StepRunPaused { reason, .. } = ev {
-            reasons.push(reason);
+    // 按事件同步，不以 900ms 硬截断磁盘/线程池调度较慢的 CI 执行。
+    // 收到实际暂停事件后正常续跑，同时确认工作流最终成功；超时只作死锁保护。
+    let observe_and_resume = async {
+        loop {
+            match rx.recv().await.expect("工作流事件通道应保持可用") {
+                WorkflowEvent::StepRunPaused {
+                    step_id, reason, ..
+                } if step_id == "report_plan" => {
+                    executor.resume(&wf_id).await;
+                    break reason;
+                }
+                _ => {}
+            }
         }
-    }
-    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    };
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            executor.execute_v2(&wf_id, &store, &events, tool_exec, None, None, None, None, false,),
+            observe_and_resume
+        )
+    })
+    .await;
+    tokio::fs::remove_dir_all(&tmp).await.unwrap();
+    let (result, reason) = observed.expect("wait 步骤应发出 StepRunPaused 并在续跑后完成");
 
-    assert!(!reasons.is_empty(), "wait 步骤应发出 StepRunPaused");
+    assert!(result.is_ok(), "续跑后应成功完成: {result:?}");
     assert!(
-        reasons.iter().any(|r| r.contains("5 门课未完成")),
-        "wait 提示语里的 {{{{pending_raw}}}} 应被替换为变量值，实际: {reasons:?}"
+        reason.contains("5 门课未完成"),
+        "wait 提示语里的 {{{{pending_raw}}}} 应被替换为变量值，实际: {reason:?}"
     );
     assert!(
-        !reasons.iter().any(|r| r.contains("{{")),
-        "wait 提示语不应残留模板占位符，实际: {reasons:?}"
+        !reason.contains("{{"),
+        "wait 提示语不应残留模板占位符，实际: {reason:?}"
     );
 }
 
