@@ -16,7 +16,10 @@ on:
         default: ""
     secrets:
       TAURI_SIGNING_PRIVATE_KEY:
-        required: true
+        # Older default-branch dispatchers must still be able to run source sync.
+        # Missing signing credentials are rejected in the build job, not while
+        # validating the whole caller graph (including its skipped build branch).
+        required: false
       OSS_ACCESS_KEY_ID:
         required: false
       OSS_ACCESS_KEY_SECRET:
@@ -62,6 +65,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           PUBLISH: ${{ inputs.publish }}
           REUSE_RUN: ${{ inputs.reuse_build_run }}
+          SIGNING_AVAILABLE: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
           GH_TOKEN: ${{ github.token }}
         run: node tools/lingque-release/revision.mjs
   verify:
