@@ -112,7 +112,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: npx tauri build --config src-tauri/tauri.workbench.conf.json --features workbench --bundles ${{ matrix.bundle }}
-      - name: Windows packaged MCP and official updater acceptance
+      - name: Windows packaged MCP acceptance
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -121,7 +121,12 @@ jobs:
           $env:WORKBENCH_TEST_EXE = (Resolve-Path target/release/nuphus-workbench.exe).Path
           $env:WORKBENCH_TEST_MCP = (Resolve-Path target/release/nuphus-workbench-mcp.exe).Path
           ./scripts/workbench-mcp-focus.ps1 -TestRoot $env:WORKBENCH_TEST_ROOT
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The PowerShell MCP script throws on failure, but does not set LASTEXITCODE.
+      # Checking its null exit code can silently exit 0 and skip installer tests.
+      - name: Windows official updater installer acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
           cargo build -p nuphus-desktop --features workbench --example lingque-updater-probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File src-tauri/installer/tests/run.ps1 -McpExecutable target/release/nuphus-workbench-mcp.exe -NativeUpdaterProbe target/debug/examples/lingque-updater-probe.exe -RequireTauriTemplate
