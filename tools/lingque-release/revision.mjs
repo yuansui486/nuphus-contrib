@@ -6,6 +6,10 @@ const config = JSON.parse(
   await readFile("src-tauri/tauri.workbench.conf.json", "utf8"),
 );
 const sha = git("rev-parse", "HEAD");
+if (!process.env.REUSE_RUN && process.env.SIGNING_AVAILABLE === "false")
+  throw Error(
+    "缺少灵雀签名 Secret；请将新版 dispatcher 同步到贡献仓默认分支并显式转发签名密钥",
+  );
 const tag = process.env.RELEASE_TAG || `lingque-v${config.version}`;
 execFileSync(
   process.execPath,
