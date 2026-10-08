@@ -1111,6 +1111,10 @@ fn main() {
                             }
                         }
                         "quit" => {
+                            #[cfg(feature = "workbench")]
+                            if app.try_state::<workbench::WorkbenchState>().is_some_and(|state| state.service.updates.installing()) {
+                                return;
+                            }
                             // 退出前保存当前 session（元数据行 + Shelf 磁盘镜像）
                             if let Some(state) = app.try_state::<crate::state::AppState>() {
                                 // 快照保护名单先于 runtime 锁收集，避免嵌套加锁
@@ -1165,6 +1169,17 @@ fn main() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        #[cfg(feature = "workbench")]
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            if app_handle
+                .try_state::<workbench::WorkbenchState>()
+                .is_some_and(|state| state.service.updates.installing())
+            {
+                // Tauri still permits its dedicated restart exit code after a
+                // successful Mac replacement; user quit cannot interrupt installation.
+                api.prevent_exit();
+            }
+        }
         if let tauri::RunEvent::WindowEvent {
             label,
             event: win_event,
