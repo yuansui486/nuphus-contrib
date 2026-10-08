@@ -39,7 +39,7 @@ jobs:
   build:
     if: github.repository == 'yuansui486/nuphus-contrib' && github.event_name == 'workflow_dispatch' && inputs.task == 'build'
     # Temporary acceptance branch: pinned updater candidate, never stable publication.
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@43901cf0a37ad0ffaff866f552d7cdff9212bafc
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@74a746cfa62f30ee38a048adf7db8ead59840f90
     with:
       ref: ${{ inputs.ref }}
       tag: ${{ inputs.tag }}
