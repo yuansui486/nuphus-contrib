@@ -7,6 +7,7 @@ import {
   IconX as X,
 } from '../ui/Icons'
 import type { Project } from './api'
+import { useAppUpdates } from './Updates'
 
 interface Props {
   ui: (zh: string, en: string) => string
@@ -24,6 +25,7 @@ interface Props {
 
 /** Workbench-only controls; shared model settings and canvas stay upstream-owned. */
 export function WorkbenchSettings(props: Props) {
+  const updates = useAppUpdates()
   const { ui, onClose } = props
   const panel = useRef<HTMLDivElement>(null)
   const close = useRef(onClose)
@@ -83,6 +85,14 @@ export function WorkbenchSettings(props: Props) {
           </button>
         </header>
         <div className="wb-settings-actions">
+          <button
+            onClick={() => {
+              onClose()
+              updates.open()
+            }}
+          >
+            版本与更新
+          </button>
           <button onClick={props.onModels}>
             <SlidersHorizontal size={16} />
             <span>{ui('模型配置', 'Models')}</span>

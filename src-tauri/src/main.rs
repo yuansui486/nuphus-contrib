@@ -211,6 +211,18 @@ fn main() {
         )
         .invoke_handler({
           let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool=tauri::generate_handler![
+            #[cfg(feature = "workbench")]
+            workbench::updates::get_app_update_status,
+            #[cfg(feature = "workbench")]
+            workbench::updates::set_app_update_preferences,
+            #[cfg(feature = "workbench")]
+            workbench::updates::check_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::download_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::cancel_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::install_app_update,
             #[cfg(feature="workbench")]
             workbench::product_auth::lingque_auth,
             workbench::workbench_call,
@@ -530,6 +542,14 @@ fn main() {
           ];
           move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature="workbench")]
+            if let Some(state) = invoke.message.webview_ref().app_handle().try_state::<workbench::WorkbenchState>() {
+                if state.service.updates.installing()
+                    && !matches!(invoke.message.command(), "get_app_update_status" | "hide_main_window") {
+                    invoke.resolver.reject("灵雀正在安装更新，请稍候。");
+                    return true;
+                }
+            }
+            #[cfg(feature="workbench")]
             if let Err(error)=workbench::product_auth::guard_command(invoke.message.command()) {
                 invoke.resolver.reject(error);
                 return true;
@@ -540,6 +560,8 @@ fn main() {
         .setup(|app| {
             if nuphus::profile::WORKBENCH {
                 workbench::install(app.handle())?;
+                #[cfg(feature = "workbench")]
+                workbench::updates::install(app.handle())?;
             }
             let desktop_state = app.state::<state::AppState>();
             nuphus::tools::desktop_approval::install_host(

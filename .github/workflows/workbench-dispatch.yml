@@ -4,18 +4,33 @@ name: Workbench dispatcher
 # GitHub runs scheduled workflows from the default branch, not an edition branch.
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       task:
-        description: 'Synchronize source or build independent installers'
+        description: "Synchronize source or build independent installers"
         type: choice
         options: [sync, build]
         default: sync
+      ref:
+        description: "构建来源；同步任务忽略此项"
+        type: string
+        default: edition/lingque
+      tag:
+        description: "灵雀发布标签 lingque-v<版本>"
+        type: string
+      publish:
+        description: "手动确认发布稳定更新；默认只构建验收"
+        type: boolean
+        default: false
+      reuse_build_run:
+        description: "复用已验收构建的运行 ID"
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
+  actions: read
 
 jobs:
   sync:
@@ -24,3 +39,12 @@ jobs:
   build:
     if: github.repository == 'yuansui486/nuphus-contrib' && github.event_name == 'workflow_dispatch' && inputs.task == 'build'
     uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@edition/lingque
+    with:
+      ref: ${{ inputs.ref }}
+      tag: ${{ inputs.tag }}
+      publish: ${{ inputs.publish }}
+      reuse_build_run: ${{ inputs.reuse_build_run }}
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}

@@ -32,6 +32,7 @@ import { ExternalConnections } from './ExternalConnections'
 import { ScheduleControl, ScheduleHistory, type ScheduleSummary } from './ScheduleControls'
 import './workbench.css'
 import { LingqueLogo } from './LingqueLogo'
+import { useAppUpdates } from './Updates'
 
 const ModelsPage = lazy(() =>
   import('../main-window/pages/ModelsPage').then(m => ({ default: m.ModelsPage })),
@@ -40,6 +41,11 @@ const terminal = (status: string) =>
   ['completed', 'failed', 'cancelled', 'interrupted', 'skipped'].includes(status)
 
 export default function WorkbenchApp({ storageScope }: { storageScope?: string } = {}) {
+  const updates = useAppUpdates()
+  const updateSave = useRef<(() => Promise<boolean>) | null>(null)
+  const registerUpdateSave = useCallback((save: (() => Promise<boolean>) | null) => {
+    updateSave.current = save
+  }, [])
   const projectStorageKey = storageScope
     ? `workbench:${storageScope}:last-project`
     : 'workbench:last-project'
@@ -73,9 +79,26 @@ export default function WorkbenchApp({ storageScope }: { storageScope?: string }
   const refreshSequence = useRef(0)
   const navigationSequence = useRef(0)
   const generationRef = useRef(generationBusy)
+  const updatingRef = useRef(updates.busy)
+  updatingRef.current = updates.busy
   generationRef.current = generationBusy
   const { register, leave } = useCanvasLeaveGuard()
   const fail = useCallback((error: unknown) => setNotice(String(error)), [])
+  useEffect(() => {
+    updates.registerSave(async () => {
+      if (generationRef.current) return false
+      const draft = activeRef.current
+      if (!draft) return true
+      if (!updateSave.current || !(await updateSave.current())) return false
+      await invoke('workbench_view_state', {
+        projectId: draft.project_id,
+        workflowId: draft.workflow_id,
+        view: { open: true, dirty: false },
+      })
+      return true
+    })
+    return () => updates.registerSave(null)
+  }, [updates.registerSave])
   useEffect(() => {
     setDrafts([])
     setRuns([])
@@ -187,6 +210,7 @@ export default function WorkbenchApp({ storageScope }: { storageScope?: string }
   }, [])
   const navigate = useCallback(
     (action: () => void) => {
+      if (updatingRef.current) return
       if (generationRef.current) {
         setNotice(
           ui('请先停止当前生成，再切换画布。', 'Stop generation before switching canvases.'),
@@ -607,6 +631,8 @@ export default function WorkbenchApp({ storageScope }: { storageScope?: string }
                     workflowId={active.workflow_id}
                     onClose={() => navigate(() => setActive(null))}
                     registerLeaveGuard={register}
+                    registerUpdateSave={registerUpdateSave}
+                    suspended={updates.busy}
                     onSwitchWorkflow={id => {
                       // CanvasPage already checks unsaved edits; only add the host's generation lock.
                       if (generationRef.current) {

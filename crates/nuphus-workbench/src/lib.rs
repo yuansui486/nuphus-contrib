@@ -19,6 +19,8 @@ pub mod schedules;
 pub mod service;
 pub mod store;
 pub mod types;
+pub mod update_gate;
+pub mod updating;
 
 pub use store::WorkbenchStore;
 pub use types::*;

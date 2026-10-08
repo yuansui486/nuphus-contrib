@@ -55,6 +55,9 @@ pub fn bridge_path() -> std::io::Result<PathBuf> {
 }
 
 fn upgrade_in_progress(host: &Path) -> bool {
+    if crate::updating::active() {
+        return true;
+    }
     let Some(parent) = host.parent() else {
         return false;
     };

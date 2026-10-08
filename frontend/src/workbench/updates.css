@@ -1,0 +1,78 @@
+.lq-update-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: #0006;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.lq-update-dialog {
+  width: min(580px, 100%);
+  max-height: 85vh;
+  overflow: auto;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #202124);
+  border: 1px solid var(--border-primary, #8885);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 70px #0004;
+}
+.lq-update-dialog header,
+.lq-update-dialog footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.lq-update-dialog h2 {
+  margin: 0;
+}
+.lq-update-dialog button {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-primary, #8885);
+  background: var(--bg-secondary, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+.lq-update-dialog button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.lq-update-dialog label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lq-update-dialog progress {
+  width: 100%;
+}
+.lq-update-dialog [role='alert'] {
+  color: #c33;
+  overflow-wrap: anywhere;
+}
+.lq-update-dialog small {
+  display: block;
+  opacity: 0.75;
+  margin-top: 16px;
+}
+.lq-update-notes {
+  max-height: 220px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.lq-update-notice {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  z-index: 9000;
+  padding: 10px 16px;
+  border: 1px solid var(--border-primary, #8885);
+  border-radius: 12px;
+  background: var(--bg-primary, #fff);
+  color: var(--text-primary, #202124);
+  box-shadow: 0 4px 20px #0002;
+  cursor: pointer;
+}

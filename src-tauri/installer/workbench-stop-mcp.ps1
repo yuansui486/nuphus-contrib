@@ -1,6 +1,7 @@
 param([Parameter(Mandatory = $true)][string]$InstallDir)
 $ErrorActionPreference = 'Stop'
 try {
+  if (-not [IO.Path]::IsPathRooted($InstallDir)) { exit 4 }
   $directory = [IO.Path]::GetFullPath($InstallDir)
   if (-not [IO.Path]::IsPathRooted($directory)) { exit 4 }
   $executable = [IO.Path]::Combine($directory, 'nuphus-workbench-mcp.exe')

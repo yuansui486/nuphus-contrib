@@ -38,6 +38,7 @@ pub async fn execute_tool(
     tool_name: String,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _activity = crate::workbench::admit_native()?;
     let manual_owner = format!(
         "{}:{}",
         nuphus::automation_gate::OWNER_MANUAL_TOOL,

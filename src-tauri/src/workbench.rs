@@ -4,6 +4,8 @@ pub mod authoring;
 #[cfg(feature = "workbench")]
 pub mod product_auth;
 mod schedule_secrets;
+#[cfg(feature = "workbench")]
+pub mod updates;
 use async_trait::async_trait;
 use nuphus::workflow::{
     compiler::Compiler,
@@ -50,6 +52,26 @@ pub struct NativeHost {
 
 fn native_error(error: impl std::fmt::Display) -> ApiError {
     ApiError::new("native_error", error.to_string())
+}
+
+/// Retain this guard in spawned workers until their final writes complete.
+pub fn admit(app: &AppHandle) -> Result<Option<nuphus_workbench::update_gate::Activity>> {
+    app.try_state::<WorkbenchState>()
+        .map(|state| state.service.updates.admit())
+        .transpose()
+}
+
+// Shared configuration helpers are also called outside IPC. Keep the guard in
+// those helpers through their final write, not merely around command dispatch.
+static NATIVE_UPDATES: std::sync::OnceLock<Arc<nuphus_workbench::update_gate::UpdateGate>> =
+    std::sync::OnceLock::new();
+pub fn admit_native() -> std::result::Result<Option<nuphus_workbench::update_gate::Activity>, String>
+{
+    NATIVE_UPDATES
+        .get()
+        .map(|gate| gate.admit())
+        .transpose()
+        .map_err(|e| e.to_string())
 }
 
 pub fn install(app: &AppHandle) -> Result<()> {
@@ -123,6 +145,12 @@ pub fn install(app: &AppHandle) -> Result<()> {
             active_workflows: Arc::new(Mutex::new(HashMap::new())),
         },
     ));
+    NATIVE_UPDATES.set(service.updates.clone()).map_err(|_| {
+        ApiError::new(
+            "already_running",
+            "Workbench update admission is already installed",
+        )
+    })?;
     let endpoint = Arc::new(Mutex::new(json!({"status":"starting"})));
     let local_endpoint = Arc::new(Mutex::new(json!({"status":"unavailable"})));
     #[cfg(feature = "workbench")]
@@ -247,6 +275,7 @@ pub async fn workbench_call(app: AppHandle, operation: String, args: Value) -> R
 
 #[tauri::command]
 pub async fn workbench_clients(app: AppHandle, action: String, args: Value) -> Result<Value> {
+    let _activity = admit(&app)?;
     if nuphus::profile::WORKBENCH && !matches!(action.as_str(), "status" | "check") {
         return Err(ApiError::new(
             "unsupported_operation",
@@ -320,6 +349,7 @@ pub fn workbench_view_state(
     workflow_id: String,
     view: Value,
 ) -> Result<()> {
+    let _activity = admit(&app)?;
     let state = app
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "Start the Workbench edition"))?;
@@ -416,6 +446,7 @@ impl Host for NativeHost {
     }
 
     async fn start(&self, store: WorkbenchStore, run: Run, inputs: Value) -> Result<()> {
+        let update_activity = admit(&self.app)?;
         self.authorize_product()?;
         let epoch = self.session_epoch()?.unwrap_or_default();
         let store = store.pinned()?;
@@ -608,6 +639,7 @@ impl Host for NativeHost {
         // Run ownership outlives the request and any external connection.
         tauri::async_runtime::spawn(nuphus::profile::PRODUCT_EPOCH.scope(epoch, async move {
             let _lease = lease;
+            let _update_activity = update_activity;
             let result = nuphus::automation_gate::with_execution_owner(
                 owner,
                 CURRENT.scope(context, async {

@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './main-window/App'
 import AuthGate from './workbench/AuthGate'
+import { AppUpdatesProvider } from './workbench/Updates'
 import { readBaseTheme, ThemeProvider } from './hooks/useTheme'
 import { LangProvider } from './locales'
 import { ErrorBoundary } from './ui/ErrorBoundary'
@@ -36,7 +37,13 @@ ReactDOM.createRoot(root).render(
     <ThemeProvider defaultTheme={defaultTheme}>
       <LangProvider>
         <ErrorBoundary onExit={() => window.close()}>
-          {import.meta.env.VITE_NUPHUS_EDITION === 'workbench' ? <AuthGate /> : <App />}
+          {import.meta.env.VITE_NUPHUS_EDITION === 'workbench' ? (
+            <AppUpdatesProvider>
+              <AuthGate />
+            </AppUpdatesProvider>
+          ) : (
+            <App />
+          )}
         </ErrorBoundary>
       </LangProvider>
     </ThemeProvider>

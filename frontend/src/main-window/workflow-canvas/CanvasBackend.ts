@@ -23,6 +23,7 @@ export const legacyCanvasBackend = {
   generation: true,
 }
 export type CanvasBackend = typeof legacyCanvasBackend & {
+  flushForUpdate?: () => Promise<void>
   schedule?: WorkflowScheduleBackend
   intent?: IntentTextOptions & { draftScope?: string }
 }

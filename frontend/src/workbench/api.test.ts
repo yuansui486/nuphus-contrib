@@ -17,6 +17,31 @@ beforeEach(() => {
 })
 
 describe('Workbench canvas backend', () => {
+  it('更新保存等待布局队列；失败不会被 flush 静默忽略', async () => {
+    const backend = canvasBackend(fixture(), vi.fn(), vi.fn())
+    let finish!: (draft: Draft) => void
+    ipc.mockImplementation(
+      () =>
+        new Promise<Draft>(resolve => {
+          finish = resolve
+        }),
+    )
+    const saving = backend.wfLayoutSave('flow', { test: true })
+    let flushed = false
+    const flushing = backend.flushForUpdate!().then(() => {
+      flushed = true
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(flushed).toBe(false)
+    finish({ ...fixture(), layout_revision: 3 })
+    await saving
+    await flushing
+    expect(flushed).toBe(true)
+    ipc.mockRejectedValue(new Error('磁盘不可写'))
+    await expect(backend.wfLayoutSave('flow', {})).rejects.toThrow('磁盘不可写')
+    await expect(backend.flushForUpdate!()).rejects.toThrow('磁盘不可写')
+  })
   it('uses project-scoped scheduling and advances the canvas base revision', async () => {
     const draft = fixture(),
       changed = vi.fn()

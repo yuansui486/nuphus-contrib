@@ -147,6 +147,7 @@ pub async fn workbench_generate(
     if action != "start" {
         return Err(ApiError::new("unknown_operation", action));
     }
+    let update_activity = super::admit(&app)?;
     if draft.authoring_mode != nuphus_workbench::AuthoringMode::Internal {
         return Err(ApiError::new(
             "external_authoring",
@@ -221,6 +222,7 @@ pub async fn workbench_generate(
     let generations = state.generations.clone();
     let returned = turn.clone();
     tauri::async_runtime::spawn(nuphus::profile::PRODUCT_EPOCH.scope(epoch, async move {
+        let _update_activity = update_activity;
         let result = tokio::select! {
             result=agent.run(&input, &None, &cancel)=>result,
             _=async {

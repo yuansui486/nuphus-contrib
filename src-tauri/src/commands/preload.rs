@@ -11,12 +11,14 @@ use tauri::AppHandle;
 /// 直接在主线程执行会让进度事件排队到返回后才投递，splash 进度就死了。
 #[tauri::command]
 pub async fn preload_model(app: AppHandle) -> Result<bool, String> {
+    let activity = crate::workbench::admit(&app).map_err(|e| e.to_string())?;
     tracing::info!("[Preload] Starting embedding model load...");
 
     let worker_app = app.clone();
     // 返回 bool 而非 &'static Embedder，避免 spawn_blocking 的 Send 边界
     // 依赖 Embedder: Sync；is_some() 即代表全局已就绪。
     let loaded = tauri::async_runtime::spawn_blocking(move || {
+        let _activity = activity;
         let mut on_progress = |downloaded: u64, total: u64, file: &str| {
             let pct =
                 (total > 0).then(|| ((downloaded as f64 / total as f64) * 100.0).round() as u8);

@@ -598,6 +598,7 @@ pub fn set_agent_model(
     model: String,
     provider: Option<String>,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     if model.is_empty() {
         // 清除绑定 → 跟随 leader：无 provider 维度，不适用消歧校验
         save_agent_model(&state.llm_config_path, &agent, &model, None)?;
@@ -637,6 +638,7 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
     context_window: Option<usize>,
     mode: Option<String>,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     // Read the target provider's stored API key from config.toml.
     //
     // 自定义中转站允许无 key 切换（Ollama / llama-swap / 无鉴权网关：地址自己填，
@@ -958,6 +960,7 @@ pub async fn configure_llm(
     base_url: Option<String>,
     context_window: Option<usize>,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     let resolved_provider = provider
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "minimax".to_string());
@@ -1090,6 +1093,7 @@ pub async fn configure_llm(
 /// is emptied. Idempotent: unknown providers return `Ok(())` without changes.
 #[tauri::command]
 pub fn clear_provider_api_key(state: State<'_, AppState>, provider: String) -> Result<(), String> {
+    let _activity = crate::workbench::admit_native()?;
     let toml_config_path = get_config_path().or_else(|| {
         let fallback = state.llm_config_path.with_file_name("providers.toml");
         if let Some(parent) = fallback.parent() {
@@ -1125,6 +1129,7 @@ pub fn set_model_context_window(
     model: String,
     context_window: usize,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     if context_window == 0 || context_window > 10_000_000 {
         return Err(format!(
             "Context Window 需在 1 ~ 10,000,000 之间，收到: {}",
@@ -1186,6 +1191,7 @@ pub fn set_model_supports_vision(
     model: String,
     supports_vision: bool,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     if provider.trim().is_empty() || model.trim().is_empty() {
         return Err("provider 与 model 不能为空".to_string());
     }
@@ -1244,6 +1250,7 @@ pub fn set_model_supports_image_generation(
     model: String,
     supports_image_generation: bool,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     if provider.trim().is_empty() || model.trim().is_empty() {
         return Err("provider 与 model 不能为空".to_string());
     }
@@ -1551,6 +1558,7 @@ pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::Model
 /// 调用时探测。
 #[tauri::command]
 pub fn add_provider_model(provider: String, model_id: String) -> Result<(), String> {
+    let _activity = crate::workbench::admit_native()?;
     let model_id = model_id.trim().to_string();
     if model_id.is_empty() {
         return Err("模型代号不能为空".to_string());
@@ -1582,6 +1590,7 @@ pub fn add_provider_model(provider: String, model_id: String) -> Result<(), Stri
 /// 保留 name / provider_type / base_url / api_key。返回清除条目数（幂等）。
 #[tauri::command]
 pub fn clear_provider_models(provider: String) -> Result<usize, String> {
+    let _activity = crate::workbench::admit_native()?;
     let config_path =
         get_config_path().ok_or_else(|| "无法定位 config.toml 配置路径".to_string())?;
     clear_provider_models_in_config_toml(&config_path, &provider)
@@ -1621,6 +1630,7 @@ pub fn set_reasoning_effort(
     provider: String,
     effort: Option<String>,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     let path = get_config_path().ok_or_else(|| "config.toml 未找到".to_string())?;
     update_reasoning_effort(&path, &provider, effort.as_deref())?;
     {
@@ -1649,6 +1659,7 @@ pub async fn test_llm_connection(
     // Option：旧前端调用不传该参数时为 None，契约向后兼容。
     headers: Option<Vec<(String, String)>>,
 ) -> Result<String, String> {
+    let _activity = crate::workbench::admit_native()?;
     // ProviderKind is now the canonical type (merged from KnownProvider).
     // 函数体内不需要直接命名该类型。
     use nuphus::api::MessageRequest;
@@ -2059,6 +2070,7 @@ pub async fn list_provider_models(
     provider: String,
     base_url: Option<String>,
 ) -> Result<Vec<ProviderModelBrief>, String> {
+    let _activity = crate::workbench::admit_native()?;
     fetch_provider_models(&api_key, &provider, base_url.as_deref()).await
 }
 
@@ -2112,6 +2124,7 @@ pub async fn refresh_provider_models(
     base_url: Option<String>,
     sync: Option<bool>,
 ) -> Result<RefreshModelsResult, String> {
+    let _activity = crate::workbench::admit_native()?;
     // 与 fetch_provider_models 同一判据：未声明内置鉴权方案的 Provider（local 等）
     // 与用户自建的自定义中转站（含 custom-xxx 实例），允许无 key 刷新
     // （Ollama / llama.cpp / 无鉴权中转默认无鉴权）。
@@ -2335,6 +2348,7 @@ fn custom_provider_config_path(state: &AppState) -> std::path::PathBuf {
 /// 「name 非空」这类不变量必须在后端也成立一次。
 #[tauri::command]
 pub fn remove_custom_provider(state: State<'_, AppState>, name: String) -> Result<bool, String> {
+    let _activity = crate::workbench::admit_native()?;
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("provider name must not be empty".to_string());
@@ -2367,6 +2381,7 @@ pub fn create_custom_provider(
     headers: Vec<(String, String)>,
     oauth: Option<super::oauth::OauthConfigDto>,
 ) -> Result<ProviderInfo, String> {
+    let _activity = crate::workbench::admit_native()?;
     let config_path = custom_provider_config_path(&state);
     create_custom_provider_segment(
         &config_path,
@@ -2429,6 +2444,7 @@ pub fn update_custom_provider(
     headers: Vec<(String, String)>,
     oauth: Option<super::oauth::OauthConfigDto>,
 ) -> Result<ProviderInfo, String> {
+    let _activity = crate::workbench::admit_native()?;
     let config_path = custom_provider_config_path(&state);
     update_custom_provider_segment(
         &config_path,
@@ -2807,6 +2823,9 @@ pub fn get_context_limit(state: State<'_, AppState>) -> Result<usize, String> {
 
 /// Startup discovery shares the switch path's generation and manual-override guards.
 pub async fn startup_model_calibration(app: &tauri::AppHandle) {
+    let Ok(_activity) = crate::workbench::admit_native() else {
+        return;
+    };
     let state = app.state::<AppState>();
     let binding = state.runtime.lock().ok().and_then(|runtime| {
         runtime

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { TitleBar } from '../main-window/layout/TitleBar'
 import WorkbenchApp from './WorkbenchApp'
+import { useAppUpdates } from './Updates'
 import './auth.css'
 import { LingqueLogo } from './LingqueLogo'
 
@@ -27,6 +28,7 @@ const message = (error: unknown) =>
   typeof error === 'object' && error && 'message' in error ? String(error.message) : String(error)
 
 export default function AuthGate() {
+  const updates = useAppUpdates()
   const [status, setStatus] = useState<AuthStatus | null>(null)
   const [tenant, setTenant] = useState('')
   const [username, setUsername] = useState('')
@@ -157,6 +159,7 @@ export default function AuthGate() {
     <div className="lq-login-shell">
       <TitleBar brand="灵雀 Lingque" brandIcon={<LingqueLogo />} />
       <main className="lq-login-main">
+        <button onClick={updates.open}>版本与更新</button>
         <section className="lq-login-card" aria-label="灵雀登录">
           <div className="lq-login-brand">
             <LingqueLogo size={56} />

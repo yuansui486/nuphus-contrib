@@ -18,6 +18,95 @@ struct FakeHost {
 }
 
 #[tokio::test]
+async fn installation_blocks_all_transports_and_schedules_then_failure_restores_them() {
+    let (_dir, service, p, _) = fixture();
+    let installation = service.updates.freeze().unwrap();
+    for principal in [Principal::LocalUi, Principal::LocalExternal] {
+        for operation in crate::catalog::operations() {
+            assert_eq!(
+                service
+                    .dispatch(
+                        &principal,
+                        operation.name,
+                        json!({"project_id":p.project_id})
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                "upgrade_in_progress",
+                "{}",
+                operation.name
+            );
+        }
+    }
+    assert_eq!(
+        service
+            .tick_schedules(&p.project_id, 0)
+            .await
+            .unwrap_err()
+            .code,
+        "upgrade_in_progress"
+    );
+    assert_eq!(
+        service
+            .recover_schedules(&p.project_id, 0)
+            .await
+            .unwrap_err()
+            .code,
+        "upgrade_in_progress"
+    );
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 0);
+    drop(installation);
+    assert!(service
+        .dispatch(&Principal::LocalUi, "project.list", json!({}))
+        .await
+        .is_ok());
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn real_ipc_and_http_cannot_enter_during_installation() {
+    let (dir, service, _, _) = fixture();
+    let root = dir.path().join("app");
+    let local = crate::local::Server::bind(&root).unwrap();
+    let local_task = tokio::spawn(local.serve(service.clone()));
+    let client = crate::local::Client::new(root, dir.path().join("missing-app"), None);
+    let listener = crate::gateway::bind(0).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = crate::gateway::local_router(service.clone());
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let installation = service.updates.freeze().unwrap();
+    assert_eq!(
+        client
+            .operation("project.list", json!({}))
+            .await
+            .unwrap_err()
+            .code,
+        "upgrade_in_progress"
+    );
+    let body: Value = reqwest::Client::new()
+        .post(format!("http://{address}/api/v1/project.list"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["error"]["code"], "upgrade_in_progress");
+    drop(installation);
+    assert!(client
+        .operation("project.list", json!({}))
+        .await
+        .unwrap()
+        .is_array());
+    local_task.abort();
+    http_task.abort();
+}
+
+#[tokio::test]
 async fn product_lock_blocks_every_public_operation_and_scheduling() {
     let (_dir, service, p, _) = fixture();
     service.host.locked.store(true, Ordering::SeqCst);

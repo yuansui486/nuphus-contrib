@@ -14,6 +14,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NUPHUS_BUILD_SKIP_MODELS: "1"
+
 jobs:
   frontend:
     name: Workbench frontend and original editor
@@ -31,13 +34,18 @@ jobs:
           echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --no-audit --no-fund
         working-directory: frontend
       - run: npx tsc --noEmit
         working-directory: frontend
+      - run: npm ci --no-audit --no-fund
+        working-directory: tools/lingque-release
+      - run: npm test
+        working-directory: tools/lingque-release
+      - run: node tools/lingque-release/check-version.mjs
       - run: npm run lint
         working-directory: frontend
       - run: npx prettier --check "src/workbench/**/*.{ts,tsx,css}" src/main-window/workflow-canvas/CanvasBackend.ts
@@ -68,7 +76,7 @@ jobs:
           echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -100,6 +108,18 @@ jobs:
           cargo test -p nuphus --lib tools::registry::tests:: --features workbench
       - run: cargo check -p nuphus-desktop --features workbench
       - run: cargo test -p nuphus-desktop --features workbench --bin nuphus workbench
+      - name: Windows official updater offline installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p nuphus-desktop --features workbench --example lingque-updater-probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File src-tauri/installer/tests/run.ps1 -MakeNsis "${env:ProgramFiles(x86)}/NSIS/makensis.exe" -McpExecutable target/debug/nuphus-workbench-mcp.exe -NativeUpdaterProbe target/debug/examples/lingque-updater-probe.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Handoff migration and edition isolation
         run: cargo test -p nuphus-desktop --features workbench --bin nuphus commands::config::handoff::tests
       - run: cargo check -p nuphus-desktop

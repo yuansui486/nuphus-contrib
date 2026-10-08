@@ -55,6 +55,8 @@ audit/
 # 插件市场建好后会重写公开开发文档
 docs/*
 !docs/lingque-upstream-maintenance.md
+!docs/lingque-updates.md
+!docs/lingque-releases/
 !docs/readme-hero/
 !docs/readme-hero/*
 
