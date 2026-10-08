@@ -144,7 +144,6 @@ Constitution > Safety > Evidence > Goal > System > Efficiency > Style
 禁止"功能通了"当作"闭环完成"。
 
 ## 构建与验证
-禁止未经显式指令允许构建（debug / release）、全量测试
 验证 / 测试 前必读 `prompts/build-verification-policy.md`，重审任务指令需求，确认与设计意图对齐。
 **验证四原则**：必要性（待办任务继承依赖）· 最小化（只验证本次改动）· 时间成本（选轻量手段）· 无后续（不产生待办债务）。
 "#;
@@ -264,14 +263,15 @@ pub fn build_leader_base_prompt(ctx: &LeaderContext) -> String {
 // ═══════════════════════════════════════════════════════
 
 /// Tool schemas section (L1)
+///
+/// 契约：本节只列工具名称（表格）。每个工具的详细参数（入参 / 枚举值 /
+/// 默认值 / 嵌套结构）由同请求的 API `tools` 字段完整下发——prompt 内
+/// 不做任何参数级复制，残缺摘录只会扭曲模型对能力边界的判断。
 pub fn tool_schemas_section(schemas: &str) -> String {
     format!(
-        "## 可用工具\n\
-         调用格式：\n\
-         <tool_call>\n\
-         {{\"name\": \"工具名\", \"arguments\": {{\"参数名\": \"参数值\"}}}}\n\
-         </tool_call>\n\
-         工具列表（详细参数见 API tools 定义）：\n\
+        "## 可用工具\n\n\
+         以下仅列工具名称；每个工具的详细参数（入参 / 枚举值 / 默认值）\
+         由请求的 API tools 字段完整下发，以该字段为准。\n\n\
          {schemas}\n"
     )
 }
@@ -1329,16 +1329,20 @@ mod tests {
     /// Exec 路径的展示标签形如 `"<model> (<provider>)"`；把它喂给
     /// `get_context_window_for` 必然 miss → 恒回落 128K。本用例断言：
     ///   1. `当前模型:` 显示标签本身（展示契约逐字符不变）；
-    ///   2. 上下文窗口来自**真 model id** 的解析结果（把标签当 id 用会得到 128K）。
+    ///   2. 上下文窗口来自**真 model id 的段限定解析**（把标签当 id 用会得到 128K）。
+    ///
+    /// provider 取 builtin 真实段（google）：二元组化 P1 起，盲查扫已删，
+    /// 幽灵 provider 名不再跨段拾遗——miss 就是 miss（128K 兜底），这是
+    /// 「不猜」的预期行为，不是退化。
     #[test]
     fn test_build_exec_prompt_keeps_display_label_out_of_resolution() {
         // 真 id 取自 builtin ProviderRegistry（gemini-2.5-pro → 2M），
         // 标签形式 "id (provider)" 在任何 registry 中都解析不到。
         let real = "gemini-2.5-pro";
-        let label = format!("{real} (gw)");
+        let label = format!("{real} (google)");
         let prompt = build_exec_prompt(
             real,
-            Some("gw"),
+            Some("google"),
             Some(&label),
             "schema",
             GoalType::ScriptingExec,
@@ -1348,7 +1352,7 @@ mod tests {
             None,
         );
 
-        let expected = crate::agent::goal_types::get_context_window_for(real, Some("gw"));
+        let expected = crate::agent::goal_types::get_context_window_for(real, Some("google"));
         let expected_str = if expected >= 1_000_000 {
             format!("{}M", expected / 1_000_000)
         } else {
@@ -1373,7 +1377,7 @@ mod tests {
         // fixture 自检：标签必解析到 128K 兜底，与真 id 取值不同——否则本用例
         // 无法区分「用标签解析」这一回归（退化即失败，不静默放过）。
         assert_ne!(
-            crate::agent::goal_types::get_context_window_for(&label, Some("gw")),
+            crate::agent::goal_types::get_context_window_for(&label, Some("google")),
             expected,
             "fixture degenerate: the label resolves like the real model id"
         );

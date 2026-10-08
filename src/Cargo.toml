@@ -15,12 +15,6 @@ path = "lib.rs"
 [features]
 workbench = []
 
-# 回程上报 CLI（方案 v8 四章：nuphus task done/blocked 唯一化替代 curl）。
-# 显式声明 bin：本包自动发现异常（src/main.rs 未作为 bin 目标），显式 [[bin]] 最稳。
-[[bin]]
-name = "nuphus-task"
-path = "bin/nuphus-task.rs"
-
 [lints]
 workspace = true
 
@@ -34,6 +28,8 @@ async-recursion = "1"
 # Web/API调用
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 base64 = "0.22"
+# 网页字符集解码（web 工具嗅探 GBK/GB2312/Shift_JIS 等非 UTF-8 页面）
+encoding_rs = "0.8"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }

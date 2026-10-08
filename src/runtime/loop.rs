@@ -109,6 +109,7 @@ impl RuntimeEvent {
                     mode: mode.to_string(),
                     session_id: None,
                     turn_id: None,
+                    started_at_ms: Some(crate::utils::now_unix_ms()),
                 }
             }
             RuntimeEvent::LlmTextDelta {
@@ -160,6 +161,16 @@ impl RuntimeEvent {
                 },
                 total_duration_ms,
                 total_calls,
+                meta: Some(crate::agent::turn_meta::TurnMeta {
+                    duration_ms: Some(total_duration_ms),
+                    tool_calls: total_calls as u32,
+                    started_at_ms: if total_duration_ms > 0 {
+                        Some(crate::utils::now_unix_ms().saturating_sub(total_duration_ms))
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                }),
             },
             RuntimeEvent::Error {
                 code,
@@ -302,13 +313,14 @@ impl RuntimeBuilder {
             crate::config::VisionStrategy::Main => Some(runtime.agent.config.model.clone()),
             crate::config::VisionStrategy::None => None,
         };
-        // 主模型 supports_vision：统一消歧入口（provider 绑定优先，候选遍历）
+        // 主模型 supports_vision：provider 取**当前生效绑定**（AgentConfig.provider，
+        // build 时由 create_client_for 写入）——不查 [last_model] 影子表反查
         let main_supports_vision = crate::config::load_registry()
             .ok()
             .map(|r| {
                 crate::config::resolve_capability(
                     &r,
-                    r.last_model_provider_hint().as_deref(),
+                    Some(runtime.agent.config.provider.as_str()),
                     &runtime.agent.config.model,
                     |m| m.supports_vision,
                     false,
@@ -318,13 +330,13 @@ impl RuntimeBuilder {
         runtime.agent.config.vision_model = vision_model;
         runtime.agent.config.supports_vision = main_supports_vision;
 
-        // 主模型 supports_image_generation：同一消歧入口
+        // 主模型 supports_image_generation：同一消歧入口，同源 provider
         let main_supports_image_gen = crate::config::load_registry()
             .ok()
             .map(|r| {
                 crate::config::resolve_capability(
                     &r,
-                    r.last_model_provider_hint().as_deref(),
+                    Some(runtime.agent.config.provider.as_str()),
                     &runtime.agent.config.model,
                     |m| m.supports_image_generation,
                     false,
@@ -354,8 +366,10 @@ pub struct RuntimeConfig {
     pub mode: Mode,
     /// Agent configuration
     pub agent_config: AgentConfig,
-    /// Context refine threshold
-    pub refine_threshold: f64,
+    /// Large-window force-refine ratio (0.50~0.80, default 0.80).
+    /// Only takes effect for `RefineTier::Large` (context_window > 600K);
+    /// Small/Medium tiers ignore it and use their fixed ratios.
+    pub large_force_refine_threshold: f64,
     /// Shared tool permissions (updated by Tauri layer, read by runtime before each tool call)
     #[allow(clippy::type_complexity)]
     pub tool_permissions: Arc<std::sync::Mutex<ToolPermissions>>,
@@ -366,7 +380,7 @@ impl Default for RuntimeConfig {
         Self {
             mode: Mode::Leader,
             agent_config: AgentConfig::default(),
-            refine_threshold: 0.5,
+            large_force_refine_threshold: crate::agent::distill::LARGE_FORCE_DEFAULT,
             tool_permissions: Arc::new(std::sync::Mutex::new(ToolPermissions::default())),
         }
     }

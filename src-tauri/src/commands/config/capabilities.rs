@@ -73,7 +73,7 @@ pub fn set_capability(
 /// provider + model 精确解析时找不到该组合，能力请求直接失败，而 UI 已经提示成功。
 /// 这里收敛为一次读写：要么两个字段都更新，要么都不动。
 ///
-/// `kind` ∈ { vision, stt, tts, voice, image_generation }。
+/// `kind` ∈ { vision, stt, tts, voice, image_generation, video_generation }。
 #[tauri::command]
 pub fn set_capability_binding(
     kind: String,
@@ -81,7 +81,14 @@ pub fn set_capability_binding(
     provider: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    const KINDS: [&str; 5] = ["vision", "stt", "tts", "voice", "image_generation"];
+    const KINDS: [&str; 6] = [
+        "vision",
+        "stt",
+        "tts",
+        "voice",
+        "image_generation",
+        "video_generation",
+    ];
     if !KINDS.contains(&kind.as_str()) {
         return Err(format!("未知能力类型: {kind}"));
     }
@@ -108,25 +115,35 @@ pub fn set_capability_binding(
 
 #[tauri::command]
 pub fn get_session_refine_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let threshold = state.runtime.lock().map_err(|e| e.to_string())?;
+    let rt = state.runtime.lock().map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
-        "threshold": threshold.refine_threshold,
+        // 大窗口强制线（仅 RefineTier::Large 生效）；附带可调范围供前端渲染 slider
+        "force_threshold": rt.large_force_refine_threshold,
+        "force_min": nuphus::agent::distill::LARGE_FORCE_MIN,
+        "force_max": nuphus::agent::distill::LARGE_FORCE_MAX,
     }))
 }
 
-/// Set refinement config
+/// Set the large-window force-refine ratio.
+///
+/// Only meaningful for `RefineTier::Large` (context_window > 600K); Small/Medium
+/// tiers use their fixed ratios and ignore this value. Rejects out-of-range input
+/// rather than silently clamping — a bad value here means the caller's UI and the
+/// backend disagree, which is worth surfacing instead of hiding.
 #[tauri::command]
 pub fn set_session_refine_config(
     state: State<'_, AppState>,
-    threshold: Option<f64>,
+    force_threshold: Option<f64>,
 ) -> Result<String, String> {
-    if let Some(th) = threshold {
-        if !(0.0..=1.0).contains(&th) {
-            return Err("threshold must be between 0.0 ~ 1.0".to_string());
+    if let Some(th) = force_threshold {
+        let min = nuphus::agent::distill::LARGE_FORCE_MIN;
+        let max = nuphus::agent::distill::LARGE_FORCE_MAX;
+        if !(min..=max).contains(&th) {
+            return Err(format!("force_threshold must be between {} ~ {}", min, max));
         }
         let mut guard = state.runtime.lock().map_err(|e| e.to_string())?;
-        guard.refine_threshold = th;
-        tracing::info!("set_session_refine_config: threshold={}", th);
+        guard.large_force_refine_threshold = th;
+        tracing::info!("set_session_refine_config: force_threshold={}", th);
     }
     Ok("Refinement config updated".to_string())
 }

@@ -26,6 +26,9 @@ param(
     [switch]$SkipDownload,
     [switch]$SkipVerify,
     [switch]$DryRun,
+    # 续跑：前一轮已发布部分包（npm 上传成功但脚本被终止）时，
+    # 对「已发布」的包跳过而不是 throw，只发剩余包。
+    [switch]$Resume,
     # npm 风格开关经位置传入时的兜底收口（--skip-download --dry-run 等多标记）
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
     [string[]]$ExtraFlags
@@ -40,6 +43,7 @@ if ($flagTokens.Count -gt 0) {
         if     ($t -match 'skip.download') { $SkipDownload = $true }
         elseif ($t -match 'skip.verify')   { $SkipVerify   = $true }
         elseif ($t -match 'dry')           { $DryRun       = $true }
+        elseif ($t -match 'resume')        { $Resume       = $true }
         else { throw "无法识别的参数 '$t'——开关用 -SkipDownload/-SkipVerify/-DryRun/--skip-download 等；显式版本号用 -Version x.y.z" }
     }
     if ($Version -match '^-') { $Version = "" }
@@ -134,6 +138,12 @@ function Get-PublishedVersion($pkgName) {
 function Test-NotPublished($pkgName, $version) {
     $published = Get-PublishedVersion $pkgName
     if ($published -eq $version) {
+        # registry 不可变：同版本重发必失败。默认仍 throw（防误重发），
+        # -Resume 下跳过已发完成的包，只发剩余包。
+        if ($Resume) {
+            Write-Ok "resume: $pkgName@$version already published, skipping (registry is immutable, republish would fail anyway)"
+            return $false
+        }
         throw "SKIP: $pkgName@$version already published. Bump the version or unpublish first (npm unpublish is discouraged)."
     }
     if ($published) {
@@ -141,6 +151,8 @@ function Test-NotPublished($pkgName, $version) {
     } else {
         Write-Ok "$pkgName not on registry yet (first publish)"
     }
+    # 需要发布才返回 $true；-Resume 下已发布返回 $false（供主流程跳过）
+    return $true
 }
 
 function Get-ReleaseDigest($assetName, $version) {
@@ -198,6 +210,8 @@ function Get-Asset($p, $version) {
     $lastErr = ''
     foreach ($s in $sources) {
         # 一律先落 .tmp：校验不过或中途失败即删除，截断/污染文件不得留在缓存里被 -SkipDownload 复用
+        # ⚠️ IWR 大文件坑（PS 5.1，>40MB 会停滞或 .tmp 循环删档，见 git-pr-protocol SKILL §7.7）：
+        # 本段若停滞，用 npm-desktop/fetch-release-asset.ps1 预下载 + digest 对账，再 -SkipDownload 续跑本脚本。
         $tmp = "$localFile.tmp"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Step "Downloading $assetName <- $($s.Uri)"
@@ -326,7 +340,18 @@ function Publish-Package($pkgName, $version) {
     Write-Step "npm publish $pkgName@$version"
     # 捕获输出：npm 的 `+ <pkg>@<version>` 行 + exit 0 才是「发布成功」的权威信号。
     # registry view 滞后不得推翻它（见下文 Registry verification）。
-    $out = & npm.cmd publish $dir --registry $Registry 2>&1
+    # npm 会把 notice / deprecation 打到 stderr；PS 5.1 用 2>&1 合并后这些行变成
+    # ErrorRecord，在全局 $ErrorActionPreference='Stop' 下会直接终止整条发布链——
+    # v0.2.24 实测在第一个包上就这样死掉（`npm.cmd : npm notice`，四包一个未发）。
+    # 因此仅本次调用把 EAP 降为 Continue，让 stderr 作为数据被捕获；
+    # 成功判定不变（下方仍要求确认行 + exit 0），不是「永不失败」。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & npm.cmd publish $dir --registry $Registry 2>&1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     $exit = $LASTEXITCODE
     if ($exit -ne 0) {
         $out | Select-Object -Last 20 | ForEach-Object { Write-Host "    $_" }
@@ -387,8 +412,11 @@ Write-Host ''
 
 Test-NpmAuth
 
-foreach ($p in $Platforms) { Test-NotPublished "@nuphus/$($p.Name)" $version }
-Test-NotPublished "@nuphus/$MetaName" $version
+# 返回值收进哈希，避免落到输出流；-Resume 下已发布的包在发布段整段跳过
+# （registry 不可变，重发只会拿到 E403）。不加 -Resume 时 Test-NotPublished 自己 throw。
+$needsPublish = @{}
+foreach ($p in $Platforms) { $needsPublish[$p.Name] = Test-NotPublished "@nuphus/$($p.Name)" $version }
+$needsPublish[$MetaName] = Test-NotPublished "@nuphus/$MetaName" $version
 
 $assetFiles = @{}
 foreach ($p in $Platforms) {
@@ -420,8 +448,12 @@ Write-Step 'Publishing (platform packages first, then meta)'
 # pkgName -> $true when npm itself printed `+ <pkg>@<version>` and exited 0.
 # Registry view lag must never override this (see Registry verification below).
 $script:PublishResults = @{}
-foreach ($p in $Platforms) { Publish-Package $p.Name $version }
-Publish-Package $MetaName $version
+foreach ($p in $Platforms) {
+    if ($needsPublish[$p.Name]) { Publish-Package $p.Name $version }
+    else { Write-Ok "skipping publish of @nuphus/$($p.Name)@$version (already on registry)" }
+}
+if ($needsPublish[$MetaName]) { Publish-Package $MetaName $version }
+else { Write-Ok "skipping publish of @nuphus/$MetaName@$version (already on registry)" }
 
 # Verify published versions on registry.
 #
@@ -484,6 +516,33 @@ if ($DryRun) {
 }
 
 Verify-Install $version
+
+# ── Gitee 国内下载点同步 ──────────────────────────────────────────────────
+# 国内用户没有本地下载渠道（Gitee 此前只有 v0.2.0 源码包），而 updater 的
+# endpoint[] 第一顺位就是 Gitee raw 清单：不同步，国内用户会"成功读到旧清单"
+# 而不回落到权威源 —— 那不是报错，是静默收不到更新。所以这是发版必做步骤。
+# 详细机制与踩坑（均已实测）：Gitee API v5 只收 form（JSON body 报 tag_name is missing）；
+# 资产下载是 302×2 重定向，校验必须 curl -sL 跟随；中文 body 写临时文件再 -F "body=<file"
+# 避开命令行编码；上传后必须从 Gitee 下载回来再哈希一次，与 GitHub Release API 的 sha256 对账；
+# Gitee 清单里的 signature 与 GitHub 权威版逐字节相同——镜像换的是传输通道，minisign 按内容验签。
+$SyncGitee = Join-Path $PSScriptRoot 'sync-gitee-release.ps1'
+if (Test-Path $SyncGitee) {
+    Write-Step 'Sync to Gitee (domestic download point)'
+    try {
+        # dry-run 必须传导给同步脚本：否则 publish 的 dry-run 会真去 Gitee 建
+        # release、传资产、推 latest.json，dry-run 名不副实。
+        $syncArgs = @('-NoProfile', '-File', $SyncGitee, '-Version', $version)
+        if ($DryRun) { $syncArgs += '-DryRun' }
+        & pwsh @syncArgs
+    } catch {
+        # 不同步不阻断 npm 发包（npm 是主渠道），但必须显式失败而不是假装成功
+        Write-WarnMsg "Gitee sync FAILED: $($_.Exception.Message)"
+        Write-WarnMsg '  Domestic users will NOT receive this version until it is synced.'
+        Write-WarnMsg "  Re-run manually:  pwsh -File `"$SyncGitee`" -Version $version"
+    }
+} else {
+    Write-WarnMsg "sync script not found: $SyncGitee (Gitee domestic point NOT updated)"
+}
 
 Write-Host ''
 Write-Host '============================================================' -ForegroundColor Green

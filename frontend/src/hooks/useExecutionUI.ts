@@ -10,10 +10,83 @@ import type {
   TaskRun,
   WorkflowRunStep,
   ApiHealthState,
+  TurnMeta,
 } from '../core/types'
 import { executeSessionRefine, refineSkip } from '../main-window/lib/api'
 import type { Toast } from './useInit'
 import { initialApiHealthState } from '../main-window/chat/ApiHealthBadge'
+
+/**
+ * 提炼提示的状态。
+ *
+ * `tier` 来自后端 `RefinePrompt` 事件，是**当前模型上下文窗口的分档**：
+ *  - `small`  (cw ≤ 256K)  无提示阶段，到达 75% 直接提炼（forced 路径会用
+ *    `usagePercent: 0` 占位设置本状态以承载 tier/阈值——UI 不渲染询问体，
+ *    输入框占位符只认 `refining`，勿据此推断「不该出现」）
+ *  - `medium` (≤ 600K)     50% 提示 / 80% 强制，两条线均固定 → 不给 slider
+ *  - `large`  (> 600K)     30% 提示 / 强制线可调 → **只有这档给 slider**
+ *
+ * `forceThreshold` 是当前生效的强制线比例，`forceMin/forceMax` 是可调范围，
+ * 一并随事件下发，避免前端自己硬编码一份（后端 `LARGE_FORCE_MIN/MAX` 是唯一权威）。
+ */
+export type RefineTier = 'small' | 'medium' | 'large'
+
+export interface RefineState {
+  usagePercent: number
+  totalLimit: number
+  tier: RefineTier
+  /** 当前生效的强制线比例（0~1） */
+  forceThreshold: number
+  /** 可调范围（0~1）；非 large 档同样下发，UI 按 tier 决定是否渲染 slider */
+  forceMin: number
+  forceMax: number
+}
+
+/** 调整大窗口强制线（后端仅 large 档生效，其余档忽略）。
+ *  走 set_session_refine_config：越界会被后端拒绝而非静默 clamp，
+ *  那说明 UI 与后端不一致，值得暴露出来。 */
+export async function setRefineForceThreshold(ratio: number): Promise<void> {
+  await invoke('set_session_refine_config', { forceThreshold: ratio })
+}
+
+/**
+ * 滑杆的**实际下限**（百分比）。
+ *
+ * 除后端范围外，还被当前用量顶高：阈值低于当前用量等于"下一轮立刻提炼"，
+ * 这种值没有意义（用户不会想追求它，只会误触）。在上限处硬性挡住，
+ * 好过让用户拖下去再弹警告。
+ *
+ * 返回 5 的整数倍以对齐 step；向上取整，保证不低于当前用量。
+ */
+export function refineForceMinPct(s: RefineState): number {
+  const floor = Math.round(s.forceMin * 100)
+  const ceilByUsage = Math.ceil(s.usagePercent / 5) * 5
+  const cap = Math.round(s.forceMax * 100)
+  return Math.max(floor, Math.min(cap, ceilByUsage))
+}
+
+/**
+ * 把后端已生效的 forceThreshold 自动抬到当前滑块下限。
+ *
+ * 补孔：提示事件里 usagePercent 涨上去后 `refineForceMinPct` 把滑块下限顶高，
+ * 但后端配置还是旧值——滑块显示 65% 而配置停在 0.55，下一轮 55% 即触发，
+ * 「显示撒谎」。这里只做 reconcile：低于下限 → 把配置抬到下限，使滑块显示 /
+ * 后端配置 / 实际行为三者一致。
+ *
+ * 静默自愈：invoke 失败只 console.warn，不 toast、不抛 rejection——这是自动
+ * 修复不是用户操作，下一轮事件到达还会再 reconcile；不做乐观 state 更新
+ * （滑块显示的本来就是抬升后的值，另写一份只会重新制造双数据源不一致）。
+ * 后端 set 只写 runtime guard 不发事件，故本地 state 无需抢先更新。
+ */
+export async function autoRaiseForceThreshold(s: RefineState): Promise<void> {
+  const minPct = refineForceMinPct(s)
+  if (Math.round(s.forceThreshold * 100) >= minPct) return
+  try {
+    await setRefineForceThreshold(minPct / 100)
+  } catch (e) {
+    console.warn('[refine] autoRaiseForceThreshold 失败：', e)
+  }
+}
 
 export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) => void) {
   // ── Execution trace visibility ──
@@ -58,24 +131,43 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
 
   const [totalDurationMs, setTotalDurationMs] = useState(0)
   const [totalCalls, setTotalCalls] = useState(0)
+  /**
+   * 本轮执行元数据（耗时 / token / 步数）——**三处接入点共用的唯一数据源**。
+   *
+   * 事件语义：
+   *   execution_started     → 重置为 { startedAtMs }（后端权威起点，刷新不丢）
+   *   token_usage           → 累加本轮 input/output/cache（main/exec 源之和）
+   *   execution_progress    → 更新 iterations / toolCalls（ReAct 循环步）
+   *   execution_completed   → 整体替换为后端权威 meta（含 durationMs）
+   *
+   * 前端**不持有起点 ref**：`startedAtMs` 是后端绝对时间戳，刷新后 `Date.now() -
+   * startedAtMs` 仍指向真实起点——根治「刷新后耗时归零」。
+   */
+  const [turnMeta, setTurnMeta] = useState<TurnMeta | null>(null)
+  /** 执行中实时工具调用累计（timeline 尚无对应条目时给 ctx 弹窗兜底） */
+  const [liveTurnToolCalls, setLiveTurnToolCalls] = useState(0)
   const [contextLimit, setContextLimit] = useState<number>(0)
   /** ExecAgent 执行生命周期快照（task 面板唯一数据源，见 agent/task_run.rs） */
   const [taskRuns, setTaskRuns] = useState<TaskRun[]>([])
 
   // ── 上下文提炼状态 ──
-  const [refineState, setRefineState] = useState<{
-    usagePercent: number
-    totalLimit: number
-  } | null>(null)
+  const [refineState, setRefineState] = useState<RefineState | null>(null)
   /** 提炼执行中（全局）：驱动「提炼中」全屏遮罩（弹窗路径与 refine-pending-btn
    *  路径统一）。handleRefine 成功/失败 finally 恢复；useEvents 事件兜底恢复。 */
   const [refining, setRefining] = useState(false)
 
-  const [pendingRefine, setPendingRefine] = useState<{
-    usagePercent: number
-    totalLimit: number
-    skippedTurns: number
-  } | null>(null)
+  /** 大窗口强制线滑块的本地草稿：拖动要即时反馈，不等后端往返。
+   *  refineState 更换（新一轮提示 / 模型切换作废）时清空，回到后端当前生效值。 */
+  const [forceDraft, setForceDraft] = useState<number | null>(null)
+  useEffect(() => {
+    setForceDraft(null)
+  }, [refineState])
+
+  /** 用户跳过提示后的常驻入口数据。除水位外还携带 tier / 强制线——
+   *  否则跳过之后再点开按钮，大窗口用户就失去了调节入口（同一个提示的复用）。 */
+  const [pendingRefine, setPendingRefine] = useState<
+    (RefineState & { skippedTurns: number }) | null
+  >(null)
 
   // ── 工作流运行状态 ──
   const [workflowRunSteps, setWorkflowRunSteps] = useState<WorkflowRunStep[]>([])
@@ -150,11 +242,8 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
 
   const handleSkipRefine = useCallback(() => {
     if (refineState) {
-      setPendingRefine({
-        usagePercent: refineState.usagePercent,
-        totalLimit: refineState.totalLimit,
-        skippedTurns: 0,
-      })
+      // 整份带走（含 tier 与强制线）：跳过只是不再弹窗，调节能力要保留
+      setPendingRefine({ ...refineState, skippedTurns: 0 })
     }
     setRefineState(null)
     // 通知后端广播 RefineSkipped——手机端弹窗同步关闭（双端状态一致）
@@ -293,6 +382,10 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
     setTotalDurationMs,
     totalCalls,
     setTotalCalls,
+    turnMeta,
+    setTurnMeta,
+    liveTurnToolCalls,
+    setLiveTurnToolCalls,
     contextLimit,
     setContextLimit,
 
@@ -302,6 +395,8 @@ export function useExecutionUI(showToast: (msg: string, type?: Toast['type']) =>
     pendingRefine,
     setPendingRefine,
     refining,
+    forceDraft,
+    setForceDraft,
     setRefining,
     handleRefine,
     handleSkipRefine,

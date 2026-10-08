@@ -23,9 +23,23 @@
  * 确认该区间 ahead=27 / behind=0，并用 `/pulls?state=closed` 核对三个 PR 的 merged_at
  * 与作者（#87 01:49 与 #88 10:48 均 yuansui486，#84 10:53 为 zhoupeiyu515-ui），
  * 三者均能在 git log 找到 `Merge PR #NN` 合并提交。两位作者均已在既有轮次出现，
- * 非新提交者，故头像墙无需新增。0.2.24 发版时把 version 改为 `0.2.24`、date 填实际日期。
- * #91 同轮追加：2026-09-29 16:09 经 `/issues/91/events` 确认 merged，作者 Steooenwolf-666
- * 已在 0.2.23 轮次出现（非新提交者），出处为 `Merge PR #91`（fb52f668）。
+ * 非新提交者，故头像墙无需新增。该组随 v0.2.24 发行（tag 日期 2026-09-30，
+ * 与 CHANGELOG `## [0.2.24] - 2026-09-30` 一致）；#91 同轮追加：2026-09-29 16:09
+ * 经 `/issues/91/events` 确认 merged，作者 Steooenwolf-666 已在 0.2.23 轮次出现
+ * （非新提交者），出处为 `Merge PR #91`（fb52f668）。
+ *
+ * `0.2.25` 轮次（零 PR）取证：2026-10-02 经 `/pulls?state=closed` API 核对，最后合并的 PR
+ * 仍是 #91（2026-09-29，已收录于 0.2.24 轮次，非新提交者）；`git log v0.2.24..HEAD`
+ * 区间 24 个提交全部为仓库所有者直推、零合并 PR。经大王指示，本轮的作者重要功能以
+ * **commit 出处**补入（`pr: null` + `commit: 短 sha`，`/commit/<sha>` 可公开核对），
+ * 不写 PR 号——无出处不写，宁缺勿造。
+ *
+ * `0.2.26` 轮次（零 PR）取证：2026-10-05 重跑 `/pulls?state=closed` API，最后合并的 PR 仍是
+ * #91（2026-09-29，已收录于 0.2.24 轮次，非新提交者）；`/contributors` API 六个账号与提交数
+ * 与 REPO_COMMITTERS 完全一致（头像墙无新增）。`git log v0.2.25..HEAD` 区间同样零合并 PR，
+ * 全为仓库所有者直推。经大王指示（本轮无 PR），作者自己的重要功能继续以 **commit 出处**
+ * 补入（`pr: null` + `commit: 短 sha`，`/commit/<sha>` 可公开核对），措辞对齐提交标题；
+ * 纯格式 / lint 提交不收录。
  *
  * ⛔ 新增记录前必须先在上面的三处找到出处；不得凭印象补充贡献者或贡献内容。
  */
@@ -50,12 +64,26 @@ export const avatarUrl = (user: string, size = 96) => `https://github.com/${user
 /** PR 详情 URL */
 export const pullUrl = (pr: number) => `${REPO_URL}/pull/${pr}`
 
+/** 提交详情 URL（作者直推、无 PR 时的出处，`/commit/<sha>` 可公开核对） */
+export const commitUrl = (sha: string) => `${REPO_URL}/commit/${sha}`
+
 export interface GithubContribution {
-  /** Pull Request 号（来自 `Merge PR #NN` 合并记录） */
-  pr: number
+  /** Pull Request 号（来自 `Merge PR #NN` 合并记录；作者直推提交无 PR，此时为 null） */
+  pr: number | null
+  /** 作者直推提交的短 sha（无 PR 时给出处，GitHub `/commit/<sha>` 可核对；有 PR 时可省略） */
+  commit?: string | null
   /** 贡献内容（措辞对齐 CHANGELOG 段落 / README 致谢） */
   summary: string
 }
+
+/**
+ * 贡献条目的出处徽标：有 PR 号显示 `#N` 指向 pull；作者直推提交显示短 sha 指向 commit。
+ * 二者必有且仅有一（由数据契约测试钉住）。
+ */
+export const contributionRef = (item: GithubContribution): { label: string; url: string } =>
+  item.pr !== null
+    ? { label: `#${item.pr}`, url: pullUrl(item.pr) }
+    : { label: String(item.commit ?? ''), url: commitUrl(item.commit ?? '') }
 
 export interface GithubContributor {
   /** GitHub 用户名（主页 = https://github.com/<user>） */
@@ -74,8 +102,100 @@ export interface GithubRound {
 /** 轮次倒序（最新在前），轮内按贡献时间先后 */
 export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
   {
-    version: 'Unreleased',
-    date: null,
+    version: '0.2.26',
+    date: '2026-10-05',
+    contributors: [
+      {
+        user: 'mrpulor-gh',
+        contributions: [
+          {
+            pr: null,
+            commit: '0675b9e8',
+            summary: 'npm 发布与 git hooks 脚本补 UTF-8 BOM：PS 5.1 按 GBK 误读吞字符致解析失败',
+          },
+          {
+            pr: null,
+            commit: 'd099408f',
+            summary: 'Gitee 同步脚本 native 调用统一降 EAP：git stderr 通知不再炸流水线误判失败',
+          },
+          {
+            pr: null,
+            commit: '0b51ce50',
+            summary: '新增 fetch-release-asset.ps1：发布资产预下载与 sha256 对账固化',
+          },
+          {
+            pr: null,
+            commit: '0b1abc05',
+            summary: '截图管线改 PNG 单次写入、OCR 引擎进程级共享、dev profile 调优',
+          },
+          {
+            pr: null,
+            commit: 'c7054b53',
+            summary:
+              '原生遮罩截图链路接入桌面工具栏五模式：冻结帧 + hover 跟窗框选 + 8 节点 + 单点拾取',
+          },
+          {
+            pr: null,
+            commit: '20cb116e',
+            summary: '用户资源内容寻址去重：同字节文件不再重复落盘',
+          },
+          {
+            pr: null,
+            commit: 'a8824397',
+            summary: 'OCR 工具改名「字典」，登记应用按钮补图标与文字',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    version: '0.2.25',
+    date: '2026-10-02',
+    contributors: [
+      {
+        user: 'mrpulor-gh',
+        contributions: [
+          {
+            pr: null,
+            commit: '019859cb',
+            summary:
+              'Gitee 国内下载点落地：更新入口扩为 GitHub / 镜像 / Gitee raw 三路，任一失败自动回落',
+          },
+          {
+            pr: null,
+            commit: 'cc545ca1',
+            summary: '模型身份二元组化：以「服务商段 + 模型 id」成对解析绑定，同 id 跨段不再串台',
+          },
+          {
+            pr: null,
+            commit: '77aad176',
+            summary:
+              'refine 按上下文窗口分档重构：大窗口强制线 50%–80% 可调（默认 50%），提示线与强制线分离',
+          },
+          {
+            pr: null,
+            commit: 'df0937fc',
+            summary:
+              'refine 全链路审计修复：越线后真实触发提炼、切换模型作废过期提示、失败重试兜底',
+          },
+          {
+            pr: null,
+            commit: 'dc94f6b9',
+            summary:
+              '轮次元数据改后端单一来源：耗时/步数从执行启动起算、刷新不归零，上下文占用取 API 官方口径',
+          },
+          {
+            pr: null,
+            commit: '1f5c823d',
+            summary: '会话台按项目限容：镜像改为每项目 10 条，不再挤掉其它项目的会话记录',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    version: '0.2.24',
+    date: '2026-09-30',
     contributors: [
       {
         user: 'yuansui486',
@@ -348,9 +468,10 @@ export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
  */
 export const REPO_COMMITTERS: string[] = [
   'yuansui486', // 78 commits
-  'Steooenwolf-666', // 21 commits（#91 合并后 /contributors 计数尚未刷新）
+  'Steooenwolf-666', // 22 commits（#91 合并后 /contributors 已刷新）
   'fouyzjl', // 13 commits
-  'mrpulor-gh', // 3 commits（仓库所有者）
+  'mrpulor-gh', // 3 commits（仓库所有者；2026-10-05 发版后重跑 API 仍报 3——/contributors
+  // 统计有缓存滞后，0.2.26 的 8 个直推提交已 push 双远端，计数待 GitHub 后台刷新）
   'jiangdingwei123-afk', // 1 commit
   'zhoupeiyu515-ui', // 1 commit
 ]

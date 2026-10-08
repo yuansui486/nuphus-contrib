@@ -15,6 +15,7 @@ pub mod pause;
 pub mod prompt;
 pub mod reminders;
 pub mod task_run;
+pub mod turn_meta;
 use crate::agent::events::{EventEmitter, NuphusEvent};
 use crate::agent::reminders::ReminderQueue;
 use crate::{
@@ -36,8 +37,10 @@ pub struct AgentConfig {
     pub max_iterations: usize,
     pub enable_memory: bool,
     pub tool_permissions: ToolPermissions,
-    /// Context refine threshold (0.0~1.0, default 0.50)
-    pub refine_threshold: f64,
+    /// Large-window force-refine ratio (0.50~0.80, default 0.80).
+    /// Only takes effect for `RefineTier::Large` (context_window > 600K);
+    /// Small/Medium tiers ignore it and use their fixed ratios.
+    pub large_force_refine_threshold: f64,
     /// Shell Hooks configuration
     pub hooks: HookConfig,
     /// 视觉模型（None=未配置，Some=模型名）
@@ -68,7 +71,7 @@ impl Default for AgentConfig {
             max_iterations: crate::agent::goal_types::GoalType::MAX_ITERATIONS,
             enable_memory: true,
             tool_permissions: ToolPermissions::default(),
-            refine_threshold: 0.5,
+            large_force_refine_threshold: crate::agent::distill::LARGE_FORCE_DEFAULT,
             hooks: HookConfig::default(),
             vision_model: None,
             supports_vision: false,
@@ -160,6 +163,12 @@ pub struct ReactAgent {
     pub(crate) config: AgentConfig,
     pub(crate) session: Session,
     pub(crate) steps: Vec<ExecutionStep>,
+    /// 本轮执行的元数据累加器（耗时 / token / 步数）。
+    ///
+    /// 生命周期与「一轮用户请求」对齐：收到输入时 `reset_for_turn()`，
+    /// 每次 LLM 调用累加 token，完成时作为 `ExecutionCompleted.meta` 下发。
+    /// 单一数据源——消息底部 / 执行面板 / ctx 弹窗共用，避免各处口径不一。
+    pub(crate) turn_meta: crate::agent::turn_meta::TurnMeta,
     /// Shell Hooks runtime (initialized from config.hooks)
     pub(crate) hooks: Option<HookRunner>,
     /// Full tool registry (includes system_shell, file_edit, desktop_*, etc.),
@@ -249,6 +258,7 @@ impl ReactAgent {
             config,
             session: Session::new(),
             steps: Vec::new(),
+            turn_meta: crate::agent::turn_meta::TurnMeta::default(),
             hooks,
             exec_tools: None,
             exec_llm: None,

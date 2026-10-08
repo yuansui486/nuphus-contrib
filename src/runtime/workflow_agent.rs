@@ -109,10 +109,13 @@ pub struct WorkflowAgent {
     pub(crate) user_terminated: bool,
     /// Execution start time (per round)
     pub(crate) execution_started_at: std::time::Instant,
+    /// 本轮元数据累加器（耗时 / token / 步数）——与 ReactAgent/SubTaskRunner
+    /// 同一结构与口径，完成时作为 ExecutionCompleted.meta 下发。
+    pub(crate) turn_meta: crate::agent::turn_meta::TurnMeta,
     /// Session refine counter (max 2 auto-refines)
     pub(crate) refine_count: u32,
     /// Refine threshold (inherited from Runtime config, same as Leader)
-    pub(crate) refine_threshold: f64,
+    pub(crate) large_force_threshold: f64,
     /// Model label for prompt building
     pub(crate) model_label: String,
     /// 主模型是否原生支持视觉（来自 ModelDef.supports_vision）。
@@ -146,7 +149,7 @@ impl WorkflowAgent {
         user_label: String,
         assistant_name: String,
         tool_permissions: crate::permissions::ToolPermissions,
-        refine_threshold: f64,
+        large_force_threshold: f64,
     ) -> Self {
         Self {
             llm,
@@ -169,8 +172,9 @@ impl WorkflowAgent {
             pending_warnings: Vec::new(),
             user_terminated: false,
             execution_started_at: std::time::Instant::now(),
+            turn_meta: crate::agent::turn_meta::TurnMeta::started(crate::utils::now_unix_ms()),
             refine_count: 0,
-            refine_threshold,
+            large_force_threshold,
             model_label,
             supports_vision: false,
             user_label,
@@ -186,7 +190,8 @@ impl WorkflowAgent {
 
     /// 构造后用 model_label 初始化 supports_vision（与 set_model_label 同源）
     fn apply_supports_vision(mut self) -> Self {
-        self.supports_vision = Self::resolve_supports_vision(&self.model_label);
+        self.supports_vision =
+            Self::resolve_supports_vision(&self.model_label, self.llm.provider_name());
         self
     }
 
@@ -232,7 +237,8 @@ impl WorkflowAgent {
 
     /// Set model label (for prompt building)
     pub fn set_model_label(&mut self, label: String) {
-        self.supports_vision = Self::resolve_supports_vision(&label);
+        // label 只影响展示；视觉能力判定的实例身份以持有的 client 为准
+        self.supports_vision = Self::resolve_supports_vision(&label, self.llm.provider_name());
         self.model_label = label;
     }
 
@@ -245,8 +251,8 @@ impl WorkflowAgent {
     /// Keeps session (cross-turn context), invalidates prompt/tool caches
     /// (prompt content is model-dependent).
     pub fn set_llm(&mut self, llm: Arc<dyn ApiClient>, model_label: String) {
+        self.supports_vision = Self::resolve_supports_vision(&model_label, llm.provider_name());
         self.llm = llm;
-        self.supports_vision = Self::resolve_supports_vision(&model_label);
         self.model_label = model_label;
         self.cached_prompt = None;
         self.cached_tools = None;
@@ -267,14 +273,22 @@ impl WorkflowAgent {
         self.tools.enhanced_mode()
     }
 
-    /// 从 model registry 解析主模型是否原生支持视觉（与 RuntimeBuilder 同源逻辑）
-    fn resolve_supports_vision(model_label: &str) -> bool {
+    /// 从 model registry 解析主模型是否原生支持视觉（与 RuntimeBuilder 同源逻辑）。
+    ///
+    /// provider 取自 client 自带身份（`ApiClient::provider_name`，段名）——
+    /// 当前生效实例的权威；不查 `[last_model]` 影子表反查。
+    fn resolve_supports_vision(model_label: &str, provider: &str) -> bool {
+        let provider = if provider.is_empty() {
+            None
+        } else {
+            Some(provider)
+        };
         crate::config::load_registry()
             .ok()
             .map(|r| {
                 crate::config::resolve_capability(
                     &r,
-                    r.last_model_provider_hint().as_deref(),
+                    provider,
                     model_label,
                     |m| m.supports_vision,
                     false,
@@ -369,13 +383,13 @@ impl WorkflowAgent {
     pub async fn maybe_refine_session(
         &mut self,
         context_window: usize,
-        refine_threshold: f64,
+        large_force_threshold: f64,
         emitter: Option<&dyn EventEmitter>,
     ) {
         distill::maybe_refine_session(
             &mut self.session,
             context_window,
-            refine_threshold,
+            large_force_threshold,
             emitter,
             &mut self.refine_count,
         )
@@ -408,7 +422,8 @@ impl WorkflowAgent {
                 crate::config::VisionStrategy::None => None,
             };
             // 主模型 supports_vision：统一消歧入口（经 resolve_supports_vision 同源）
-            let main_supports_vision = Self::resolve_supports_vision(&self.model_label);
+            let main_supports_vision =
+                Self::resolve_supports_vision(&self.model_label, self.llm.provider_name());
             self.cached_prompt = Some(crate::agent::prompt::build_workagent_prompt(
                 &self.model_label,
                 Some(self.llm.provider_name()),
@@ -503,6 +518,12 @@ impl WorkflowAgent {
         }
 
         // 2. Emit lifecycle events
+        // 轮次开始：记下起点与「开始时上下文占用」，结束时才算得出本轮增量
+        // （会话是新建的，此刻占用≈0；内部 refine  resume 时则带上既有占用）
+        let turn_start = crate::utils::now_unix_ms();
+        self.turn_meta = crate::agent::turn_meta::TurnMeta::started(turn_start);
+        self.turn_meta
+            .set_context_start(self.session.context_occupancy());
         self.emit(NuphusEvent::ExecutionStarted {
             step_index: 0,
             goal: input.chars().take(120).collect(),
@@ -511,6 +532,7 @@ impl WorkflowAgent {
             mode: "workflow".to_string(),
             session_id: Some(self.session.id.clone()),
             turn_id: Some(self.session.turn_count.to_string()),
+            started_at_ms: Some(crate::utils::now_unix_ms()),
         });
         let mut progress_cadence =
             super::workflow_progress::ProgressCadence::new(std::time::Instant::now());
@@ -701,6 +723,15 @@ impl WorkflowAgent {
                     },
                     total_duration_ms: total_duration,
                     total_calls: self.tool_call_count,
+                    meta: Some({
+                        let mut m = self.turn_meta.clone();
+                        m.finish(
+                            total_duration,
+                            self.tool_call_count,
+                            self.session.context_occupancy(),
+                        );
+                        m
+                    }),
                 });
                 self.store_turn_memory(input, &result_msg, true);
                 return Ok(AgentOutput {
@@ -739,13 +770,22 @@ impl WorkflowAgent {
                     },
                     total_duration_ms: total_duration,
                     total_calls: self.tool_call_count,
+                    meta: Some({
+                        let mut m = self.turn_meta.clone();
+                        m.finish(
+                            total_duration,
+                            self.tool_call_count,
+                            self.session.context_occupancy(),
+                        );
+                        m
+                    }),
                 });
                 // ── Session distillation before user stop exit ──
                 let ctx_window = crate::agent::goal_types::get_context_window_of(self.llm.as_ref());
                 distill::maybe_refine_session(
                     &mut self.session,
                     ctx_window,
-                    self.refine_threshold,
+                    self.large_force_threshold,
                     self.emitter.as_deref(),
                     &mut self.refine_count,
                 )
@@ -825,6 +865,8 @@ impl WorkflowAgent {
                 }
                 progress_cadence.business_call();
                 self.tool_call_count += 1;
+                // 步数由后端累加（SignalState），前端只读快照、绝不自己数
+                crate::state::SignalState::inc_execution_tool_calls(self.tools.signals());
                 self.emit(NuphusEvent::ToolCallStart {
                     call_id: call.id.clone(),
                     tool_name: call.tool.clone(),
@@ -1228,7 +1270,7 @@ impl WorkflowAgent {
         distill::maybe_refine_session(
             &mut self.session,
             ctx_window,
-            self.refine_threshold,
+            self.large_force_threshold,
             self.emitter.as_deref(),
             &mut self.refine_count,
         )
@@ -1507,6 +1549,7 @@ impl WorkflowAgent {
         let result = crate::agent::common::process_events(events, content_tool_tags);
         if let Some((input, output)) = &result.usage {
             self.session.update_api_input_tokens(*input as u64);
+            self.session.update_api_output_tokens(*output as u64);
             // Per-call consumption for exec tracking (shows "XX tok" in status bar)
             self.emit(NuphusEvent::TokenUsage {
                 input_tokens: *input,
@@ -1517,8 +1560,9 @@ impl WorkflowAgent {
                 ttft_ms: None,
             });
             // Cumulative session usage for context bar (like Leader's "main" source)
+            // 同 Leader：分母用官方口径占用（input+output），不用字符估算。
             self.emit(NuphusEvent::TokenUsage {
-                input_tokens: self.session.api_input_tokens as u32,
+                input_tokens: self.session.context_occupancy() as u32,
                 output_tokens: 0,
                 cache_hit_tokens: result.cache_hit_tokens,
                 source: "main".to_string(),

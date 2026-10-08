@@ -13,6 +13,11 @@ import type { SecurityCheck } from '../../core/types'
 import { listen } from '../../core/bridge'
 import { composeAssistantReplies } from '../../core/progressMessages'
 import type { ExecutionStage } from '../../hooks/useExecutionState'
+import {
+  refineForceMinPct,
+  setRefineForceThreshold,
+  type RefineState,
+} from '../../hooks/useExecutionUI'
 import { useStickyScroll } from '../../hooks/useStickyScroll'
 import { createSendReceiptHub, type SendReceiptHub } from '../lib/sendReceipt'
 import { isCustomProviderId } from '../lib/customProvider'
@@ -43,6 +48,7 @@ import type { ProviderInfo, ModelInfo, ProjectBookmark, ToolPermissions } from '
 import { friendlyIpcError } from '../lib/ipcError'
 import { orderProviderModels, readRecentModels, rememberRecentModel } from './modelPopupOrder'
 import { buildQuoteRef, isSelectableInBubble, truncateQuote } from './messageSelection'
+import { RefIcon } from './ReferenceBar'
 import { WelcomeScreen } from './WelcomeScreen'
 import { OnboardingModal } from './OnboardingModal'
 import { SessionDivider } from './SessionDivider'
@@ -82,6 +88,8 @@ import {
 import { RatingModal } from '../layout/ExecutionTraceFloating'
 import { MoodFace } from '../../ui/MoodFace'
 import { useLanguage } from '../../locales'
+import { TurnMetaBar } from '../../ui/TurnMetaBar'
+import type { TurnMeta } from '../../core/types'
 import { LetterAvatar } from '../../ui/LetterAvatar'
 import { playUiSound } from '../../ui/sound'
 import { useWheelSelection } from '../../ui/wheelSelection'
@@ -157,6 +165,9 @@ interface ChatPanelProps {
   } | null
   totalDurationMs?: number
   totalCalls?: number
+  /** 本轮元数据（耗时 / token / 步数）——最后一条 assistant 气泡实时元数据条用；
+   *  历史消息各用自己的 msg.meta，不走这个 prop */
+  turnMeta?: TurnMeta | null
   contextLimit?: number
   apiHealth?: ApiHealthState
   onApiHealthRead?: () => void
@@ -167,16 +178,19 @@ interface ChatPanelProps {
    *  followReset 最新闭包（useEvents 经 h.refs 同读此 ref）。缺省（未注入）时
    *  useEvents 侧静默跳过，回底按钮与冻结/宽限语义不受影响。 */
   followResetRef?: React.MutableRefObject<(() => void) | null>
-  refineState?: { usagePercent: number; totalLimit: number } | null
-  pendingRefine: { usagePercent: number; totalLimit: number; skippedTurns: number } | null
+  refineState?: RefineState | null
+  pendingRefine: (RefineState & { skippedTurns: number }) | null
   setPendingRefine: React.Dispatch<
-    React.SetStateAction<{ usagePercent: number; totalLimit: number; skippedTurns: number } | null>
+    React.SetStateAction<(RefineState & { skippedTurns: number }) | null>
   >
   onRefine?: () => void
   onSkipRefine?: () => void
   /** 提炼执行中（全局）：驱动提炼中全屏遮罩（弹窗路径与 refine-pending-btn 路径统一） */
   refining?: boolean
   setRefining?: (v: boolean) => void
+  /** 大窗口强制线滑块的本地草稿（session 层持有，模型切换时由 useEvents 清空） */
+  forceDraft?: number | null
+  setForceDraft?: (v: number | null) => void
   /** 手动关闭「提炼中」弹窗/遮罩：复位提炼 UI + 追踪 refs（后台提炼不中断，
    *  完成后 session_refined / refine_failed 照常落地）。缺省退化为仅收起遮罩 */
   onDismissRefine?: () => void
@@ -298,6 +312,7 @@ export function ChatPanel({
   execTokenUsage,
   totalDurationMs,
   totalCalls,
+  turnMeta,
   contextLimit,
   apiHealth,
   onApiHealthRead,
@@ -305,6 +320,8 @@ export function ChatPanel({
   followResetRef,
   refineState,
   pendingRefine,
+  forceDraft,
+  setForceDraft,
   setPendingRefine,
   onRefine,
   onSkipRefine,
@@ -347,6 +364,16 @@ export function ChatPanel({
 
   // ── 文件预览覆盖层（AI 回复路径点击） ──
   const [previewPath, setPreviewPath] = useState<string | null>(null)
+
+  // 执行中每 500ms 重渲染一次，让消息气泡的 TurnMetaBar 走秒。
+  // **不持有任何时间值**——耗时一律由 TurnMetaBar → resolveTurnDuration 从
+  // turnMeta/msg.meta 求出（执行中按 startedAtMs 推算、完成后取 durationMs）。
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    if (!isProcessing) return
+    const timer = window.setInterval(() => forceTick(n => n + 1), 500)
+    return () => window.clearInterval(timer)
+  }, [isProcessing])
   /**
    * 自定义头像的**可渲染 URL**（用户侧 / 智能体侧）。
    *
@@ -614,6 +641,9 @@ export function ChatPanel({
   const [input, setInput] = useState('')
   const [refineSelected, setRefineSelected] = useState(0) // 0=refine, 1=skip
   const [showRefineConfirm, setShowRefineConfirm] = useState(false)
+  /** 强制线滑杆的后端拒绝反馈（越界 Err）；渲染在滑杆下方而非静默吞掉——
+   *  「看得见失败」是该控件的契约。开合弹窗/执行提炼时清空。 */
+  const [forceError, setForceError] = useState<string | null>(null)
   /* ── 外观浮窗 ──
      开关 state 放本组件内：面板常驻保活（打开/关闭不卸载内容），未保存调整跨开合存活。
      唯一的外部入口是 Ctrl+K 命令面板 —— 它经 App 层把 useModals.showThemes 置 true，
@@ -1469,10 +1499,29 @@ export function ChatPanel({
     setPendingReferences(prev => prev.filter((_, i) => i !== index))
   }, [])
 
+  /**
+   * 右键菜单「引用这段」→ 加入引用栏。
+   *
+   * 与浮条共用同一链路（buildQuoteRef + addReference），只换触发入口：
+   * 拖选松手弹浮条 / 右键菜单选引用，两条路产出完全相同的 chip。
+   * 不落盘、不查文件——引用的就是这段文本本身（见 process.rs 的 quote 分支）。
+   */
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ text?: string }>).detail
+      const ref = buildQuoteRef(detail?.text ?? '')
+      if (ref) addReference(ref)
+    }
+    window.addEventListener('nuphus:add-quote-reference', handler)
+    return () => window.removeEventListener('nuphus:add-quote-reference', handler)
+  }, [addReference])
+
   // ── 选中文字 → 引用（复用 ChatReference 的 quote 分支，不新开注入通道）──
   /** mouseup 判定选区：非空 + 锚点落在 .message-content 内才弹浮条。
-   *  刻意不用 selectionchange——拖选过程中弹窗会跟着选区跳动，松手才定型。 */
-  const handleMessagesMouseUp = useCallback(() => {
+   *  刻意不用 selectionchange——拖选过程中弹窗会跟着选区跳动，松手才定型。
+   *  位置取松手瞬间的光标（clientX/Y），贴合「鼠标在哪就在哪」的操作直觉；
+   *  贴边时自动翻转，避免浮条被视口裁掉。 */
+  const handleMessagesMouseUp = useCallback((e: React.MouseEvent) => {
     const sel = window.getSelection()
     const raw = sel?.toString() ?? ''
     if (!raw.trim() || !sel || sel.rangeCount === 0) {
@@ -1490,8 +1539,18 @@ export function ChatPanel({
       setQuoteBar(null)
       return
     }
-    const rect = sel.getRangeAt(0).getBoundingClientRect()
-    setQuoteBar({ x: rect.left + rect.width / 2, y: rect.bottom, label: text })
+    // 浮条尺寸（与 .quote-float 的 padding/font-size 对齐，用于边缘翻转判定）
+    const barW = 110
+    const barH = 28
+    const gap = 10
+    let x = e.clientX
+    let y = e.clientY + gap
+    // 下方不够 → 翻到光标上方
+    if (y + barH > window.innerHeight - 4) y = e.clientY - barH - gap
+    // 右侧不够 → 右对齐到视口内
+    if (x + barW > window.innerWidth - 4) x = window.innerWidth - barW - 4
+    if (x - barW < 4) x = barW + 4
+    setQuoteBar({ x, y, label: text })
   }, [])
 
   /** 点击浮条 → 入引用栏。按钮的 mousedown 已 preventDefault（见 JSX 注释）保住
@@ -1728,7 +1787,10 @@ export function ChatPanel({
             <div className="refine-pending-area">
               <button
                 className="refine-pending-btn"
-                onClick={() => setShowRefineConfirm(true)}
+                onClick={() => {
+                  setShowRefineConfirm(true)
+                  setForceError(null)
+                }}
                 title={`${t('refine.pendingBtn')} (${pendingRefine.usagePercent}%)`}
               >
                 <IconChartColumn size={14} />
@@ -1747,6 +1809,50 @@ export function ChatPanel({
                     <div className="item-desc">
                       {t('refine.pendingDesc', String(pendingRefine.usagePercent))}
                     </div>
+                    {/* 与主弹窗同一套规则：只有大窗口档给 slider。
+                        跳过只是不再自动弹窗，调节强制线的能力必须保留。 */}
+                    {pendingRefine.tier === 'large' && (
+                      <div className="refine-force">
+                        <div className="refine-force-head">
+                          <span>{t('refine.forceLabel')}</span>
+                          <span className="refine-force-value">
+                            {Math.round((forceDraft ?? pendingRefine.forceThreshold) * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          className="refine-force-slider"
+                          type="range"
+                          min={refineForceMinPct(pendingRefine)}
+                          max={Math.round(pendingRefine.forceMax * 100)}
+                          step={5}
+                          value={Math.max(
+                            refineForceMinPct(pendingRefine),
+                            Math.round((forceDraft ?? pendingRefine.forceThreshold) * 100),
+                          )}
+                          aria-label={t('refine.forceLabel')}
+                          onChange={e => {
+                            const next = Number(e.target.value) / 100
+                            setForceDraft?.(next)
+                            setRefineForceThreshold(next).catch((err: unknown) => {
+                              const msg = err instanceof Error ? err.message : String(err)
+                              setForceError(`强制线设置失败：${msg}`)
+                            })
+                          }}
+                        />
+                        {forceError && <div className="refine-force-warn">{forceError}</div>}
+                        {refineForceMinPct(pendingRefine) >
+                          Math.round(pendingRefine.forceMin * 100) && (
+                          <div className="refine-force-warn">
+                            {t(
+                              'refine.forceFloorRaised',
+                              String(refineForceMinPct(pendingRefine)),
+                              String(Math.round(pendingRefine.usagePercent)),
+                            )}
+                          </div>
+                        )}
+                        <div className="refine-force-hint">{t('refine.forceHint')}</div>
+                      </div>
+                    )}
                     <div className="refine-confirm-actions">
                       <button
                         className="refine-confirm-btn"
@@ -1905,6 +2011,38 @@ export function ChatPanel({
                                     ))}
                                   </div>
                                 )}
+                                {/* ── 内容引用（quote/skill/knowledge/workflow）──
+                                    正文上方展示，先看引用的哪段、再看提问，符合阅读顺序。
+                                    quote 只截断显示、全文进 title：引文上限 2000 字符，
+                                    在气泡内铺全文会撑爆布局（发送时后端注入的是 label 全文）。 */}
+                                {msg.references &&
+                                  msg.references.some(r => r.type !== 'capture') && (
+                                    <div className="msg-refs">
+                                      {msg.references
+                                        .filter(r => r.type !== 'capture')
+                                        .map((r, i) => {
+                                          const short =
+                                            r.label.length > 60
+                                              ? r.label.slice(0, 60) + '…'
+                                              : r.label
+                                          return (
+                                            <span
+                                              key={`ref-${r.type}-${r.id}-${i}`}
+                                              className={`msg-ref-chip msg-ref-chip--${r.type}`}
+                                              title={r.label}
+                                            >
+                                              <span
+                                                className="msg-ref-chip-icon"
+                                                aria-hidden="true"
+                                              >
+                                                <RefIcon type={r.type} size={12} />
+                                              </span>
+                                              <span className="msg-ref-chip-label">{short}</span>
+                                            </span>
+                                          )
+                                        })}
+                                    </div>
+                                  )}
                                 {/* ── 截图引用（Ctrl+U 截图：本地文件路径经 asset 协议显示）── */}
                                 {msg.references &&
                                   msg.references.some(r => r.type === 'capture') && (
@@ -2018,6 +2156,13 @@ export function ChatPanel({
                                       <IconHistory size={14} />
                                     </IconButton>
                                   )}
+                                  {/* ── 本轮元数据（耗时 / 令牌 / 步数）──
+                                      与复制/点评同排陈列，随 hover 一同显隐（招安
+                                      .message-actions 的交互与配色）。数据源 =
+                                      ChatMessage.meta（后端 TurnMeta）：实时轮次由
+                                      useEvents 写入、历史由 applyHistory 还原。
+                                      空数据由组件判空后不渲染，不留空位。 */}
+                                  <TurnMetaBar meta={msg.meta} className="turn-meta-bar--actions" />
                                 </div>
                               )}
                               {/* user 消息首轮 LLM 失败：hover 显示重试（优雅停止气泡无此标记） */}
@@ -2063,7 +2208,8 @@ export function ChatPanel({
         </div>
       </div>
 
-      {/* ── 选中文字引用浮条：fixed + portal（避开 .chat-messages 的滚动裁剪）── */}
+      {/* ── 选中文字引用浮条：fixed + portal（避开 .chat-messages 的滚动裁剪）──
+          位置 = 松手时光标处（见 handleMessagesMouseUp 的边缘翻转），不再居中于选区。 */}
       {quoteBar &&
         createPortal(
           <button
@@ -2164,6 +2310,56 @@ export function ChatPanel({
                         }}
                       />
                     </div>
+                    {/* 大窗口强制线：仅 large 档给 slider。
+                        小/中档两条线都是设计定值，给它 UI 只会造成"调了却没生效"
+                        的困惑——用户拖完发现行为不变，比不给更糟。 */}
+                    {refineState.tier === 'large' && (
+                      <div className="refine-force">
+                        <div className="refine-force-head">
+                          <span>{t('refine.forceLabel')}</span>
+                          <span className="refine-force-value">
+                            {Math.round((forceDraft ?? refineState.forceThreshold) * 100)}%
+                          </span>
+                        </div>
+                        <input
+                          className="refine-force-slider"
+                          type="range"
+                          min={refineForceMinPct(refineState)}
+                          max={Math.round(refineState.forceMax * 100)}
+                          step={5}
+                          value={Math.max(
+                            refineForceMinPct(refineState),
+                            Math.round((forceDraft ?? refineState.forceThreshold) * 100),
+                          )}
+                          aria-label={t('refine.forceLabel')}
+                          onChange={e => {
+                            const next = Number(e.target.value) / 100
+                            // 先落草稿保证拖动即时可见；后端越界会拒绝（范围外
+                            // Err 不 clamp），失败渲染在滑杆下方——「看得见失败」
+                            // 是此控件的契约（S2：曾静默 catch 无任何反馈）。
+                            setForceDraft?.(next)
+                            setRefineForceThreshold(next).catch((err: unknown) => {
+                              const msg = err instanceof Error ? err.message : String(err)
+                              setForceError(`强制线设置失败：${msg}`)
+                            })
+                          }}
+                        />
+                        {forceError && <div className="refine-force-warn">{forceError}</div>}
+                        {/* 下限被当前用量顶高时说明原因：不是不给调，是这个值以下
+                            等于"下一轮立刻提炼"。硬限制好过事后警告。 */}
+                        {refineForceMinPct(refineState) >
+                          Math.round(refineState.forceMin * 100) && (
+                          <div className="refine-force-warn">
+                            {t(
+                              'refine.forceFloorRaised',
+                              String(refineForceMinPct(refineState)),
+                              String(Math.round(refineState.usagePercent)),
+                            )}
+                          </div>
+                        )}
+                        <div className="refine-force-hint">{t('refine.forceHint')}</div>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div
@@ -2353,11 +2549,13 @@ export function ChatPanel({
           executionStage={executionStage}
           pauseState={pauseState ?? null}
           refineState={refineState ?? null}
+          refining={refining}
           tokenUsage={tokenUsage || null}
           mainTokenUsage={mainTokenUsage || null}
           execTokenUsage={execTokenUsage || null}
           totalDurationMs={totalDurationMs}
           totalCalls={totalCalls}
+          turnMeta={turnMeta}
           mood={mood || 'idle'}
           contextLimit={contextLimit}
           apiHealth={apiHealth}

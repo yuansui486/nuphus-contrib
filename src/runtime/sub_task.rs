@@ -62,6 +62,9 @@ pub struct SubTaskRunner {
     // Execution statistics
     /// Total execution duration timer
     pub(crate) execution_started_at: std::time::Instant,
+    /// 本轮元数据累加器（耗时 / token / 步数）——与 ReactAgent 同一结构、
+    /// 同一口径，完成时作为 ExecutionCompleted.meta 下发。
+    pub(crate) turn_meta: crate::agent::turn_meta::TurnMeta,
     /// Actual total tool calls (for progress events)
     pub(crate) tool_call_total_count: u32,
     // Pause flag (set externally, polled between iterations)
@@ -113,7 +116,7 @@ impl SubTaskRunner {
         system_prompt: String,
         goal: String,
     ) -> Self {
-        let supports_vision = Self::resolve_supports_vision(llm.model_name());
+        let supports_vision = Self::resolve_supports_vision(llm.model_name(), llm.provider_name());
         Self {
             llm,
             tools,
@@ -127,6 +130,7 @@ impl SubTaskRunner {
             suppress_error_events: false,
             suppress_lifecycle_events: false,
             execution_started_at: std::time::Instant::now(),
+            turn_meta: crate::agent::turn_meta::TurnMeta::started(crate::utils::now_unix_ms()),
             tool_call_total_count: 0,
             pause_flag: None,
             protection: ProtectionGuard::new(),
@@ -147,14 +151,23 @@ impl SubTaskRunner {
         }
     }
 
-    /// 从 model registry 解析主模型是否原生支持视觉（统一消歧入口）
-    fn resolve_supports_vision(model_name: &str) -> bool {
+    /// 从 model registry 解析主模型是否原生支持视觉（统一消歧入口）。
+    ///
+    /// provider 取自 client 自带身份（`ApiClient::provider_name`，段名）——
+    /// 当前生效实例的权威；不查 `[last_model]` 影子表反查。空 provider 时
+    /// 显式 unknown（None），由 registry 按候选唯一性处置。
+    fn resolve_supports_vision(model_name: &str, provider: &str) -> bool {
+        let provider = if provider.is_empty() {
+            None
+        } else {
+            Some(provider)
+        };
         crate::config::load_registry()
             .ok()
             .map(|r| {
                 crate::config::resolve_capability(
                     &r,
-                    r.last_model_provider_hint().as_deref(),
+                    provider,
                     model_name,
                     |m| m.supports_vision,
                     false,

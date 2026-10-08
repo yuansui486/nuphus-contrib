@@ -8,17 +8,18 @@ use super::toml_ops::{
     add_provider_model_entry, builtin_capability, clear_provider_api_key_in_config_toml,
     clear_provider_models_in_config_toml, create_custom_provider_segment, get_config_path,
     is_custom_segment_name, list_configured_providers, provider_segment_exists,
-    read_model_context_window, read_model_supports_vision, read_provider_api_key_from_config_toml,
-    read_provider_base_url_from_config_toml, read_provider_display_name,
-    read_provider_reasoning_effort_from_config_toml, remove_provider_segment,
-    sanitize_extra_headers, sync_provider_models, update_config_toml,
-    update_custom_provider_segment, update_model_context_window, update_model_supports_vision,
-    update_provider_base_url, update_reasoning_effort, CapabilityOverride, CapabilitySource,
-    SyncReport,
+    read_model_context_window, read_model_supports_image_generation, read_model_supports_vision,
+    read_provider_api_key_from_config_toml, read_provider_base_url_from_config_toml,
+    read_provider_display_name, read_provider_reasoning_effort_from_config_toml,
+    remove_provider_segment, sanitize_extra_headers, sync_provider_models, update_config_toml,
+    update_custom_provider_segment, update_model_context_window,
+    update_model_supports_image_generation, update_model_supports_vision, update_provider_base_url,
+    update_reasoning_effort, CapabilityOverride, CapabilitySource, SyncReport,
 };
 use crate::emitter::CompoundEmitter;
 use crate::models::aggregator as or_agg;
 use crate::state::{AppState, LlamaConfig};
+use nuphus::agent::distill::RefineTier;
 use nuphus::agent::events::{EventEmitter, NuphusEvent};
 use nuphus::config::registry::ProviderRegistry;
 use tauri::{Manager, State};
@@ -674,6 +675,21 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
         resolved_base_url
     );
 
+    // Install the exact provider+model client before mutating persisted/runtime state.
+    // Failure leaves the old binding intact and emits no success event.
+    let agent_key = mode
+        .as_deref()
+        .filter(|m| AgentModels::AGENTS.contains(m))
+        .unwrap_or("leader");
+    // 切换前上下文窗口校验（零副作用：只读 runtime/session 锁，不写任何状态）。
+    // 必须早于**一切**副作用——base_url 写盘 / 换 client / save_agent_model /
+    // record / activate / 广播：拒绝切换时任何持久状态都不得被改写，「拒绝失败」
+    // 变成半吊子切换是契约破坏（H1：校验曾晚于 base_url 持久化，2026-10 修）。
+    // 只对 leader 校验：main 会话在 leader 槽，workflow/exec 会话在别槽。
+    if agent_key == "leader" {
+        ensure_switch_within_context_window(&state, &resolved_provider, &resolved_model)?;
+    }
+
     // 持久化用户显式改过的接口地址：switch_model 此前只把地址写进运行时内存，
     // 磁盘 providers.toml 仍保留旧值 → 重启后「改了地址又回退」的根因。空/未传
     // = 交回 resolve_effective_base_url 已解析的已存地址，无需写盘。
@@ -694,13 +710,7 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
     // (from_single → transport) picks it up.
     let reasoning_effort = read_provider_reasoning_effort_from_config_toml(&resolved_provider);
 
-    // Install the exact provider+model client before mutating persisted/runtime state.
-    // Failure leaves the old binding intact and emits no success event.
-    let agent_key = mode
-        .as_deref()
-        .filter(|m| AgentModels::AGENTS.contains(m))
-        .unwrap_or("leader");
-    if agent_key == "leader" {
+    {
         let mut guard = state.runtime.lock().map_err(|e| e.to_string())?;
         if let Some(agent) = guard.leader_agent.as_mut() {
             agent
@@ -727,9 +737,11 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
         Some(&resolved_provider),
     )?;
 
-    // provider 归属磁盘记录：[agent_models] 只存 model id，同 id 跨 provider
-    // （官方 deepseek vs opencode-go）时 get_provider_context 靠本表回查归属。
-    nuphus::config::record_last_model(&state.llm_config_path, &resolved_model, &resolved_provider)?;
+    // [last_model] 影子表停写（二元组化 P1）：扁平 id→段 表在同 id 跨段时
+    // 只能存一个归属，与 custom-xxx 多实例现实结构性冲突——用户当前选择的
+    // 唯一权威是 [agent_models] 成对表（上方 save_agent_model）+ runtime
+    // llm_config。表内既有数据保留只读（get_provider_context 迁移链见
+    // config/last_model.rs），迁移窗口结束后随文件一并退役。
     let generation = super::model_metadata::activate(&state, &cfg, context_window)?;
 
     // 写盘后诊断一次绑定健康（含旧版半绑定遗留）：命中 B 类静默降级 → HUD 提示。
@@ -769,6 +781,154 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
         "Switched to: provider={}, model={}",
         resolved_provider, resolved_model
     ))
+}
+
+/// leader 会话当前用量——权威口径与 `agent::distill::maybe_refine_session` 一致：
+/// 官方读数 `api_input_tokens` 优先，为 0 回落字符估算。
+fn leader_session_usage(session: &nuphus::session::Session) -> usize {
+    if session.api_input_tokens > 0 {
+        session.api_input_tokens as usize
+    } else {
+        session.estimate_token_usage()
+    }
+}
+
+/// 切换前上下文窗口校验的拒绝详情——含用户可读文案所需的全部数字。
+///
+/// 由 [`evaluate_switch_context_window`] 产出；[`Self::user_message`] 直接渲染成
+/// 前端 `modelSwitchError` 错误通道可展示的中文文案。
+struct SwitchWindowOverflow {
+    /// 当前会话用量（tokens）
+    usage: usize,
+    /// 目标模型上下文窗口（tokens）
+    context_window: usize,
+    /// 生效强制线比例（small/medium 定值，large 为用户配置 clamp 后）
+    ratio: f64,
+    /// 强制线绝对阈值（tokens）
+    limit: usize,
+}
+
+impl SwitchWindowOverflow {
+    /// 已占目标窗口的百分比（窗口为 0 时防御性给 0）。
+    fn occupancy_pct(&self) -> f64 {
+        if self.context_window == 0 {
+            0.0
+        } else {
+            self.usage as f64 / self.context_window as f64 * 100.0
+        }
+    }
+
+    /// 拒绝文案：当前用量 / 占窗口比 / 阈值比例(=绝对 tokens) / 行动建议。
+    fn user_message(&self, model: &str) -> String {
+        format!(
+            "当前会话用量约 {} tokens，已占目标模型「{}」上下文窗口的 {:.1}%，\
+             超过切换阈值 {:.1}%（= {} tokens）。请先提炼上下文，或选择上下文窗口更大的模型",
+            self.usage,
+            model,
+            self.occupancy_pct(),
+            self.ratio * 100.0,
+            self.limit
+        )
+    }
+}
+
+/// 切换校验的判定核心（纯函数，不触碰 AppState，供单测直接覆盖）。
+///
+/// 口径与 `agent::distill::maybe_refine_session` 完全一致：档位按目标窗口分
+/// （[`RefineTier::for_window`]），比例取 [`RefineTier::force_ratio`]（small/medium
+/// 定值，large 读用户配置并经其内部 clamp）。**严格大于才拒绝**——强制线是下一轮
+/// 收尾的处理线而非错误线，等于阈值放行。
+///
+/// `None` 窗口（无元数据）一律放行：禁止拿 128K 兜底猜，那会把未知窗口的模型
+/// 一刀切死。
+fn evaluate_switch_context_window(
+    target_window: Option<usize>,
+    configured_large: f64,
+    usage: usize,
+) -> Result<(), SwitchWindowOverflow> {
+    let Some(context_window) = target_window else {
+        return Ok(());
+    };
+    let ratio = RefineTier::for_window(context_window).force_ratio(configured_large);
+    let limit = (context_window as f64 * ratio) as usize;
+    if usage > limit {
+        Err(SwitchWindowOverflow {
+            usage,
+            context_window,
+            ratio,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// 切换前上下文窗口校验：当前会话用量超过目标模型的**生效强制线**时拒绝切换。
+///
+/// 拒绝发生在任何副作用之前（调用方保证：换 client / 落盘 / 广播都在此之后）。
+/// 只对 leader 会话生效（main 会话在 leader 槽）。
+///
+/// 当前用量两个来源：① `leader_agent.session()`（空闲态）；② 执行中 agent 被
+/// process 每轮 take 走，回落 `state.session` 的 `session_backup`（轮初快照，
+/// 保守近似，不含本轮新增）。两个源都拿不到 → 放行（无数据不制造阻塞）。
+/// runtime 锁与 session 锁各自短持有，不嵌套。
+fn ensure_switch_within_context_window(
+    state: &AppState,
+    provider: &str,
+    model: &str,
+) -> Result<(), String> {
+    // 目标窗口无元数据 → 放行并留痕。禁止编造 128K 兜底：那会把未知窗口的
+    // 模型一刀切死（用户手上的新模型元数据缺失是常态）。
+    let Some(target_window) =
+        nuphus::agent::goal_types::try_get_context_window_for(model, Some(provider))
+    else {
+        tracing::info!(
+            "switch_model: 目标模型 provider={}, model={} 无 context_window 元数据，跳过切换校验",
+            provider,
+            model
+        );
+        return Ok(());
+    };
+
+    let (agent_usage, configured_large) = match state.runtime.lock() {
+        Ok(g) => (
+            g.leader_agent
+                .as_ref()
+                .map(|agent| leader_session_usage(agent.session())),
+            g.large_force_refine_threshold,
+        ),
+        Err(_) => (None, nuphus::agent::distill::LARGE_FORCE_DEFAULT),
+    };
+    let usage = match agent_usage {
+        Some(u) => Some(u),
+        None => state.session.lock().ok().and_then(|sb| {
+            sb.session_backup
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<nuphus::session::Session>(json).ok())
+                .map(|session| leader_session_usage(&session))
+        }),
+    };
+    let Some(usage) = usage else {
+        tracing::info!(
+            "switch_model: leader_agent 与 session_backup 均取不到会话用量，跳过切换校验"
+        );
+        return Ok(());
+    };
+
+    match evaluate_switch_context_window(Some(target_window), configured_large, usage) {
+        Ok(()) => Ok(()),
+        Err(overflow) => {
+            tracing::info!(
+                "switch_model: 拒绝切换 —— provider={}, model={}, usage={}, window={}, limit={}",
+                provider,
+                model,
+                overflow.usage,
+                overflow.context_window,
+                overflow.limit
+            );
+            Err(overflow.user_message(model))
+        }
+    }
 }
 
 /// 桌面 IPC 命令入口（thin wrapper）：委托泛型核心 `switch_model_impl`。
@@ -1067,6 +1227,66 @@ pub fn set_model_supports_vision(
     ))
 }
 
+/// 手动设置某 provider 下某模型的图像生成能力 —— 模型行内开关。
+///
+/// 与 `set_model_supports_vision` 逐条同构（差异仅函数名与字段名）：
+/// - 落盘 providers.toml 对应模型条目，并把来源标记为 `user`；
+///   此后自动探测（内置 metadata / OpenRouter 聚合库经 apply_capabilities
+///   落盘）一律让位，不再覆盖——否则用户在自定义中转站上手动打开的生成
+///   声明，会在下次「连接/刷新」时被抹掉，图片/视频生成绑定列表重新变空。
+/// - 回读校验：写盘原语对「找不到条目」是静默 Ok，这里把「没写进去」
+///   暴露给 UI，禁止假装保存成功。
+/// - 只改模型元数据，不动当前生成能力绑定（capabilities.image_generation）。
+#[tauri::command]
+pub fn set_model_supports_image_generation(
+    state: State<'_, AppState>,
+    provider: String,
+    model: String,
+    supports_image_generation: bool,
+) -> Result<String, String> {
+    if provider.trim().is_empty() || model.trim().is_empty() {
+        return Err("provider 与 model 不能为空".to_string());
+    }
+
+    let toml_config_path =
+        get_config_path().unwrap_or_else(|| state.llm_config_path.with_file_name("providers.toml"));
+
+    update_model_supports_image_generation(
+        &toml_config_path,
+        &provider,
+        &model,
+        supports_image_generation,
+        Some("user"),
+    )?;
+
+    if read_model_supports_image_generation(&toml_config_path, &provider, &model)
+        != Some(supports_image_generation)
+    {
+        return Err(format!(
+            "未在配置中找到 {}/{} 模型条目，未写入（请先连接/配置该模型）",
+            provider, model
+        ));
+    }
+
+    tracing::info!(
+        "[set_model_supports_image_generation] {}/{} -> {} (source=user)",
+        provider,
+        model,
+        supports_image_generation
+    );
+
+    Ok(format!(
+        "{}/{} 图像生成能力已设为{}",
+        provider,
+        model,
+        if supports_image_generation {
+            "支持"
+        } else {
+            "不支持"
+        }
+    ))
+}
+
 #[tauri::command]
 pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let configured_providers = list_configured_providers();
@@ -1243,17 +1463,11 @@ pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::Model
                     or_agg::lookup_generic_cached(&config_dir, &provider.name, &model.id)
                 });
 
-            // builtin 元数据解析：provider 限定优先。同名模型可能同时由官方段与
-            // 网关段发布（官方 deepseek 与 opencode-go 都列 deepseek-v4-flash），
-            // 无限定的 find_model 会因 HashMap 迭代顺序命中另一段的元数据。
-            // Reasoning-effort options: prefer per-model metadata persisted at
-            // configure time (discovered from the provider's /models response,
-            // e.g. Kimi think_efforts); fall back to the built-in ModelDef
-            // (e.g. deepseek-flash = [high, max]); final fallback —
-            // OpenRouter supported_efforts. Unknown models → no effort knob.
-            let builtin_meta = builtin
-                .find_model_for_provider(provider.provider_type.as_str(), &model.id)
-                .or_else(|| builtin.find_model(&model.id).map(|(_, m)| m));
+            // builtin 元数据解析：provider 限定（协议类型键）。无限定的盲查
+            // 已删（二元组化 P1）：同 id 跨段时它会因迭代序命中另一段的元数据，
+            // 那是错贴不是兜底——miss 就 miss，effort 旋钮缺失好过贴错值。
+            let builtin_meta =
+                builtin.find_model_for_provider(provider.provider_type.as_str(), &model.id);
             let (mut reasoning_efforts, mut default_effort) = if !model.reasoning_efforts.is_empty()
             {
                 (
@@ -1771,7 +1985,9 @@ async fn fetch_provider_models(
     // （id/alias 均可命中）。builtin miss 的模型用 OpenRouter 聚合库补齐
     // （context_window + input_modalities → vision/audio/image_generation）。
     // 仍未知的模型保持缺省值，前端隐藏对应徽标（不做字符串启发式猜测）。
-    let agg_entries = if or_agg::has_vendor(provider) {
+    let agg_entries = if or_agg::has_vendor(provider) || is_custom_segment_name(provider) {
+        // 自定义中转 / 自建网关段同样需要目录：它们的 id 无法静态映射 vendor，
+        // 只能靠全目录基名匹配兜底（见 or_agg::lookup_generic）。官方段行为不变。
         or_agg::ensure_cache(&openrouter_cache_path()).await
     } else {
         Vec::new()
@@ -1779,12 +1995,14 @@ async fn fetch_provider_models(
     let briefs = models
         .into_iter()
         .map(|id| {
-            // builtin 元数据解析：provider 限定优先。同名模型可能同时由官方段与
-            // 网关段发布（官方 deepseek 与 opencode-go 都列 deepseek-v4-flash），
-            // 无限定的 find_model 会因迭代顺序命中另一段的元数据。
+            // builtin 元数据解析：段限定优先（provider_kind = 协议类型键），
+            // tier-1 精确 miss 后允许 tier-2 段限定 fuzzy（中转别名归一）。
+            // 无限定的 find_model / find_model_fuzzy 盲扫已删（二元组化 P1）：
+            // 同 id 跨段时会因迭代序把别段的元数据贴进本段 brief——UI 上将
+            // 显示错误的窗口/能力，属错贴非兜底。
             let meta = registry
                 .find_model_for_provider(provider_kind.as_str(), &id)
-                .or_else(|| registry.find_model(&id).map(|(_, m)| m));
+                .or_else(|| registry.find_model_for_provider_fuzzy(provider_kind.as_str(), &id));
             let mut brief = ProviderModelBrief {
                 id,
                 supports_streaming: meta.map(|m| m.supports_streaming).unwrap_or(true),
@@ -1798,6 +2016,22 @@ async fn fetch_provider_models(
             // builtin miss（context_window None）→ OpenRouter 权威库补齐能力
             if brief.context_window.is_none() {
                 if let Some(entry) = or_agg::lookup(&agg_entries, provider, &brief.id) {
+                    brief.context_window = entry.context_length;
+                    if !entry.input_modalities.is_empty() {
+                        brief.supports_vision = entry.input_modalities.iter().any(|m| m == "image");
+                        brief.supports_audio = entry.input_modalities.iter().any(|m| m == "audio");
+                    }
+                    if !entry.output_modalities.is_empty() {
+                        brief.supports_image_generation =
+                            entry.output_modalities.iter().any(|m| m == "image");
+                    }
+                }
+            }
+            // 自定义中转 / 自建网关段：id 无法静态映射 vendor，`lookup` 直接返回 None。
+            // 改走全目录基名匹配（lookup_generic：两侧归一 + 同 vendor 变体去重 +
+            // 跨厂商重名不采信）。官方段不进这条路径，行为不变。
+            if brief.context_window.is_none() && is_custom_segment_name(provider) {
+                if let Some(entry) = or_agg::lookup_generic(&agg_entries, &brief.id) {
                     brief.context_window = entry.context_length;
                     if !entry.input_modalities.is_empty() {
                         brief.supports_vision = entry.input_modalities.iter().any(|m| m == "image");
@@ -2270,6 +2504,8 @@ pub fn get_capabilities(state: State<'_, AppState>) -> Result<serde_json::Value,
         "voice_provider": caps.voice_provider,
         "image_generation": caps.image_generation,
         "image_generation_provider": caps.image_generation_provider,
+        "video_generation": caps.video_generation,
+        "video_generation_provider": caps.video_generation_provider,
         "chat_agent_max_iterations": caps.chat_agent_max_iterations,
     });
 
@@ -2323,6 +2559,20 @@ fn find_model_entry<'a>(
             .unwrap_or(false)
     })
 }
+
+/// 上游 `/models` 条目里的上下文字段候选（provider-agnostic）。
+///
+/// ⚠️ 不含 `max_tokens`：那是**输出**上限（completion cap，如 deepseek-v4-pro
+/// 的 32768），不是上下文窗口。上游若只暴露 max_tokens，旧实现会把它当成
+/// context_window 写进 providers.toml —— 分母从此错一个量级（128K 的模型显示成
+/// 32K），且 auto-calibration 只在「缺失」时补写、之后永不纠正。
+/// 宁可解析不出（→ 0 → 界面显示 "--"），不要一个错的官方感数字。
+const CTX_KEYS: &[&str] = &[
+    "context_length",
+    "max_context_length",
+    "context_window",
+    "max_input_tokens",
+];
 
 pub(super) fn query_model_metadata_from_api(
     base_url: &str,
@@ -2399,14 +2649,8 @@ pub(super) fn query_model_metadata_from_api(
         }
     };
 
-    // Context window field names (provider-agnostic)
-    const CTX_KEYS: &[&str] = &[
-        "context_length",
-        "max_context_length",
-        "context_window",
-        "max_tokens",
-        "max_input_tokens",
-    ];
+    // Context window field names live in the module-level CTX_KEYS (see its doc:
+    // deliberately excludes `max_tokens` — that is an output cap, not a window).
 
     let build_meta = |m: &serde_json::Value| {
         let (reasoning_efforts, default_effort) = extract_reasoning_efforts(m);
@@ -2578,6 +2822,35 @@ pub async fn startup_model_calibration(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上游 /models 条目的上下文字段解析：只认**输入侧**窗口字段。
+    /// 钉子：`max_tokens`（输出上限）绝不可能是上下文窗口。
+    #[test]
+    fn extract_context_ignores_max_tokens() {
+        // 同时带 context_length 与 max_tokens：取前者（官方窗口），不被输出上限顶掉
+        let both =
+            serde_json::json!({"id": "m", "context_length": 1_000_000, "max_tokens": 32_768});
+        assert_eq!(extract_context(&both, CTX_KEYS), Some(1_000_000));
+
+        // 只暴露 max_tokens：解析不出 → None（调用方按「未知」处理，显示 "--"），
+        // 而不是把 32768 当上下文窗口写进 providers.toml
+        let only_max = serde_json::json!({"id": "m", "max_tokens": 32_768});
+        assert_eq!(extract_context(&only_max, CTX_KEYS), None);
+
+        // 其余输入侧字段照常识别
+        assert_eq!(
+            extract_context(&serde_json::json!({"max_input_tokens": 200_000}), CTX_KEYS),
+            Some(200_000)
+        );
+        assert_eq!(
+            extract_context(&serde_json::json!({"context_window": 128_000}), CTX_KEYS),
+            Some(128_000)
+        );
+        assert_eq!(
+            extract_context(&serde_json::json!({"id": "m"}), CTX_KEYS),
+            None
+        );
+    }
 
     /// 写临时配置：agent_models 内容 + registry config（providers 列表）。
     /// 返回 (providers_path, config_path)，测试结束由调用方清理目录。
@@ -2915,6 +3188,83 @@ mod tests {
         let e = resolve_agent_binding_provider(&registry, "nope", "same", None).unwrap_err();
         assert!(e.contains("未知 agent"), "{e}");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── 切换前上下文窗口校验（switch_model 拒绝逻辑的判定核心）──
+
+    /// usage 超过强制线 → 拒绝；拒绝详情带上用户可读文案所需的全部数字。
+    #[test]
+    fn switch_window_check_rejects_usage_above_limit() {
+        // 200K 窗口 = Small 档，强制线比例 0.75 → limit = 150_000（配置 0.99 不得生效）
+        let overflow = evaluate_switch_context_window(Some(200_000), 0.99, 180_000)
+            .expect_err("180_000 > 150_000 应拒绝");
+        assert_eq!(overflow.usage, 180_000);
+        assert_eq!(overflow.context_window, 200_000);
+        assert_eq!(overflow.ratio, 0.75);
+        assert_eq!(overflow.limit, 150_000);
+
+        // 文案四要素：当前用量 / 占窗口比 / 阈值比例(=绝对 tokens) / 行动建议
+        let msg = overflow.user_message("test-model");
+        assert!(msg.contains("当前会话用量约 180000 tokens"), "{msg}");
+        assert!(msg.contains("上下文窗口的 90.0%"), "{msg}");
+        assert!(
+            msg.contains("超过切换阈值 75.0%（= 150000 tokens）"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("请先提炼上下文，或选择上下文窗口更大的模型"),
+            "{msg}"
+        );
+    }
+
+    /// 严格大于才拒绝：等于阈值放行——强制线是下一轮收尾的处理线，不是错误线。
+    #[test]
+    fn switch_window_check_allows_usage_at_limit() {
+        // small：200_000 * 0.75 = 150_000
+        assert!(evaluate_switch_context_window(Some(200_000), 0.99, 150_000).is_ok());
+        // medium：600_000 * 0.80 = 480_000
+        assert!(evaluate_switch_context_window(Some(600_000), 0.99, 480_000).is_ok());
+        // large：1_000_000 * 0.60（配置值）= 600_000
+        assert!(evaluate_switch_context_window(Some(1_000_000), 0.60, 600_000).is_ok());
+    }
+
+    /// 低于阈值放行（含空会话零用量）。
+    #[test]
+    fn switch_window_check_allows_usage_below_limit() {
+        assert!(evaluate_switch_context_window(Some(200_000), 0.99, 149_999).is_ok());
+        assert!(evaluate_switch_context_window(Some(200_000), 0.99, 0).is_ok());
+    }
+
+    /// 目标窗口无元数据 → 一律放行。禁止编造 128K 兜底：那会把未知窗口的模型一刀切死。
+    #[test]
+    fn switch_window_check_passes_when_window_unknown() {
+        assert!(evaluate_switch_context_window(None, 0.99, usize::MAX).is_ok());
+    }
+
+    /// 三档比例与 distill 强制线完全一致：small 0.75 / medium 0.80 固定，large 读用户
+    /// 配置（经 clamp）；small/medium 不受 large 配置污染（大模型设置不污染小模型）。
+    #[test]
+    fn switch_window_force_ratio_tiers() {
+        // 档位边界：256K → Small，600K → Medium，600_001 → Large
+        assert_eq!(RefineTier::for_window(256_000), RefineTier::Small);
+        assert_eq!(RefineTier::for_window(600_000), RefineTier::Medium);
+        assert_eq!(RefineTier::for_window(600_001), RefineTier::Large);
+
+        // small/medium 定值，用户配什么都不影响
+        assert_eq!(RefineTier::for_window(200_000).force_ratio(0.99), 0.75);
+        assert_eq!(RefineTier::for_window(400_000).force_ratio(0.99), 0.80);
+        // large 读配置
+        assert_eq!(RefineTier::for_window(1_000_000).force_ratio(0.60), 0.60);
+        // clamp 越界（既有语义，不得因本次校验漂移）
+        assert_eq!(RefineTier::for_window(1_000_000).force_ratio(0.99), 0.80);
+        assert_eq!(RefineTier::for_window(1_000_000).force_ratio(0.10), 0.50);
+
+        // 经判定链落地：small 档 configured=0.99 不得把线抬过 150_000
+        let overflow = evaluate_switch_context_window(Some(200_000), 0.99, 160_000)
+            .expect_err("small 档若误读配置（0.80/0.99）会放过 160_000");
+        assert_eq!(overflow.limit, 150_000);
+        // medium 档同理：480_001 拒绝（线仍是 480_000）
+        assert!(evaluate_switch_context_window(Some(600_000), 0.99, 480_001).is_err());
     }
 
     /// 自动补全 → 落盘 → 诊断健康：写入的绑定必是完整 (provider, model) 对。

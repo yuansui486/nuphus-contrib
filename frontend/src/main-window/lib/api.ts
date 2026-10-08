@@ -23,6 +23,7 @@ import type {
   RunRecord,
   ChatAgentConfig,
   InlineChatAgentEntry,
+  TurnMeta,
 } from '../../core/types'
 
 // ── Tools ──
@@ -125,6 +126,9 @@ export interface HistoryMessage {
   timestamp?: number
   /** 执行过程（思考/流式文本/工具调用，按实际顺序）——Session 完整存储 */
   traceItems?: HistoryTraceItem[]
+  /** 本轮执行的元数据（耗时 / token / 步数）；仅 assistant 消息携带，
+   *  旧历史缺省 → 前端不渲染元数据条（对齐后端 state::HistoryMessage.meta）。 */
+  meta?: TurnMeta
 }
 
 export function getChatHistory() {
@@ -357,6 +361,17 @@ export interface ExecutionStateSnapshot {
   busy: boolean
   /** 当前提交是否会按追加指令受理（仅 running；finalizing 会被拒收） */
   append_accepting: boolean
+  /**
+   * 本轮起点（Unix 毫秒，后端权威）——`SignalState::set_execution_stage` 在
+   * 「空闲 → 执行」这一跳记录。刷新 / 重连后前端据此 `now - started_at_ms`
+   * 继续推算耗时，**不归零**；没有它就只能显示 0（不可知）。
+   */
+  started_at_ms: number | null
+  /**
+   * 本轮工具调用步数（后端累加，`SignalState::inc_execution_tool_calls`）。
+   * 前端**不得**自己数调用次数——刷新 / 丢事件时前端计数会与实际不符。
+   */
+  tool_calls: number
 }
 
 export function getExecutionState() {
@@ -378,7 +393,7 @@ export function forceReset() {
 // ── 后端资源互斥门（见 nuphus::automation_gate）──
 
 /**
- * 稳定错误码：桌面自动化 / 浏览器控制 / 录制 / 主执行体互斥被拒。
+ * 稳定错误码：桌面自动化 / 浏览器控制 / 主执行体互斥被拒。
  * 后端 `LeaseBusy` 的 Display 固定为 `automation_busy: <人话>`（Tauri 的 Err 只有
  * 字符串通道，码前缀是前端识别的唯一锚点，前后端契约不可改名）。
  */
@@ -390,7 +405,7 @@ function errorText(err: unknown): string {
   return String(err ?? '')
 }
 
-/** 该错误是否来自资源互斥门（执行体/录制占用中） */
+/** 该错误是否来自资源互斥门（执行体占用中） */
 export function isAutomationBusy(err: unknown): boolean {
   return errorText(err).startsWith(AUTOMATION_BUSY)
 }
@@ -1122,6 +1137,8 @@ export interface Capabilities {
   voice_provider?: string
   image_generation?: string
   image_generation_provider?: string
+  video_generation?: string
+  video_generation_provider?: string
   chat_agent_max_iterations: number | null
 }
 
@@ -1136,7 +1153,7 @@ export function setCapability(key: string, value: string) {
 /** 原子设置能力模型绑定：model 与 provider 必须在同一次写入内落盘，
  *  否则会留下「新 model + 旧 provider」的半绑定（能力请求按 provider+model
  *  精确解析时找不到该组合，保存看似成功但实际用不了）。
- *  kind ∈ 'vision' | 'stt' | 'tts' | 'voice' | 'image_generation'。 */
+ *  kind ∈ 'vision' | 'stt' | 'tts' | 'voice' | 'image_generation' | 'video_generation'。 */
 export function setCapabilityBinding(kind: string, model: string, provider: string) {
   return invoke<void>('set_capability_binding', { kind, model, provider })
 }
@@ -1145,6 +1162,20 @@ export function setCapabilityBinding(kind: string, model: string, provider: stri
  *  落盘后在 providers.toml 标记来源 user，自动探测不再覆盖该值。 */
 export function setModelSupportsVision(provider: string, model: string, supportsVision: boolean) {
   return invoke<string>('set_model_supports_vision', { provider, model, supportsVision })
+}
+
+/** 手动设定某 provider 下某模型的图像生成能力（模型行内开关）。
+ *  与视觉开关同构：落盘后在 providers.toml 标记来源 user，自动探测不再覆盖该值。 */
+export function setModelSupportsImageGeneration(
+  provider: string,
+  model: string,
+  supportsImageGeneration: boolean,
+) {
+  return invoke<string>('set_model_supports_image_generation', {
+    provider,
+    model,
+    supportsImageGeneration,
+  })
 }
 
 export function getContextLimit() {

@@ -446,7 +446,11 @@ impl ToolRegistry {
     ///
     /// 纪律：每个档位必须能讲清「为什么是这个数」——无出处魔数禁止入链；
     /// 能复用已有档位就不新造数字。各档推导：
-    /// - system_shell/system_sleep 自带超时机制，600s 容纳默认 180s + 余量
+    /// - system_shell/system_sleep：**1800s，与 video 档同级**。原 600s 是
+    ///   「容纳默认 180s + 余量」，但实测 Release 全量构建/测试在乾淨 target
+    ///   下可跑 5-10 分钟，600s 会把长任务拦腰砍断。而本桶取消不了任何东西
+    ///   （见下方 timeouts 说明），砍断只会诱导重试 → 重跑 → 再砍断的循环。
+    ///   取宽档：宁可晚、不可早。工具的 `timeout` 参数上限同步提高到 1800s。
     /// - web_search/web_extract/http_request 走 reqwest::blocking 慢抓取，120s 防误杀
     /// - video_subtitle_extract 含 yt-dlp 下载 + ffmpeg 转码 + 本地 ASR，
     ///   长视频兜底链路给 900s（15min）
@@ -472,7 +476,7 @@ impl ToolRegistry {
     /// 注：desktop_/browser_ 工具在上方分支已提前返回，不经过此处
     fn tool_timeout(tool_name: &str) -> Duration {
         if tool_name == "system_shell" || tool_name == "system_sleep" {
-            Duration::from_secs(600) // 足够容纳默认 180s + 余量
+            Duration::from_secs(1800) // 与 video 档同级，容纳 Release 全量构建/测试
         } else if tool_name == "web_search"
             || tool_name == "web_extract"
             || tool_name == "http_request"
@@ -504,6 +508,13 @@ impl ToolRegistry {
                  处置：先核对目标窗口/进程实况（windows_list / 截图看回显），确认指令是否已进入终端：\n\
                  已进入 → 勿重复投递（双序列会交错敲键、任务被外部 Agent 执行两遍）；\n\
                  确认未进入 → 才补输单行指令「Read {{brief_path}} and execute it.」补完投递，brief 无需重新上板。",
+                timeout.as_secs()
+            )
+        } else if tool_name == "system_shell" {
+            format!(
+                "工具 'system_shell' 已等待 {}秒仍未结束（到达等待上限）。\n\
+                 若本次调用 timeout > 300s（长任务：构建/全量测试/大下载），进程**未被终止**，仍在后台运行 —— 输出若重定向到文件，稍后直接读取，**勿重复执行**。\n\
+                 若为普通命令，进程已被终止，可修正后重试。",
                 timeout.as_secs()
             )
         } else {
@@ -610,36 +621,6 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// 工具总览单行摘要。
-    ///
-    /// 完整参数说明由 API `tools` 字段承载（`Agent::build_request` 无条件
-    /// `.with_tools(schemas)` 下发），本函数产物仅用于 system prompt 的
-    /// 「有哪些工具」总览——模型据此知道能力边界、避免臆造工具名。
-    ///
-    /// 原实现把 `t.description` 全量复制进 prompt，与 tools 字段逐字重复，
-    /// 实测 67 个工具占 12,339 字节（约 4.5K token）纯冗余。此处只取首句
-    /// 并限长：既保住「这个工具是干什么的」的最小判别信息，又不再挤占预算。
-    fn summarize_for_overview(desc: &str) -> String {
-        const MAX_CHARS: usize = 48;
-        // 首句边界：中文句号或换行（换行常用于「一句标题 + 详述」的写法）
-        let head = match desc.find(['。', '\n']) {
-            Some(i) => {
-                let ch = desc[i..].chars().next();
-                let end = i + ch.map(|c| c.len_utf8()).unwrap_or(0);
-                &desc[..end]
-            }
-            None => desc,
-        };
-        // 按字符（非字节）截断，避免切坏 UTF-8
-        if head.chars().count() <= MAX_CHARS {
-            head.to_string()
-        } else {
-            let mut s: String = head.chars().take(MAX_CHARS).collect();
-            s.push('…');
-            s
-        }
-    }
-
     /// Render tool schemas as JSON string, embedded in system prompt's <tools> tag
     ///
     /// Result is cached (lazy-built), automatically cleared when register adds/updates tools.
@@ -654,20 +635,7 @@ impl ToolRegistry {
 
         // Cache miss → build
         let schemas = self.get_schemas();
-        let simplified: Vec<String> = schemas
-            .iter()
-            .map(|s| {
-                // Tool names in prompt must match API schemas (:: → _)
-                let normalized_name = s.function.name.replace("::", "_");
-                let desc = s.function.description.as_deref().unwrap_or("");
-                format!(
-                    "- {}: {}",
-                    normalized_name,
-                    Self::summarize_for_overview(desc)
-                )
-            })
-            .collect();
-        let result = simplified.join("\n");
+        let result = render_tool_names_by_group(&schemas);
 
         // Write cache
         {
@@ -682,19 +650,7 @@ impl ToolRegistry {
     /// Bypasses prompt_cache — the whitelist is session/mode-specific, not global.
     pub fn render_tools_for_prompt_filtered(&self, whitelist: &[String]) -> String {
         let schemas = self.get_schemas_for(whitelist);
-        schemas
-            .iter()
-            .map(|s| {
-                let normalized_name = s.function.name.replace("::", "_");
-                let desc = s.function.description.as_deref().unwrap_or("");
-                format!(
-                    "- {}: {}",
-                    normalized_name,
-                    Self::summarize_for_overview(desc)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        render_tool_names_by_group(&schemas)
     }
 
     /// Get references to all tool definitions
@@ -942,6 +898,134 @@ pub fn workflow_tool_group(name: &str) -> &'static str {
         "image_generate" | "video_generate" => "generation",
         _ => "misc",
     }
+}
+
+// ── Prompt 工具总览分组（system prompt 的「可用工具」节唯一来源）──
+//
+// 纯展示语义，与 ToolCategory（权限 taxonomy）、workflow_tool_group（画布面板）
+// 均独立。按工具名的实际形态判定，不维护名单——不同 agent（Leader / Exec /
+// Workflow / Custom 白名单）各自渲染出自己的分类，缺失的分组不出现。
+
+/// 分组展示顺序（未列出的分组排在其后，保持字典序稳定）
+pub const PROMPT_TOOL_GROUP_ORDER: &[&str] = &[
+    "文件",
+    "系统",
+    "搜索",
+    "记忆",
+    "协作",
+    "编排",
+    "技能",
+    "生成",
+    "桌面",
+    "浏览器",
+    "工作流",
+    "其它",
+];
+
+/// 工具名 → prompt 总览分组键。**纯判定函数，按名称形态归组；不匹配任何
+/// 已知族时归入「其它」**——新增工具若不落族，会自然出现在「其它」而非消失。
+pub fn prompt_tool_group(name: &str) -> &'static str {
+    // 文件族（大小写混用，须显式列举）
+    if matches!(
+        name,
+        "Read"
+            | "Write"
+            | "Edit"
+            | "Delete"
+            | "Rename"
+            | "Copy"
+            | "CreateDir"
+            | "RemoveDir"
+            | "ListDir"
+            | "FilesInfo"
+            | "Append"
+            | "Glob"
+            | "Grep"
+            | "Diff"
+            | "Open"
+            | "Search"
+    ) {
+        return "文件";
+    }
+    if name.starts_with("system_") || name.starts_with("process_") {
+        return "系统";
+    }
+    if name.starts_with("web_") || name == "http_request" {
+        return "搜索";
+    }
+    if name.starts_with("desktop_") {
+        return "桌面";
+    }
+    if name.starts_with("browser_") {
+        return "浏览器";
+    }
+    if name.starts_with("memory_")
+        || name.starts_with("annotation_")
+        || name.starts_with("timeline_")
+        || name.contains("memory_update")
+    {
+        return "记忆";
+    }
+    if name.starts_with("skill_") || name.starts_with("knowledge_") {
+        return "技能";
+    }
+    if name.starts_with("workflow_")
+        || name.starts_with("wf_")
+        || name.starts_with("experience_")
+        || name.starts_with("ui_maps_")
+        || name == "schedule_cron"
+    {
+        return "工作流";
+    }
+    match name {
+        "image_generate" | "video_generate" | "video_subtitle_extract" => "生成",
+        "task_dispatch" | "agent_dispatch" | "request_user_input" => "协作",
+        "planner_create" | "planner_parse" | "planner_archive" | "planner_list" | "tenet_add" => {
+            "编排"
+        }
+        _ => "其它",
+    }
+}
+
+/// 按 [`prompt_tool_group`] 聚合，渲染为「**分组名**\n工具名1, 工具名2, …」。
+///
+/// 分类 + 最省渲染：同类工具挤一行，名称以 `,` 分隔；空组不输出。
+/// 详细参数由请求体 API `tools` 字段完整下发，本节仅承担「有哪些工具」的
+/// 能力边界提示。
+pub fn render_tool_names_by_group(schemas: &[crate::api::ToolDefinition]) -> String {
+    let mut buckets: std::collections::BTreeMap<&'static str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for s in schemas {
+        // 分组键按归一后的名字判定（`leader::memory_update` → `leader_memory_update`），
+        // 避免 `::` 前缀族逃逸归类。
+        let name = s.function.name.replace("::", "_");
+        let group = prompt_tool_group(&name);
+        buckets.entry(group).or_default().push(name);
+    }
+
+    let mut out = String::new();
+    let emit = |group: &str, names: &[String], out: &mut String| {
+        if names.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("**{group}**\n"));
+        out.push_str(&names.join(", "));
+        out.push('\n');
+    };
+
+    for group in PROMPT_TOOL_GROUP_ORDER {
+        if let Some(names) = buckets.remove(group) {
+            emit(group, &names, &mut out);
+        }
+    }
+    // 兜底：未在顺序表列出的分组（不应发生，防御性保留）
+    for (group, names) in buckets {
+        emit(group, &names, &mut out);
+    }
+    out.trim_end().to_string()
 }
 
 // ── Built-in tools ──
@@ -1494,32 +1578,58 @@ mod tests {
         );
     }
 
-    /// 工具总览摘要：首句截取 + 限长 + UTF-8 边界安全。
+    /// 工具总览契约：分类 + 名称（最省渲染），不含任何 description / 参数。
     ///
-    /// 钉子：覆盖「全量复制 description」的旧行为回归——一旦有人把
-    /// `render_tools_for_prompt` 改回 `desc`，限长断言会立刻失败。
+    /// 钉子：完整参数由 API `tools` 字段下发；一旦有人把 description 重新
+    /// 拼回 prompt 总览（历史上曾占 ~4.5K token 纯冗余），本断言立刻失败。
     #[test]
-    fn test_summarize_for_overview() {
-        // 中文句号截断
-        assert_eq!(
-            ToolRegistry::summarize_for_overview("读文件。后面还有很长很长的详情"),
-            "读文件。"
-        );
-        // 换行截断（「标题 + 详述」写法）
-        assert_eq!(
-            ToolRegistry::summarize_for_overview("标题行\n详述内容"),
-            "标题行\n"
-        );
-        // 无分隔符且不超限 → 原样返回
-        assert_eq!(ToolRegistry::summarize_for_overview("短描述"), "短描述");
-        // 超长无分隔符 → 48 字符 + 省略号
-        let long = "很长的描述".repeat(20);
-        let out = ToolRegistry::summarize_for_overview(&long);
-        assert_eq!(out.chars().count(), 49, "应为 48 字符 + 省略号");
-        assert!(out.ends_with('…'));
-        assert!(out.len() < long.len(), "摘要必须短于原文");
-        // 多字节边界：每个字符完整，未切坏 UTF-8
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    fn test_render_tools_for_prompt_is_grouped_names_only() {
+        let registry = ToolRegistry::builtin();
+        let rendered = registry.render_tools_for_prompt();
+        // 分组标题形如 `**文件**`，紧跟一行逗号分隔的工具名
+        assert!(rendered.contains("**文件**"), "缺少文件分组标题");
+        assert!(rendered.contains("**系统**"), "缺少系统分组标题");
+        assert!(rendered.contains("Read"), "文件组缺少 Read");
+        // 不得含 description（`name: desc` 形态）与截断省略号
+        assert!(!rendered.contains('…'), "总览不得含截断省略号");
+        assert!(rendered.starts_with("**"), "应以分组标题开头");
+        // 分组标题行不得带 `:`（那是 description 残留）
+        for line in rendered.lines() {
+            if line.starts_with("**") {
+                assert!(line.ends_with("**"), "分组标题格式异常: {line}");
+                assert!(!line.contains(':'), "分组标题不得含 ':'：{line}");
+            }
+        }
+        // 每个已注册工具名都应出现（不因归类丢失）
+        for s in registry.get_schemas() {
+            let name = s.function.name.replace("::", "_");
+            assert!(rendered.contains(&name), "工具 '{name}' 未出现在总览中");
+        }
+    }
+
+    /// 分组判定：各族的代表工具归入预期分组，未知工具兜底「其它」。
+    #[test]
+    fn test_prompt_tool_group_mapping() {
+        assert_eq!(prompt_tool_group("Read"), "文件");
+        assert_eq!(prompt_tool_group("Grep"), "文件");
+        assert_eq!(prompt_tool_group("system_shell"), "系统");
+        assert_eq!(prompt_tool_group("process_kill"), "系统");
+        assert_eq!(prompt_tool_group("web_search"), "搜索");
+        assert_eq!(prompt_tool_group("http_request"), "搜索");
+        assert_eq!(prompt_tool_group("desktop_mouse"), "桌面");
+        assert_eq!(prompt_tool_group("browser_click"), "浏览器");
+        assert_eq!(prompt_tool_group("memory_search"), "记忆");
+        assert_eq!(prompt_tool_group("annotation_add"), "记忆");
+        // `::` 归一后应归入记忆（leader_memory_update），不得落入「其它」
+        assert_eq!(prompt_tool_group("leader_memory_update"), "记忆");
+        assert_eq!(prompt_tool_group("skill_read"), "技能");
+        assert_eq!(prompt_tool_group("knowledge_search"), "技能");
+        assert_eq!(prompt_tool_group("image_generate"), "生成");
+        assert_eq!(prompt_tool_group("task_dispatch"), "协作");
+        assert_eq!(prompt_tool_group("planner_create"), "编排");
+        assert_eq!(prompt_tool_group("workflow_run"), "工作流");
+        // 未知工具兜底，不消失
+        assert_eq!(prompt_tool_group("totally_new_tool"), "其它");
     }
 
     #[test]
@@ -1617,9 +1727,14 @@ mod tests {
 
     /// issue #69 方向 3 回归：超时文案必须讲实情——spawn_blocking 不可取消，
     /// 禁止出现「已取消」这类与实现矛盾的表述（诱导安全重试 ⇒ 双投递/双执行）。
+    ///
+    /// 第二个断言只要求「不断言进程已被取消」：system_shell 自超时分层后，
+    /// 普通命令（timeout ≤ 300s）确实是**会被终止**的，说「仍在后台运行」反而
+    /// 与实现矛盾。故改为按工具分辨：dispatch/其余工具仍是「不可取消」口径，
+    /// system_shell 只要不断言「未取消」即可（它按任务类型区分）。
     #[test]
     fn test_timeout_message_tells_the_truth() {
-        for tool in ["agent_dispatch", "system_shell", "Read", "Write"] {
+        for tool in ["agent_dispatch", "Read", "Write"] {
             let msg = ToolRegistry::timeout_message(tool, Duration::from_secs(180));
             assert!(
                 !msg.contains("已取消"),
@@ -1630,6 +1745,17 @@ mod tests {
                 "{tool} 的超时文案必须说明「未取消 + 可能仍在后台运行」: {msg}"
             );
         }
+
+        // system_shell：分层措辞，两种结局都要说明，且都不得声称「已取消」
+        let shell_msg = ToolRegistry::timeout_message("system_shell", Duration::from_secs(180));
+        assert!(
+            !shell_msg.contains("已取消"),
+            "system_shell 不得声称「已取消」: {shell_msg}"
+        );
+        assert!(
+            shell_msg.contains("未被终止") && shell_msg.contains("已被终止"),
+            "system_shell 文案必须同时说明长任务未终止与普通命令已终止两种结局: {shell_msg}"
+        );
         // agent_dispatch 专属文案必须带「先核对实况、已进终端勿重投」指引
         let msg = ToolRegistry::timeout_message("agent_dispatch", Duration::from_secs(180));
         assert!(

@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef } from 'react'
 import { invoke, listen } from '../core/bridge'
 import { debugEnabled } from '../core/debug'
 import { continueReplyAfterUser } from '../core/progressMessages'
+import type { RefineState, RefineTier } from './useExecutionUI'
+import { autoRaiseForceThreshold } from './useExecutionUI'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type {
   ChatMessage,
@@ -13,6 +15,7 @@ import type {
   PlanData,
   PlanTask,
   TaskRun,
+  TurnMeta,
 } from '../core/types'
 import type { MutableRefObject } from 'react'
 import type { ExecutionStage } from './useExecutionState'
@@ -62,7 +65,8 @@ export interface EventHandlers {
     lastStreamingMsgId: MutableRefObject<string | null>
     executionActiveRef: MutableRefObject<boolean>
     processingRef: MutableRefObject<boolean>
-    toolCallCountRef: MutableRefObject<number>
+    /** 本轮 token 累加基准（同步可读）：token_usage 连续到达时以闭包 prev 累加会漏加 */
+    turnMetaTokensRef: MutableRefObject<TurnMeta>
     /** 用户已点击强制中断；置位后迟到的 tool_call 事件不再把 mood 打回执行中 */
     interruptedRef: MutableRefObject<boolean>
     /** ChatPanel 贴底跟随的 followReset 回填位：execution_started / execution_completed 调 */
@@ -111,6 +115,10 @@ export interface EventHandlers {
   >
   setTotalDurationMs: (v: number) => void
   setTotalCalls: (v: number) => void
+  /** 本轮元数据（耗时 / token / 步数）——三处接入点共用的唯一数据源 */
+  setTurnMeta: React.Dispatch<React.SetStateAction<TurnMeta | null>>
+  /** 执行中实时工具调用累计 */
+  setLiveTurnToolCalls: React.Dispatch<React.SetStateAction<number>>
   setPlanData: React.Dispatch<React.SetStateAction<PlanData | null>>
   /** ExecAgent 执行生命周期快照（task 面板唯一数据源） */
   setTaskRuns: React.Dispatch<React.SetStateAction<TaskRun[]>>
@@ -127,18 +135,20 @@ export interface EventHandlers {
     }>
   >
   setTaskBubbleVisible: (v: boolean) => void
-  setRefineState: React.Dispatch<
-    React.SetStateAction<{ usagePercent: number; totalLimit: number } | null>
-  >
-  refineState: { usagePercent: number; totalLimit: number } | null
+  setRefineState: React.Dispatch<React.SetStateAction<RefineState | null>>
+  refineState: RefineState | null
   setRefining: (v: boolean) => void
-  pendingRefine: { usagePercent: number; totalLimit: number; skippedTurns: number } | null
+  pendingRefine: (RefineState & { skippedTurns: number }) | null
   setPendingRefine: React.Dispatch<
-    React.SetStateAction<{ usagePercent: number; totalLimit: number; skippedTurns: number } | null>
+    React.SetStateAction<(RefineState & { skippedTurns: number }) | null>
   >
   setDismissThinking: (v: boolean) => void
   setExecutionCounter: React.Dispatch<React.SetStateAction<number>>
   setModelName: (v: string) => void
+  /** 当前模型名：仅用于识别"模型真的切换了"，不触发渲染 */
+  modelName?: string
+  /** 作废 refine 提示时一并清掉大窗口强制线的本地草稿 */
+  setForceDraftForRefine?: (v: number | null) => void
   setSessionId: (v: string) => void
   setStepIndex: (v: number | ((prev: number) => number)) => void
   setSecurity: React.Dispatch<React.SetStateAction<SecurityCheck | null>>
@@ -174,6 +184,10 @@ export function useEvents(h: EventHandlers) {
   userInputRequestRef.current = h.userInputRequest
   const pendingRefineRef = useRef(h.pendingRefine)
   pendingRefineRef.current = h.pendingRefine
+  // 当前模型名：模型切换时要靠它判断"真的换了"，才能作废基于旧窗口的
+  // refine 提示（见 session_info case）
+  const modelNameRef = useRef(h.modelName ?? '')
+  modelNameRef.current = h.modelName ?? ''
   const refineActiveRef = useRef(false)
   const refineOutputRef = useRef('')
   const refineStartTimeRef = useRef(0)
@@ -374,6 +388,20 @@ export function useEvents(h: EventHandlers) {
 
       const sid = () => h.refs.streamingMsgId.current || h.refs.lastStreamingMsgId.current
 
+      // ── 本轮元数据同步到流式气泡 ──
+      // turnMeta 是唯一数据源，但消息气泡读的是 `msg.meta`。若只在 execution_completed
+      // 一次性落定，执行中的 token / 步数在气泡上不可见（ctx 弹窗有实时通道、气泡没有）。
+      // 故每次 turnMeta 增量都把**同一字段**合并进当前流式消息的 meta：
+      // 执行中实时可见、完成后被 completedMeta 权威覆盖、刷新后由 HistoryMessage.meta 恢复。
+      // 只合并不覆盖：保留尚未下发的字段（如 startedAtMs 由 execution_started 单独写入）。
+      const syncDraftMeta = (patch: TurnMeta) => {
+        const s = h.refs.streamingMsgId.current
+        if (!s) return
+        h.setMessages(prev =>
+          prev.map(m => (m.id === s ? { ...m, meta: { ...(m.meta ?? {}), ...patch } } : m)),
+        )
+      }
+
       // ── Shared helpers (extracted duplicated patterns) ──
       const addSystemMsg = (content: string) =>
         h.addMessage({
@@ -438,10 +466,25 @@ export function useEvents(h: EventHandlers) {
           h.setMood(isInterrupted ? 'idle' : 'error')
           break
         }
-        case 'session_info':
+        case 'session_info': {
+          // 模型切换 → 上下文窗口变了，待确认的 refine 提示全部作废。
+          // usagePercent 是按旧窗口算的，tier/阈值也基于旧档位；留着会让用户
+          // 拿过期数据做决定（例如在 1M 模型的提示里拖滑杆，而当前已是 128K
+          // 模型——那个滑杆对 small 档毫无作用）。清除比保留更诚实。
+          const modelChanged = event.model && event.model !== modelNameRef.current
+          if (modelChanged && (refineStateRef.current || pendingRefineRef.current)) {
+            h.setRefineState(null)
+            h.setPendingRefine(null)
+            h.setForceDraftForRefine?.(null)
+            addSystemMsg('模型已切换，上下文提示已按新的上下文窗口重新计算。')
+          }
           h.setModelName(event.model)
-          if (event.session_id) h.setSessionId(event.session_id)
+          // ⚠️ SessionInfo.session_id 是**每轮随机生成的事件关联 id**（后端
+          // uuid::new_v4()），不是会话 id——会话 id 的唯一权威来源是
+          // execution_started.session_id（见该 case 的写入）。曾经在此处
+          // 消费它导致点评等消费关联到假会话（2026-10 纠正，勿再加回）。
           break
+        }
         case 'understanding_complete':
           if (event.needs_clarification && event.critiques?.length > 0) {
             addSystemMsg(`我需要了解更多信息：${event.critiques[0]}`)
@@ -509,6 +552,11 @@ export function useEvents(h: EventHandlers) {
             event.session_id && event.turn_id
               ? { session_id: event.session_id, turn_id: event.turn_id }
               : null
+          // 真实会话 id 的唯一权威来源：execution_started.session_id（后端
+          // rt.session().id）——点评提交（useAgentControl submitExecutionRating）
+          // 等消费方据此关联后端会话记录。SessionInfo.session_id 是每轮随机
+          // 事件关联 id、**不是会话 id**（曾误消费，点评关联到假会话，2026-10 纠）。
+          if (event.session_id) h.setSessionId(event.session_id)
           progressIdsRef.current.clear()
           // Refine mode: set execution state but don't create a message bubble
           // Keep refineState intact — the modal should stay open until SessionRefined
@@ -526,6 +574,11 @@ export function useEvents(h: EventHandlers) {
             h.setCompleted(false)
             h.setTotalDurationMs(0)
             h.setTotalCalls(0)
+            // 本轮元数据重置为「后端权威起点」——刷新后此值仍指向真实起点，
+            // 前端据此推算耗时不会归零。token/步数随后续事件累加。
+            h.refs.turnMetaTokensRef.current = {}
+            h.setTurnMeta(event.started_at_ms != null ? { startedAtMs: event.started_at_ms } : null)
+            h.setLiveTurnToolCalls(0)
             h.setExecTokenUsage(null)
             h.setExecPhase('understanding')
             h.refs.lastStreamingMsgId.current = null
@@ -549,6 +602,10 @@ export function useEvents(h: EventHandlers) {
           h.setCompleted(false)
           h.setTotalDurationMs(0)
           h.setTotalCalls(0)
+          // 本轮元数据重置为「后端权威起点」（同 refine 分支），token/步数随后续事件累加
+          h.refs.turnMetaTokensRef.current = {}
+          h.setTurnMeta(event.started_at_ms != null ? { startedAtMs: event.started_at_ms } : null)
+          h.setLiveTurnToolCalls(0)
           h.setExecTokenUsage(null)
           h.setExecPhase('understanding')
           h.refs.executionActiveRef.current = true
@@ -564,6 +621,9 @@ export function useEvents(h: EventHandlers) {
             runtime: 'live',
             timestamp: Date.now(),
           })
+          // 起点立刻落到气泡：执行中即可用 `Date.now() - startedAtMs` 推算耗时，
+          // 刷新后（durationMs 缺失）也能从 msg.meta.startedAtMs 恢复推算
+          if (event.started_at_ms != null) syncDraftMeta({ startedAtMs: event.started_at_ms })
           // Sync current mode（mode_changed 已权威驱动过 mode 时不覆盖，防迟到旧执行事件打回旧值）
           if (event.mode && h.setMode && !lastModeChangedRef.current) {
             h.setMode(event.mode)
@@ -586,7 +646,8 @@ export function useEvents(h: EventHandlers) {
           // 暂停菜单打开期间收到工具调用 = agent 已越过暂停检查点恢复执行（如手机端追加），
           // 自动关闭桌面暂停菜单，避免弹窗残留
           h.setPauseState(null)
-          h.refs.toolCallCountRef.current++
+          // 步数**不在这里累加**：后端已在 emit ToolCallStart 时累加进 SignalState，
+          // 并经 get_execution_state 快照下发。前端自己数会在刷新 / 丢事件后与实际不符。
           h.setExecPhase('executing')
           h.setTimeline((prev: TimelineEntry[]) => [
             ...prev,
@@ -828,10 +889,37 @@ export function useEvents(h: EventHandlers) {
             max: event.max_iterations,
             calls: event.tool_calls_so_far,
           })
+          // 同步本轮元数据的「步数」维度：迭代轮次 + 工具调用累计。
+          // 只更新对应字段，保留 started_at_ms 起点与其它已累加的 token 值。
+          h.setTurnMeta(prev => ({
+            ...(prev ?? {}),
+            iterations: event.iteration,
+            toolCalls: event.tool_calls_so_far,
+          }))
+          // 同值落到流式气泡：气泡的「步数」chip 读 msg.meta.toolCalls
+          syncDraftMeta({ iterations: event.iteration, toolCalls: event.tool_calls_so_far })
+          h.setLiveTurnToolCalls(event.tool_calls_so_far)
           break
         case 'execution_completed': {
           const finalMsg = event.output?.result_message || ''
           const s = sid()
+          // ── 本轮元数据：以后端权威值落定 ──
+          // meta / durationMs / total_calls 全部来自后端（execution_completed 事件），
+          // 前端**不参与计算、不补任何本地值**——步数与耗时都由后端单一来源给出。
+          // 执行中已累加的字段（token / startedAtMs）沿用 prev，不用 undefined 冲掉。
+          const completedMeta: TurnMeta = {
+            ...(event.meta ?? {}),
+            durationMs: event.meta?.durationMs ?? event.total_duration_ms,
+            toolCalls: event.meta?.toolCalls ?? event.total_calls ?? undefined,
+          }
+          // 与执行中已累积的元数据合并：缺失字段沿用 prev，不用 undefined 冲掉已有值
+          h.setTurnMeta(prev => ({
+            ...prev,
+            ...completedMeta,
+            startedAtMs: completedMeta.startedAtMs ?? prev?.startedAtMs,
+            durationMs: completedMeta.durationMs ?? prev?.durationMs,
+            toolCalls: completedMeta.toolCalls || prev?.toolCalls,
+          }))
           // Refine 模式：execution_completed 的 result_message 是后端 resume 内部
           // 生成的提炼摘要（已经 llm_text_delta → refine 气泡路由显示，且 session_refined
           // 会用 event.summary 最终更新 refine 气泡）。此时 sid() 仍指向 refine 前最后一条
@@ -850,20 +938,17 @@ export function useEvents(h: EventHandlers) {
                       ...m,
                       content: finalMsg.trim() ? finalMsg : m.content || content,
                       runtime: 'done',
+                      // 完成元数据落到该轮 assistant 气泡：历史消息重开（applyHistory
+                      // 由后端 HistoryMessage.meta 回填）与实时路径共用同一字段，
+                      // 消息底部 <TurnMetaBar> 读它，无需另建一处计时。
+                      meta: completedMeta,
                     }
                   : m,
               ),
             )
           }
-          if (
-            event.output?.tool_calls_count &&
-            h.refs.toolCallCountRef.current < event.output.tool_calls_count
-          ) {
-            console.warn(
-              `[EVENT] Tool call count mismatch: expected ${event.output.tool_calls_count}, got ${h.refs.toolCallCountRef.current} (lost ${event.output.tool_calls_count - h.refs.toolCallCountRef.current})`,
-            )
-          }
-          h.refs.toolCallCountRef.current = 0
+          // 步数一致性由后端单一来源保证（SignalState 累加 + execution_completed 下发），
+          // 前端不参与计数，故不再需要「本地计数 vs 后端计数」的 mismatch 比对。
           h.setCompleted(true)
           // 完成任务瞬间补拉一次（非执行态唯一的自动下拉）：成果落地即下拉展示——
           // 用户上翻+空闲不会被拉，两样和睦共处。refine 内部子执行不产 chat 气泡，
@@ -1029,13 +1114,50 @@ export function useEvents(h: EventHandlers) {
             // 会把 Profile/Workflow 的会话规模也塞进 exec 槽，污染 ctx 弹窗那套整组指标。
             if (event.source === 'main') update(h.setMainTokenUsage)
             else if (event.source === 'exec') update(h.setExecTokenUsage)
+            // 本轮元数据的 token 维度：**只累加执行中（本轮活跃）的事件**。
+            // token_usage 是「每次 LLM 调用后」的用量，同轮多次调用逐条到达，累加即为
+            // 本轮总量（与后端 TurnMeta::add_usage 语义一致）。空闲态残留事件不计入，
+            // 不污染下一轮的起点与总量。
+            // 且只累加**单次调用用量**源（exec = 主轮/子任务单次消耗，workflow = 工作流
+            // 单次消耗）：main 源是「主上下文占用」快照（input=会话规模、cache=哨兵
+            // 0xffffffff、tps/ttft=None），把它一并累加会把上下文规模翻倍计进本轮
+            // token、把 4294967295（0xffffffff 哨兵）计进 cacheHit，并用 undefined
+            // 覆盖掉 exec 刚写进的 tps/ttft —— 三者都让 turnMeta 的读数变成废数。
+            const is_per_call_usage = event.source === 'exec' || event.source === 'workflow'
+            if (h.refs.executionActiveRef.current && is_per_call_usage) {
+              // 累加后的绝对值一并同步给流式气泡：气泡读 msg.meta，拿不到 turnMeta 的闭包值，
+              // 必须在同一次 setState 里算出结果再分发（两处各自累加会因批处理读到同一 prev）。
+              const nextTokens: TurnMeta = {
+                inputTokens:
+                  (h.refs.turnMetaTokensRef.current.inputTokens ?? 0) + event.input_tokens,
+                outputTokens:
+                  (h.refs.turnMetaTokensRef.current.outputTokens ?? 0) + event.output_tokens,
+                cacheHitTokens:
+                  (h.refs.turnMetaTokensRef.current.cacheHitTokens ?? 0) + event.cache_hit_tokens,
+                genTps: event.gen_tps,
+                ttftMs: event.ttft_ms,
+              }
+              h.refs.turnMetaTokensRef.current = nextTokens
+              h.setTurnMeta(prev => ({ ...(prev ?? {}), ...nextTokens }))
+              syncDraftMeta(nextTokens)
+            }
           })()
           break
-        case 'refine_prompt':
+        case 'refine_prompt': {
           // context_window 优先（新后端），refine_limit 兜底（旧后端兼容）
           const win = event.context_window || event.refine_limit || 0
           const pct =
             event.current_tokens && win ? Math.round((event.current_tokens / win) * 100) : 0
+          // 分档与强制线由后端下发：档位决定 UI 形态（仅 large 给 slider），
+          // 阈值范围以后端 LARGE_FORCE_MIN/MAX 为唯一权威，前端不硬编码。
+          const tier = (event.tier || 'medium') as RefineTier
+          // force_threshold 由后端下发（2026-10 修复：此前后端未发该字段，
+          // fallback 0.8 导致弹窗恒显 80%）；0.5 = 后端 LARGE_FORCE_DEFAULT，
+          // 仅旧后端（无 tier/force_* 字段的远古版本）兼容路径。
+          const forceThreshold =
+            typeof event.force_threshold === 'number' ? event.force_threshold : 0.5
+          const forceMin = typeof event.force_min === 'number' ? event.force_min : 0.5
+          const forceMax = typeof event.force_max === 'number' ? event.force_max : 0.8
 
           // forced=true → 强制提炼，清空 pendingRefine
           if (event.forced) {
@@ -1065,7 +1187,16 @@ export function useEvents(h: EventHandlers) {
               },
             ])
             h.setExecutionStage('running')
-            h.setRefineState({ usagePercent: 0, totalLimit: 0 })
+            // 清零用水位占位：forced 路径直接执行、不展示询问态，
+            // tier/阈值字段随便填即可（UI 不会读它）
+            h.setRefineState({
+              usagePercent: 0,
+              totalLimit: 0,
+              tier,
+              forceThreshold,
+              forceMin,
+              forceMax,
+            })
             import('../main-window/lib/api').then(({ executeSessionRefine }) => {
               // forced 自动提炼是「主流程自己广播、前端代跑」的机器触发路径：
               // maybe_refine_session 在轮次收尾期（busy 仍被主流程持有）才发
@@ -1108,32 +1239,41 @@ export function useEvents(h: EventHandlers) {
 
           // 如果已经有 pendingRefine（用户已跳过弹窗）→ 只更新数据，不弹窗
           if (pendingRefineRef.current) {
-            h.setPendingRefine(prev =>
-              prev
-                ? {
-                    ...prev,
-                    usagePercent: pct,
-                    skippedTurns: prev.skippedTurns + 1,
-                  }
-                : null,
-            )
+            const pending = pendingRefineRef.current
+            const nextPending = {
+              ...pending,
+              usagePercent: pct,
+              skippedTurns: pending.skippedTurns + 1,
+            }
+            h.setPendingRefine(cur => (cur ? nextPending : null))
+            // usagePercent 把滑块下限顶高、而后端 forceThreshold 还停在旧值时
+            // 自动抬配置：滑块显示 / 后端配置 / 实际行为三者一致（静默自愈）
+            void autoRaiseForceThreshold(nextPending)
             break
           }
 
-          // 正常弹窗（现有逻辑）
-          h.setRefineState({ usagePercent: pct, totalLimit: win })
+          // 正常弹窗（现有逻辑）；tier / 阈值一并带上，供弹窗决定是否给 slider
+          const nextRefineState: RefineState = {
+            usagePercent: pct,
+            totalLimit: win,
+            tier,
+            forceThreshold,
+            forceMin,
+            forceMax,
+          }
+          h.setRefineState(nextRefineState)
+          // 同上：低于当前滑块下限的旧 active 配置在此 reconcile 抬升
+          void autoRaiseForceThreshold(nextRefineState)
           break
+        }
         case 'refine_skipped':
           // 另一端（手机/桌面）跳过了提炼：本端同步关闭弹窗 + 记录跳过（防重复弹窗）。
           // 提炼已开始则跳过无效（refine 正在执行中）。
           if (refineActiveRef.current) break
           h.setRefining(false)
           if (refineStateRef.current) {
-            h.setPendingRefine({
-              usagePercent: refineStateRef.current.usagePercent,
-              totalLimit: refineStateRef.current.totalLimit,
-              skippedTurns: 0,
-            })
+            // 整份带走（含 tier 与强制线）：跨端同步同样要保留调节能力
+            h.setPendingRefine({ ...refineStateRef.current, skippedTurns: 0 })
           }
           h.setRefineState(null)
           break
@@ -1197,7 +1337,28 @@ export function useEvents(h: EventHandlers) {
                   : m,
               ),
             )
+          } else {
+            // H2 兜底：95s 超时 guard 已删过流式气泡（refineMsgIdRef 清空）——
+            // 但后端提炼可能还在跑（本地端点预算 max(配置,900s)+60s，远大于 95s），
+            // SessionRefined 到达时**补一条**已完成摘要气泡。不猜时间阈值：
+            // 「后台成功、前台无感」比任何 guard 数字之争都更该消除。
+            h.setMessages((prev: ChatMessage[]) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: 'refine' as const,
+                content: event.summary,
+                timestamp: Date.now(),
+                messageCount: event.message_count,
+                sessionId: event.session_id,
+                refineStatus: 'completed' as const,
+              },
+            ])
           }
+          // 提炼后会话已压缩：主指示器的旧快照（提炼前用量）作废，置 null 走
+          // 「--」未知态——下一轮 TokenUsage 官方读数到达前不显示过期百分比
+          // （与换会话时的处置一致，避免「已提炼仍显示 75%」）。
+          h.setMainTokenUsage(null)
           break
         case 'refine_failed': {
           // 提炼失败（LLM key 失效/连不上/超时/空摘要）：与 refine_executing 配对的
@@ -1229,7 +1390,6 @@ export function useEvents(h: EventHandlers) {
     h.refs.lastStreamingMsgId,
     h.refs.executionActiveRef,
     h.refs.processingRef,
-    h.refs.toolCallCountRef,
     h.addMessage,
     resetRefineUI,
   ])

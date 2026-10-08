@@ -185,7 +185,11 @@ export default function App() {
     return () => document.removeEventListener('click', onClick, true)
   }, [])
 
-  const { dismissRefine } = useEvents(s)
+  const { dismissRefine } = useEvents({
+    ...s,
+    modelName: s.modelName,
+    setForceDraftForRefine: s.setForceDraft,
+  })
   /**
    * 当前激活的自定义主题（null = 系统预设态）。启动恢复皮肤背景时要用它的 skin
    * 快照 —— 只读 LS_SKIN 是不够的，见下方 effect 注释。
@@ -514,6 +518,7 @@ export default function App() {
               execTokenUsage={s.execTokenUsage}
               totalDurationMs={s.totalDurationMs}
               totalCalls={s.liveCalls}
+              turnMeta={s.turnMeta}
               contextLimit={s.contextLimit}
               apiHealth={s.apiHealth}
               onModelChanged={s.refreshModelInfo}
@@ -530,6 +535,8 @@ export default function App() {
               refineState={s.refineState}
               pendingRefine={s.pendingRefine}
               setPendingRefine={s.setPendingRefine}
+              forceDraft={s.forceDraft}
+              setForceDraft={s.setForceDraft}
               onRefine={s.handleRefine}
               onSkipRefine={s.handleSkipRefine}
               refining={s.refining}
@@ -624,6 +631,7 @@ export default function App() {
               dismissed={s.dismissThinking}
               phase={s.execPhase}
               timeline={s.timeline}
+              toolCallCount={s.turnMeta?.toolCalls}
               mood={s.mood}
               progress={s.progress}
               onExpand={() => s.setShowExecTrace(true)}
@@ -643,6 +651,8 @@ export default function App() {
             goal={s.goal}
             totalDurationMs={s.totalDurationMs}
             totalCalls={s.totalCalls}
+            liveCalls={s.liveCalls}
+            turnMeta={s.turnMeta}
             visible={s.showExecTrace}
             onClose={() => {
               s.setExecTraceOverride(null)

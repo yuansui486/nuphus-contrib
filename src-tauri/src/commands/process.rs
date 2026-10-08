@@ -372,14 +372,14 @@ pub async fn submit_user_message<R: tauri::Runtime>(
     cancel_flag.store(false, Ordering::SeqCst);
     state.pause_flag.store(false, Ordering::SeqCst);
 
-    let refine_threshold = state
+    let large_force_refine_threshold = state
         .runtime
         .lock()
         .map_err(|e| {
             state.busy.store(false, Ordering::SeqCst);
             e.to_string()
         })?
-        .refine_threshold;
+        .large_force_refine_threshold;
 
     // ── ClientFactory：实时源（providers.toml 是唯一权威源）──
     // 每次构建客户端时按当前配置解析：Leader/Workflow/Exec/Custom 各 agent 可独立模型，
@@ -623,7 +623,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
     let relation2 = relation.clone();
     let mode2 = mode.clone();
     let _backup_session2 = backup_session.clone();
-    let refine_threshold2 = refine_threshold;
+    let large_force_refine_threshold2 = large_force_refine_threshold;
     let existing_workflow_agent2 = existing_workflow_agent;
     let is_workflow2 = is_workflow;
     let source2 = source.clone();
@@ -841,7 +841,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                     user_label.clone(),
                     assistant_name.clone(),
                     perms,
-                    refine_threshold2,
+                    large_force_refine_threshold2,
                 );
                 new_wa.set_workflow_engine(state.workflow_engine.clone());
                 let new_session_id = new_wa.session().id.clone();
@@ -937,7 +937,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 &emitter,
                 existing_agent,
                 session_backup_json,
-                refine_threshold2,
+                large_force_refine_threshold2,
                 mode_parsed,
                 state.workflow_engine.clone(),
                 false,
@@ -989,7 +989,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                                         state.tool_permissions_ref.clone(),
                                         &emitter,
                                         &pause_flag2,
-                                        refine_threshold2,
+                                        large_force_refine_threshold2,
                                     )
                                 {
                                     tracing::info!(
@@ -1053,7 +1053,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                                 &emitter,
                                 None,
                                 session_backup_json_retry.clone(),
-                                refine_threshold2,
+                                large_force_refine_threshold2,
                                 m2,
                                 state.workflow_engine.clone(),
                                 false,
@@ -1174,9 +1174,16 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 guard.workflow_agent.take()
             };
             if let Some(ref mut wa) = wa_opt {
+                // 同 Leader 分支：官方口径占用优先，无官方读数（提炼后）才退回字符估算
+                let occupancy = wa.session().context_occupancy();
+                let session_usage = if occupancy > 0 {
+                    occupancy
+                } else {
+                    wa.session().estimate_token_usage() as u64
+                } as u32;
                 emitter.emit(NuphusEvent::TokenUsage {
                     source: "workflow".to_string(),
-                    input_tokens: wa.session().estimate_token_usage() as u32,
+                    input_tokens: session_usage,
                     output_tokens: 0,
                     cache_hit_tokens: u32::MAX,
                     gen_tps: None,
@@ -1186,11 +1193,21 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 // 名会拿到别的段（或 builtin 无此模型 → 128K 猜测）。
                 // workflow 分支必须用 workflow_binding：leader_config 是当前 mode 的
                 // 活动模型，workflow 绑定与它可能不同（同 id 跨 provider 段）。
-                let cw = nuphus::agent::goal_types::get_context_window_for(
+                // 同 Leader 分支：无 fallback 查询 + 明确的兜底告警（见下方注释）
+                let cw = nuphus::agent::goal_types::try_get_context_window_for(
                     &workflow_binding.1,
                     Some(workflow_binding.0.as_str()),
-                );
-                wa.maybe_refine_session(cw, refine_threshold2, Some(&emitter))
+                )
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "[REFINE] workflow 模型 {}/{} 无 context_window 元数据，回落到 128K 兜底。\
+                         如需准确分档，请在模型设置中手动指定上下文窗口。",
+                        workflow_binding.0,
+                        workflow_binding.1
+                    );
+                    128_000
+                });
+                wa.maybe_refine_session(cw, large_force_refine_threshold2, Some(&emitter))
                     .await;
                 let mut guard = state.runtime.lock().unwrap_or_else(|e| e.into_inner());
                 guard.workflow_agent = wa_opt.take();
@@ -1202,12 +1219,22 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 guard.leader_agent.take()
             };
             if let Some(ref mut rt) = runtime_opt {
-                let session_usage = rt.session().estimate_token_usage() as u32;
-                // source="main"：这是**主会话上下文**的真实规模（estimate_token_usage 量的就是
-                // 当前会话），归 main 槽。此前写 "leader" 会按前端「非 main 即 exec」的兜底
-                // 落进 exec 槽——那个槽专供 exec 执行（dispatch/子任务），由 ctx 弹窗整组消费，
-                // 混入 Leader 的会话规模会让弹窗与主指示器互相污染。Leader 回合本就属于主会话，
-                // 与 exec 执行不是一类东西。
+                // 轮次结束的 ctx 占用 = **官方口径**：最后一次 API 调用的 input + output
+                // （末轮无工具调用，最后追加的内容正是那一次产出）→ 即下一次请求的
+                // 提示词规模。三个数全来自 usage，无字符估算。
+                // 仅当尚无官方读数（新会话 / 提炼后清零）才退回字符估算——
+                // 那时会话内容确实只在本地手里，估算比显示 "--" 有用。
+                let occupancy = rt.session().context_occupancy();
+                let session_usage = if occupancy > 0 {
+                    occupancy
+                } else {
+                    rt.session().estimate_token_usage() as u64
+                } as u32;
+                // source="main"：这是**主会话上下文**的真实规模，归 main 槽。此前写
+                // "leader" 会按前端「非 main 即 exec」的兜底落进 exec 槽——那个槽专供
+                // exec 执行（dispatch/子任务），由 ctx 弹窗整组消费，混入 Leader 的会话
+                // 规模会让弹窗与主指示器互相污染。Leader 回合本就属于主会话，与 exec
+                // 执行不是一类东西。
                 emitter.emit(NuphusEvent::TokenUsage {
                     source: "main".to_string(),
                     input_tokens: session_usage,
@@ -1217,12 +1244,26 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                     ttft_ms: None,
                 });
 
-                let cw = nuphus::agent::goal_types::get_context_window_for(
+                // 窗口必须走**无 fallback** 查询：猜一个 128K 会让未知窗口的模型
+                // 静默落进 small 档（无提示、75% 静默提炼），用户看不到 slider 也无从
+                // 知晓阈值依据是什么。custom 段模型靠 providers.toml 的手动设置入口
+                // （set_model_context_window）显式声明；128K 只是这条路也走不通时的
+                // 最后兜底，且必须留下可观测痕迹，不能无声无息。
+                let cw = nuphus::agent::goal_types::try_get_context_window_for(
                     &rt.config().model,
                     Some(rt.config().provider.as_str()),
-                );
-                let refine_threshold = rt.config().refine_threshold;
-                rt.maybe_refine_session(&cancel_flag2, cw, refine_threshold)
+                )
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "[REFINE] 模型 {}/{} 无 context_window 元数据，回落到 128K 兜底。\
+                         如需准确分档，请在模型设置中手动指定上下文窗口。",
+                        rt.config().provider,
+                        rt.config().model
+                    );
+                    128_000
+                });
+                let large_force_refine_threshold = rt.config().large_force_refine_threshold;
+                rt.maybe_refine_session(&cancel_flag2, cw, large_force_refine_threshold)
                     .await;
 
                 {
@@ -1240,12 +1281,19 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 .as_ref()
                 .map(|r| r.model.clone())
                 .unwrap_or_default();
+            // provider 取权威成对绑定（resolve_main_binding），不查 [last_model]
+            // 影子表（二元组化 P2-a）——与 runtime build 的 vision 判定同源。
+            let main_provider = registry
+                .as_ref()
+                .and_then(|r| r.resolve_main_binding().ok())
+                .map(|(provider, _)| provider)
+                .unwrap_or_default();
             let main_supports_vision = registry
                 .as_ref()
                 .map(|r| {
                     nuphus::config::resolve_capability(
                         r,
-                        r.last_model_provider_hint().as_deref(),
+                        Some(main_provider.as_str()),
                         &main_model,
                         |m| m.supports_vision,
                         false,

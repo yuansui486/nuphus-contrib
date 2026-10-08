@@ -55,8 +55,15 @@ jobs:
           else
             git switch -c "$sync_branch"
             if ! git merge --no-ff --no-edit --signoff -m "chore: 同步上游主分支 ${upstream_sha:0:12}" "$upstream_sha"; then
-              echo 'Merge conflict: product branch unchanged. Resolve the conflict on a contribution branch; no automatic conflict resolution is attempted.' >> "$GITHUB_STEP_SUMMARY"
-              git diff --name-only --diff-filter=U >> "$GITHUB_STEP_SUMMARY"
+              echo '::error title=灵雀上游同步冲突::合并尚未完成，未进入编译；产品分支未改变。需人工解决冲突后重新验证，重复重跑不会自动解决。'
+              {
+                echo '### 需要人工解决合并冲突'
+                echo '产品分支未改变，尚未进入编译。禁止自动选择 ours/theirs 或跳过验证。'
+                echo '冲突文件：'
+                git diff --name-only --diff-filter=U
+                echo "修复方式：从产品基线 $base_sha 创建 $sync_branch，合并上游 $upstream_sha，解决冲突后推送候选分支。"
+                echo '重新运行同步会复用该候选并核对两个祖先提交，随后执行完整 CI；全部成功且产品基线未改变才推进。'
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
             git push origin "HEAD:refs/heads/$sync_branch"

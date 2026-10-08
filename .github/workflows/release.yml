@@ -110,8 +110,19 @@ jobs:
           df -h / | tail -1
           cd target/release/bundle/macos
           # 手动 hdiutil create -srcfolder：一步创建，无需 attach/detach/AppleScript，
-          # 是 dmg 打包最简可靠方式；GitHub Actions 直接显示 stderr 便于诊断
-          hdiutil create -volname "Nuphus" -srcfolder Nuphus.app -ov -format UDZO ../../../../nuphus-osx-arm64-${{ env.VER }}.dmg
+          # 是 dmg 打包最简可靠方式；GitHub Actions 直接显示 stderr 便于诊断。
+          # 重试 3 次：v0.2.26 首跑撞见 `hdiutil: create failed - Resource busy`
+          # （深签名刚落盘、Spotlight/文件系统仍在扫新 .app，一次性竞态；磁盘余量充足，
+          # 非空间问题）。sleep 5s 后重试即过——环境竞态，靠重试兜底，不改变产物。
+          for attempt in 1 2 3; do
+            if hdiutil create -volname "Nuphus" -srcfolder Nuphus.app -ov -format UDZO ../../../../nuphus-osx-arm64-${{ env.VER }}.dmg; then
+              echo "dmg created on attempt $attempt"
+              break
+            fi
+            echo "hdiutil attempt $attempt failed, retrying in 5s"
+            sleep 5
+          done
+          test -f ../../../../nuphus-osx-arm64-${{ env.VER }}.dmg
           ls -lh ../../../../nuphus-osx-arm64-${{ env.VER }}.dmg
 
       - name: Package portable (Linux)
@@ -223,8 +234,8 @@ jobs:
           VER="${GITHUB_REF_NAME#v}"
           BASE="https://github.com/mrpulor-gh/nuphus/releases/download/${GITHUB_REF_NAME}"
           # 资产下载域名单独拆出 ASSET_BASE：国内用户直连 GitHub 资产实测不通（TLS 被重置）
-          # 或仅 ~19 KB/s，走 gh-proxy 镜像 ~6.4 MB/s（2026-09-28 实测，清单见 plugin/skills
-          # /community/git-pr-protocol/SKILL.md §7.2）。上面的 BASE 只用于取 .sig 权威签名，
+          # 或仅 ~19 KB/s，走 gh-proxy 镜像 ~6.4 MB/s（2026-09-28 实测，镜像清单 gh-proxy.com
+          # 可用、ghproxy.com/gh.llkk.cc/ghproxy.net/hub.gitmirror.com 均失败勿用）。上面的 BASE 只用于取 .sig 权威签名，
           # minisign 按内容验签，镜像改了文件也过不了——换的是传输通道，不是可信根。
           ASSET_BASE="https://gh-proxy.com/${BASE}"
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)

@@ -132,6 +132,23 @@ const COMPOSITOR_SETTLE_MS: u64 = 150;
 /// mode parameter is injected into overlay frontend via window.__setOverlayMode__().
 #[tauri::command]
 pub async fn start_overlay_mask(app: AppHandle, mode: Option<String>) -> Result<(), String> {
+    // ── Windows + 全部 5 个工具模式：走原生遮罩新链路 ──
+    //    截图 / 选区 / 取色 / 鼠标坐标 / 游戏字典(OCR) 共用同一套原生遮罩
+    //    （冻结帧 + hover 框选 + 8 节点 + OK/X；取色与鼠标坐标走单点拾取模式）。
+    //    非 Windows 平台保持原 WebView 链路不动。
+    #[cfg(windows)]
+    {
+        let m = mode.as_deref().unwrap_or("screenshot");
+        // 5 个工具模式全部走原生遮罩（截图 / 选区 / 取色 / 鼠标 / 游戏字典-OCR）：
+        // 同一套冻结帧与交互，统一排除自身主窗、统一退出语义。
+        if matches!(
+            m,
+            "screenshot" | "picker" | "color_picker" | "mouse_pos" | "ocr"
+        ) {
+            return start_native_capture(app, m.to_string()).await;
+        }
+    }
+
     // 0. Hide main window first so screenshot is clean (no self-capture).
     //    xcap 走 DXGI 桌面采集，hide() 后立刻截图会拿到隐藏前的旧帧 →
     //    冻结背景里会带上主窗口。先轮询确认 OS 层已隐藏，再等桌面合成刷新帧。
@@ -301,9 +318,9 @@ pub async fn overlay_magnifier_region(x: i32, y: i32, size: u32) -> Result<Strin
 /// * mode = "screenshot" (default) / "ocr" / "picker": crop from PRE_SCREENSHOT 冻结帧
 ///   （全部模式统一走冻结帧裁剪：产物必须与用户眼里那张图一致）
 /// * mode = "ocr" / "picker": crop directly from PRE_SCREENSHOT (clean, no overlay mask interference)
-/// * mode = "rec_region" / "rec_template": crop directly from PRE_SCREENSHOT（录制铁律：ROI 证据与
-///   find_image 模板一律走预截图裁剪，禁止 live capture——透明竞态根因），PNG 保存到当前录制会话
-///   screenshots 目录（rec.rs 会话 state 注入），返回结构不变。
+/// * mode = "rec_region" / "rec_template": crop directly from PRE_SCREENSHOT（ROI 证据与
+///   find_image 模板一律走预截图裁剪，禁止 live capture——透明竞态根因），PNG 保存到全局
+///   截图目录（与 "capture" 模式同源），返回结构不变。
 /// Overlay is closed by overlay_capture_done (confirm) or overlay_capture_cancel (cancel).
 #[tauri::command]
 pub async fn overlay_capture_confirm(
@@ -316,8 +333,8 @@ pub async fn overlay_capture_confirm(
 ) -> Result<serde_json::Value, String> {
     use base64::Engine;
 
-    // 录制框选（ROI 证据 / find_image 模板）：仅保存目录/文件名前缀按 mode 区分，
-    // 其余行为与其它模式完全一致（都走同一份冻结帧裁剪）。
+    // ROI 证据 / find_image 模板框选：仅文件名前缀按 mode 区分，
+    // 其余行为与其它模式完全一致（同一份冻结帧裁剪 + 同一全局截图目录）。
     let rec_prefix = match mode.as_deref() {
         Some("rec_region") => Some("rec_region"),
         Some("rec_template") => Some("rec_template"),
@@ -353,18 +370,13 @@ pub async fn overlay_capture_confirm(
             .ok_or_else(|| "创建裁剪图像失败".to_string())?,
     );
 
-    // Save as PNG —— 录制模式保存到当前录制会话截图目录（会话未初始化则报错）
-    let (save_dir, file_prefix) = if let Some(prefix) = rec_prefix {
-        (
-            crate::commands::rec::rec_active_screenshots_dir()?,
-            prefix.to_string(),
-        )
-    } else {
-        (
-            nuphus::desktop::captures_dir_path().map_err(|e| format!("获取截图目录失败: {e}"))?,
-            "capture".to_string(),
-        )
-    };
+    // Save as PNG —— 所有模式统一保存到全局截图目录（NUPHUS_CAPTURES_DIR > temp/nuphus/captures）。
+    // rec_region / rec_template（ROI 证据 / find_image 模板）旧实现借道录制会话截图目录
+    // （随录制链路删除），现义为「带前缀的同目录裁剪产物」，与普通截图同目录同生命周期；
+    // 目录获取/创建失败仍返回明确错误。
+    let file_prefix = rec_prefix.unwrap_or("capture");
+    let save_dir =
+        nuphus::desktop::captures_dir_path().map_err(|e| format!("获取截图目录失败: {e}"))?;
     std::fs::create_dir_all(&save_dir).map_err(|e| format!("创建截图目录失败: {e}"))?;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
     let save_path = save_dir.join(format!("{file_prefix}_{ts}.png"));
@@ -505,6 +517,117 @@ pub async fn overlay_capture_cancel(app: AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 【Windows 原生遮罩链路】5 个工具模式共用实现：
+/// `screenshot` / `picker` / `color_picker` / `mouse_pos` / `ocr`。
+///
+/// 与旧 WebView 链路的区别：
+///   · 遮罩 = Win32 分层窗口（像素精确、无 WebView 渲染竞态 → 无残影/无位移）
+///   · 等待 = DwmFlush 合成器同步（非 sleep）
+///   · 结果 = 直接写 `CAPTURE_RESULT`（前端轮询 `take_capture_result` 的消费方式不变）
+///
+/// 交付物按模式分流（坐标一律是夹紧后的屏幕物理像素，与截图落盘口径一致）：
+///   · screenshot      → 冻结帧裁切 + 落盘：`path` + `region`
+///   · ocr             → 同 screenshot（OCR 由调用方拿 path 自己跑）
+///   · picker（选区）  → 只回坐标：`region`
+///   · color_picker    → 该点颜色：`color_rgb` + `hex`（单点拾取模式）
+///   · mouse_pos（鼠标）→ 该点坐标：`region`(1x1) + `x`/`y`（单点拾取模式）
+#[cfg(windows)]
+async fn start_native_capture(app: AppHandle, mode: String) -> Result<(), String> {
+    use crate::commands::capture::session;
+
+    // 单点拾取：取色 / 鼠标坐标 —— 单击即确认、选区=该点 1x1，不画 8 节点/OK-X
+    let point_pick = mode == "color_picker" || mode == "mouse_pos";
+    // 取色在单点拾取之上还要 HUD（放大镜 + 实时色值条）；鼠标坐标模式不需要。
+    let pick_color = mode == "color_picker";
+    let app2 = app.clone();
+    // run_screenshot 内部会阻塞跑遮罩消息循环 → 必须放到阻塞线程池，不能占 tokio 工作线程
+    let res =
+        tokio::task::spawn_blocking(move || session::run_screenshot(&app2, point_pick, pick_color))
+            .await
+            .map_err(|e| format!("截图任务失败: {e}"))??;
+
+    match res {
+        Some(r) => {
+            let (x, y, w, h) = session::clamp_sel(r.sel, r.screen_w, r.screen_h)
+                .ok_or_else(|| "选区非法（夹紧后为空）".to_string())?;
+            let region = serde_json::json!({ "x": x, "y": y, "width": w, "height": h });
+            let payload = match mode.as_str() {
+                // 选区：只回坐标，不裁切、不落盘
+                "picker" => serde_json::json!({
+                    "path": "",
+                    "region": region,
+                    "base64": serde_json::Value::Null,
+                }),
+                // 取色：从冻结帧取该点像素（布局 0xAARRGGBB）
+                "color_picker" => {
+                    let idx = (y as usize) * (r.screen_w as usize) + x as usize;
+                    let p = r.frozen.get(idx).copied().unwrap_or(0);
+                    let (rr, gg, bb) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                    serde_json::json!({
+                        "path": "",
+                        "region": region,
+                        "x": x,
+                        "y": y,
+                        "color_rgb": [rr, gg, bb],
+                        "hex": format!("#{rr:02X}{gg:02X}{bb:02X}"),
+                        "base64": serde_json::Value::Null,
+                    })
+                }
+                // 鼠标坐标：该点 1x1（调用方从 region 提取 x/y）
+                "mouse_pos" => serde_json::json!({
+                    "path": "",
+                    "region": region,
+                    "x": x,
+                    "y": y,
+                    "base64": serde_json::Value::Null,
+                }),
+                // screenshot / ocr：裁切落盘
+                _ => {
+                    let (_, _, cw, ch, px) =
+                        session::crop_from_frozen(&r.frozen, r.screen_w, r.screen_h, r.sel)?;
+                    let path = save_frozen_crop(cw, ch, &px)?;
+                    tracing::info!("[capture] 原生截图完成 {} ({}x{})", path, cw, ch);
+                    serde_json::json!({
+                        "path": path,
+                        "region": region,
+                        "base64": serde_json::Value::Null,
+                    })
+                }
+            };
+            tracing::info!("[capture] 原生 {mode} 完成 ({x},{y}) {w}x{h}");
+            *CAPTURE_RESULT.lock().expect("store native capture result") = Some(payload);
+        }
+        None => {
+            *CAPTURE_RESULT.lock().expect("store native cancel") =
+                Some(serde_json::json!({ "cancelled": true }));
+            tracing::info!("[capture] 原生流程已取消（{mode}）");
+        }
+    }
+    Ok(())
+}
+
+/// 把冻结帧裁剪结果（top-down BGRA u32）编码为 PNG 落盘到截图目录。
+#[cfg(windows)]
+fn save_frozen_crop(w: i32, h: i32, px: &[u32]) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+    for &p in px {
+        buf.push(((p >> 16) & 0xFF) as u8); // R
+        buf.push(((p >> 8) & 0xFF) as u8); // G
+        buf.push((p & 0xFF) as u8); // B
+        buf.push(((p >> 24) & 0xFF) as u8); // A
+    }
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, buf)
+        .ok_or_else(|| "构造裁剪图像失败".to_string())?;
+    let dir = nuphus::desktop::captures_dir_path().map_err(|e| format!("获取截图目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建截图目录失败: {e}"))?;
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let path = dir.join(format!("capture_{ts}.png"));
+    image::DynamicImage::ImageRgba8(img)
+        .save(&path)
+        .map_err(|e| format!("保存截图失败: {e}"))?;
+    Ok(path.display().to_string())
 }
 
 fn hide_overlay(app: &AppHandle) {

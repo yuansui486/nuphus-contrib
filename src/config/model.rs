@@ -72,6 +72,12 @@ pub struct ModelEntry {
     /// written before this field existed deserializing as `auto`.
     #[serde(default)]
     pub source: ModelSource,
+    /// 窗口来源戳：`"user"` = 用户手动校准（`set_model_context_window`），
+    /// `"auto"`/None = 权威同步或校准补值。`"user"` 屏蔽 sync 覆写——手填
+    /// 窗口是用户意图，不该被官方 /models 聚合值顶掉（对齐
+    /// `supports_vision_source` 既有契约，见 toml_ops apply_capabilities）。
+    #[serde(default)]
+    pub context_window_source: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -430,6 +436,12 @@ pub struct Capabilities {
     /// 图片生成模型所属服务商（旧配置为空时按模型 ID 兼容解析）
     #[serde(default)]
     pub image_generation_provider: String,
+    /// 视频生成模型（空 = 未绑定，生成工具直接报错，不静默发现）
+    #[serde(default)]
+    pub video_generation: String,
+    /// 视频生成模型所属服务商（旧配置为空时按模型 ID 兼容解析）
+    #[serde(default)]
+    pub video_generation_provider: String,
     /// ChatAgent 默认最大推理轮数（不配则 15）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_agent_max_iterations: Option<u32>,
@@ -456,6 +468,15 @@ pub struct ModelRegistry {
     /// Model alias mapping: alias -> (provider_name, model_id)
     #[serde(skip)]
     alias_map: HashMap<String, (String, String)>,
+    /// 主模型 provider 绑定（`[agent_models].leader_provider`，与 `model` 成对）。
+    ///
+    /// **实例身份的唯一权威**：同 id 模型跨 custom-xxx 段是常态，provider 段名
+    /// 才是「用户选了哪个接入实例」的答案。缺失时不猜——由
+    /// [`Self::resolve_main_binding`] 按「候选唯一推断 / 多候选报错」处置。
+    /// serde 不参与：from_toml 手工解析（与 `model` 的 leader 覆盖同源），
+    /// 序列化路径不经此结构体。
+    #[serde(skip)]
+    pub leader_provider: Option<String>,
     /// 配置文件来源路径（from_toml 记录；其它构造路径为 None）。
     /// transport 构造链（factory）据此定位段配置，完成 OAuth 令牌的
     /// 过期刷新与注入（见 `config::oauth::ensure_fresh_oauth_token`）。
@@ -533,6 +554,14 @@ impl ModelRegistry {
                 registry.model = leader.to_string();
             }
         }
+        // provider 绑定与 model 成对读入（同一 [agent_models] 段）。实例身份
+        // 权威：同 id 跨段时禁止无据段名猜测，model 与 provider 必须成对。
+        registry.leader_provider = doc
+            .get("agent_models")
+            .and_then(|a| a.get("leader_provider"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         registry.build_alias_map();
         Ok(registry)
     }
@@ -567,6 +596,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -600,6 +630,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -633,6 +664,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -666,6 +698,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -698,6 +731,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -731,6 +765,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -752,6 +787,7 @@ impl ModelRegistry {
             jev: JevConfig::default(),
             laya: LayaConfig::default(),
             alias_map: Default::default(),
+            leader_provider: None,
             // env 来源没有配置文件：OAuth 令牌注入路径据此跳过（无盘可刷新）
             source_path: None,
         };
@@ -844,36 +880,60 @@ impl ModelRegistry {
 
     /// Resolve a model's context window from the registry (provider-aware).
     ///
-    /// Same-id models can live under several providers (official segment vs
-    /// gateway/custom segment) and only some of them declare `context_window`.
-    /// A first-match lookup therefore returns `None` whenever the segment-order
-    /// first hit happens to omit the value, masking a sibling that declares it
-    /// (root cause of `deepseek-v4.1-flash-expires-on-0910` falling through to
-    /// the builtin table and then to the 128K guess).
+    /// **Provider-exact only.** A missing binding (`None`/`""`) or a segment
+    /// that declares no value → `None` (caller decides). The former
+    /// candidate-scan rule was removed: a same-name model under a sibling
+    /// custom-xxx segment supplying its window is a silent mis-route, not a
+    /// fallback — custom-xxx multi-instance same ids are the norm, not noise.
     ///
-    /// Rules:
-    /// 1. `provider_name` given and that provider publishes `model_id` with a
-    ///    value → the provider-exact value wins. Callers that know the routing
-    ///    binding must pass it (see §4.6, `provider` of `LlamaConfig`/`AgentConfig`).
-    /// 2. Otherwise every same-id candidate is scanned in segment order
-    ///    ([`Self::find_model_candidates`]) and the first one carrying a value
-    ///    is returned — a candidate without a value never masks its siblings.
-    /// 3. No candidate carries a value → `None` (caller decides the fallback).
+    /// Callers that know the routing binding must pass it (see §4.6,
+    /// `provider` of `LlamaConfig`/`AgentConfig`).
     pub fn resolve_context_window(
         &self,
         provider_name: Option<&str>,
         model_id: &str,
     ) -> Option<usize> {
-        if let Some(provider_name) = provider_name.filter(|p| !p.is_empty()) {
-            if let Some((_, model)) = self.find_model_for_provider(provider_name, model_id) {
-                if let Some(window) = model.context_window {
-                    return Some(window);
-                }
+        let provider_name = provider_name.filter(|p| !p.is_empty())?;
+        let (_, model) = self.find_model_for_provider(provider_name, model_id)?;
+        model.context_window
+    }
+
+    /// 主模型绑定解析（provider + model 成对）——**运行时唯一权威入口**。
+    ///
+    /// 权威源 = `[agent_models]` 的 (leader, leader_provider) 成对表
+    /// （`from_toml` 已读入 `model` / `leader_provider`）。语义与桌面
+    /// `effective_model_binding` 逐条对齐（lib/desktop 两端不得分叉）：
+    /// - 成对绑定有效（该段确实发布此 model）→ 直接采用
+    /// - 绑定缺失/陈旧（段不发布该 model 了）+ 候选唯一 → 唯一段
+    ///   （安全推断：候选唯一时别无选择，非猜测）
+    /// - 多候选且无有效绑定 → **Err**。同 id 跨 custom-xxx 段是多实例常态，
+    ///   取段序首段等于把用户选错实例，必须显式失败
+    pub fn resolve_main_binding(&self) -> crate::Result<(String, String)> {
+        if self.model.is_empty() {
+            return Err(crate::NuphusError::Config("no model configured".into()));
+        }
+        if let Some(provider) = self.leader_provider.as_deref().filter(|p| !p.is_empty()) {
+            // 绑定有效性校验：段存在但已不发布此 model（用户删过条目）视为陈旧，
+            // 不静默沿用——按「无绑定」处置。
+            if self
+                .find_model_for_provider(provider, &self.model)
+                .is_some()
+            {
+                return Ok((provider.to_string(), self.model.clone()));
             }
         }
-        self.find_model_candidates(model_id)
-            .into_iter()
-            .find_map(|(_, model)| model.context_window)
+        let candidates = self.find_model_candidates(&self.model);
+        match candidates.len() {
+            1 => Ok((candidates[0].0.name.clone(), self.model.clone())),
+            0 => Err(crate::NuphusError::llm(format!(
+                "model '{}' not found",
+                self.model
+            ))),
+            n => Err(crate::NuphusError::llm(format!(
+                "model '{}' has multiple providers ({} candidates); provider binding is required",
+                self.model, n
+            ))),
+        }
     }
 
     /// Resolve the model entry backing a capability by model id
@@ -886,19 +946,19 @@ impl ModelRegistry {
     /// (root cause of cross-provider cross-routing). Capability probes go
     /// through here instead.
     ///
-    /// Rules (mirroring [`Self::resolve_context_window`]):
+    /// Rules:
     /// 1. `provider` given and that provider publishes `model_id` → that exact
     ///    entry. Callers holding a routing binding (agent `provider` field,
     ///    `run.provider`, `capabilities.*_provider`) must pass it.
-    /// 2. Otherwise every same-id candidate is scanned in segment order and the
-    ///    first one for which `predicate` holds is returned — a candidate that
-    ///    lacks the capability never masks a sibling that has it.
-    /// 3. No candidate satisfies `predicate` → `None`.
+    /// 2. **The former candidate scan is gone** (二元组化 P2-a, twin of
+    ///    `resolve_context_window`): no binding or a valueless segment hit →
+    ///    `None`. A sibling same-id entry under another custom-xxx segment
+    ///    must never supply the capability.
     ///
-    /// `None` means "could not resolve": unknown model id, or no candidate
-    /// carries the capability. Callers must keep the two apart from "model
-    /// exists but is unverified" by giving unknown models a known fallback
-    /// before calling (see `config::resolve_capability`).
+    /// `None` means "could not resolve": unknown model id, or the bound
+    /// provider does not publish it. Callers must keep the two apart from
+    /// "model exists but is unverified" by giving unknown models a known
+    /// fallback before calling (see `config::resolve_capability`).
     pub fn resolve_capability<F>(
         &self,
         provider: Option<&str>,
@@ -908,29 +968,9 @@ impl ModelRegistry {
     where
         F: Fn(&ModelEntry) -> bool,
     {
-        if let Some(provider) = provider.filter(|p| !p.is_empty()) {
-            if let Some((_, model)) = self.find_model_for_provider(provider, model_id) {
-                return predicate(model).then_some(model);
-            }
-        }
-        self.find_model_candidates(model_id)
-            .into_iter()
-            .map(|(_, model)| model)
-            .find(|model| predicate(model))
-    }
-
-    /// Provider hint for the registry's own main model (`self.model`).
-    ///
-    /// The main model binding is written by `switch_model` into `[last_model]`
-    /// (`model id → provider name`); reading it back gives the capability
-    /// probes a provider context so a same-named main model resolves to the
-    /// segment the user actually bound. Returns `None` when no binding is
-    /// recorded (or the record no longer resolves) — callers then fall back to
-    /// the candidate scan of [`Self::resolve_capability`].
-    pub fn last_model_provider_hint(&self) -> Option<String> {
-        let path = self.source_path.as_deref()?;
-        crate::config::load_last_model_provider(path, &self.model)
-            .filter(|p| self.find_model_for_provider(p, &self.model).is_some())
+        let provider = provider.filter(|p| !p.is_empty())?;
+        let (_, model) = self.find_model_for_provider(provider, model_id)?;
+        predicate(model).then_some(model)
     }
 
     /// List all available models
@@ -990,6 +1030,7 @@ impl ModelRegistry {
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort,
                 extra_headers: BTreeMap::new(),
@@ -999,6 +1040,7 @@ impl ModelRegistry {
             jev: JevConfig::default(),
             laya: LayaConfig::default(),
             alias_map: HashMap::new(),
+            leader_provider: None,
             // from_single 无文件来源（内存构造）：OAuth 刷新链路自然跳过。
             source_path: None,
         };
@@ -1018,9 +1060,9 @@ impl ModelRegistry {
     /// truncated long thinking streams for reasoning models (see transport).
     ///
     /// Provider-aware (`resolve_capability` semantics): with a known binding the
-    /// provider-exact entry wins, otherwise the first same-id candidate carrying
-    /// a value is used — a candidate without `max_tokens` never masks a sibling
-    /// that declares it. See [`Self::resolve_capability`].
+    /// provider-exact entry wins; no binding (or a valueless segment hit) →
+    /// `None` — 二元组化 P2-a 起 sibling 候选扫描已删，`max_tokens` 与
+    /// context window 同等只认段限定。See [`Self::resolve_capability`].
     pub fn get_max_output_tokens(&self, provider: Option<&str>, model_id: &str) -> Option<u32> {
         self.resolve_capability(provider, model_id, |m| m.max_tokens.is_some())
             .and_then(|m| m.max_tokens)
@@ -1164,6 +1206,157 @@ id = "gpt-4o"
         std::fs::remove_file(&path).ok();
     }
 
+    /// 主模型绑定解析（成对权威，不猜）——同 id 跨 custom-xxx 段常态的四态验证。
+    #[test]
+    fn resolve_main_binding_pair_authority_never_guesses() {
+        fn write_registry(tag: &str, body: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "nuphus_binding_main_{}_{}.toml",
+                tag,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+
+        // ① 成对绑定有效 → 精确段，即便 step-5-preview 同时在两段发布
+        let path = write_registry(
+            "pair",
+            r#"
+[[providers]]
+name = "custom-stepfun"
+provider_type = "custom"
+api_key = ""
+base_url = "https://api.stepfun.com/v1"
+
+[[providers.models]]
+id = "step-5-preview"
+context_window = 1024000
+
+[[providers]]
+name = "custom-anna"
+provider_type = "anthropic"
+api_key = ""
+base_url = "https://ai.anna.tf"
+
+[[providers.models]]
+id = "step-5-preview"
+context_window = 2048000
+
+[agent_models]
+leader = "step-5-preview"
+leader_provider = "custom-anna"
+"#,
+        );
+        let registry = ModelRegistry::from_toml(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            registry.resolve_main_binding().unwrap(),
+            ("custom-anna".to_string(), "step-5-preview".to_string()),
+            "成对绑定有效时必须取绑定段，别段同 id 不干扰"
+        );
+        assert_eq!(
+            registry.leader_provider.as_deref(),
+            Some("custom-anna"),
+            "leader_provider 必须与 leader 成对读入（实例身份）"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // ② 绑定陈旧（段已不发布该 model）+ 另一段唯一发布 → 唯一段推断
+        let path = write_registry(
+            "stale",
+            r#"
+[[providers]]
+name = "custom-anna"
+provider_type = "anthropic"
+api_key = ""
+base_url = "https://ai.anna.tf"
+
+[[providers]]
+name = "custom-stepfun"
+provider_type = "custom"
+api_key = ""
+base_url = "https://api.stepfun.com/v1"
+
+[[providers.models]]
+id = "step-5-preview"
+
+[agent_models]
+leader = "step-5-preview"
+leader_provider = "custom-anna"
+"#,
+        );
+        let registry = ModelRegistry::from_toml(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            registry.resolve_main_binding().unwrap(),
+            ("custom-stepfun".to_string(), "step-5-preview".to_string()),
+            "陈旧绑定不静默沿用；唯一候选时推断安全（别无选择）"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // ③ 同 id 两段发布 + 无绑定 → 报错（禁取段序首段）
+        let path = write_registry(
+            "multi",
+            r#"
+[[providers]]
+name = "custom-stepfun"
+provider_type = "custom"
+api_key = ""
+base_url = "https://api.stepfun.com/v1"
+
+[[providers.models]]
+id = "step-5-preview"
+
+[[providers]]
+name = "custom-anna"
+provider_type = "anthropic"
+api_key = ""
+base_url = "https://ai.anna.tf"
+
+[[providers.models]]
+id = "step-5-preview"
+
+[agent_models]
+leader = "step-5-preview"
+"#,
+        );
+        let registry = ModelRegistry::from_toml(path.to_str().unwrap()).unwrap();
+        let err = registry
+            .resolve_main_binding()
+            .expect_err("同 id 多候选且无绑定必须报错");
+        assert!(
+            err.to_string().contains("provider binding is required"),
+            "错误须含绑定要求契约，实际: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // ④ 单段发布 + 无绑定 → 唯一段推断
+        let path = write_registry(
+            "single",
+            r#"
+[[providers]]
+name = "custom-only"
+provider_type = "custom"
+api_key = ""
+base_url = "https://only.example/v1"
+
+[[providers.models]]
+id = "step-5-preview"
+
+[agent_models]
+leader = "step-5-preview"
+"#,
+        );
+        let registry = ModelRegistry::from_toml(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            registry.resolve_main_binding().unwrap(),
+            ("custom-only".to_string(), "step-5-preview".to_string())
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn test_known_provider_from_id() {
         assert_eq!(
@@ -1264,6 +1457,7 @@ id = "m1"
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 }],
                 reasoning_effort: None,
                 extra_headers: BTreeMap::new(),
@@ -1273,6 +1467,7 @@ id = "m1"
             jev: JevConfig::default(),
             laya: LayaConfig::default(),
             alias_map: Default::default(),
+            leader_provider: None,
             source_path: None,
         };
         registry.build_alias_map();
@@ -1395,6 +1590,7 @@ vision_provider = "custom"
                     cost_per_million_in: None,
                     cost_per_million_out: None,
                     source: ModelSource::Auto,
+                    context_window_source: None,
                 })
                 .collect(),
             reasoning_effort: None,
@@ -1428,6 +1624,7 @@ vision_provider = "custom"
                 cost_per_million_in: None,
                 cost_per_million_out: None,
                 source: ModelSource::Auto,
+                context_window_source: None,
             })
             .collect();
         provider
@@ -1446,6 +1643,7 @@ vision_provider = "custom"
             jev: JevConfig::default(),
             laya: LayaConfig::default(),
             alias_map: Default::default(),
+            leader_provider: None,
             source_path: None,
         };
         registry.build_alias_map();
@@ -1518,78 +1716,53 @@ vision_provider = "custom"
         assert_eq!(registry.find_model_candidates("glm-4.7").len(), 1);
     }
 
-    /// Same id across segments where the segment-order first hit declares no
-    /// window: the lookup must keep scanning siblings instead of returning None
-    /// (a valueless hit must never mask a sibling — P0-a root cause).
+    /// Provider-exact only（二元组化 P1）：同 id 跨段时，段内无值、绑定缺失、
+    /// 幽灵段名——**一律 None**。原「扫候选取首个带值」规则已删：custom-xxx
+    /// 多实例同 id 是常态，sibling 供给窗口是静默错路由，不是兜底。
     #[test]
-    fn test_resolve_context_window_skips_valueless_candidate() {
+    fn test_resolve_context_window_provider_exact_only() {
         let registry = registry_with(vec![
             provider_with_windows("custom", KnownProvider::Custom, &[("m", None)]),
             provider_with_windows("deepseek", KnownProvider::DeepSeek, &[("m", Some(64_000))]),
         ]);
 
-        // Legacy first-match stops at the "custom" hit and would fall through.
-        assert_eq!(registry.find_model("m").unwrap().1.context_window, None);
-        assert_eq!(registry.resolve_context_window(None, "m"), Some(64_000));
-    }
-
-    /// Provider-exact value wins; an unknown provider (or one that publishes the
-    /// model without a value) falls back to the same-id candidate scan; nothing
-    /// declares a value → None.
-    #[test]
-    fn test_resolve_context_window_provider_exact_then_fallback() {
-        let registry = registry_with(vec![
-            provider_with_windows("deepseek", KnownProvider::DeepSeek, &[("m", Some(64_000))]),
-            provider_with_windows("custom", KnownProvider::Custom, &[("m", Some(131_072))]),
-        ]);
-
-        // Provider-exact beats the segment-order first hit.
+        // 段内无值 → None（不扫 sibling，哪怕 sibling 有值）
+        assert_eq!(registry.resolve_context_window(Some("custom"), "m"), None);
+        // 段内有值 → 段内值（段序首段不干扰段限定结果）
         assert_eq!(
-            registry.resolve_context_window(Some("custom"), "m"),
-            Some(131_072)
+            registry.resolve_context_window(Some("deepseek"), "m"),
+            Some(64_000)
         );
-        // Empty provider = "no hint" (same as None).
-        assert_eq!(registry.resolve_context_window(Some(""), "m"), Some(64_000));
-        // Provider not in the registry → candidate scan (segment order).
+        // 绑定缺失（None / 空串 / 幽灵段名）→ None，一律不猜
+        assert_eq!(registry.resolve_context_window(None, "m"), None);
+        assert_eq!(registry.resolve_context_window(Some(""), "m"), None);
         assert_eq!(
             registry.resolve_context_window(Some("gone-provider"), "m"),
-            Some(64_000)
+            None
         );
-
-        // Provider-exact hit WITHOUT a value must not short-circuit the scan.
-        let valueless = registry_with(vec![
-            provider_with_windows("custom", KnownProvider::Custom, &[("m", None)]),
-            provider_with_windows("deepseek", KnownProvider::DeepSeek, &[("m", Some(64_000))]),
-        ]);
+        // 模型不存在 → None
         assert_eq!(
-            valueless.resolve_context_window(Some("custom"), "m"),
-            Some(64_000)
+            registry.resolve_context_window(Some("deepseek"), "no-such-model"),
+            None
         );
 
-        let unknown = registry_with(vec![provider_with_windows(
-            "custom",
-            KnownProvider::Custom,
-            &[("m", None)],
-        )]);
-        assert_eq!(unknown.resolve_context_window(None, "m"), None);
-        assert_eq!(unknown.resolve_context_window(None, "no-such-model"), None);
-    }
-
-    /// Alias lookups keep the same candidate-scan semantics (alias hit expands
-    /// to the canonical id before the window is picked up).
-    #[test]
-    fn test_resolve_context_window_alias_candidate() {
+        // alias 同样只走段限定：别段同 id 的值不得经 alias 泄漏进来
         let mut aliased =
             provider_with_windows("deepseek", KnownProvider::DeepSeek, &[("m", None)]);
         aliased.models[0].alias = vec!["m-alias".to_string()];
-        let registry = registry_with(vec![
+        let aliased_registry = registry_with(vec![
             aliased,
             provider_with_windows("custom", KnownProvider::Custom, &[("m", Some(32_000))]),
         ]);
-
         assert_eq!(
-            registry.resolve_context_window(None, "m-alias"),
-            Some(32_000)
+            aliased_registry.resolve_context_window(Some("deepseek"), "m-alias"),
+            None,
+            "deepseek 段 m-alias 无窗口值 → None；custom 段同 id 的 32_000 不得跨段泄漏"
+        );
+        assert_eq!(
+            aliased_registry.resolve_context_window(Some("custom"), "m-alias"),
+            None,
+            "custom 段无 m-alias 条目（alias 属 deepseek 段）→ None，不扫 sibling"
         );
     }
 
@@ -1618,6 +1791,7 @@ vision_provider = "custom"
                 cost_per_million_in: None,
                 cost_per_million_out: None,
                 source: ModelSource::Auto,
+                context_window_source: None,
             })
             .collect();
         provider
@@ -1646,15 +1820,15 @@ vision_provider = "custom"
         assert!(registry
             .resolve_capability(Some("custom"), "m", |e| e.supports_vision)
             .is_some());
-        // No hint → candidate scan finds the vision-declaring sibling (the old
-        // first-segment-order lookup returned deepseek and missed it).
+        // No hint → None（二元组化 P2-a）：旧「扫候选取有值 sibling」规则已删——
+        // sibling 的能力/取值跨段泄漏即错路由，缺绑定一律显式 unknown。
         assert!(registry
             .resolve_capability(None, "m", |e| e.supports_vision)
-            .is_some());
-        // Empty provider == no hint.
+            .is_none());
+        // Empty provider == no hint → None（同上，不猜）。
         assert!(registry
             .resolve_capability(Some(""), "m", |e| e.supports_vision)
-            .is_some());
+            .is_none());
     }
 
     /// No candidate (or no candidate) declares the capability → None.
@@ -1701,8 +1875,10 @@ vision_provider = "custom"
         // Exact binding on a segment without a value → None (does not borrow the
         // sibling's value).
         assert_eq!(registry.get_max_output_tokens(Some("deepseek"), "m"), None);
-        // No hint → scan finds the declaring sibling.
-        assert_eq!(registry.get_max_output_tokens(None, "m"), Some(65_536));
+        // No hint → None（二元组化 P2-a）：段限定 only，sibling 的 65_536 不得
+        // 跨段泄漏成 deepseek 段的输出上限。
+        assert_eq!(registry.get_max_output_tokens(None, "m"), None);
+        assert_eq!(registry.get_max_output_tokens(Some(""), "m"), None);
     }
 
     /// Capability provider fields round-trip; legacy configs omitting them
@@ -1722,6 +1898,8 @@ image_generation = "dall-e"
         assert!(registry.capabilities.tts_provider.is_empty());
         assert!(registry.capabilities.voice_provider.is_empty());
         assert!(registry.capabilities.image_generation_provider.is_empty());
+        assert!(registry.capabilities.video_generation.is_empty());
+        assert!(registry.capabilities.video_generation_provider.is_empty());
 
         let current = r#"
 [capabilities]
@@ -1735,11 +1913,15 @@ voice = "clone"
 voice_provider = "seg-d"
 image_generation = "dall-e"
 image_generation_provider = "seg-e"
+video_generation = "MiniMax-H3"
+video_generation_provider = "seg-f"
 "#;
         let registry: ModelRegistry = toml::from_str(current).unwrap();
         assert_eq!(registry.capabilities.stt_provider, "seg-b");
         assert_eq!(registry.capabilities.tts_provider, "seg-c");
         assert_eq!(registry.capabilities.voice_provider, "seg-d");
         assert_eq!(registry.capabilities.image_generation_provider, "seg-e");
+        assert_eq!(registry.capabilities.video_generation, "MiniMax-H3");
+        assert_eq!(registry.capabilities.video_generation_provider, "seg-f");
     }
 }
