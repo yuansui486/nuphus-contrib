@@ -582,6 +582,30 @@ pub fn cancel_app_update(state: tauri::State<'_, Updates>) {
     state.cancel();
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_location(executable: &Path) -> Result<()> {
+    let macos = executable.parent();
+    let contents = macos.and_then(Path::parent);
+    let bundle = contents.and_then(Path::parent);
+    if executable.starts_with("/Volumes")
+        || executable.to_string_lossy().contains("/AppTranslocation/")
+        || macos
+            .and_then(Path::file_name)
+            .is_none_or(|name| name != "MacOS")
+        || contents
+            .and_then(Path::file_name)
+            .is_none_or(|name| name != "Contents")
+        || bundle
+            .and_then(Path::extension)
+            .is_none_or(|ext| ext != "app")
+    {
+        return Err(Error::State(
+            "请先退出灵雀，将应用拖入“应用程序”文件夹并从那里打开，再安装更新".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn install_app_update(app: tauri::AppHandle) -> Result<Status> {
     let state = app.state::<Updates>();
@@ -606,13 +630,7 @@ pub async fn install_app_update(app: tauri::AppHandle) -> Result<Status> {
     #[cfg(target_os = "macos")]
     {
         let executable = std::env::current_exe().map_err(error)?;
-        if executable.starts_with("/Volumes")
-            || executable.to_string_lossy().contains("/AppTranslocation/")
-        {
-            return Err(Error::State(
-                "请先退出灵雀，将应用拖入“应用程序”文件夹并从那里打开，再安装更新".into(),
-            ));
-        }
+        validate_macos_location(&executable)?;
     }
     // The WebView flushes its review queue before invoking this command. Native
     // admissions close atomically, so MCP cannot race the last idle check.
@@ -744,6 +762,20 @@ async fn release_windows_mcp() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn macos_requires_an_installed_bundle_never_a_development_directory() {
+        assert!(validate_macos_location(Path::new(
+            "/Applications/Nuphus Workbench.app/Contents/MacOS/nuphus-workbench"
+        ))
+        .is_ok());
+        for path in [
+            "/tmp/target/debug/nuphus",
+            "/Volumes/Lingque/Nuphus Workbench.app/Contents/MacOS/nuphus-workbench",
+            "/private/tmp/AppTranslocation/id/Nuphus Workbench.app/Contents/MacOS/nuphus-workbench",
+        ] {
+            assert!(validate_macos_location(Path::new(path)).is_err());
+        }
+    }
     #[test]
     fn damaged_update_preferences_do_not_prevent_application_startup() {
         let root = tempfile::tempdir().unwrap();
