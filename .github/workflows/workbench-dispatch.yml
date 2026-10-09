@@ -38,12 +38,14 @@ jobs:
     uses: yuansui486/nuphus-contrib/.github/workflows/workbench-sync.yml@edition/lingque
   build:
     if: github.repository == 'yuansui486/nuphus-contrib' && github.event_name == 'workflow_dispatch' && inputs.task == 'build'
-    # Temporary acceptance branch: pinned updater candidate, never stable publication.
+    # Release branch: reuse accepted artifacts from this exact product source.
     uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@c23d93c2217fdc42e5482eec565bbc130057874a
     with:
       ref: ${{ inputs.ref }}
       tag: ${{ inputs.tag }}
-      publish: false
+      publish: ${{ inputs.publish }}
       reuse_build_run: ${{ inputs.reuse_build_run }}
     secrets:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
