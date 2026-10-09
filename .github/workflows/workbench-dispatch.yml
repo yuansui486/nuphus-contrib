@@ -39,7 +39,7 @@ jobs:
   build:
     if: github.repository == 'yuansui486/nuphus-contrib' && github.event_name == 'workflow_dispatch' && inputs.task == 'build'
     # Release branch: reuse accepted artifacts from this exact product source.
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@c23d93c2217fdc42e5482eec565bbc130057874a
+    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-release.yml@21361e3353e41d2a7693006639c738212bbcd587
     with:
       ref: ${{ inputs.ref }}
       tag: ${{ inputs.tag }}
