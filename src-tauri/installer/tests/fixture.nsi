@@ -1,5 +1,5 @@
 ; A registry-free install/uninstall harness for the production hooks.
-; Tauri's existing main-process guard is outside this harness's scope.
+; Packaged acceptance also uses Tauri's generated main-process guard and language.
 Unicode true
 RequestExecutionLevel user
 AutoCloseWindow true
@@ -11,8 +11,8 @@ OutFile "${OUTPUT}"
 !define INSTALLMODE "currentUser"
 !ifdef TAURI_NSIS_DIR
   ; Exercise the exact main-process guard and plugin used by the built installer.
-  LoadLanguageFile "${NSISDIR}\Contrib\Language files\SimpChinese.nlf"
-  !include "${TAURI_NSIS_DIR}\SimpChinese.nsh"
+  LoadLanguageFile "${NSISDIR}\Contrib\Language files\${TAURI_NSIS_LANGUAGE}.nlf"
+  !include "${TAURI_NSIS_DIR}\${TAURI_NSIS_LANGUAGE}.nsh"
   !include "${TAURI_NSIS_DIR}\utils.nsh"
   !include "Win\RestartManager.nsh"
   !addplugindir "${TAURI_PLUGIN_DIR}"

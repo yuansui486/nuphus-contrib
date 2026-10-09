@@ -78,6 +78,15 @@ try {
         if ($nsisFiles.Count -eq 1) { $TauriNsisDirectory = $nsisFiles[0].DirectoryName }
     }
     if ($RequireTauriTemplate -and -not $TauriNsisDirectory) { throw 'Packaged acceptance requires the generated Tauri NSIS template' }
+    $tauriDefines = @()
+    if ($TauriNsisDirectory) {
+        $TauriNsisDirectory = (Resolve-Path -LiteralPath $TauriNsisDirectory).Path
+        $nsisDirectory = Split-Path $MakeNsis
+        $language = & (Join-Path $PSScriptRoot 'tauri-language.ps1') -TauriNsisDirectory $TauriNsisDirectory -NsisDirectory $nsisDirectory
+        $pluginDir = Join-Path $nsisDirectory 'Plugins\x86-unicode\additional'
+        $tauriDefines = @("/DTAURI_NSIS_DIR=$TauriNsisDirectory", "/DTAURI_PLUGIN_DIR=$pluginDir", "/DTAURI_NSIS_LANGUAGE=$language")
+        Write-Host "Using generated Tauri NSIS language: $language"
+    }
     New-Item -ItemType Directory -Path $root | Out-Null
     # Build the name using code points to keep this script ASCII-compatible with PS 5.1.
     $directory = Join-Path $root (([char]0x7075).ToString() + [char]0x96c0 + " O'Brien & space")
@@ -143,12 +152,7 @@ try {
     Passed 'access-denied file is not treated as absent'
 
     $installer = Join-Path $root 'fixture-setup.exe'
-    $defines = @("/DMCP_BINARY=$McpExecutable", "/DOUTPUT=$installer")
-    if ($TauriNsisDirectory) {
-        $TauriNsisDirectory = (Resolve-Path -LiteralPath $TauriNsisDirectory).Path
-        $pluginDir = Join-Path (Split-Path $MakeNsis) 'Plugins\x86-unicode\additional'
-        $defines += @("/DTAURI_NSIS_DIR=$TauriNsisDirectory", "/DTAURI_PLUGIN_DIR=$pluginDir")
-    }
+    $defines = @("/DMCP_BINARY=$McpExecutable", "/DOUTPUT=$installer") + $tauriDefines
     & $MakeNsis '/V2' '/WX' @defines (Join-Path $PSScriptRoot 'fixture.nsi')
     Assert-True ($LASTEXITCODE -eq 0) 'NSIS hooks failed to compile'
     $marker = Join-Path $root 'user-data-preserved.txt'
@@ -215,9 +219,8 @@ class UpdatedFixture {
 }
 '@
         $nativeInstaller = Join-Path $root 'native-setup.exe'
-        $nativeDefines = @("/DMCP_BINARY=$McpExecutable", "/DMAIN_BINARY=$versionMain", "/DOUTPUT=$nativeInstaller")
+        $nativeDefines = @("/DMCP_BINARY=$McpExecutable", "/DMAIN_BINARY=$versionMain", "/DOUTPUT=$nativeInstaller") + $tauriDefines
         if ($TauriNsisDirectory) {
-            $nativeDefines += @("/DTAURI_NSIS_DIR=$TauriNsisDirectory", "/DTAURI_PLUGIN_DIR=$pluginDir")
             Copy-Item -LiteralPath $McpExecutable -Destination (Join-Path $nativeDirectory 'lingque-installer-regression.exe')
             $nativeMain = Start-Hidden (Join-Path $nativeDirectory 'lingque-installer-regression.exe') 'serve'
         }

@@ -112,6 +112,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          node --test tools/lingque-release/installer-language.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm ci --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           choco install nsis --yes --no-progress
