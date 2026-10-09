@@ -23,7 +23,8 @@ Function ${PREFIX}WorkbenchStopMcp
     MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Please pause Nuphus Workbench MCP in your Agent, then retry. The MCP executable is still in use or cannot be accessed. No application data will be removed." IDRETRY wb_retry
   wb_abort:
     SetErrorLevel 10
-    Abort "Cannot release Workbench MCP executable."
+    ; Passive updater has nobody to dismiss an Abort error page.
+    Quit
   wb_done:
 FunctionEnd
 !macroend
@@ -38,7 +39,7 @@ FunctionEnd
   FileOpen $WorkbenchUpgradeHandle "$INSTDIR\.workbench-upgrading" w
   ${If} ${Errors}
     SetErrorLevel 10
-    Abort "Cannot prepare Workbench upgrade. Check installation directory permissions."
+    Quit
   ${EndIf}
   FileWrite $WorkbenchUpgradeHandle "Workbench upgrade in progress"
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"

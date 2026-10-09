@@ -367,6 +367,7 @@ impl<H: Host> Service<H> {
 
     /// On host startup (and project reconnection), never execute missed occurrences.
     pub async fn recover_schedules(&self, project: &str, time: i64) -> Result<()> {
+        let _activity = self.updates.admit()?;
         self.host.authorize_product()?;
         let _guard = self.schedule_guard.lock().await;
         for mut binding in self.store.schedules(project)? {
@@ -391,6 +392,7 @@ impl<H: Host> Service<H> {
     }
 
     pub async fn tick_schedules(&self, project: &str, time: i64) -> Result<()> {
+        let _activity = self.updates.admit()?;
         self.host.authorize_product()?;
         let _guard = self.schedule_guard.lock().await;
         for binding in self.store.schedules(project)? {

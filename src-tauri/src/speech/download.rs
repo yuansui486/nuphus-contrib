@@ -265,6 +265,7 @@ fn run_download(app: &AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn stt_download_model(app: AppHandle) -> Result<(), String> {
+    let activity = crate::workbench::admit(&app).map_err(|e| e.to_string())?;
     if DOWNLOAD_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("stt_download_busy".to_string());
     }
@@ -272,6 +273,7 @@ pub fn stt_download_model(app: AppHandle) -> Result<(), String> {
     let spawn = std::thread::Builder::new()
         .name("stt-download".to_string())
         .spawn(move || {
+            let _activity = activity;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_download(&worker_app)
             }));

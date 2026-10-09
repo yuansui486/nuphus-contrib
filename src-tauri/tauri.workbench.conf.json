@@ -3,9 +3,10 @@
   "productName": "Nuphus Workbench",
   "mainBinaryName": "nuphus-workbench",
   "identifier": "io.github.yuansui486.nuphusworkbench",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "app": {
     "security": {
+      "capabilities": ["workbench"],
       "assetProtocol": {
         "scope": { "allow": ["$APPDATA/**", "$APPLOCALDATA/**", "$HOME/.nuphus-workbench/**", "$TEMP/**"] }
       }
@@ -19,15 +20,16 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": [],
-      "pubkey": ""
+      "endpoints": ["https://tct12.oss-cn-beijing.aliyuncs.com/12box/lingque/updates/stable/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg3MzgxNDJENkQ4MUM2MzcKUldRM3hvRnRMUlE0aHhTM3hCQnNWcmI4M2RKWnFRNnEwMnVuU0xLUGdkV0UxL1NxVkd5cFRqYW4K",
+      "windows": { "installMode": "passive" }
     }
   },
   "bundle": {
     "icon": ["icons-lingque/32x32.png", "icons-lingque/128x128.png", "icons-lingque/128x128@2x.png", "icons-lingque/icon.icns", "icons-lingque/icon.ico", "icons-lingque/icon.png"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "externalBin": ["binaries/nuphus-workbench-mcp"],
     "windows": { "nsis": { "installerHooks": "installer/workbench-hooks.nsh" } },
-    "macOS": { "minimumSystemVersion": "15.0" }
+    "macOS": { "minimumSystemVersion": "15.0", "signingIdentity": "-" }
   }
 }

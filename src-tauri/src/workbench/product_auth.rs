@@ -247,31 +247,37 @@ pub fn start(app: AppHandle, authority: Arc<Authority>) {
         let mut previous = None;
         let mut previous_wall = chrono::Utc::now().timestamp();
         loop {
-            let wall = chrono::Utc::now().timestamp();
-            let resumed = wall - previous_wall > 5;
-            previous_wall = wall;
-            // Check local expiry before a potentially slow network request.
-            let current = authority.status();
-            let identity = if current.authorized {
-                current.epoch.clone()
-            } else {
-                None
-            };
-            if identity != previous {
-                if previous.is_some() {
-                    stop_work(app.clone()).await;
+            if let Ok(_activity) = super::admit(&app) {
+                let wall = chrono::Utc::now().timestamp();
+                let resumed = wall - previous_wall > 5;
+                previous_wall = wall;
+                // Check local expiry before a potentially slow network request.
+                let current = authority.status();
+                let identity = if current.authorized {
+                    current.epoch.clone()
+                } else {
+                    None
+                };
+                if identity != previous {
+                    if previous.is_some() {
+                        stop_work(app.clone()).await;
+                    }
+                    previous = identity;
+                    if current.authorized {
+                        let _ = ensure_default(&app);
+                    }
                 }
-                previous = identity;
-                if current.authorized {
-                    let _ = ensure_default(&app);
-                }
+                let _ = app.emit("lingque-auth-changed", &current);
+                let a = authority.clone();
+                let heartbeat_app = app.clone();
+                // The Authority is single-flight; the monitor continues cancelling at deadlines.
+                tauri::async_runtime::spawn(async move {
+                    let Ok(_activity) = super::admit(&heartbeat_app) else {
+                        return;
+                    };
+                    let _ = a.heartbeat(resumed).await;
+                });
             }
-            let _ = app.emit("lingque-auth-changed", &current);
-            let a = authority.clone();
-            // The Authority is single-flight; the monitor continues cancelling at deadlines.
-            tauri::async_runtime::spawn(async move {
-                let _ = a.heartbeat(resumed).await;
-            });
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -344,6 +350,7 @@ pub async fn lingque_auth(
     expected_epoch: Option<String>,
     project_ids: Option<Vec<String>>,
 ) -> Result<Value> {
+    let _activity = super::admit(&app)?;
     let state = app
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "请启动灵雀版本"))?;
@@ -396,6 +403,12 @@ pub fn public_command(command: &str) -> bool {
     matches!(
         command,
         "lingque_auth"
+            | "get_app_update_status"
+            | "set_app_update_preferences"
+            | "check_app_update"
+            | "download_app_update"
+            | "cancel_app_update"
+            | "install_app_update"
             | "finish_startup"
             | "splash_status_update"
             | "splash_bootstrap_status"

@@ -145,6 +145,9 @@ export function canvasBackend(
     intent: { target: 'workbench', draftScope: `workbench:${initial.project_id}` },
     wfGetRaw: async () => current.document as unknown as Record<string, unknown>,
     wfLayoutGet: async () => current.layout,
+    flushForUpdate: async () => {
+      await layoutQueue
+    },
     wfLayoutSave: async (_id, layout) => {
       const operation = layoutQueue
         .catch(() => {})

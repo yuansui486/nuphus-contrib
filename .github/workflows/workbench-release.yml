@@ -1,30 +1,82 @@
-name: Workbench installation packages
-
+name: Lingque signed installation packages
 on:
   workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: edition/lingque
+      tag:
+        type: string
+        default: ""
+      publish:
+        type: boolean
+        default: false
+      reuse_build_run:
+        type: string
+        default: ""
+    secrets:
+      TAURI_SIGNING_PRIVATE_KEY:
+        # Older default-branch dispatchers must still be able to run source sync.
+        # Missing signing credentials are rejected in the build job, not while
+        # validating the whole caller graph (including its skipped build branch).
+        required: false
+      OSS_ACCESS_KEY_ID:
+        required: false
+      OSS_ACCESS_KEY_SECRET:
+        required: false
   workflow_dispatch:
-
+    inputs:
+      ref:
+        description: "固定构建来源（分支、标签或 SHA）"
+        type: string
+        default: edition/lingque
+      tag:
+        description: "lingque-v<版本>；发布时必须是已存在且指向 ref 的标签"
+        type: string
+      publish:
+        description: "手动确认发布 OSS 稳定清单（默认仅构建验收）"
+        type: boolean
+        default: false
+      reuse_build_run:
+        description: "复用此前成功验收的运行 ID，避免重新编译已发布版本"
+        type: string
 permissions:
   contents: read
-
+  actions: read
+env:
+  NUPHUS_BUILD_SKIP_MODELS: "1"
 jobs:
   revision:
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.revision.outputs.sha }}
+      version: ${{ steps.revision.outputs.version }}
+      date: ${{ steps.revision.outputs.date }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: edition/lingque
+          ref: ${{ inputs.ref || 'edition/lingque' }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - id: revision
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
+          REUSE_RUN: ${{ inputs.reuse_build_run }}
+          SIGNING_AVAILABLE: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: node tools/lingque-release/revision.mjs
   verify:
     needs: revision
-    uses: yuansui486/nuphus-contrib/.github/workflows/workbench-ci.yml@edition/lingque
+    if: inputs.reuse_build_run == ''
+    uses: ./.github/workflows/workbench-ci.yml
     with:
       ref: ${{ needs.revision.outputs.sha }}
   package:
     needs: [revision, verify]
+    if: inputs.reuse_build_run == ''
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +86,7 @@ jobs:
             bundle: nsis
           - os: macos-15
             platform: macos-arm64
-            bundle: app
+            bundle: app,dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -43,10 +95,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: workbench-release-${{ matrix.os }}
+          prefix-key: lingque-release-${{ matrix.os }}
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --no-audit --no-fund
@@ -55,9 +107,12 @@ jobs:
       - name: Verify Apple Silicon runner
         if: runner.os == 'macOS'
         run: test "$(uname -m)" = arm64
-      - name: Build independent edition (never upstream updater channel)
+      - name: Build and sign final updater artifacts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: npx tauri build --config src-tauri/tauri.workbench.conf.json --features workbench --bundles ${{ matrix.bundle }}
-      - name: Windows native MCP acceptance
+      - name: Windows packaged MCP acceptance
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -66,49 +121,93 @@ jobs:
           $env:WORKBENCH_TEST_EXE = (Resolve-Path target/release/nuphus-workbench.exe).Path
           $env:WORKBENCH_TEST_MCP = (Resolve-Path target/release/nuphus-workbench-mcp.exe).Path
           ./scripts/workbench-mcp-focus.ps1 -TestRoot $env:WORKBENCH_TEST_ROOT
-      - name: Sign and package ARM64 DMG
-        if: runner.os == 'macOS'
-        shell: bash
+      # The PowerShell MCP script throws on failure, but does not set LASTEXITCODE.
+      # Checking its null exit code can silently exit 0 and skip installer tests.
+      - name: Windows official updater installer acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          set -euo pipefail
-          app='target/release/bundle/macos/Nuphus Workbench.app'
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict "$app"
-          lipo "$app/Contents/MacOS/nuphus-workbench" -verify_arch arm64
-          test -x "$app/Contents/MacOS/nuphus-workbench-mcp"
-          lipo "$app/Contents/MacOS/nuphus-workbench-mcp" -verify_arch arm64
-          WORKBENCH_TEST_EXPECT_AUTH_REQUIRED=1 WORKBENCH_TEST_ROOT="$(mktemp -d)" WORKBENCH_TEST_EXE="$app/Contents/MacOS/nuphus-workbench" WORKBENCH_TEST_MCP="$app/Contents/MacOS/nuphus-workbench-mcp" node scripts/workbench-mcp-smoke.mjs
-          smoke_root=$(mktemp -d)
-          NUPHUS_WORKBENCH_DATA_DIR="$smoke_root" NUPHUS_WORKBENCH_PORT=47739 "$app/Contents/MacOS/nuphus-workbench" --background > "$smoke_root/launch.log" 2>&1 &
-          app_pid=$!
-          trap 'kill "$app_pid" 2>/dev/null || true' EXIT
-          ready=false
-          for attempt in $(seq 1 30); do
-            if [ "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:47739/api/v1/discover || true)" = 200 ]; then
-              ready=true
-              break
-            fi
-            kill -0 "$app_pid"
-            sleep 1
-          done
-          if [ "$ready" != true ]; then tail -40 "$smoke_root/launch.log"; exit 1; fi
-          kill "$app_pid"
-          wait "$app_pid" || true
-          trap - EXIT
-          stage=$(mktemp -d)
-          cp -R "$app" "$stage/"
-          ln -s /Applications "$stage/Applications"
-          hdiutil create -volname 'Nuphus Workbench' -srcfolder "$stage" -format UDZO -ov 'Nuphus-Workbench-macos-arm64.dmg'
-          hdiutil verify 'Nuphus-Workbench-macos-arm64.dmg'
-          shasum -a 256 'Nuphus-Workbench-macos-arm64.dmg' > 'Nuphus-Workbench-macos-arm64.dmg.sha256'
-          echo 'ARM64 preview is ad-hoc signed, not Apple notarized. macOS 15+ Accessibility/Screen Recording authorization and real-app operation need manual acceptance.' >> "$GITHUB_STEP_SUMMARY"
+          cargo build -p nuphus-desktop --features workbench --example lingque-updater-probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File src-tauri/installer/tests/run.ps1 -McpExecutable target/release/nuphus-workbench-mcp.exe -NativeUpdaterProbe target/debug/examples/lingque-updater-probe.exe -RequireTauriTemplate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify signed app, archive and DMG are identical; launch packaged app
+        if: runner.os == 'macOS'
+        run: bash scripts/lingque-macos-package-check.sh
+      - name: Record tested source and artifact hashes
+        env:
+          BUILD_SHA: ${{ needs.revision.outputs.sha }}
+          BUILD_VERSION: ${{ needs.revision.outputs.version }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
+        run: node tools/lingque-release/receipt.mjs
       - uses: actions/upload-artifact@v4
         with:
-          name: nuphus-workbench-${{ matrix.platform }}-${{ needs.revision.outputs.sha }}
+          name: lingque-${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 14
           path: |
             target/release/bundle/nsis/*.exe
-            Nuphus-Workbench-macos-arm64.dmg
-            Nuphus-Workbench-macos-arm64.dmg.sha256
-            target/release/nuphus-workbench-mcp*
+            target/release/bundle/nsis/*.exe.sig
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.app.tar.gz.sig
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/build-receipt.json
+  manifest:
+    needs: [revision, verify, package]
+    if: always() && needs.revision.result == 'success' && ((needs.verify.result == 'success' && needs.package.result == 'success') || inputs.reuse_build_run != '')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.revision.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lingque-*
+          path: artifacts
+          run-id: ${{ inputs.reuse_build_run || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify receipts, signatures and generate deterministic manifest
+        env:
+          BUILD_SHA: ${{ needs.revision.outputs.sha }}
+          BUILD_VERSION: ${{ needs.revision.outputs.version }}
+          BUILD_RUN: ${{ inputs.reuse_build_run || github.run_id }}
+          RELEASE_DATE: ${{ needs.revision.outputs.date }}
+        run: |
+          node tools/lingque-release/receipt.mjs artifacts
+          node tools/lingque-release/manifest.mjs artifacts prepared "$BUILD_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lingque-prepared
+          path: prepared/*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: [revision, manifest]
+    # Reused builds skip verify/package. An explicit status check prevents that
+    # expected skip from propagating through manifest and suppressing publication.
+    if: ${{ !cancelled() && inputs.publish && needs.revision.result == 'success' && needs.manifest.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: lingque-oss-stable-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.revision.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: lingque-prepared
+          path: prepared
+      - run: npm ci --no-audit --no-fund
+        working-directory: tools/lingque-release
+      - name: Publish immutable objects, then conditionally promote stable
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: node tools/lingque-release/publish.mjs prepared

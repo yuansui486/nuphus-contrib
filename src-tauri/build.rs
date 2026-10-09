@@ -1,4 +1,13 @@
 fn main() {
+    // Tauri embeds the desktop manifest for the main binary, not Cargo examples.
+    // The offline native updater probe also needs Common Controls v6 (TaskDialogIndirect).
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    {
+        println!("cargo:rustc-link-arg-examples=/MANIFEST:EMBED");
+        println!(
+            r#"cargo:rustc-link-arg-examples=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"#
+        );
+    }
     // ═══ 中继凭据编译期注入（开源仓库不硬编码，2026-08-26 审计）═══
     // 官方发布构建设置 NUPHUS_RELAY_DEVICE_TOKEN / NUPHUS_RELAY_CALLER_TOKEN 环境变量，
     // 经 cargo:rustc-env 内嵌进二进制（源码端 env! 读取）；用户自建 build 无环境变量 →
@@ -73,12 +82,22 @@ fn main() {
     // 打 warning 不中断构建（断网 build 仍成功，运行时 bootstrap.rs 会补下载）。
     // 顺序：先 OCR（最常缺）→ sherpa（其 shared 包自带 onnxruntime）→
     // onnxruntime（sherpa 未内置时兜底）→ YOLO → 最后 sync_*。
-    download_ocr_models();
+    println!("cargo:rerun-if-env-changed=NUPHUS_BUILD_SKIP_MODELS");
+    let skip_models = std::env::var("NUPHUS_BUILD_SKIP_MODELS").as_deref() == Ok("1");
+    if !skip_models {
+        download_ocr_models();
+    }
     #[cfg(target_os = "macos")]
     decouple_onnxruntime_name();
     ensure_onnxruntime_libs();
-    ensure_yolo_model();
-    sync_models_to_data_dir();
+    if !skip_models {
+        ensure_yolo_model();
+    }
+    // Building Lingque must never modify a developer's installed application data.
+    // Runtime bootstrap handles first-run model preparation in the active profile.
+    if std::env::var_os("CARGO_FEATURE_WORKBENCH").is_none() && !skip_models {
+        sync_models_to_data_dir();
+    }
     sync_sherpa_libs();
 }
 

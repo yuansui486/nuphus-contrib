@@ -1,0 +1,2 @@
+# Signed fixtures must have identical bytes on Windows and Unix.
+src-tauri/src/workbench/updates/fixtures/* -text

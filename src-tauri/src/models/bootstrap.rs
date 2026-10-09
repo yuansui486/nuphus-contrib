@@ -582,6 +582,7 @@ fn emit_splash_pct(app: &AppHandle, done: u64, total: u64, text: &str) {
 /// 调用方必须放在 spawn_blocking / 独立线程，避免阻塞主线程事件循环导致
 /// 进度事件无法投递（`run_download` 内部使用 reqwest::blocking）。
 pub fn ensure_vision_models_blocking(app: &AppHandle) -> Result<(), String> {
+    let _activity = crate::workbench::admit(app).map_err(|e| e.to_string())?;
     let status = scan_status();
     // 诊断：目录视图一行汇总——排障「为何要下载 / 为何误报后台下载」的关键证据
     //（splash 判定只看 data_dir；bundled 是随应用分发的 desktop/models）。

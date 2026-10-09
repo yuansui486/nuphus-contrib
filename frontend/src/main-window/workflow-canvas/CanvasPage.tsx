@@ -118,6 +118,8 @@ interface CanvasPageProps {
   /** 切换到另一个工作流画布（工作台注入：换 id 即整页换成目标工作流） */
   onSwitchWorkflow?: (id: string) => void
   registerLeaveGuard?: (guard: CanvasLeaveGuard | null) => void
+  registerUpdateSave?: (save: (() => Promise<boolean>) | null) => void
+  suspended?: boolean
   onEditorState?: (state: {
     dirty: boolean
     selection: string[]
@@ -202,6 +204,8 @@ function CanvasInner({
   onClose,
   onSwitchWorkflow,
   registerLeaveGuard,
+  registerUpdateSave,
+  suspended = false,
   onEditorState,
   onGenerateIntent,
 }: CanvasPageProps) {
@@ -404,6 +408,8 @@ function CanvasInner({
   const viewportMem = useRef(new Map<string, Viewport>())
   const breadcrumbRef = useRef<HTMLDivElement | null>(null)
   const sidecarSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingSidecar = useRef<CanvasLayoutSidecar | null>(null)
+  const layoutWrite = useRef<Promise<void>>(Promise.resolve())
   const stepsRef = useRef<WorkflowStep[] | null>(null)
   stepsRef.current = steps
   useEffect(() => {
@@ -509,7 +515,10 @@ function CanvasInner({
 
   // ── 只读判定：运行中锁（1.6）+ 旧格式整树只读（V13/R1）──
   const readOnly =
-    (!backend.versioned && snapshot.running) || !!projection?.index.hasCustomNodes || !!replayRunId
+    suspended ||
+    (!backend.versioned && snapshot.running) ||
+    !!projection?.index.hasCustomNodes ||
+    !!replayRunId
   useEffect(() => {
     onEditorState?.({ dirty, selection: selectedIds, layerId, problems, validation: backendReport })
   }, [dirty, selectedIds, layerId, problems, backendReport, onEditorState])
@@ -1140,18 +1149,50 @@ function CanvasInner({
   )
 
   // ── sidecar 持久化（防抖）──
+  const writeSidecar = useCallback(
+    (next: CanvasLayoutSidecar) => {
+      const layers = projection?.layers
+      const cleaned = layers ? pruneSidecar(next, layers) : next
+      const write = wfLayoutSave(workflowId, cleaned).then(() => {
+        if (pendingSidecar.current === next) pendingSidecar.current = null
+      })
+      layoutWrite.current = write
+      return write
+    },
+    [workflowId, projection, wfLayoutSave],
+  )
   const persistSidecar = useCallback(
     (next: CanvasLayoutSidecar) => {
       setSidecar(next)
+      pendingSidecar.current = next
       if (sidecarSaveTimer.current) clearTimeout(sidecarSaveTimer.current)
       sidecarSaveTimer.current = setTimeout(() => {
-        const layers = projection?.layers
-        const cleaned = layers ? pruneSidecar(next, layers) : next
-        void wfLayoutSave(workflowId, cleaned).catch(error => setNotice(String(error)))
+        sidecarSaveTimer.current = null
+        void writeSidecar(next).catch(error => setNotice(String(error)))
       }, 600)
     },
-    [workflowId, projection],
+    [writeSidecar],
   )
+  useEffect(() => {
+    registerUpdateSave?.(async () => {
+      if (saving.current) return false
+      if (dirty && !(await save())) return false
+      if (sidecarSaveTimer.current) {
+        clearTimeout(sidecarSaveTimer.current)
+        sidecarSaveTimer.current = null
+      }
+      try {
+        if (pendingSidecar.current) await writeSidecar(pendingSidecar.current)
+        else await layoutWrite.current
+        await backend.flushForUpdate?.()
+        return true
+      } catch (error) {
+        setNotice(String(error))
+        return false
+      }
+    })
+    return () => registerUpdateSave?.(null)
+  }, [registerUpdateSave, dirty, save, backend, writeSidecar])
 
   // ── 拖拽：重排 / 跨泳道 / 入容器 / 到面包屑（2.5）──
   const onNodesChange = useCallback((changes: NodeChange[]) => {

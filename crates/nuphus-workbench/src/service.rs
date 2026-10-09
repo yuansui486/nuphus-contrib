@@ -68,6 +68,7 @@ pub trait Host: Send + Sync + 'static {
 pub struct Service<H: Host> {
     pub store: WorkbenchStore,
     pub host: Arc<H>,
+    pub updates: Arc<crate::update_gate::UpdateGate>,
     pub(crate) schedule_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -93,6 +94,7 @@ impl<H: Host> Service<H> {
         Self {
             store,
             host: Arc::new(host),
+            updates: Arc::new(crate::update_gate::UpdateGate::default()),
             schedule_guard: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -103,6 +105,7 @@ impl<H: Host> Service<H> {
         operation: &str,
         args: Value,
     ) -> Result<Value> {
+        let _activity = self.updates.admit()?;
         // Static discovery reveals no projects, credentials or tenant identity.
         let epoch = if operation == "system.capabilities" {
             self.host.session_epoch().ok().flatten()

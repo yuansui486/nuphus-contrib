@@ -211,6 +211,18 @@ fn main() {
         )
         .invoke_handler({
           let handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool=tauri::generate_handler![
+            #[cfg(feature = "workbench")]
+            workbench::updates::get_app_update_status,
+            #[cfg(feature = "workbench")]
+            workbench::updates::set_app_update_preferences,
+            #[cfg(feature = "workbench")]
+            workbench::updates::check_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::download_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::cancel_app_update,
+            #[cfg(feature = "workbench")]
+            workbench::updates::install_app_update,
             #[cfg(feature="workbench")]
             workbench::product_auth::lingque_auth,
             workbench::workbench_call,
@@ -530,6 +542,14 @@ fn main() {
           ];
           move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
             #[cfg(feature="workbench")]
+            if let Some(state) = invoke.message.webview_ref().app_handle().try_state::<workbench::WorkbenchState>() {
+                if state.service.updates.installing()
+                    && !matches!(invoke.message.command(), "get_app_update_status" | "hide_main_window") {
+                    invoke.resolver.reject("灵雀正在安装更新，请稍候。");
+                    return true;
+                }
+            }
+            #[cfg(feature="workbench")]
             if let Err(error)=workbench::product_auth::guard_command(invoke.message.command()) {
                 invoke.resolver.reject(error);
                 return true;
@@ -540,6 +560,8 @@ fn main() {
         .setup(|app| {
             if nuphus::profile::WORKBENCH {
                 workbench::install(app.handle())?;
+                #[cfg(feature = "workbench")]
+                workbench::updates::install(app.handle())?;
             }
             let desktop_state = app.state::<state::AppState>();
             nuphus::tools::desktop_approval::install_host(
@@ -1089,6 +1111,10 @@ fn main() {
                             }
                         }
                         "quit" => {
+                            #[cfg(feature = "workbench")]
+                            if app.try_state::<workbench::WorkbenchState>().is_some_and(|state| state.service.updates.installing()) {
+                                return;
+                            }
                             // 退出前保存当前 session（元数据行 + Shelf 磁盘镜像）
                             if let Some(state) = app.try_state::<crate::state::AppState>() {
                                 // 快照保护名单先于 runtime 锁收集，避免嵌套加锁
@@ -1143,6 +1169,17 @@ fn main() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        #[cfg(feature = "workbench")]
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            if app_handle
+                .try_state::<workbench::WorkbenchState>()
+                .is_some_and(|state| state.service.updates.installing())
+            {
+                // Tauri still permits its dedicated restart exit code after a
+                // successful Mac replacement; user quit cannot interrupt installation.
+                api.prevent_exit();
+            }
+        }
         if let tauri::RunEvent::WindowEvent {
             label,
             event: win_event,

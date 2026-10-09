@@ -187,6 +187,51 @@ function shortcut() {
 }
 
 describe('Canvas save coordination', () => {
+  it('更新保存会提交检查器草稿并等待布局队列', async () => {
+    let updateSave: (() => Promise<boolean>) | null = null
+    const flush = vi.fn(async () => {})
+    await renderCanvas(
+      <CanvasBackendContext.Provider value={{ ...legacyCanvasBackend, flushForUpdate: flush }}>
+        <CanvasPage
+          workflowId="wf"
+          onClose={() => {}}
+          registerUpdateSave={save => {
+            updateSave = save
+          }}
+        />
+      </CanvasBackendContext.Provider>,
+    )
+    await openNode('first')
+    fireEvent.change(panel('first').getByLabelText(/^名称/), { target: { value: '安装前保存' } })
+    let result = false
+    await act(async () => {
+      result = await updateSave!()
+    })
+    expect(result).toBe(true)
+    expect(mocks.save.mock.calls[0][0].steps[0].name).toBe('安装前保存')
+    expect(flush).toHaveBeenCalledOnce()
+  })
+  it('更新保存失败保持草稿，不报告可安装', async () => {
+    let updateSave: (() => Promise<boolean>) | null = null
+    await renderCanvas(
+      <CanvasPage
+        workflowId="wf"
+        onClose={() => {}}
+        registerUpdateSave={save => {
+          updateSave = save
+        }}
+      />,
+    )
+    await openNode('first')
+    fireEvent.change(panel('first').getByLabelText(/^名称/), { target: { value: '保留编辑' } })
+    mocks.save.mockRejectedValue(new Error('磁盘不可写'))
+    let result = true
+    await act(async () => {
+      result = await updateSave!()
+    })
+    expect(result).toBe(false)
+    expect(panel('first').getByLabelText(/^名称/)).toHaveValue('保留编辑')
+  })
   it('passes workbench scope and safe intent text to the composer without running or closing', async () => {
     const receiveIntent = vi.fn()
     const close = vi.fn()

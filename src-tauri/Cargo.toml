@@ -22,6 +22,10 @@ nuphus-workbench = { path = "../crates/nuphus-workbench" }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+semver = "1"
+minisign-verify = "0.2"
+tempfile = "3"
 
 # IDs & Time
 uuid = "1"
