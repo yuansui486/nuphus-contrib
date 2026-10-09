@@ -186,7 +186,9 @@ jobs:
           retention-days: 14
   publish:
     needs: [revision, manifest]
-    if: inputs.publish && needs.manifest.result == 'success'
+    # Reused builds skip verify/package. An explicit status check prevents that
+    # expected skip from propagating through manifest and suppressing publication.
+    if: ${{ !cancelled() && inputs.publish && needs.revision.result == 'success' && needs.manifest.result == 'success' }}
     runs-on: ubuntu-latest
     concurrency:
       group: lingque-oss-stable-publication
