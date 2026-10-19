@@ -899,7 +899,7 @@ async fn versioned_run_keeps_host_cancellation_and_cleans_per_run_state() {
     use crate::workflow::run_context::{RunContext, CURRENT};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let root = tempfile::tempdir().unwrap();
+    let root = std::env::temp_dir().join(format!("nuphus-host-cancel-{}", uuid::Uuid::new_v4()));
     let mut workflow = Workflow::new("versioned cancellation");
     workflow.steps = vec![
         make_tool_step("first", "test_tool", serde_json::json!({})),
@@ -909,9 +909,9 @@ async fn versioned_run_keeps_host_cancellation_and_cleans_per_run_state() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let context = Arc::new(RunContext {
         run_id: uuid::Uuid::new_v4().to_string(),
-        project_dir: root.path().into(),
+        project_dir: root.clone(),
         cancelled: cancelled.clone(),
-        store: WorkflowStore::frozen(root.path().into(), vec![workflow]),
+        store: WorkflowStore::frozen(root.clone(), vec![workflow]),
         event_sink: None,
     });
     let executor = Executor::new();
@@ -950,6 +950,7 @@ async fn versioned_run_keeps_host_cancellation_and_cleans_per_run_state() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(cancelled.load(Ordering::SeqCst));
     assert!(!executor.cancel_flags.read().await.contains_key(&id));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
