@@ -119,6 +119,18 @@ beforeEach(() => {
 })
 
 describe('Workbench assistant', () => {
+  it('joins streamed chunks without adding paragraph breaks between tokens', async () => {
+    mocks.history = { busy: true, session: { messages: [] } }
+    setup()
+    await ready()
+    await emit('progress', { text: 'Reading ', delta: true })
+    await emit('progress', { text: 'the canvas', delta: true })
+    expect(screen.getByText('Reading the canvas').textContent).toBe('Reading the canvas')
+    await emit('tool', { name: 'canvas_get' })
+    await emit('progress', { text: 'Ready', delta: true })
+    expect(screen.getByText(/Reading the canvas/).textContent).toBe('Reading the canvas\n\nReady')
+  })
+
   it('retries a failed history load without duplicating its listener or losing input', async () => {
     mocks.invoke.mockRejectedValueOnce(new Error('History temporarily unavailable'))
     setup()

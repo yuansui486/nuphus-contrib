@@ -40,7 +40,7 @@ interface Progress {
   project_id: string
   workflow_id: string
   turn_id: string
-  event: { type: string; text?: string; name?: string; success?: boolean }
+  event: { type: string; text?: string; name?: string; success?: boolean; delta?: boolean }
 }
 
 export function AuthoringPanel({
@@ -137,9 +137,18 @@ export function AuthoringPanel({
       const event = payload.event
       if (event.type === 'progress')
         setProgress(previous =>
-          previous ? `${previous}\n\n${event.text ?? ''}` : (event.text ?? ''),
+          event.delta
+            ? previous + (event.text ?? '')
+            : previous
+              ? `${previous}\n\n${event.text ?? ''}`
+              : (event.text ?? ''),
         )
-      if (event.type === 'tool') setActivity(event.name ?? '')
+      if (event.type === 'tool') {
+        setActivity(event.name ?? '')
+        setProgress(previous =>
+          previous && !previous.endsWith('\n\n') ? `${previous}\n\n` : previous,
+        )
+      }
       if (event.type === 'error') setError(event.text ?? '')
       if (event.type === 'completed') {
         setBusy(false)

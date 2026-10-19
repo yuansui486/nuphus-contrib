@@ -42,14 +42,19 @@ impl WorkflowAuthoring for Authoring {
                 }
             })
             .collect();
-        for (name,description,parameters) in [
-            ("workbench_schema","Read the authoritative native step schema and workflow tool schemas. Filter tools by name fragment to limit context.",json!({"type":"object","properties":{"tool_filter":{"type":"string"}},"additionalProperties":false})),
-            ("workflow_report_progress","Send a short user-facing progress update while continuing work. Never expose private model reasoning.",json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]})),
-        ] { tools.push(ToolDefinition {tool_type:"function".into(),function:FunctionDefinition{name:name.into(),description:Some(description.into()),parameters,permission:None}}); }
+        tools.push(ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "workbench_schema".into(),
+                description: Some("Read the authoritative native step schema and workflow tool schemas. Filter tools by name fragment to limit context.".into()),
+                parameters: json!({"type":"object","properties":{"tool_filter":{"type":"string"}},"additionalProperties":false}),
+                permission: None,
+            },
+        });
         tools
     }
     fn system_prompt(&self) -> String {
-        "You are Nuphus Workbench's workflow author, using the existing WorkflowAgent conversation runtime. Respond in the user's language. The active canvas is already bound to your tools; do not request project IDs. First briefly tell the user your approach using workflow_report_progress, then read canvas_get and workbench_schema. Create or modify the native Workflow IR using canvas_update with its exact current revision. Preserve existing user edits, IDs and fields not implicated by the request. On revision_conflict reread and reconcile, never blindly overwrite. Native validation is authoritative: validate, repair actionable errors, and publish with workflow_save when valid. Incomplete drafts can be stored without claiming they are runnable. UI canvas renders changes automatically. Do not write workflow files, invoke a shell, invent tools, or claim a run/test happened: this authoring panel edits but does not execute; the user starts a published version with Run. Deterministic tools, waits, conditions, loops, child workflows, inputs and Agent nodes use the existing step schema. Prefer semantic desktop targets, with mouse/OCR as supported alternatives when needed; don't fabricate live UI IDs or coordinates. If necessary live target information is missing, declare runtime inputs/observation steps or ask the user a concise question. A configured model is needed only for this generation and AI nodes, not deterministic execution. Give concise progress during longer work, finish with what changed and any unresolved validation issue. Never send private unrelated app content to a model.".into()
+        "You are Nuphus Workbench's workflow author, using the existing WorkflowAgent conversation runtime. Respond in the user's language. The active canvas is already bound to your tools; do not request project IDs. Use concise public text alongside tool calls to describe progress, then read canvas_get and workbench_schema. Create or modify the native Workflow IR using canvas_update with its exact current revision. Preserve existing user edits, IDs and fields not implicated by the request. On revision_conflict reread and reconcile, never blindly overwrite. Native validation is authoritative: validate, repair actionable errors, and publish with workflow_save when valid. Incomplete drafts can be stored without claiming they are runnable. UI canvas renders changes automatically. Do not write workflow files, invoke a shell, invent tools, or claim a run/test happened: this authoring panel edits but does not execute; the user starts a published version with Run. Deterministic tools, waits, conditions, loops, child workflows, inputs and Agent nodes use the existing step schema. Prefer semantic desktop targets, with mouse/OCR as supported alternatives when needed; don't fabricate live UI IDs or coordinates. If necessary live target information is missing, declare runtime inputs/observation steps or ask the user a concise question. A configured model is needed only for this generation and AI nodes, not deterministic execution. Give concise progress during longer work, finish with what changed and any unresolved validation issue. Never send private unrelated app content to a model.".into()
     }
     async fn execute(&self, tool: &str, params: &Value) -> nuphus::ToolResult {
         let result: Result<Value> = async {
@@ -104,18 +109,32 @@ impl nuphus::agent::events::EventEmitter for AuthoringEmitter {
         {
             return;
         }
-        use nuphus::agent::events::NuphusEvent;
-        // No reasoning chunks, model credentials or unrelated app events enter
-        // this workflow-bound panel.
-        let visible = match event {
-            NuphusEvent::AssistantProgress { text, .. } => json!({"type":"progress","text":text}),
-            NuphusEvent::ToolCallStart { tool_name, .. } => json!({"type":"tool","name":tool_name}),
-            NuphusEvent::ToolCallEnd { success, error, .. } if !success => {
-                json!({"type":"error","text":error})
-            }
-            _ => return,
+        let Some(visible) = authoring_event(event) else {
+            return;
         };
         let _=self.app.emit("workbench-authoring",json!({"project_id":self.project,"workflow_id":self.workflow,"turn_id":self.turn,"event":visible}));
+    }
+}
+
+fn authoring_event(event: nuphus::agent::events::NuphusEvent) -> Option<Value> {
+    use nuphus::agent::events::NuphusEvent;
+    // Only public text from this authoring agent enters the panel. Thinking,
+    // subtask output and unrelated app events remain excluded.
+    match event {
+        NuphusEvent::LlmTextDelta {
+            text,
+            is_thinking: false,
+            from_task: false,
+        } => Some(json!({"type":"progress","text":text,"delta":true})),
+        NuphusEvent::ToolCallStart { tool_name, .. } => {
+            Some(json!({"type":"tool","name":tool_name}))
+        }
+        NuphusEvent::ToolCallEnd {
+            success: false,
+            error,
+            ..
+        } => Some(json!({"type":"error","text":error})),
+        _ => None,
     }
 }
 
@@ -251,4 +270,34 @@ pub async fn workbench_generate(
         }
     }));
     Ok(json!({"turn_id":returned}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nuphus::agent::events::NuphusEvent;
+
+    #[test]
+    fn authoring_stream_exposes_public_text_but_not_thinking_or_subtasks() {
+        for (is_thinking, from_task) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let event = authoring_event(NuphusEvent::LlmTextDelta {
+                text: "chunk".into(),
+                is_thinking,
+                from_task,
+            });
+            if !is_thinking && !from_task {
+                assert_eq!(
+                    event,
+                    Some(json!({"type":"progress","text":"chunk","delta":true}))
+                );
+            } else {
+                assert!(event.is_none());
+            }
+        }
+        assert!(authoring_event(NuphusEvent::DirectResponse {
+            message: "unrelated".into()
+        })
+        .is_none());
+    }
 }
