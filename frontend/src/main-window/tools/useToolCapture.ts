@@ -167,6 +167,14 @@ export function useToolCapture() {
               return
             }
 
+            // 「保存」（只留文件、不注入对话）：覆盖窗确认条的新出口。对本 Promise
+            // 的消费方（icon 重截 / 截图输入框）而言 = 没有可注入的截图，按取消同形
+            // 静默收尾——不报错、不注入，文件已落盘由覆盖窗提示（DesktopToolbar 路径）。
+            if (raw.saved_only) {
+              done({ mode, cancelled: true })
+              return
+            }
+
             // Parse region from raw result
             const region: CaptureRegion | undefined = raw.region
               ? {

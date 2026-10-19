@@ -99,11 +99,12 @@ impl AnthropicTransport {
         }
 
         // ── reasoning effort (extended thinking depth) ────────────────────
-        // Anthropic Messages API: `{"reasoning": {"effort": "none|low|high|max"}}`.
-        // Only emitted when the user configured a value — otherwise the request
-        // stays byte-identical to current behavior.
+        // Anthropic Messages API（官方 Effort 页，2026-10 核对）：effort 设在
+        // **顶层 `output_config.effort`**，不在 `thinking` 对象内。旧实现发
+        // `reasoning: {effort}` 不是官方字段（会被忽略/拒绝，档位实际不生效）。
+        // 仅当用户配置了值时才下发，否则请求与现状逐字节一致。
         if let Some(effort) = &self.config.reasoning_effort {
-            body["reasoning"] = serde_json::json!({ "effort": effort });
+            body["output_config"] = serde_json::json!({ "effort": effort });
         }
 
         body
@@ -393,14 +394,15 @@ mod tests {
 
     #[test]
     fn test_build_request_body_reasoning_effort_sent() {
-        for effort in ["none", "low", "high", "max"] {
+        // 官方枚举五档（platform.claude.com · Effort）：low/medium/high/xhigh/max。
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
             let transport = AnthropicTransport::new(config_with(Some(effort)));
             let request = MessageRequest::new("claude-sonnet-5", vec![]);
             let body = transport.build_request_body(&request);
             assert_eq!(
-                body["reasoning"],
+                body["output_config"],
                 serde_json::json!({ "effort": effort }),
-                "configured effort {} should be sent as reasoning.effort",
+                "configured effort {} should be sent as output_config.effort",
                 effort
             );
         }
@@ -412,8 +414,8 @@ mod tests {
         let request = MessageRequest::new("claude-sonnet-5", vec![]);
         let body = transport.build_request_body(&request);
         assert!(
-            body.get("reasoning").is_none(),
-            "no reasoning block when effort is not configured (current behavior preserved)"
+            body.get("output_config").is_none(),
+            "no output_config block when effort is not configured (current behavior preserved)"
         );
     }
 }

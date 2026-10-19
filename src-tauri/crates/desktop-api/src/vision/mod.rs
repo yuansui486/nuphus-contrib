@@ -145,7 +145,7 @@ pub struct ColorSpot {
 
 // ───────────────────────────── 偏色系统 ─────────────────────────────
 
-/// RGB 三通道独立偏色（大漠风格 "203040" = dr=32, dg=48, db=64）
+/// RGB 三通道独立偏色（"203040" = dr=32, dg=48, db=64）
 #[derive(Debug, Clone, Copy)]
 pub struct DeltaColor {
     pub dr: u8, // R 通道最大偏差

@@ -10,6 +10,7 @@ use tauri::Manager;
 use tauri::State;
 
 // Submodule split
+pub mod background;
 pub mod leader;
 pub mod lifecycle;
 pub mod mode;
@@ -19,6 +20,7 @@ pub mod session;
 pub mod shelf;
 
 // Re-export public commands so commands::xxx remains accessible
+pub use background::*;
 pub use lifecycle::*;
 pub use mode::*;
 pub use retry::*;
@@ -94,7 +96,15 @@ async fn resolve_references(refs: &[ChatReference]) -> String {
             "quote" => r.label.clone(),
             _ => format!("[Unknown reference type: {}]", r.ref_type),
         };
-        if !content.is_empty() {
+        if content.is_empty() {
+            continue;
+        }
+        // quote 的 label 即原文全文（该类型没有独立显示名）：若套用下面
+        // 「[类型] label:」的通用格式，会把同一段文本注入两次
+        // （[quote] 原文:\n原文）。该类型只发类型标记 + 原文。
+        if r.ref_type == "quote" {
+            parts.push(format!("[quote]\n{}", content));
+        } else {
             parts.push(format!("[{}] {}:\n{}", r.ref_type, r.label, content));
         }
     }
@@ -826,6 +836,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                 let mut tools = nuphus::ToolRegistry::work_agent();
                 // 与 AppState 持有的全局唯一信号实例对齐
                 tools.set_signals(state.signals.clone());
+                tools.set_cancel_flag(state.cancel_flag.clone());
                 tools.set_automation_gate(state.automation_gate.clone());
                 let perms = state
                     .runtime
@@ -894,7 +905,32 @@ pub async fn submit_user_message<R: tauri::Runtime>(
             match wa.run(&effective_message, &images2, &cancel_flag2).await {
                 Ok(output) => {
                     if let Ok(mut guard) = state.runtime.lock() {
+                        // ── workflow 轮次完成落盘（对齐 leader 持久化时机）──
+                        // 此前 workflow 轮次结束只把 agent 放回槽，镜像（SQLite 快照 +
+                        // 元数据行）要等 refine 或退出钩子才写——期间切走/崩溃，rail 显示
+                        // 的 preview/message_count 与恢复链拿到的都是旧快照。
+                        // 保护名单先于 runtime 锁收集（std Mutex 不可重入）。
+                        let protected =
+                            crate::commands::process::shelf::protected_snapshot_ids_with_ctx(
+                                &guard, state.inner(),
+                            );
+                        crate::commands::process::shelf::persist_and_mirror(
+                            "workflow",
+                            wa.session(),
+                            &protected,
+                        );
                         guard.workflow_agent = Some(wa);
+                    }
+                    // ── 轮次收敛：清 session_backup ──
+                    // session_backup 只服务「执行中 agent 被 take 的历史回退」与
+                    // 「切换降级中转」两个生命周期内场景。轮次成功放回槽后槽位已是
+                    // 权威数据，残留旧快照会让空态判据（process.rs backup_none）失真、
+                    // 且跨 mode 切回时被 chat_history / rail 的 backup 回退路径读到
+                    // 其它 mode 的会话（2026-10-13 leader 会话"被覆盖"事故根因之一）。
+                    if let Ok(mut sb) = state.session.lock() {
+                        sb.session_backup = None;
+                        sb.last_message.clear();
+                        sb.last_message_images.clear();
                     }
                     (output, false, Option::<String>::None)
                 }
@@ -962,6 +998,14 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                     if let Ok(mut guard) = state.runtime.lock() {
                         guard.leader_agent = Some(runtime);
                     }
+                    // ── 轮次收敛：清 session_backup（与 workflow 分支同语义）──
+                    // 槽位已放回权威数据，备份的「执行中回退」使命结束；残留会污染
+                    // 空态判据与跨 mode 切回时的 backup 回退路径（2026-10-13 事故）。
+                    if let Ok(mut sb) = state.session.lock() {
+                        sb.session_backup = None;
+                        sb.last_message.clear();
+                        sb.last_message_images.clear();
+                    }
                     (output, false, Option::<String>::None)
                 }
                 Err(e) => {
@@ -989,6 +1033,7 @@ pub async fn submit_user_message<R: tauri::Runtime>(
                                         state.tool_permissions_ref.clone(),
                                         &emitter,
                                         &pause_flag2,
+                                        &state.cancel_flag,
                                         large_force_refine_threshold2,
                                     )
                                 {
@@ -1531,7 +1576,7 @@ pub async fn execute_session_refine(
 }
 
 /// 桌面端「跳过提炼」：本地关闭弹窗 + 广播 RefineSkipped（双端同步关闭）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn refine_skip(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -1622,6 +1667,44 @@ fn persist_leader_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── quote 引用注入格式回归 ──
+    // 事故：resolve_references 曾对 quote 套用「[类型] label:」通用格式，而 quote 的
+    // label 即原文全文（无独立显示名）→ 同一段文本注入两遍（[quote] 原文:\n原文）。
+    #[tokio::test]
+    async fn quote_reference_injects_original_text_exactly_once() {
+        let text = "顺带记录一个附带发现：模型切换提示曾永久驻留会话。";
+        let refs = vec![ChatReference {
+            ref_type: "quote".into(),
+            id: "q1".into(),
+            label: text.into(),
+        }];
+        let out = resolve_references(&refs).await;
+        assert_eq!(
+            out.matches(text).count(),
+            1,
+            "quote 原文只许出现一次: {out}"
+        );
+        assert!(
+            out.starts_with("[quote]\n"),
+            "quote 只发类型标记 + 原文: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_quote_references_keep_label_header_format() {
+        // 其他类型 label 是短名、content 是文件内容，头部格式不变
+        let refs = vec![ChatReference {
+            ref_type: "skill".into(),
+            id: "nonexistent-skill".into(),
+            label: "我的技能".into(),
+        }];
+        let out = resolve_references(&refs).await;
+        assert_eq!(
+            out,
+            "[skill] 我的技能:\n[Skill not found: nonexistent-skill]"
+        );
+    }
 
     // ── dedup 防线纯函数回归 ──
     // 历史事故：追加指令重复注入（busy 路径）与刷新重试重复提交（非 busy 路径）。

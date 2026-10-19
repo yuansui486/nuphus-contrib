@@ -41,6 +41,20 @@ export class InspectorDraftStore {
       this.entries.set(`${to}\u0000${entry.field}`, entry)
     }
   }
+  /**
+   * I-2：外部替换 IR（undo/redo/终态对账）后丢弃全部脏草稿。
+   * 脏草稿基于旧 IR；若保留，下次 flush 会把撤销前的文本写回，静默覆盖撤销结果。
+   * 全部失效（而非保留脏文本）：undo 的语义是「回到过去」，未提交编辑与目标版本无关。
+   */
+  invalidateAll() {
+    let removed = false
+    for (const [key, entry] of this.entries) {
+      if (entry.text === entry.baseline) continue
+      this.entries.delete(key)
+      removed = true
+    }
+    if (removed) this.changed()
+  }
   prune(nodeIds: Set<string>) {
     let removed = false
     for (const [key, entry] of this.entries) {

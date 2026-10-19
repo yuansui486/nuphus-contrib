@@ -325,34 +325,32 @@ pub fn lookup<'a>(
 
 /// Two-tier read-only-cache lookup:
 /// tier 1 — known vendor via [`lookup`]（builtin 映射表里的厂商）；
-/// tier 2 — unknown/custom providers（中转站、自建网关）：无法静态映射 vendor，
-/// 用模型 id 的基名段在全目录里做「唯一命中」匹配 —— 中转站转发的大多是
-/// 与官方同名同源的模型，能力数据可信；恰好一个命中才采信，零或多个
-/// → None（宁缺勿错，避免跨厂商重名误配出假能力值）。
-/// Catalog-wide **base-segment** match over an already-loaded entry list —
-/// the relay / self-hosted-gateway tier.
+/// tier 2 — unknown/custom providers（中转站、自建网关）：委托
+/// [`lookup_generic`]（同构归一 + 变体折叠 + 唯一厂商护栏）。中转站转发的
+/// 大多是官方同名同源的模型，能力数据可信；恰好一个厂商命中才采信，零或
+/// 多个 → None（宁缺勿错，避免跨厂商重名误配出假能力值）。
+/// Tier-2 匹配器本体（全目录基名段唯一命中）——也是两处调用的唯一实现：
+/// `lookup_generic_cached` 的 tier-2（展示链）与激活时发现链
+/// （`model_metadata.rs`）都委托到这里。匹配规则：
 ///
-/// Why a separate function instead of extending [`lookup_generic_cached`]:
-/// that one is on the official-provider path and its hit set must stay
-/// byte-for-byte unchanged; relay ids need two extra tolerances plus one new
-/// guardrail, so they live here:
-///
-/// * tolerant — both sides go through
-///   [`nuphus::config::registry::normalize_model_id`], so a relay alias
-///   (`Claude-Opus-4.6`) matches an OpenRouter id (`anthropic/claude-opus-4.6`)
-///   despite capitals and dots;
-/// * variant-aware — `:batch` / `:free` variants of the same vendor are the
-///   *same* model, not a second one. Without collapsing them, every modern
-///   catalog entry double-counts and a unique-hit rule can never fire;
-/// * still 宁缺勿错 — a base segment published by **more than one vendor**
-///   resolves to `None` rather than attributing another vendor's capabilities.
+/// * tolerant — 两侧都过 [`nuphus::config::registry::normalize_model_id`]，
+///   中转别名（`Claude-Opus-4.6`）对得上目录 id（`anthropic/claude-opus-4.6`）；
+/// * prefix-symmetric — 两侧都先过 `normalize_base` 剥 vendor 前缀，
+///   带前缀的配置 id（`deepseek/deepseek-v4.1-flash`）不会因斜杠失配
+///   （repo issue #99 的硬伤 2）；
+/// * variant-aware — `:batch` / `:free` 变体折叠为同一模型；
+/// * still 宁缺勿错 — 同一基名段被**多个厂商**发布 → None。
 ///
 /// Prefers the canonical (non-variant) entry when one exists.
 pub fn lookup_generic<'a>(
     entries: &'a [OpenRouterEntry],
     model_id: &str,
 ) -> Option<&'a OpenRouterEntry> {
-    let needle = normalize_model_id(model_id);
+    // needle 与候选侧同构：都先过 normalize_base 去 vendor 前缀。中转 /v1/models
+    // 常返回 `deepseek/deepseek-v4.1-flash` 这类**带前缀** id，而 normalize_model_id
+    // 只归一 `.` `_` `-`、不处理 `/`——needle 不剥前缀就永远带着斜杠，配不上被
+    // normalize_base 剥过前缀的目录条目（repo issue #99 的硬伤 2）。
+    let needle = normalize_model_id(&normalize_base(model_id));
     if needle.is_empty() {
         return None;
     }
@@ -392,20 +390,10 @@ pub fn lookup_generic_cached(
     if let Some(e) = lookup(&cache.entries, provider_id, model_id) {
         return Some(e.clone());
     }
-    let model_lower = model_id.trim().to_lowercase();
-    if model_lower.is_empty() {
-        return None;
-    }
-    let hits: Vec<&OpenRouterEntry> = cache
-        .entries
-        .iter()
-        .filter(|e| normalize_base(&e.id) == model_lower)
-        .collect();
-    if hits.len() == 1 {
-        Some(hits[0].clone())
-    } else {
-        None
-    }
+    // 中转 / 自建网关：tier-2 统一委托 lookup_generic（两侧同构归一 + 变体折叠 +
+    // 唯一厂商护栏）。旧的内联比较（needle 整串 vs 剥前缀候选）对带 vendor 前缀的
+    // id 必然失配——repo issue #99 的硬伤 2，已整段移除。
+    lookup_generic(&cache.entries, model_id).cloned()
 }
 
 #[cfg(test)]
@@ -506,6 +494,55 @@ mod tests {
             entry("some-relay/claude-opus-4.6", Some(200_000)),
         ];
         assert!(lookup_generic(&entries, "claude-opus-4.6").is_none());
+    }
+
+    #[test]
+    fn lookup_generic_matches_vendor_prefixed_relay_id() {
+        // repo issue #99 的复现形态：中转 /v1/models 返回带 vendor 前缀的 id。
+        // needle 不剥前缀时（旧行为）斜杠令两侧永不相等，必然 None。
+        let entries = vec![
+            entry("deepseek/deepseek-v4.1-flash", Some(256_000)),
+            entry("deepseek/deepseek-v4.1-flash:batch", Some(256_000)),
+        ];
+        let hit = lookup_generic(&entries, "deepseek/deepseek-v4.1-flash")
+            .expect("prefixed relay id must hit");
+        assert_eq!(hit.id, "deepseek/deepseek-v4.1-flash");
+        // 大小写 / 下划线混合写法同样命中（两侧都过 normalize_model_id）
+        assert!(lookup_generic(&entries, "DeepSeek/DeepSeek_V4.1-Flash").is_some());
+        // 目录只有 :batch 变体时不丢命中（变体折叠）
+        let only_batch = vec![entry("deepseek/deepseek-v4.1-flash:batch", Some(256_000))];
+        assert!(lookup_generic(&only_batch, "deepseek/deepseek-v4.1-flash").is_some());
+    }
+
+    #[test]
+    fn lookup_generic_prefixed_id_still_requires_unique_vendor() {
+        // 带前缀也不豁免护栏：两个厂商发布同基名段 → None
+        let entries = vec![
+            entry("deepseek/deepseek-v4.1-flash", Some(256_000)),
+            entry("some-relay/deepseek-v4.1-flash", Some(128_000)),
+        ];
+        assert!(lookup_generic(&entries, "deepseek/deepseek-v4.1-flash").is_none());
+    }
+
+    #[test]
+    fn lookup_generic_cached_tier2_matches_vendor_prefixed_id() {
+        // 展示链（list_models → lookup_generic_cached）对 custom 段 + 带前缀 id
+        // 必须拿到条目及其 efforts（issue #99：数据在缓存里却取不到）。
+        let dir = std::env::temp_dir().join(format!(
+            "nuphus-oragg-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = entry("deepseek/deepseek-v4.1-flash", Some(256_000));
+        e.supported_efforts = vec!["max".into(), "high".into(), "low".into()];
+        e.default_effort = Some("high".into());
+        save_cache(&cache_path(&dir), &[e]).unwrap();
+        let hit = lookup_generic_cached(&dir, "custom-1790570943", "deepseek/deepseek-v4.1-flash")
+            .expect("tier-2 must hit prefixed id on custom segment");
+        assert_eq!(hit.id, "deepseek/deepseek-v4.1-flash");
+        assert_eq!(hit.supported_efforts, vec!["max", "high", "low"]);
+        assert_eq!(hit.default_effort.as_deref(), Some("high"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -372,6 +372,10 @@ describe('SessionRail 项目文件夹分组渲染', () => {
   it('启动时只展开「上次对话」所在的项目文件夹，其余文件夹收起', async () => {
     // 上次关闭软件前停在 E:\NUS\1 下的对话
     localStorage.setItem('nuphus:rail-last-project', 'E:\\NUS\\1')
+    // active 会话必须也在同一组：组件在 items 到达后会把 active 的归属写回
+    // localStorage（「记录上次对话」effect）。若 active 停在别的组，它会在断言前
+    // 覆盖掉上面这行预置值 —— 单跑时常因时序差躲过，CI 高并发下必暴露。
+    activeId = 'bm1-new'
     renderRail()
     await waitFor(() => expect(screen.getByText('一号')).toBeInTheDocument())
 
@@ -388,6 +392,9 @@ describe('SessionRail 项目文件夹分组渲染', () => {
 
   it('上次对话无归属 → 展开「未分组」兜底组', async () => {
     localStorage.setItem('nuphus:rail-last-project', '')
+    // active 必须落在「未分组」才算真正验证兜底逻辑：否则「记录上次对话」
+    // effect 会把 key 覆盖成 active 的组，本用例即使通过也证明不了兜底分支。
+    activeId = 'lonely'
     renderRail()
     await waitFor(() => expect(screen.getByText('无归属会话')).toBeInTheDocument())
 
@@ -397,6 +404,8 @@ describe('SessionRail 项目文件夹分组渲染', () => {
   })
 
   it('无「上次对话」记录（首次使用 / 存储被清）→ 保持全展开', async () => {
+    // 清掉上例可能遗留的记录（beforeEach 已 clear，这里显式重申意图）
+    localStorage.removeItem('nuphus:rail-last-project')
     renderRail()
     await waitFor(() => expect(screen.getByText('一号新会话')).toBeInTheDocument())
     expect(screen.getByText('当前会话')).toBeInTheDocument()
@@ -405,6 +414,8 @@ describe('SessionRail 项目文件夹分组渲染', () => {
 
   it('「上次对话」所在文件夹已不在列表（归档 / 删书签）→ 保持全展开，不给空视角', async () => {
     localStorage.setItem('nuphus:rail-last-project', 'E:\\work\\Gone')
+    // 记录指向不存在的组 → 该 effect 只在 groups 命中时才覆盖，故此处预置值
+    // 会保留下来，可稳定验证「记录失效 → 全展开」这条分支。
     renderRail()
     await waitFor(() => expect(screen.getByText('一号新会话')).toBeInTheDocument())
     expect(screen.getByText('当前会话')).toBeInTheDocument()

@@ -6,7 +6,7 @@
 
 /// 提取文档文本（docx/pptx/xls/ods/odt/odp/pdf），返回 Markdown/纯文本。
 /// 供工具页「文档转文本」能力使用；PDF 走既有三层降级（文本层 → lopdf → 渲染 OCR）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn doc_extract_text(path: String) -> Result<serde_json::Value, String> {
     match nuphus::utils::office::read_office(&path) {
         Some(Ok(text)) => {

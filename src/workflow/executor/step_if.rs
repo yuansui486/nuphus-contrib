@@ -1,4 +1,5 @@
 //! 条件分支执行
+use super::control_flow;
 use super::*;
 
 impl Executor {
@@ -31,21 +32,32 @@ impl Executor {
         let body = async {
             let mut scope = variables.clone();
             for sub in target {
-                self.execute_step(
-                    sub,
-                    depth + 1,
-                    store,
-                    events,
-                    tool_exec,
-                    &mut scope,
-                    workflow_id,
-                    llm,
-                    emitter,
-                    tool_schemas,
-                    completed_ids,
-                    run_record,
-                )
-                .await?;
+                // B2：控制流信号穿透 if 容器——提升 if 内已产生的变量后
+                // 原样向上传播，由最近一层 loop 消费。
+                if let Err(error) = self
+                    .execute_step(
+                        sub,
+                        depth + 1,
+                        store,
+                        events,
+                        tool_exec,
+                        &mut scope,
+                        workflow_id,
+                        llm,
+                        emitter,
+                        tool_schemas,
+                        completed_ids,
+                        run_record,
+                    )
+                    .await
+                {
+                    if control_flow::is_control_flow_error(&error).is_some() {
+                        for (k, v) in &scope {
+                            variables.insert(k.clone(), v.clone());
+                        }
+                    }
+                    return Err(error);
+                }
             }
             for (k, v) in &scope {
                 variables.insert(k.clone(), v.clone());

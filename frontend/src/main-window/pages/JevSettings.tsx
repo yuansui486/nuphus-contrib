@@ -142,6 +142,14 @@ function makeTXT(t: TFunc) {
     clearOk: tr(t, 'jev.clearOk', '增强判断模型 API Key 已清除'),
     clearFail: (e: string) =>
       t('jev.clearFail', e) === 'jev.clearFail' ? `清除失败：${e}` : t('jev.clearFail', e),
+    // ── Section 外壳 / tab 导航 ──
+    sectionTitle: tr(t, 'jev.sectionTitle', '增强判断模型'),
+    sectionDesc: tr(
+      t,
+      'jev.sectionDesc',
+      '用于在工作流开发中从有限候选动作里进行结构化判断，不替代聊天模型，也不能直接点击坐标或生成任意脚本。',
+    ),
+    tabsAria: tr(t, 'jev.tabsAria', '决策后端'),
   }
 }
 
@@ -319,11 +327,8 @@ export function JevSettings() {
 
   return (
     <>
-      <Section
-        title="增强判断模型"
-        description="用于在工作流开发中从有限候选动作里进行结构化判断，不替代聊天模型，也不能直接点击坐标或生成任意脚本。"
-      >
-        <div className="decision-backend-tabs" role="tablist" aria-label="决策后端">
+      <Section title={TXT.sectionTitle} description={TXT.sectionDesc}>
+        <div className="decision-backend-tabs" role="tablist" aria-label={TXT.tabsAria}>
           <button
             type="button"
             role="tab"

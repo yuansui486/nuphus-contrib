@@ -22,10 +22,12 @@ pub async fn interrupt(state: State<'_, AppState>) -> Result<String, String> {
     // 用户点「中断」的意图是"停掉当前执行"，所以这里一并取消活动工作流。
     // `active_id` 由执行器 set_active/clear_active 维护，wait 步骤轮询期间也一直有值。
     // mark_user_cancelled 是既有机制：工具返回后 react_loop 据此不再重启工作流。
+    let mut workflow_note = "无活动工作流".to_string();
     if let Some(wf_id) = nuphus::workflow::hud_control::active_id(&state.signals) {
         let engine = state.workflow_engine.read().await;
         engine.cancel_workflow(&wf_id).await;
         nuphus::workflow::hud_control::mark_user_cancelled();
+        workflow_note = format!("已取消工作流 {wf_id}");
         tracing::info!(
             "[INTERRUPT] cancel_flag set + cancelled active workflow: {}",
             wf_id
@@ -34,12 +36,59 @@ pub async fn interrupt(state: State<'_, AppState>) -> Result<String, String> {
         tracing::info!("[INTERRUPT] cancel_flag set (no active workflow)");
     }
 
-    Ok("Task interrupted".to_string())
+    // 置位 cancel_flag 只是让 agent 循环「不再等」；工具执行体是 spawn_blocking 里的
+    // 同步代码，`spawn_blocking` 不可中断 —— 真正让阻塞线程退出的唯一办法是**杀掉它
+    // 手里正在跑的进程**。所以这里立即结算后台任务清单：只终止 retain=false 的前台
+    // 进程（保留项是显式意图，一律不碰），并把真实数字带回去。
+    //
+    // 汇报纪律：**不许说「已全部停止」**。杀不掉的（权限/已脱离进程树）与仍在跑的
+    // 保留项都必须原样上报，否则上层会向用户谎报执行状态。
+    let report = nuphus::tools::background_tasks::global().kill_foreground();
+    for (id, pid, reason) in &report.failed {
+        tracing::error!("[INTERRUPT] 终止前台进程失败 {id} (PID {pid}): {reason}");
+    }
+    let retained_detail = if report.retained > 0 {
+        let kept: Vec<String> = nuphus::tools::background_tasks::global()
+            .list()
+            .into_iter()
+            .filter(|t| t.retain)
+            .map(|t| format!("{} (PID {})", t.command, t.pid))
+            .collect();
+        format!(
+            "，保留 {} 个后台任务仍在运行（不会被中断杀掉，需按需结束）：{}",
+            report.retained,
+            kept.join("; ")
+        )
+    } else {
+        String::new()
+    };
+    let failed_detail = if report.failed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "，另有 {} 个前台进程未能终止（已如实记录）",
+            report.failed.len()
+        )
+    };
+
+    tracing::info!(
+        "[INTERRUPT] kill_foreground: killed={} already_gone={} retained={} failed={}",
+        report.killed.len(),
+        report.already_gone,
+        report.retained,
+        report.failed.len()
+    );
+
+    Ok(format!(
+        "Task interrupted: {workflow_note}；已终止 {} 个前台进程（{} 个自行退出）{failed_detail}{retained_detail}",
+        report.killed.len(),
+        report.already_gone
+    ))
 }
 
 /// 暂停执行(弹出中断菜单:继续/追加/终止)
 /// 立即发射 ExecutionPaused 事件让前端弹出暂停菜单，不需要等 Agent 循环到检查点
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pause_execution(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -64,7 +113,7 @@ pub fn pause_execution(
 /// 继续执行(用户点击"继续"按钮)
 /// 注：不清 pause_flag 也不清 action_id，由运行时循环消费决策后自行清除。
 /// 循环进入暂停等待前会先用 action_id 查决策，已存在则直接处理不弹窗。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn continue_execution(state: State<'_, AppState>, action_id: String) -> Result<String, String> {
     nuphus::agent::pause::set_pause_decision(
         &state.signals,
@@ -77,7 +126,7 @@ pub fn continue_execution(state: State<'_, AppState>, action_id: String) -> Resu
 }
 
 /// 追加指令后继续执行(用户输入新指令后点击发送)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn append_instruction(
     state: State<'_, AppState>,
     action_id: String,
@@ -132,7 +181,7 @@ pub fn append_instruction(
 /// 终止执行(用户点击"终止"按钮)
 /// 不设 cancel_flag，由循环的 pause check 读到 Terminate 决策后
 /// 注入系统提示词并走 leader_should_stop 优雅退出。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn terminate_execution(
     state: State<'_, AppState>,
     action_id: String,
@@ -151,7 +200,7 @@ pub fn terminate_execution(
 /// Agent 循环检测到 pause_flag 后，直接走 Terminate 路径：
 ///   → LLM 整理输出 → 保存结果 → 返回
 /// 与用户点暂停菜单「终止」等价，但跳过前端弹窗。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn graceful_stop(state: State<'_, AppState>) -> Result<String, String> {
     let action_id = uuid::Uuid::new_v4().to_string();
     nuphus::agent::pause::set_pause_action_id(&state.signals, &action_id);
@@ -238,7 +287,7 @@ pub async fn force_reset(state: State<'_, AppState>) -> Result<String, String> {
 
 /// 兼容壳：只回答「后端是否仍被占用」。新代码请用 [`get_execution_state`]——
 /// 追加判定需要区分 Running / Finalizing，单一布尔无法表达（见 ExecutionStage）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn is_busy(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(state.busy.load(Ordering::SeqCst))
 }
@@ -265,7 +314,7 @@ pub struct ExecutionStateSnapshot {
     pub tool_calls: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_execution_state(state: State<'_, AppState>) -> Result<ExecutionStateSnapshot, String> {
     let signals = nuphus::state::SignalState::read(&state.signals);
     let stage = signals.execution_stage;
@@ -279,7 +328,7 @@ pub fn get_execution_state(state: State<'_, AppState>) -> Result<ExecutionStateS
 }
 
 /// Read the backend-owned append queue for the execution control UI.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_append_queue(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let signals = nuphus::state::SignalState::read(&state.signals);
     Ok(signals.append_queue.clone())
@@ -288,7 +337,7 @@ pub fn get_append_queue(state: State<'_, AppState>) -> Result<Vec<String>, Strin
 /// Remove one still-pending append instruction by its queue index.
 /// The active agent consumes from this same vector, so an already-consumed
 /// instruction cannot be deleted through this command.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_append_queue_item(
     state: State<'_, AppState>,
     index: usize,

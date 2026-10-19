@@ -24,7 +24,7 @@ pub const EXPIRY_SKEW_SECS: i64 = 60;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TokenIssuance {
     pub access_token: String,
-    /// 响应缺 refresh_token（部分服务只在首次下发）→ None，刷��时保留旧值。
+    /// 响应缺 refresh_token（部分服务只在首次下发）→ None，刷新时保留旧值。
     pub refresh_token: Option<String>,
     pub expires_in: Option<i64>,
 }
@@ -97,7 +97,7 @@ pub fn parse_token_response(body: &str) -> Result<TokenIssuance, String> {
 /// 读指定段的 OAuth 配置（令牌字段已透明解密）。
 ///
 /// 段不存在 / 未配 oauth → None；配置文件缺失/损坏 → None（调用方按
-/// ���尚未配置」语义处理，与 api_key 读取路径口径一致）。
+/// 「尚未配置」语义处理，与 api_key 读取路径口径一致）。
 pub fn read_oauth_segment(config_path: &std::path::Path, provider: &str) -> Option<ProviderOAuth> {
     let registry = ModelRegistry::from_toml(config_path.to_str()?).ok()?;
     registry
@@ -118,6 +118,73 @@ pub fn write_oauth_tokens(
     access_token: &str,
     refresh_token: &str,
     expires_at: Option<i64>,
+) -> Result<(), String> {
+    write_oauth_tokens_inner(
+        config_path,
+        provider,
+        access_token,
+        refresh_token,
+        expires_at,
+        None,
+    )
+}
+
+pub fn write_oauth_session(
+    config_path: &std::path::Path,
+    provider: &str,
+    client_id: &str,
+    tokens: super::oauth_flow::Tokens,
+) -> Result<(), String> {
+    if let Some(oauth) = read_oauth_segment(config_path, provider) {
+        if let Some(id) = &oauth.account_ref {
+            if id != client_id {
+                return Err("OAuth callback changed the selected account".into());
+            }
+            let mut store =
+                super::oauth_accounts::LockedStore::open(config_path, &oauth.credential_file)?;
+            store.account_mut(id)?.update(tokens)?;
+            return store.save();
+        }
+    }
+    let _file_lock = lock_session(config_path)?;
+    write_oauth_tokens_inner(
+        config_path,
+        provider,
+        &tokens.access_token,
+        tokens.refresh_token.as_deref().unwrap_or(""),
+        (tokens.expires_in > 0).then(|| now_unix().saturating_add(tokens.expires_in)),
+        Some(client_id),
+    )
+}
+
+/** 从账号注册信息恢复身份绑定和主机参数，回调协议本身无需认识服务商。 */
+pub fn prepare_login(
+    config_path: &std::path::Path,
+    provider: &str,
+    redirect_uri: String,
+) -> Result<super::oauth_flow::LoginAttempt, String> {
+    let mut oauth =
+        read_oauth_segment(config_path, provider).ok_or("OAuth configuration not found")?;
+    let subject = if let Some(id) = &oauth.account_ref {
+        let mut store =
+            super::oauth_accounts::LockedStore::open(config_path, &oauth.credential_file)?;
+        for value in oauth.extra_authorize_params.values_mut() {
+            *value = value.replace("{{host_id}}", &store.data.host_id);
+        }
+        Some(store.account_mut(id)?.subject.clone())
+    } else {
+        None
+    };
+    super::oauth_flow::LoginAttempt::new(&oauth, redirect_uri, subject)
+}
+
+fn write_oauth_tokens_inner(
+    config_path: &std::path::Path,
+    provider: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: Option<i64>,
+    client_id: Option<&str>,
 ) -> Result<(), String> {
     let _config_write = crate::config::lock_provider_config();
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
@@ -142,13 +209,20 @@ pub fn write_oauth_tokens(
         .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
         .as_table_mut()
         .ok_or_else(|| format!("段 {provider} 的 oauth 配置不是表"))?;
+    if let Some(client_id) = client_id {
+        oauth.insert("client_id".into(), toml::Value::String(client_id.into()));
+        oauth.insert(
+            "dynamic_client_registration".into(),
+            toml::Value::Boolean(false),
+        );
+    }
     oauth.insert(
         "access_token".to_string(),
-        toml::Value::String(encode_credential(access_token)),
+        toml::Value::String(super::oauth_accounts::protect(access_token)?),
     );
     oauth.insert(
         "refresh_token".to_string(),
-        toml::Value::String(encode_credential(refresh_token)),
+        toml::Value::String(super::oauth_accounts::protect(refresh_token)?),
     );
     match expires_at {
         Some(ts) => oauth.insert("expires_at".to_string(), toml::Value::Integer(ts)),
@@ -165,97 +239,49 @@ pub fn write_oauth_tokens(
 
 /// 登出：清空段的三个令牌字段并落盘（配置五项保留，便于重新授权）。
 pub fn clear_oauth_tokens(config_path: &std::path::Path, provider: &str) -> Result<(), String> {
+    if let Some(oauth) = read_oauth_segment(config_path, provider) {
+        if let Some(id) = &oauth.account_ref {
+            let mut store =
+                super::oauth_accounts::LockedStore::open(config_path, &oauth.credential_file)?;
+            let account = store.account_mut(id)?;
+            account.access_token.clear();
+            account.refresh_token.clear();
+            account.id_token.clear();
+            account.expires_at = 0;
+            return store.save();
+        }
+    }
+    let _file_lock = lock_session(config_path)?;
     write_oauth_tokens(config_path, provider, "", "", None)
 }
 
-/// 令牌落盘编码：空值写空串（无令牌状态），非空走 DPAPI。
-/// 与桌面层 `encode_api_key` 同一语义；核心层写路径（本模块）就近复用
-/// [`crate::cookies::encrypt_secret`]，不跨层调用桌面私有函数。
-fn encode_credential(plain: &str) -> String {
-    let v = plain.trim();
-    if v.is_empty() {
-        String::new()
-    } else {
-        crate::cookies::encrypt_secret(v)
-    }
-}
-
-fn token_http_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client 初始化失败: {e}"))
-}
-
-/// 授权码换令牌（oauth_begin 回调后的核心一步）。
-///
-/// `verifier`：PKCE code_verifier（use_pkce=false 时不携带）。
-/// `redirect_port`：本地回调端口（redirect_uri 与授权请求一致）。
-pub fn exchange_code_blocking(
-    oauth: &ProviderOAuth,
-    code: &str,
-    verifier: &str,
-    redirect_port: u16,
-) -> Result<TokenIssuance, String> {
-    let client = token_http_client()?;
-    let mut form = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code.to_string()),
-        (
-            "redirect_uri",
-            format!("http://127.0.0.1:{redirect_port}/callback"),
-        ),
-        ("client_id", oauth.client_id.clone()),
-    ];
-    if oauth.use_pkce {
-        form.push(("code_verifier", verifier.to_string()));
-    }
-    let resp = client
-        .post(oauth.token_url.trim())
-        .form(&form)
-        .send()
-        .map_err(|e| format!("令牌端点请求失败: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        // 失败响应也走同一解析器：提取 OAuth error 字段（协议枚举，不含任何令牌值）
-        return match parse_token_response(&body) {
-            Err(e) => Err(format!("令牌端点返回错误 (HTTP {status}): {e}")),
-            Ok(_) => Err(format!("令牌端点返回错误 (HTTP {status})")),
-        };
-    }
-    parse_token_response(&body)
+/** 登录、刷新和退出使用同一文件锁，避免退出后被并发刷新写回令牌。 */
+fn lock_session(config_path: &std::path::Path) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    let lock_path = config_path.with_extension("oauth.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|_| "Could not open OAuth lock")?;
+    lock.lock_exclusive()
+        .map_err(|_| "Could not lock OAuth credentials")?;
+    Ok(lock)
 }
 
 /// 用 refresh token 换新令牌。
 pub fn refresh_tokens_blocking(oauth: &ProviderOAuth) -> Result<TokenIssuance, String> {
     if oauth.refresh_token.is_empty() {
-        return Err("尚未授权登录".to_string());
+        return Err("尚未授权登录".into());
     }
-    let client = token_http_client()?;
-    let form = [
-        ("grant_type", "refresh_token".to_string()),
-        ("refresh_token", oauth.refresh_token.clone()),
-        ("client_id", oauth.client_id.clone()),
-    ];
-    let resp = client
-        .post(oauth.token_url.trim())
-        .form(&form)
-        .send()
-        .map_err(|e| format!("令牌端点请求失败: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if status.as_u16() == 401 {
-        return Err("授权已失效（401），请重新授权登录".to_string());
-    }
-    if !status.is_success() {
-        return match parse_token_response(&body) {
-            Err(e) => Err(format!("令牌刷新失败 (HTTP {status}): {e}，请重新授权登录")),
-            Ok(_) => Err(format!("令牌刷新失败 (HTTP {status})，请重新授权登录")),
-        };
-    }
-    parse_token_response(&body)
+    let tokens = super::oauth_flow::refresh(oauth, &oauth.client_id, &oauth.refresh_token)?;
+    Ok(TokenIssuance {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_in: (tokens.expires_in > 0).then_some(tokens.expires_in),
+    })
 }
 
 /// 确保持有可用的 access token，按需自动刷新（唯一令牌读取出口）。
@@ -276,6 +302,7 @@ pub fn ensure_fresh_oauth_token_at(
     provider: &str,
     now: i64,
 ) -> Result<String, String> {
+    let _file_lock = lock_session(config_path)?;
     let oauth = read_oauth_segment(config_path, provider)
         .ok_or_else(|| "尚未配置 OAuth 授权".to_string())?;
     if let Some(token) = in_memory_fresh_token(&oauth, now) {
@@ -306,6 +333,15 @@ mod tests {
 
     fn oauth_with(expires_at: Option<i64>, access: &str, refresh: &str) -> ProviderOAuth {
         ProviderOAuth {
+            account_ref: None,
+            credential_file: String::new(),
+            extra_authorize_params: Default::default(),
+            extra_token_params: Default::default(),
+            verify_id_token: false,
+            jwks_url: String::new(),
+            issuer: String::new(),
+            dynamic_client_registration: false,
+            required_scopes: Vec::new(),
             authorize_url: "https://sso.example.com/authorize".to_string(),
             token_url: "https://sso.example.com/token".to_string(),
             client_id: "nuphus".to_string(),

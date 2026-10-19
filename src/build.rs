@@ -36,6 +36,10 @@ const ASSET_SOURCES: &[&str] = &[
     "plugin/ui-maps/desktop",
     // experiences：只收 desktop/——plugin/experiences/workflow 之类是用户攒出来的
     "plugin/experiences/desktop",
+    // nuphus-self 自我知识：Agent 提示词（prompt.rs）引导阅读的政策文档。
+    // 必须随包内嵌——发布版 Agent 按「knowledge 锚点注入的绝对路径」读它们，
+    // 内嵌缺失 = 提示词引用死链（历史上 prompts/ 路径在发布版就是断的）。
+    "plugin/knowledge/nuphus-self",
 ];
 
 fn main() {

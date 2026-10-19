@@ -10,6 +10,7 @@
 //! single-file API surface).
 
 pub mod capabilities;
+pub mod chatgpt;
 pub mod data_dirs;
 pub mod handoff;
 pub mod jev;
@@ -17,6 +18,7 @@ pub mod laya;
 pub mod llm;
 pub(crate) mod model_metadata;
 pub mod oauth;
+mod oauth_callback;
 pub mod preferences;
 pub mod relation;
 pub mod team;
@@ -26,6 +28,7 @@ pub mod toml_ops;
 // `model_supports_vision`, `load_llm_config_from_disk` etc. still resolve
 // exactly like they did when everything lived in a single `config.rs`.
 pub use self::capabilities::*;
+pub use self::chatgpt::*;
 pub use self::data_dirs::*;
 pub use self::handoff::*;
 pub use self::jev::*;

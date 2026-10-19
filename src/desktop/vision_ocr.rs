@@ -83,6 +83,17 @@ pub async fn vision_ocr_data_url(data_url: &str, prompt: Option<&str>) -> Result
     let (provider_config, model_entry) =
         resolve_vision_model(&registry, &vision_model_id, vision_provider.as_deref())?;
 
+    // 错误文案上下文：实际模型 + provider 段名 + 跟随态标注。未显式配置视觉模型时
+    // （strategy == Main）实际调用的是 Leader 主模型，错误文案必须讲清这一点，
+    // 否则用户会去错误的配置项里排查。resolve_vision_model_id 内部已按同一策略
+    // 解析过模型 id，这里重复调 resolve_vision_strategy 只为取跟随态布尔值
+    // （load_registry 为轻量读盘，与本函数既有的多次读取同一口径）。
+    let error_ctx = VisionErrorContext {
+        model: model_entry.id.clone(),
+        provider: provider_config.name.clone(),
+        follow_leader: matches!(resolve_vision_strategy(), VisionStrategy::Main),
+    };
+
     // 4. 该模型段的传输层（协议族由 Provider 自身声明；鉴权头 / 端点 / 重试 /
     //    超时 / 代理回退与该模型的常规 LLM 调用完全同源）
     let provider = config::registry::ProviderRegistry::builtin()
@@ -144,14 +155,18 @@ pub async fn vision_ocr_data_url(data_url: &str, prompt: Option<&str>) -> Result
     // 流式：中转端点要求（非流式不返回图片结果），传输层按 SSE 解析
     request = request.with_stream(true);
 
-    // 7. 经统一传输层发起请求并解析为统一事件流
-    let events = transport
-        .stream(request)
-        .await
-        .map_err(|e| format!("视觉模型请求失败: {e}"))?;
+    // 7. 经统一传输层发起请求并解析为统一事件流（错误分类富化后单层透传）
+    let events = transport.stream(request).await.map_err(|e| {
+        let (status, body) = split_transport_error(&e);
+        let kind = classify_vision_error(status, &body);
+        format_vision_error(kind, &error_ctx, &body, status)
+    })?;
 
     // 8. 事件流 → 纯文本（TextDelta 拼接；Error 不吞）
-    events_to_text(events).map_err(|e| format!("视觉模型调用失败: {e}"))
+    events_to_text(events).map_err(|e| {
+        let kind = classify_vision_error(None, &e);
+        format_vision_error(kind, &error_ctx, &e, None)
+    })
 }
 
 /// 统一事件流 → 文本。
@@ -174,6 +189,265 @@ fn events_to_text(events: Vec<crate::transports::StreamEvent>) -> Result<String,
         return Err("视觉模型未返回任何文本内容".to_string());
     }
     Ok(text.to_string())
+}
+
+// ══════════════════════════════════════════════
+// 失败分类与文案（desktop_vision 失败提醒体系）
+// ══════════════════════════════════════════════
+
+/// 视觉调用失败分类——纯状态码/字符串匹配，不引入任何 HTTP 错误处理依赖。
+///
+/// 分类决定两件事：
+/// 1. 错误文案的「出路」段（用户下一步该做什么）；
+/// 2. 是否升级 UI 横幅（Auth/Billing 重试无意义 → 发；RateLimit 稍后重试有意义 → 不发）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionErrorKind {
+    /// API 密钥无效 / 未授权——重试无意义
+    Auth,
+    /// 余额不足 / 配额耗尽——重试无意义
+    Billing,
+    /// 限流 / 服务过载——稍后重试有意义
+    RateLimit,
+    /// 图片过大 / 格式不被接受
+    ImageTooLarge,
+    /// 其它（网络故障、未知错误、空响应等）
+    Other,
+}
+
+/// 分类名（snake_case，跨进程契约：test_vision_model command / 前端按此渲染）。
+pub fn vision_error_kind_name(kind: VisionErrorKind) -> &'static str {
+    match kind {
+        VisionErrorKind::Auth => "auth",
+        VisionErrorKind::Billing => "billing",
+        VisionErrorKind::RateLimit => "rate_limit",
+        VisionErrorKind::ImageTooLarge => "image_too_large",
+        VisionErrorKind::Other => "other",
+    }
+}
+
+/// 计费类关键词：命中即 Billing——**优先级高于 HTTP 429**（OpenAI 的
+/// insufficient_quota 就是 429 返回，但重试无意义，必须归入计费而非限流）。
+const BILLING_KEYWORDS: &[&str] = &[
+    "余额不足",
+    "余额",
+    "充值",
+    "资源包",
+    "欠费",
+    "配额已用尽",
+    "配额耗尽",
+    "insufficient_quota",
+    "insufficient balance",
+    "exceeded your current quota",
+    "quota exceeded",
+    "billing",
+    "balance",
+];
+
+/// 密钥类关键词
+const AUTH_KEYWORDS: &[&str] = &[
+    "invalid api key",
+    "incorrect api key",
+    "api key not valid",
+    "invalid_api_key",
+    "unauthorized",
+    "authentication",
+    "鉴权失败",
+    "密钥无效",
+    "无效的密钥",
+    "密钥错误",
+    "令牌无效",
+    "access denied",
+];
+
+/// 限流类关键词
+const RATE_LIMIT_KEYWORDS: &[&str] = &[
+    "rate limit",
+    "ratelimit",
+    "too many requests",
+    "请求过于频繁",
+    "限流",
+    "触发频率限制",
+    "requests per min",
+];
+
+/// 图片过大类关键词
+const IMAGE_TOO_LARGE_KEYWORDS: &[&str] = &[
+    "image too large",
+    "图片过大",
+    "图片太大",
+    "payload too large",
+    "request entity too large",
+    "file too large",
+    "max image size",
+    "image size exceeds",
+];
+
+fn body_contains(body_lower: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|k| body_lower.contains(k))
+}
+
+/// 视觉调用失败的分类纯函数（HTTP status + 关键词，纯 match/字符串）。
+///
+/// 匹配顺序 = 语义优先级：
+/// 1. 计费关键词（429 + insufficient_quota 是计费不是限流——重试无意义）
+/// 2. HTTP 401/403 → 密钥
+/// 3. 密钥关键词
+/// 4. HTTP 429 / 限流关键词
+/// 5. HTTP 413 / 图片过大关键词
+/// 6. 其它
+pub fn classify_vision_error(status: Option<u16>, body: &str) -> VisionErrorKind {
+    let body_lower = body.to_lowercase();
+    if body_contains(&body_lower, BILLING_KEYWORDS) {
+        return VisionErrorKind::Billing;
+    }
+    if matches!(status, Some(401) | Some(403)) {
+        return VisionErrorKind::Auth;
+    }
+    if body_contains(&body_lower, AUTH_KEYWORDS) {
+        return VisionErrorKind::Auth;
+    }
+    if status == Some(429) || body_contains(&body_lower, RATE_LIMIT_KEYWORDS) {
+        return VisionErrorKind::RateLimit;
+    }
+    if status == Some(413) || body_contains(&body_lower, IMAGE_TOO_LARGE_KEYWORDS) {
+        return VisionErrorKind::ImageTooLarge;
+    }
+    VisionErrorKind::Other
+}
+
+/// 文案模板的判别短语——[`format_vision_error`] 与 [`classify_vision_error_text`]
+/// 共用同一常量，保证 format → classify 往返一致。
+///
+/// 横幅升级与 kind 回传只认这些短语（对最终透传文案判别时优先命中），这样
+/// 限流/其它文案里上游恰好携带 quota/balance 字样的 raw body 不会把分类劫持成
+/// 计费而误弹横幅（round-trip 单测对每种 kind 用敌意 body 验证此性质）。
+const TEMPLATE_PHRASE_AUTH: &str = "API 密钥无效或未授权";
+const TEMPLATE_PHRASE_BILLING: &str = "账户余额不足或配额已用尽";
+const TEMPLATE_PHRASE_RATE_LIMIT: &str = "请求被限流";
+const TEMPLATE_PHRASE_IMAGE_TOO_LARGE: &str = "图片过大或格式不被接受";
+
+/// 对**最终透传文案**做二次分类（exec_tool 横幅升级 / test_vision_model 复用）。
+///
+/// 先认模板判别短语（`format_vision_error` 的产物必然携带，不受 raw body 关键词
+/// 噪声干扰），再退回 [`classify_vision_error`] 处理非模板文本
+/// （超时 / 未找到模型 / None 策略说明等——它们不携带判别短语）。
+pub fn classify_vision_error_text(text: &str) -> VisionErrorKind {
+    if text.contains(TEMPLATE_PHRASE_AUTH) {
+        return VisionErrorKind::Auth;
+    }
+    if text.contains(TEMPLATE_PHRASE_BILLING) {
+        return VisionErrorKind::Billing;
+    }
+    if text.contains(TEMPLATE_PHRASE_RATE_LIMIT) {
+        return VisionErrorKind::RateLimit;
+    }
+    if text.contains(TEMPLATE_PHRASE_IMAGE_TOO_LARGE) {
+        return VisionErrorKind::ImageTooLarge;
+    }
+    classify_vision_error(None, text)
+}
+
+/// 视觉错误文案的展示上下文（模型 / provider / 是否跟随 Leader）。
+pub struct VisionErrorContext {
+    /// 实际调用的模型 id
+    pub model: String,
+    /// 模型所在 provider 段名
+    pub provider: String,
+    /// strategy == Main（未显式配置、跟随 Leader 主模型）时为 true
+    pub follow_leader: bool,
+}
+
+/// 组装**单层**错误文案：一段话讲清【哪个模型+provider】+【失败原因分类】+【出路】。
+///
+/// 单层化契约：本函数的产物就是最终文本——调用方（client.rs / exec_tool）不得再
+/// 叠加前缀。Error 文案会进入 Leader 上下文，要求信息完整且不撒谎（失败必须如实
+/// 透传，禁止编造「已重试」）。
+pub fn format_vision_error(
+    kind: VisionErrorKind,
+    ctx: &VisionErrorContext,
+    raw_detail: &str,
+    status: Option<u16>,
+) -> String {
+    let target = if ctx.provider.is_empty() {
+        ctx.model.clone()
+    } else {
+        format!("{} @ {}", ctx.model, ctx.provider)
+    };
+    let who = if ctx.follow_leader {
+        format!("视觉模型 {target}（跟随 Leader）")
+    } else {
+        format!("视觉模型 {target}")
+    };
+    let detail = raw_detail.trim();
+    let detail = if detail.is_empty() {
+        match status {
+            Some(s) => format!("HTTP {s}"),
+            None => "无详细信息".to_string(),
+        }
+    } else {
+        match status {
+            Some(s) => format!("HTTP {s}：{detail}"),
+            None => detail.to_string(),
+        }
+    };
+    match kind {
+        VisionErrorKind::Auth => format!(
+            "图像理解调用失败（{who}）：{TEMPLATE_PHRASE_AUTH}。{detail}。\
+             出路：到 设置 → 模型 → 图像音频模型 检查该服务商的 API Key 是否正确/过期；\
+             修复前重试不会成功，请如实告知用户。"
+        ),
+        VisionErrorKind::Billing => format!(
+            "图像理解调用失败（{who}）：{TEMPLATE_PHRASE_BILLING}。{detail}。\
+             出路：到该服务商控制台充值或购买资源包后重试；\
+             修复前图片理解类操作将持续失败，请如实告知用户，不要推测图像内容。"
+        ),
+        VisionErrorKind::RateLimit => format!(
+            "图像理解调用失败（{who}）：{TEMPLATE_PHRASE_RATE_LIMIT}。{detail}。\
+             出路：瞬时限制，稍等数十秒重试即可，无需改配置。"
+        ),
+        VisionErrorKind::ImageTooLarge => format!(
+            "图像理解调用失败（{who}）：{TEMPLATE_PHRASE_IMAGE_TOO_LARGE}。{detail}。\
+             出路：压缩或裁剪图片后重试。"
+        ),
+        VisionErrorKind::Other => format!(
+            "图像理解调用失败（{who}）。{detail}。\
+             出路：可稍后重试；若持续失败请检查该模型与服务商配置。"
+        ),
+    }
+}
+
+/// UI 横幅文案（一次性 island warning 提醒）——与 Leader 透传文案分开措辞：
+/// 面向用户讲清「坏了什么 + 去哪修」，不携带原始 HTTP 细节。
+/// 仅 Auth/Billing 返回 Some（重试无意义才值得弹横幅打断）；其它分类返回 None。
+pub fn vision_banner_message(kind: VisionErrorKind) -> Option<String> {
+    match kind {
+        VisionErrorKind::Auth => Some(
+            "图像理解模型鉴权失败（API 密钥无效或未授权），截图与图片识别暂不可用\
+             ——请到 设置 → 模型 → 图像音频模型 检查 API Key。"
+                .to_string(),
+        ),
+        VisionErrorKind::Billing => Some(
+            "图像理解模型余额不足或配额已用尽，截图与图片识别暂不可用\
+             ——请到对应服务商充值或购买资源包后重试。"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// 从统一传输层错误抽取 (HTTP status, 明文 body)——分类与文案的输入。
+/// 非结构化变体取内层明文，避免 `NuphusError::LLM` 的「LLM error: 」Display 前缀
+/// 混进单层文案（三层前缀收敛为此处的唯一一层）。
+fn split_transport_error(err: &crate::NuphusError) -> (Option<u16>, String) {
+    match err {
+        crate::NuphusError::LLM(crate::LLMError::ApiError { status, body }) => {
+            (Some(*status), body.clone())
+        }
+        crate::NuphusError::LLM(crate::LLMError::RequestFailed { error }) => (None, error.clone()),
+        crate::NuphusError::LLM(crate::LLMError::StreamError { error }) => (None, error.clone()),
+        crate::NuphusError::LLM(crate::LLMError::Other(s)) => (None, s.clone()),
+        other => (None, other.to_string()),
+    }
 }
 
 /// 使用统一判定获取视觉模型 ID（desktop_vision 工具与描述注入共用）
@@ -227,6 +501,198 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::transports::StreamEvent;
+
+    fn error_ctx(follow_leader: bool) -> VisionErrorContext {
+        VisionErrorContext {
+            model: "glm-5.3-flash".to_string(),
+            provider: "custom-workbuddy-intl".to_string(),
+            follow_leader,
+        }
+    }
+
+    #[test]
+    fn classify_status_codes() {
+        assert_eq!(classify_vision_error(Some(401), ""), VisionErrorKind::Auth);
+        assert_eq!(classify_vision_error(Some(403), ""), VisionErrorKind::Auth);
+        assert_eq!(
+            classify_vision_error(Some(429), ""),
+            VisionErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_vision_error(Some(413), ""),
+            VisionErrorKind::ImageTooLarge
+        );
+        assert_eq!(
+            classify_vision_error(Some(500), "internal error"),
+            VisionErrorKind::Other
+        );
+        assert_eq!(classify_vision_error(None, ""), VisionErrorKind::Other);
+    }
+
+    #[test]
+    fn classify_billing_keywords_beat_429() {
+        // OpenAI insufficient_quota 走 429，但语义是计费（重试无意义）
+        assert_eq!(
+            classify_vision_error(
+                Some(429),
+                r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#
+            ),
+            VisionErrorKind::Billing
+        );
+        assert_eq!(
+            classify_vision_error(None, "账户余额不足，请充值"),
+            VisionErrorKind::Billing
+        );
+        assert_eq!(
+            classify_vision_error(None, "Insufficient Balance"),
+            VisionErrorKind::Billing
+        );
+    }
+
+    #[test]
+    fn classify_auth_and_rate_limit_keywords() {
+        assert_eq!(
+            classify_vision_error(None, "Invalid API key provided"),
+            VisionErrorKind::Auth
+        );
+        assert_eq!(
+            classify_vision_error(None, "密钥无效，鉴权失败"),
+            VisionErrorKind::Auth
+        );
+        assert_eq!(
+            classify_vision_error(Some(400), "rate limit reached for requests"),
+            VisionErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_vision_error(None, "Too Many Requests"),
+            VisionErrorKind::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_image_too_large_keywords() {
+        assert_eq!(
+            classify_vision_error(None, "image too large: max 5MB"),
+            VisionErrorKind::ImageTooLarge
+        );
+        assert_eq!(
+            classify_vision_error(Some(400), "图片过大，请压缩后上传"),
+            VisionErrorKind::ImageTooLarge
+        );
+    }
+
+    #[test]
+    fn format_single_layer_contains_context_and_guidance() {
+        let text = format_vision_error(
+            VisionErrorKind::Auth,
+            &error_ctx(true),
+            "invalid api key",
+            Some(401),
+        );
+        // 单层：无「视觉模型请求失败：」「视觉模型调用失败：」叠加前缀
+        assert!(!text.contains("视觉模型请求失败"));
+        assert!(!text.contains("视觉模型调用失败"));
+        // 模型 + provider + 跟随态 + 分类出路
+        assert!(text.contains("glm-5.3-flash"));
+        assert!(text.contains("custom-workbuddy-intl"));
+        assert!(text.contains("跟随 Leader"));
+        assert!(text.contains("API Key"));
+        assert!(text.starts_with("图像理解调用失败"));
+    }
+
+    #[test]
+    fn format_explicit_binding_has_no_follow_marker() {
+        let text = format_vision_error(
+            VisionErrorKind::Billing,
+            &error_ctx(false),
+            "insufficient balance",
+            None,
+        );
+        assert!(!text.contains("跟随 Leader"));
+        assert!(text.contains("充值"));
+    }
+
+    #[test]
+    fn format_then_classify_round_trips_for_all_kinds() {
+        // 横幅升级依赖「最终文案 → 分类」往返一致；限流/图片过大文案故意携带
+        // quota/balance 噪声，验证模板判别短语优先、不被 raw body 劫持。
+        // 注：Other 无专属短语，但其性质是「输入 body 不含任何分类关键词才落到
+        // Other」——带余额/quota 字样的 body 本就会分类为 Billing，不构成 Other 用例。
+        let cases = [
+            (VisionErrorKind::Auth, "unauthorized"),
+            (VisionErrorKind::Billing, "billing error"),
+            (
+                VisionErrorKind::RateLimit,
+                "quota balance 余额 充值 rate limit",
+            ),
+            (VisionErrorKind::ImageTooLarge, "余额 balance"),
+            (VisionErrorKind::Other, "connection reset by peer"),
+        ];
+        for (kind, hostile_body) in cases {
+            let text = format_vision_error(kind, &error_ctx(true), hostile_body, Some(500));
+            assert_eq!(classify_vision_error_text(&text), kind, "kind={kind:?}");
+        }
+    }
+
+    #[test]
+    fn classify_text_falls_back_to_keywords_for_non_template_text() {
+        // 非模板文本（超时 / None 策略说明）不带判别短语 → 走通用关键词分类
+        assert_eq!(
+            classify_vision_error_text("视觉模型超时（120秒）"),
+            VisionErrorKind::Other
+        );
+        assert_eq!(
+            classify_vision_error_text("图像理解不可用：当前 Leader 模型不支持视觉输入"),
+            VisionErrorKind::Other
+        );
+        assert_eq!(
+            classify_vision_error_text("上游返回：Invalid API key"),
+            VisionErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn kind_names_are_stable_contract() {
+        assert_eq!(vision_error_kind_name(VisionErrorKind::Auth), "auth");
+        assert_eq!(vision_error_kind_name(VisionErrorKind::Billing), "billing");
+        assert_eq!(
+            vision_error_kind_name(VisionErrorKind::RateLimit),
+            "rate_limit"
+        );
+        assert_eq!(
+            vision_error_kind_name(VisionErrorKind::ImageTooLarge),
+            "image_too_large"
+        );
+        assert_eq!(vision_error_kind_name(VisionErrorKind::Other), "other");
+    }
+
+    #[test]
+    fn banner_message_only_for_auth_and_billing() {
+        assert!(vision_banner_message(VisionErrorKind::Auth).is_some());
+        assert!(vision_banner_message(VisionErrorKind::Billing).is_some());
+        assert!(vision_banner_message(VisionErrorKind::RateLimit).is_none());
+        assert!(vision_banner_message(VisionErrorKind::ImageTooLarge).is_none());
+        assert!(vision_banner_message(VisionErrorKind::Other).is_none());
+    }
+
+    #[test]
+    fn split_transport_error_extracts_api_error_fields_without_display_prefix() {
+        let err = crate::NuphusError::LLM(crate::LLMError::ApiError {
+            status: 429,
+            body: "rate limit reached".to_string(),
+        });
+        let (status, body) = split_transport_error(&err);
+        assert_eq!(status, Some(429));
+        assert_eq!(body, "rate limit reached");
+        // 非结构化错误取内层明文，不带「LLM error: 」前缀
+        let err = crate::NuphusError::LLM(crate::LLMError::RequestFailed {
+            error: "connection timed out".to_string(),
+        });
+        let (status, body) = split_transport_error(&err);
+        assert_eq!(status, None);
+        assert_eq!(body, "connection timed out");
+        assert!(!body.contains("LLM error"));
+    }
 
     fn duplicate_model_registry() -> config::ModelRegistry {
         toml::from_str(

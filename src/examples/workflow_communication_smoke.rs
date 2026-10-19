@@ -70,11 +70,13 @@ impl EventEmitter for Recorder {
     fn emit(&self, event: NuphusEvent) {
         let ms = self.started.elapsed().as_millis();
         let row = match event {
-            NuphusEvent::AssistantProgress {
-                text, message_id, ..
+            NuphusEvent::LlmTextDelta {
+                text,
+                is_thinking,
+                from_task,
             } => {
                 println!("progress {ms}ms: {text}");
-                json!({"kind":"progress","ms":ms,"message_id":message_id,"text":text})
+                json!({"kind":"progress","ms":ms,"is_thinking":is_thinking,"from_task":from_task,"text":text})
             }
             NuphusEvent::ToolCallStart { tool_name, .. } => {
                 json!({"kind":"tool","ms":ms,"tool":tool_name})

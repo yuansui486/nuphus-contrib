@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_error_log(content: String, app_handle: tauri::AppHandle) -> Result<String, String> {
     // Try desktop first, fall back to Nuphus root directory
     let path = get_desktop_path()

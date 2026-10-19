@@ -1,27 +1,17 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { useLanguage } from '../../locales'
-import { IconPalette, IconWrench, IconWorkflow, IconX } from '../../ui/Icons'
+import { IconPalette, IconX } from '../../ui/Icons'
 import { listWorkflows, wfSave } from '../lib/api'
 import { scheduleIdle } from '../lib/idle'
 import type { WorkflowItem } from '../../core/types'
 import './workflow-workbench.css'
 import { useCanvasLeaveGuard } from '../workflow-canvas/useCanvasLeaveGuard'
 
-// ── 按 tab 拆包 ──
-// 三个页面体量差异极大（UI 原型画布自身 4600+ 行且静态引入 motion / html-to-image），
-// 静态 import 会把三者合并进同一个 chunk，打开任一 tab 都要付全部解析代价。
-// tab 本身是条件渲染、切换即卸载，因此改为 lazy 不引入任何状态损失。
+// 画布 = 工作流编辑器单一形态。内置工具页已移出画布、成为独立功能界面
+// （入口在桌面工具条末尾），故此处不再按 tab 拆包。
 const CanvasPage = lazy(() =>
   import('../workflow-canvas/CanvasPage').then(m => ({ default: m.CanvasPage })),
 )
-const ToolsPage = lazy(() => import('../tools/ToolsPage').then(m => ({ default: m.ToolsPage })))
-const UiPrototypeCanvas = lazy(() =>
-  import('../canvases/ui-prototype/UiPrototypeCanvas').then(m => ({
-    default: m.UiPrototypeCanvas,
-  })),
-)
-
-type CanvasType = 'workflow-editor' | 'prototype' | 'tools'
 
 export function CanvasWorkbenchPage({
   onClose,
@@ -36,7 +26,6 @@ export function CanvasWorkbenchPage({
   onExitReplay?: () => void
 }) {
   const { t } = useLanguage()
-  const [canvasType, setCanvasType] = useState<CanvasType>('workflow-editor')
   const [workflowId, setWorkflowId] = useState<string | null>(initialWorkflowId)
   const [loading, setLoading] = useState(!initialWorkflowId)
   const [error, setError] = useState('')
@@ -110,66 +99,30 @@ export function CanvasWorkbenchPage({
           <IconPalette size={16} />
           <span>{t('cmd.canvas')}</span>
         </div>
-        <nav className="workflow-workbench-types" aria-label={t('workflow.workTypeLabel')}>
-          <button
-            type="button"
-            className={canvasType === 'workflow-editor' ? 'is-active' : ''}
-            onClick={() => setCanvasType('workflow-editor')}
-          >
-            <IconWorkflow size={14} />
-            <span>{t('workflow.workType.workflowEditor')}</span>
-          </button>
-          <button
-            type="button"
-            className={canvasType === 'prototype' ? 'is-active' : ''}
-            onClick={() => void navigation.leave(() => setCanvasType('prototype'))}
-          >
-            <IconPalette size={14} />
-            <span>{t('workflow.workType.prototype')}</span>
-          </button>
-          <button
-            type="button"
-            className={canvasType === 'tools' ? 'is-active' : ''}
-            onClick={() => void navigation.leave(() => setCanvasType('tools'))}
-          >
-            <IconWrench size={14} />
-            <span>{t('workflow.workType.tools')}</span>
-          </button>
-        </nav>
         <span className="workflow-workbench-drag" data-tauri-drag-region />
+        {/* ── 画布主操作组挂载点（撤销 / 重做 / 保存 / 运行）──
+            CanvasPage 经 portal 注入：这些是「画布级」动作，归画布 header 所有，
+            不该留在它下面那层 .wfc-toolbar 内（2026-10-17 大王定）。
+            用挂载点而不是把状态提升到本页：保存/运行/撤销都依赖 CanvasPage 内部
+            的 IR 与历史栈，提升会把整张画布的状态机翻出来。 */}
+        <div className="workflow-workbench-actions" id="workflow-workbench-actions" />
       </header>
-      <main className={`workflow-workbench-body workflow-workbench-body--${canvasType}`}>
-        {canvasType === 'workflow-editor' && (
-          <>
-            {loading && <div className="page-loading">{t('common.loading')}</div>}
-            {!loading && error && <div className="error-banner">{error}</div>}
-            {!loading && workflowId && (
-              <Suspense fallback={<div className="page-loading">{t('common.loading')}</div>}>
-                <CanvasPage
-                  key={workflowId}
-                  registerLeaveGuard={navigation.register}
-                  workflowId={workflowId}
-                  replayRunId={replayRunId}
-                  onExitReplay={onExitReplay}
-                  onClose={onClose}
-                  /* 标题旁下拉切换目标工作流：本页已持有 workflowId 与加载态，
-                     直接换 id 即整页换成目标画布（CanvasPage 的加载 effect 依赖 id） */
-                  onSwitchWorkflow={setWorkflowId}
-                />
-              </Suspense>
-            )}
-          </>
-        )}
-        {canvasType === 'prototype' && (
-          <div className="workflow-workbench-prototype">
-            <Suspense fallback={<div className="page-loading">{t('common.loading')}</div>}>
-              <UiPrototypeCanvas onSent={onClose} />
-            </Suspense>
-          </div>
-        )}
-        {canvasType === 'tools' && (
+      <main className="workflow-workbench-body">
+        {loading && <div className="page-loading">{t('common.loading')}</div>}
+        {!loading && error && <div className="error-banner">{error}</div>}
+        {!loading && workflowId && (
           <Suspense fallback={<div className="page-loading">{t('common.loading')}</div>}>
-            <ToolsPage onClose={onClose} embedded />
+            <CanvasPage
+              key={workflowId}
+              registerLeaveGuard={navigation.register}
+              workflowId={workflowId}
+              replayRunId={replayRunId}
+              onExitReplay={onExitReplay}
+              onClose={onClose}
+              /* 标题旁下拉切换目标工作流：本页已持有 workflowId 与加载态，
+                 直接换 id 即整页换成目标画布（CanvasPage 的加载 effect 依赖 id） */
+              onSwitchWorkflow={setWorkflowId}
+            />
           </Suspense>
         )}
       </main>

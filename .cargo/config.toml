@@ -1,0 +1,13 @@
+# 仓库级 cargo 配置（对所有构建者与 CI 生效，无需手工 export）
+#
+# 已知问题：release 构建时 rustc 编译 `nuphus` (lib) 会以
+# STATUS_STACK_BUFFER_OVERRUN (0xC0000409) 自身崩溃。
+# 这不是源码错误 —— `cargo check` 与 dev 构建都正常，只有 opt-level 较高的
+# release 路径才会触发：优化阶段的内联/遍历更深，rustc 内部工作线程的默认栈
+# （2 MiB）不够用。
+#
+# 这里把编译栈统一抬到 16 MiB，让从源码构建的人不必自己记得设 RUST_MIN_STACK。
+# force 默认为 false —— 已显式设置该变量的环境不会被覆盖，用户想调更大仍然有效。
+
+[env]
+RUST_MIN_STACK = "16777216"

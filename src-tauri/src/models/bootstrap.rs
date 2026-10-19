@@ -255,7 +255,7 @@ fn scan_status() -> VisionModelsStatus {
 }
 
 /// Synchronous status query (no side effects).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vision_models_status() -> VisionModelsStatus {
     scan_status()
 }
@@ -278,7 +278,7 @@ pub struct SplashBootstrapStatus {
     pub text: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn splash_bootstrap_status() -> SplashBootstrapStatus {
     let vision = scan_status();
     let embed_ok = nuphus::embed::Embedder::files_ready();

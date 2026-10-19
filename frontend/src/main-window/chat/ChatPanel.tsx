@@ -3,14 +3,12 @@ import { createPortal } from 'react-dom'
 import type {
   ChatMessage,
   ChatReference,
-  NuphusEvent,
   PendingImage,
   PendingFile,
   SendOutcome,
   TimelineEntry,
 } from '../../core/types'
 import type { SecurityCheck } from '../../core/types'
-import { listen } from '../../core/bridge'
 import { composeAssistantReplies } from '../../core/progressMessages'
 import type { ExecutionStage } from '../../hooks/useExecutionState'
 import {
@@ -19,7 +17,7 @@ import {
   type RefineState,
 } from '../../hooks/useExecutionUI'
 import { useStickyScroll } from '../../hooks/useStickyScroll'
-import { createSendReceiptHub, type SendReceiptHub } from '../lib/sendReceipt'
+import { TurnRail } from './TurnRail'
 import { isCustomProviderId } from '../lib/customProvider'
 import { setIslandAnchor } from '../../ui/islandChannel'
 import { toAssetUrl, resolveLocalImageUrl } from '../../ui/assetUrl'
@@ -43,11 +41,16 @@ import {
   setProjectDir as setProjectDirCmd,
   setProjectBookmarks as setProjectBookmarksCmd,
   TOOL_PERMISSIONS_CHANGED_EVENT,
+  browserShowWindow,
+  browserOpenUrl,
 } from '../lib/api'
 import type { ProviderInfo, ModelInfo, ProjectBookmark, ToolPermissions } from '../lib/api'
 import { friendlyIpcError } from '../lib/ipcError'
 import { orderProviderModels, readRecentModels, rememberRecentModel } from './modelPopupOrder'
-import { buildQuoteRef, isSelectableInBubble, truncateQuote } from './messageSelection'
+import { getProviderFavorites } from '../lib/favorites'
+import { buildQuoteRef } from './messageSelection'
+import { filesToAttachments } from './attachments'
+import { focusInputAtEnd } from './inputFocus'
 import { RefIcon } from './ReferenceBar'
 import { WelcomeScreen } from './WelcomeScreen'
 import { OnboardingModal } from './OnboardingModal'
@@ -83,7 +86,6 @@ import {
   IconStar,
   IconChartColumn,
   IconChevronsDown,
-  IconQuote,
 } from '../../ui/Icons'
 import { RatingModal } from '../layout/ExecutionTraceFloating'
 import { MoodFace } from '../../ui/MoodFace'
@@ -102,7 +104,6 @@ import { SecurityPrompt } from '../layout/SecurityPrompt'
 import { Button, IconButton } from '../../ui/Button'
 import MarkdownContent from './MarkdownContent'
 import { PreviewOverlay } from './PreviewOverlay'
-import { LiveExecutionActivity } from './LiveExecutionActivity'
 import { AppearancePanel } from '../layout/AppearancePanel'
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
@@ -118,8 +119,7 @@ interface ChatPanelProps {
    * （会话 rail 锁 / mode 锁 / 终止按钮）。禁止再各自订阅 is_busy / can_switch。
    */
   executionStage: ExecutionStage
-  /** 返回发送的真实结果；画布等外部入口据此回执（见 nuphus:send-result）。
-   *  sendId 为调用方（画布 requestId）指定的发送标识：后端受理事件按它精确对齐，
+  /** 返回发送的真实结果；sendId 为调用方指定的发送标识：后端受理事件按它精确对齐，
    *  缺省时由 useSession 生成（老调用方行为不变）。 */
   onSend: (
     input: string,
@@ -215,13 +215,6 @@ interface ChatPanelProps {
   onShowExecTrace?: (trace: TimelineEntry[]) => void
   /** Leader 暂停是否禁用（workflow 运行时） */
   isWorkflowRunning?: boolean
-  /** 桌面工具箱（Ctrl+U）显示状态与切换（workflow 模式输入栏按钮） */
-  showDesktopToolbar?: boolean
-  onToggleDesktopToolbar?: () => void
-  /** workflow 扳手菜单「工作流画布」：直达画布（续草稿或新建） */
-  onOpenWorkflowCanvas?: () => void
-  /** workflow 扳手菜单「工作流列表」：打开 WorkflowPage（等同 Ctrl+K → 工作流） */
-  onOpenWorkflowList?: () => void
   /** 输入栏最左端齿轮按钮：打开设置中心全屏覆盖层（状态由 App 层持有） */
   onOpenSettings?: () => void
   /**
@@ -337,10 +330,6 @@ export function ChatPanel({
   onToggleWorkAgentMode,
   startupStats,
   isWorkflowRunning,
-  showDesktopToolbar,
-  onToggleDesktopToolbar,
-  onOpenWorkflowCanvas,
-  onOpenWorkflowList,
   onOpenSettings,
   appearanceOpen,
   onAppearanceDismiss,
@@ -364,6 +353,43 @@ export function ChatPanel({
 
   // ── 文件预览覆盖层（AI 回复路径点击） ──
   const [previewPath, setPreviewPath] = useState<string | null>(null)
+
+  // ── 远程链接点击 → 统一进 Agent 浏览器（CDP），不再走系统浏览器 ──
+  // 2026-10-09 大王定调：点外链的常见动机是「Agent 让我登录某个网站」，登录态必须落在
+  // 工作流/Agent 用的那个 profile 里；在系统浏览器登录，工作流照样过不去。后端在新标签
+  // 打开（不导航当前页），因此不会把 Agent 正在自动化的页面顶掉。
+  const openUrl = useCallback((url: string) => {
+    browserOpenUrl(url).catch(e => {
+      hudUpdate(friendlyIpcError(e, '打开链接失败'), 'warning')
+    })
+  }, [])
+
+  /**
+   * header 浏览器按钮：把 Agent 浏览器（Nuphus 的 CDP 实例）提到前台。
+   *
+   * 它与系统浏览器是两件事：外链走 open_external 给人看，这个窗口是 Agent
+   * 自动化真正干活的地方（独立 profile）——想看它进行到哪一步时置前。
+   *
+   * 冷启动要拉起整个 Chrome 进程（不是切个标签页），所以点击后**立刻**回一条提示，
+   * 让「点了到底有没有用」当场可见；按钮自身进入 pending 直到后端返回。pending 期间
+   * 再次点击直接丢弃：后端浏览器是单槽串行的，连点只会把等待排成一队，越点越慢。
+   */
+  const [browserOpening, setBrowserOpening] = useState(false)
+  const browserOpeningRef = useRef(false)
+  const showBrowserWindow = useCallback(() => {
+    if (browserOpeningRef.current) return
+    browserOpeningRef.current = true
+    setBrowserOpening(true)
+    hudUpdate(t('browser.starting'), 'info')
+    browserShowWindow()
+      .catch(e => {
+        hudUpdate(friendlyIpcError(e, '打开浏览器失败'), 'warning')
+      })
+      .finally(() => {
+        browserOpeningRef.current = false
+        setBrowserOpening(false)
+      })
+  }, [t])
 
   // 执行中每 500ms 重渲染一次，让消息气泡的 TurnMetaBar 走秒。
   // **不持有任何时间值**——耗时一律由 TurnMetaBar → resolveTurnDuration 从
@@ -432,9 +458,6 @@ export function ChatPanel({
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   // Pending resource references (skill/knowledge/workflow) — attached to next user message
   const [pendingReferences, setPendingReferences] = useState<ChatReference[]>([])
-  /** 聊天区选中文字的引用浮条：命中 .message-content 内的非空选区时出现。
-   *  x/y 是选区最后一行的屏幕坐标（fixed 定位，CSS 负责 translate(-50%)）。 */
-  const [quoteBar, setQuoteBar] = useState<{ x: number; y: number; label: string } | null>(null)
 
   // Load tool permissions for WORKFLOW mode check
   const [toolPermissions, setToolPermissions] = useState<ToolPermissions | undefined>()
@@ -1033,14 +1056,20 @@ export function ChatPanel({
     [currentProvider],
   )
 
-  // 贴底跟随：默认跟随流式输出滚底；用户上翻则冻结 + 排「滚动驱动」的宽限计时，期间不拽回。
-  // 宽限语义（useStickyScroll）：连续无上滚满 resumeMs 才恢复（向上 scroll 都重置
-  // 计时，用户在读就永不恢复；下滚不冻结不续命，滚回底部才恢复）；仅执行态读秒
-  // （executionStage !== 'idle'）—— 空闲期翻看历史永久冻结不打扰。对话窗有回底按钮
-  // 兜底，宽限放大到 60s 与流式阅读节奏匹配。
+  // 贴底跟随（useStickyScroll）：默认跟随流式输出贴底；用户鼠标上滚 / 拖拽滚动条即
+  // 立即解锁，停在任意位置阅读不再被拽回。
+  //
+  // bottomZonePx = 80（对话窗宽容语义，2026-10-10 修回归）：严格版要求「4px 内 + 手势收尾
+  // 瞬间」双条件才恢复跟随，在流式增长下几乎不可达（用户滚回底部松手时内容已又长高一截）
+  // → 自动下拉永久丢失；且内容变矮（草稿被 progress 替换 / think 块剥离）时浏览器把
+  // scrollTop 钳回底部，会被严格版误读成「用户上滚」而静默解锁。宽容语义下：
+  // 「用户向下滚回区内」是唯一恢复入口（内容增长仍不恢复）、收缩钳位不再误解锁。
+  // 执行追踪面板（ExecutionTraceFloating）不传该选项，保持原严格语义不变。
+  // smoothPull = true（2026-10-11）：流式增长与回底按钮改走 rAF 追踪循环（每帧向底部
+  // 收拢、目标每帧重测），「瞬移跳动」变连续滑移；程序性回填（followReset）保持瞬移。
   const { scrollRef, showJumpButton, onScroll, jumpToBottom, followReset } = useStickyScroll(
     messages,
-    { resumeMs: 60_000, executing: executionStage !== 'idle' },
+    { bottomZonePx: 80, smoothPull: true },
   )
   // followReset 回填：useEvents 在 App 层（本组件之上）监听 nuphus-event，
   // execution_started（新轮次恢复跟随后续流式）/ execution_completed（完成瞬间补拉）
@@ -1099,16 +1128,28 @@ export function ChatPanel({
   }, [mode, modelName, loadEffortContext])
 
   // 当前模型声明的可选推理深度（来自内置 ModelDef 元数据；空 = 不支持配置，隐藏入口）
+  // (provider, model) 二元组限定：同 id 跨段（deepseek-v4-flash 同时在 deepseek 官方段
+  // 与 opencode-go 段；kimi-k3 / step-5-preview 同理）时，只按名称 find 会命中另一段的
+  // 档位 → 显示的档位与 handleEffortChange 实际写入的段分叉。currentProvider 与
+  // modelLabel 同出 effective_model 解析点（见下方弹窗勾选逻辑），天然同步；
+  // currentProvider 未就绪时宁可暂无档位，也不错贴（宁缺勿错，同后端 list_models）。
   const currentModelEfforts = useMemo(() => {
     const id = modelLabel || modelName || ''
-    return allModels.find(m => m.id === id)?.reasoning_efforts ?? []
-  }, [allModels, modelLabel, modelName])
+    if (!id || !currentProvider) return []
+    return (
+      allModels.find(m => m.id === id && m.provider === currentProvider)?.reasoning_efforts ?? []
+    )
+  }, [allModels, modelLabel, modelName, currentProvider])
 
   // 当前模型的默认推理强度（未配置时生效；null = 无声明，UI 显示「默认」）
+  // 同上：(provider, model) 二元组限定，不做名称兜底。
   const currentModelDefaultEffort = useMemo(() => {
     const id = modelLabel || modelName || ''
-    return allModels.find(m => m.id === id)?.default_effort ?? null
-  }, [allModels, modelLabel, modelName])
+    if (!id || !currentProvider) return null
+    return (
+      allModels.find(m => m.id === id && m.provider === currentProvider)?.default_effort ?? null
+    )
+  }, [allModels, modelLabel, modelName, currentProvider])
 
   // Reload latest config when quick-switch modal opens
   useEffect(() => {
@@ -1145,15 +1186,10 @@ export function ChatPanel({
       if (text) {
         setInput(prev => (prev ? prev + '\n' + text : text))
         autoResize()
-        // 追加后聚焦输入框并置光标到末尾（右键「问问 Nuphus」/工作流导出体验一致）
-        requestAnimationFrame(() => {
-          const ta = textareaRef.current
-          if (ta) {
-            ta.focus()
-            const len = ta.value.length
-            ta.setSelectionRange(len, len)
-          }
-        })
+        // 追加后聚焦输入框并置光标到末尾（右键「问问 Nuphus」/工作流导出体验一致）。
+        // 聚焦语义与引用入栏共用一份实现（inputFocus.ts）——两条链都是
+        // 「内容进输入区后焦点交给输入框」。
+        requestAnimationFrame(() => focusInputAtEnd(textareaRef.current))
       }
       if (mode && onSetMode) {
         onSetMode(mode)
@@ -1161,108 +1197,6 @@ export function ChatPanel({
     }
     window.addEventListener('nuphus:append-to-chat', handler)
     return () => window.removeEventListener('nuphus:append-to-chat', handler)
-  }, [])
-
-  // Canvas "send to Leader": a full-screen canvas (e.g. UI prototype) can start a
-  // real send without touching the input first. The listener is registered once and
-  // always reads the current onSend through a ref, so a send never fires a stale
-  // session handle.
-  const onSendRef = useRef(onSend)
-  onSendRef.current = onSend
-  // 带 mode 的发送（如「发送 Leader」）需先切模式再发；用 ref 防闭包拿旧 onSetMode
-  const onSetModeRef = useRef(onSetMode)
-  onSetModeRef.current = onSetMode
-  /* 发送回执单一出口（见 lib/sendReceipt）：同一 sendId 的事件回执与 onSend 结果回执
-     先到先得，保证 nuphus:send-result 只发一次。 */
-  const receiptHubRef = useRef<SendReceiptHub | null>(null)
-  if (!receiptHubRef.current) receiptHubRef.current = createSendReceiptHub()
-
-  /* 受理回执通道：后端「消息已受理」事件（真实发送成功）→ 画布立即收起发送遮罩
-     回主对话，不必等整轮执行结束（send_message_cmd 返回）。监听失败静默降级：
-     仅由 onSend 结果回执，发送本身不受影响。 */
-  useEffect(() => {
-    let unlisten: (() => void) | undefined
-    let disposed = false
-    listen<{ seq: number; event: NuphusEvent }>('nuphus-event', ({ event }) => {
-      if (disposed) return
-      receiptHubRef.current?.handleEvent(event)
-    })
-      .then(fn => {
-        if (disposed) fn()
-        else unlisten = fn
-      })
-      .catch((err: unknown) => {
-        console.warn('[nuphus:send-message] accept-event listen unavailable', err)
-      })
-    return () => {
-      disposed = true
-      unlisten?.()
-      receiptHubRef.current?.clear()
-    }
-  }, [])
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail
-      const text = detail?.text
-      if (!text) return
-      const images = Array.isArray(detail?.images) ? (detail.images as string[]) : undefined
-      const mode = detail?.mode
-      const requestId = typeof detail?.requestId === 'string' ? detail.requestId : ''
-      /* 回执：发起方（画布）按 requestId 匹配后显示真实结果，不再无条件报成功。
-         没有 requestId 的老调用方不受影响（不回发）。
-         rejected 一并透出（稳定拒收标识，如 'finalizing'）：画布没有输入框，
-         需要它给渠道自有文案，不能沿用桌面输入框的「内容已退回输入框」。 */
-      const rawReply = (ok: boolean, message?: string, rejected?: string) => {
-        if (!requestId) return
-        window.dispatchEvent(
-          new CustomEvent('nuphus:send-result', { detail: { requestId, ok, message, rejected } }),
-        )
-      }
-      /* 先登记再发送：受理事件（后端真实收下）可能早于 onSend promise 返回，
-         先登记才不会丢；回执幂等——受理先到 → 立刻收起（不等整轮执行），
-         onSend 结果先到（受理前失败）→ 立即报失败且不被迟到事件改写。 */
-      const reply = receiptHubRef.current
-        ? receiptHubRef.current.begin(requestId, rawReply)
-        : rawReply
-      const send = () => {
-        let pending: Promise<SendOutcome>
-        try {
-          // requestId 同时作为后端 send_id：受理事件按它精确对齐（camelCase → sendId）
-          pending = Promise.resolve(
-            onSendRef.current(text, images, undefined, requestId || undefined),
-          )
-        } catch (err: unknown) {
-          // onSend 理论上不会同步抛出；兜住异常，保证一定回执、不静默
-          const message = err instanceof Error ? err.message : String(err)
-          console.error('[nuphus:send-message] send threw synchronously', err)
-          reply(false, message)
-          return
-        }
-        pending
-          .then(outcome => reply(outcome?.ok !== false, outcome?.message, outcome?.rejected))
-          .catch((err: unknown) => {
-            const message = err instanceof Error ? err.message : String(err)
-            console.error('[nuphus:send-message] send failed', err)
-            reply(false, message)
-          })
-      }
-      const setMode = onSetModeRef.current
-      if (typeof mode === 'string' && mode && setMode) {
-        // 先切到事件要求的模式（leader）再发送，避免被 workflow 等当前模式劫持；
-        // 切换失败则放弃发送（与 App 内「切模式 → 发送」顺序一致，失败即中止）
-        Promise.resolve(setMode(mode))
-          .then(send)
-          .catch(err => {
-            console.error('[nuphus:send-message] mode switch failed, send skipped', err)
-            reply(false)
-          })
-      } else {
-        send()
-      }
-    }
-    window.addEventListener('nuphus:send-message', handler)
-    return () => window.removeEventListener('nuphus:send-message', handler)
   }, [])
 
   // Reset refining and selection state when refine modal closes
@@ -1456,29 +1390,19 @@ export function ChatPanel({
     const file = e.target.files?.[0]
     if (!file) return
 
-    if (file.type.startsWith('image/')) {
-      const reader = new FileReader()
-      reader.onload = () => {
-        const dataUrl = reader.result as string
-        setPendingImages(prev => [...prev, { dataUrl, name: file.name }])
-        setInput(prev => {
-          const indicator = `[图片 ${file.name}]`
-          return prev ? prev + '\n' + indicator : indicator
-        })
-        autoResize()
+    // 与拖拽同一条通道：图片/文档一律进引用栏，不再把非图片内容读成文本塞进输入框。
+    void (async () => {
+      try {
+        const { entries, failures } = await filesToAttachments([file])
+        for (const entry of entries) {
+          if (entry.kind === 'image') handleImageAttach(entry.image)
+          else handleFileAttach(entry.file)
+        }
+        if (failures.length > 0) hudUpdate(failures.join('; '), 'error')
+      } catch (e) {
+        hudUpdate(e instanceof Error ? e.message : String(e), 'error')
       }
-      reader.readAsDataURL(file)
-    } else {
-      // Non-image file → keep existing behavior: readAsText and append to input
-      const reader = new FileReader()
-      reader.onload = () => {
-        const content = reader.result as string
-        const header = `[${file.name}]\n`
-        setInput(prev => (prev ? prev + '\n' + header + content : header + content))
-        autoResize()
-      }
-      reader.readAsText(file)
-    }
+    })()
     e.target.value = ''
   }
 
@@ -1500,80 +1424,31 @@ export function ChatPanel({
   }, [])
 
   /**
-   * 右键菜单「引用这段」→ 加入引用栏。
+   * 引用入栏（统一入口）：加 chip + 聚焦输入框、光标置末尾。
    *
-   * 与浮条共用同一链路（buildQuoteRef + addReference），只换触发入口：
-   * 拖选松手弹浮条 / 右键菜单选引用，两条路产出完全相同的 chip。
-   * 不落盘、不查文件——引用的就是这段文本本身（见 process.rs 的 quote 分支）。
+   * 两条来源共用：右键菜单「引用这段」（`nuphus:add-quote-reference` 事件）
+   * 与预览浮层「发送给 Agent」（PreviewOverlay.onSendAnnotations）。
+   * 聚焦是必需语义而非锦上添花——同族 append-to-chat 一直聚焦，
+   * 引用通道漏了它会让用户入栏后必须再点一次输入框才能打字
+   * （仓库 issue #98）。rAF 理由见 inputFocus.ts 头注。
    */
+  const addQuoteReference = useCallback(
+    (ref: ChatReference) => {
+      addReference(ref)
+      requestAnimationFrame(() => focusInputAtEnd(textareaRef.current))
+    },
+    [addReference],
+  )
+
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{ text?: string }>).detail
       const ref = buildQuoteRef(detail?.text ?? '')
-      if (ref) addReference(ref)
+      if (ref) addQuoteReference(ref)
     }
     window.addEventListener('nuphus:add-quote-reference', handler)
     return () => window.removeEventListener('nuphus:add-quote-reference', handler)
-  }, [addReference])
-
-  // ── 选中文字 → 引用（复用 ChatReference 的 quote 分支，不新开注入通道）──
-  /** mouseup 判定选区：非空 + 锚点落在 .message-content 内才弹浮条。
-   *  刻意不用 selectionchange——拖选过程中弹窗会跟着选区跳动，松手才定型。
-   *  位置取松手瞬间的光标（clientX/Y），贴合「鼠标在哪就在哪」的操作直觉；
-   *  贴边时自动翻转，避免浮条被视口裁掉。 */
-  const handleMessagesMouseUp = useCallback((e: React.MouseEvent) => {
-    const sel = window.getSelection()
-    const raw = sel?.toString() ?? ''
-    if (!raw.trim() || !sel || sel.rangeCount === 0) {
-      setQuoteBar(null)
-      return
-    }
-    // 跨气泡拖选只认锚点所在气泡：多气泡会让浮条定位飘，且引文归属不明
-    if (!isSelectableInBubble(sel.anchorNode)) {
-      setQuoteBar(null)
-      return
-    }
-    // 入 state 前先截断：选区可能误拖到整篇长文，没必要把原文整体存进 React state
-    const { text } = truncateQuote(raw)
-    if (!text) {
-      setQuoteBar(null)
-      return
-    }
-    // 浮条尺寸（与 .quote-float 的 padding/font-size 对齐，用于边缘翻转判定）
-    const barW = 110
-    const barH = 28
-    const gap = 10
-    let x = e.clientX
-    let y = e.clientY + gap
-    // 下方不够 → 翻到光标上方
-    if (y + barH > window.innerHeight - 4) y = e.clientY - barH - gap
-    // 右侧不够 → 右对齐到视口内
-    if (x + barW > window.innerWidth - 4) x = window.innerWidth - barW - 4
-    if (x - barW < 4) x = barW + 4
-    setQuoteBar({ x, y, label: text })
-  }, [])
-
-  /** 点击浮条 → 入引用栏。按钮的 mousedown 已 preventDefault（见 JSX 注释）保住
-   *  selection；这里显式清除，免得残留 range 干扰下一次选区判定。 */
-  const handleQuoteCommit = useCallback(() => {
-    if (!quoteBar) return
-    const ref = buildQuoteRef(quoteBar.label)
-    if (ref) addReference(ref)
-    window.getSelection()?.removeAllRanges()
-    setQuoteBar(null)
-  }, [quoteBar, addReference])
-
-  /** 点击浮条之外（消息区空白处 / 输入框 / 按钮）→ 收起，否则浮条会滞留在原处。
-   *  selection 本身交给浏览器处理，这里只管浮条生命周期。 */
-  useEffect(() => {
-    if (!quoteBar) return
-    const onDown = (e: MouseEvent) => {
-      if ((e.target as Element | null)?.closest?.('.quote-float')) return
-      setQuoteBar(null)
-    }
-    document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
-  }, [quoteBar])
+  }, [addQuoteReference])
 
   const removePendingImage = useCallback((index: number) => {
     setPendingImages(prev => prev.filter((_, i) => i !== index))
@@ -1590,7 +1465,7 @@ export function ChatPanel({
     setPendingFiles(prev => prev.filter((_, i) => i !== index))
   }, [])
 
-  // ── Capture result from DesktopToolbar (Ctrl+U screenshot) ──
+  // ── Capture result from DesktopToolbar (右侧竖条发起的截图) ──
   useEffect(() => {
     const handler = (e: Event) => {
       const { path, region, base64 } = (e as CustomEvent).detail as {
@@ -1723,6 +1598,14 @@ export function ChatPanel({
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // ── IME 组词态守卫（必须置于所有 Enter 分支之前）──
+    // 中文/日文输入法组词时按 Enter = 确认候选词上屏，不是发送。WebView2(Chromium)
+    // 在该态仍会派发 keydown（key='Enter'、isComposing=true，部分环境 keyCode=229），
+    // 若无此守卫会被下方发送分支截获 → 候选词未上屏消息已飞出（用户反馈的"误发"）。
+    // 组词态下 Ctrl/Cmd+Enter 与 Enter 一律让位给输入法：选词期间的组合键不该生效。
+    // 同 Inspector.tsx / VariablePicker.tsx 的既有防护模式；mobile/components/Composer.tsx
+    // 与 examples/agent-chat/index.html 有等价守卫，改动时三处同步。
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return
     // Ctrl/Cmd+Enter：换行（不再等同于发送；Shift+Enter 仍是原生换行）
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault()
@@ -1761,7 +1644,7 @@ export function ChatPanel({
             AppIsland 经 portal 渲染到这里；锚点不存在时（聊天视图未挂载）岛按
             锚点优先级回落 —— 见 ui/islandChannel.ts 的「落点锚点」。 */}
         <div className="island-slot" ref={setIslandAnchor} />
-        {/* 右侧按钮列：设置（齿轮）→ 外观（调色板）纵向同一 DOM 排布；
+        {/* 右侧按钮列：设置（齿轮）→ 外观（调色板）→ 浏览器（罗盘）纵向同一 DOM 排布；
             refine chip 有值时挂在这一列尾部自然下延 —— 它原先 absolute 在
             header 外（top:50px/right:16px/z-index:20），与 header 内的其它浮层
             互相抢层级；并入本列后改为 in-flow，z-index 竞争随之消失 */}
@@ -1769,19 +1652,32 @@ export function ChatPanel({
           <button
             className="chat-header-settings-btn"
             aria-label={t('app.settings')}
-            title={t('app.settings')}
             onClick={() => onOpenSettings?.()}
           >
             <IconSettings size={15} />
+            <span className="chat-header-btn-label">{t('app.settings')}</span>
           </button>
           <button
             ref={appearanceToggleRef}
             className="chat-header-appearance-btn"
             aria-label={t('app.appearance')}
-            title={t('app.appearance')}
             onClick={() => setShowAppearance(o => !o)}
           >
             <IconPalette size={15} />
+            <span className="chat-header-btn-label">{t('app.appearance')}</span>
+          </button>
+          {/* Agent 浏览器窗口：CDP 那个 Chrome，独立 profile。这里只做「唤出/置前」，
+              Agent 的浏览与自动化操作都在那个窗口内进行。启动中禁用（is-busy），
+              避免连点把单槽串行的后端排成长队。 */}
+          <button
+            className={`chat-header-browser-btn${browserOpening ? ' is-busy' : ''}`}
+            aria-label={t('browser.toggle')}
+            aria-busy={browserOpening}
+            disabled={browserOpening}
+            onClick={showBrowserWindow}
+          >
+            <IconBrowser size={15} />
+            <span className="chat-header-btn-label">{t('browser.toggleTitle')}</span>
           </button>
           {pendingRefine && !refineState && !refining && (
             <div className="refine-pending-area">
@@ -1902,11 +1798,8 @@ export function ChatPanel({
           className="chat-messages"
           ref={scrollRef}
           onScroll={() => {
-            // 滚动即选区失效：浮条用屏幕坐标，不收起会飘到别的内容上
-            setQuoteBar(null)
             onScroll()
           }}
-          onMouseUp={handleMessagesMouseUp}
         >
           {messages.length === 0 ? (
             <WelcomeScreen
@@ -1961,6 +1854,7 @@ export function ChatPanel({
                         <React.Fragment key={`row-${msg.id}`}>
                           <div
                             key={msg.id}
+                            id={msg.role === 'user' ? `turn-anchor-${msg.id}` : undefined}
                             className={`message-row ${msg.role} ${showAvatar ? 'with-avatar' : ''}`}
                           >
                             {msg.role === 'assistant' && showAvatar && (
@@ -2043,7 +1937,7 @@ export function ChatPanel({
                                         })}
                                     </div>
                                   )}
-                                {/* ── 截图引用（Ctrl+U 截图：本地文件路径经 asset 协议显示）── */}
+                                {/* ── 截图引用（桌面工具条截图：本地文件路径经 asset 协议显示）── */}
                                 {msg.references &&
                                   msg.references.some(r => r.type === 'capture') && (
                                     <div className="msg-images">
@@ -2093,6 +1987,7 @@ export function ChatPanel({
                                           <MarkdownContent
                                             content={msg.content}
                                             onFileClick={setPreviewPath}
+                                            onUrlClick={openUrl}
                                           />
                                           <span className="message-thinking-cursor" />
                                         </>
@@ -2107,6 +2002,7 @@ export function ChatPanel({
                                       <MarkdownContent
                                         content={msg.content}
                                         onFileClick={setPreviewPath}
+                                        onUrlClick={openUrl}
                                       />
                                     )
                                   })()
@@ -2185,9 +2081,6 @@ export function ChatPanel({
                         </React.Fragment>
                       )
                     })}
-                    <LiveExecutionActivity
-                      active={isProcessing && mode === 'workflow' && !refining}
-                    />
                   </>
                 )
               })()}
@@ -2205,28 +2098,11 @@ export function ChatPanel({
               <IconChevronsDown size={16} />
             </button>
           )}
+          {/* ── 轮次轨：消息流 ≥2 轮时渲染（组件内部控制），左侧 20px / 距底 188px，
+               定位几何与显隐由 turn-rail.css 承担；锚点 = user 行的 turn-anchor id ── */}
+          <TurnRail messages={messages} scrollRef={scrollRef} t={t} />
         </div>
       </div>
-
-      {/* ── 选中文字引用浮条：fixed + portal（避开 .chat-messages 的滚动裁剪）──
-          位置 = 松手时光标处（见 handleMessagesMouseUp 的边缘翻转），不再居中于选区。 */}
-      {quoteBar &&
-        createPortal(
-          <button
-            type="button"
-            className="quote-float"
-            style={{ left: quoteBar.x, top: quoteBar.y }}
-            /* 必须拦住 mousedown：焦点移到按钮会清掉 selection，点击时就取不到原文 */
-            onMouseDown={e => e.preventDefault()}
-            onClick={handleQuoteCommit}
-            aria-label={t('chat.quoteSelection')}
-            title={t('chat.quoteSelection')}
-          >
-            <IconQuote size={13} />
-            {t('chat.quoteSelection')}
-          </button>,
-          document.body,
-        )}
 
       {/* ── Pause Modal ── */}
       <PauseOverlay
@@ -2310,56 +2186,11 @@ export function ChatPanel({
                         }}
                       />
                     </div>
-                    {/* 大窗口强制线：仅 large 档给 slider。
-                        小/中档两条线都是设计定值，给它 UI 只会造成"调了却没生效"
-                        的困惑——用户拖完发现行为不变，比不给更糟。 */}
-                    {refineState.tier === 'large' && (
-                      <div className="refine-force">
-                        <div className="refine-force-head">
-                          <span>{t('refine.forceLabel')}</span>
-                          <span className="refine-force-value">
-                            {Math.round((forceDraft ?? refineState.forceThreshold) * 100)}%
-                          </span>
-                        </div>
-                        <input
-                          className="refine-force-slider"
-                          type="range"
-                          min={refineForceMinPct(refineState)}
-                          max={Math.round(refineState.forceMax * 100)}
-                          step={5}
-                          value={Math.max(
-                            refineForceMinPct(refineState),
-                            Math.round((forceDraft ?? refineState.forceThreshold) * 100),
-                          )}
-                          aria-label={t('refine.forceLabel')}
-                          onChange={e => {
-                            const next = Number(e.target.value) / 100
-                            // 先落草稿保证拖动即时可见；后端越界会拒绝（范围外
-                            // Err 不 clamp），失败渲染在滑杆下方——「看得见失败」
-                            // 是此控件的契约（S2：曾静默 catch 无任何反馈）。
-                            setForceDraft?.(next)
-                            setRefineForceThreshold(next).catch((err: unknown) => {
-                              const msg = err instanceof Error ? err.message : String(err)
-                              setForceError(`强制线设置失败：${msg}`)
-                            })
-                          }}
-                        />
-                        {forceError && <div className="refine-force-warn">{forceError}</div>}
-                        {/* 下限被当前用量顶高时说明原因：不是不给调，是这个值以下
-                            等于"下一轮立刻提炼"。硬限制好过事后警告。 */}
-                        {refineForceMinPct(refineState) >
-                          Math.round(refineState.forceMin * 100) && (
-                          <div className="refine-force-warn">
-                            {t(
-                              'refine.forceFloorRaised',
-                              String(refineForceMinPct(refineState)),
-                              String(Math.round(refineState.usagePercent)),
-                            )}
-                          </div>
-                        )}
-                        <div className="refine-force-hint">{t('refine.forceHint')}</div>
-                      </div>
-                    )}
+                    {/* 主弹窗刻意不给强制线 slider（2026-10-08 大王定案）。
+                        这个弹窗出现在「刚触发最低阈值提炼」的当口，用户此刻的目标
+                        是看清发生了什么并决定是否继续，滑杆会把注意力从提示上拽走。
+                        slider 属于「调参」行为，只在 pending 弹窗（右上角「可提炼 N%」
+                        徽标 → 确认框）里给——那是用户主动逼近阈值、想自定义线位的地方。 */}
                   </>
                 ) : (
                   <div
@@ -2587,10 +2418,6 @@ export function ChatPanel({
           onGracefulStop={onGracefulStop}
           appendQueue={appendQueue}
           isWorkflowRunning={isWorkflowRunning}
-          showDesktopToolbar={showDesktopToolbar}
-          onToggleDesktopToolbar={onToggleDesktopToolbar}
-          onOpenWorkflowCanvas={onOpenWorkflowCanvas}
-          onOpenWorkflowList={onOpenWorkflowList}
           toolPermissions={toolPermissions}
           onFileSelect={handleFileSelect}
           onImageAttach={handleImageAttach}
@@ -2680,11 +2507,15 @@ export function ChatPanel({
                     <div className="model-provider-picker">
                       <div className="model-provider-list">
                         {savedConfigs.map(cfg => {
-                          // 子列表按「最近切换顺序」排：模型多的 provider 不必每次
-                          // 都在长列表里找。只用展示顺序，不参与模型解析/切换。
+                          // 子列表排序口径：收藏置顶 → 最近切换顺序 → 其余原序。
+                          // 收藏（设置页卡片星形写的本地偏好）只影响顺序、不过滤——
+                          // 没有收藏时行为与之前完全一致。均不参与模型解析/切换。
+                          // 同一份集合同时驱动「名称后的收藏星标」，取一次即可。
+                          const favorites = getProviderFavorites(localStorage, cfg.provider)
                           const providerModels = orderProviderModels(
                             allModels.filter(m => m.provider === cfg.provider),
                             readRecentModels(localStorage, cfg.provider),
+                            favorites,
                           )
                           // 勾选态 = (provider, model) 双全等：官方厂商与 opencode-go 存在同 id
                           // 模型（deepseek-v4-flash 等），仅比 id 会让两 provider 卡片同时打勾。
@@ -2793,6 +2624,18 @@ export function ChatPanel({
                                                   title="OpenCode Go 网关"
                                                 >
                                                   GO
+                                                </span>
+                                              )}
+                                              {/* 收藏星标紧跟在名称后；没有收藏就不渲染
+                                                  （不占位、不置灰——未收藏是默认态，
+                                                  不需要一个空图标来「说明」它） */}
+                                              {favorites?.includes(model.id) && (
+                                                <span
+                                                  className="model-popup-fav"
+                                                  title={t('modelManager.favorited')}
+                                                  aria-label={t('modelManager.favorited')}
+                                                >
+                                                  <IconStar size={10} />
                                                 </span>
                                               )}
                                             </span>
@@ -2979,7 +2822,13 @@ export function ChatPanel({
       )}
 
       {/* ── 文件预览覆盖层（AI 回复路径点击，全屏对齐画布范式） ── */}
-      {previewPath && <PreviewOverlay path={previewPath} onClose={() => setPreviewPath(null)} />}
+      {previewPath && (
+        <PreviewOverlay
+          path={previewPath}
+          onClose={() => setPreviewPath(null)}
+          onSendAnnotations={addQuoteReference}
+        />
+      )}
     </div>
   )
 }

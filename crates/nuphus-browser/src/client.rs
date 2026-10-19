@@ -173,6 +173,100 @@ impl Command for GetFullAXTree {
     type Response = serde_json::Value;
 }
 
+/// CDP `Page.getFrameTree` — enumerate every frame of the page (main frame first,
+/// children recursively). Unlike the AX/DOM domains this is answered by the
+/// browser process, so it also sees cross-process (OOPIF) frames we cannot attach
+/// to — those become the explicit "未采集" disclosure instead of silence.
+#[derive(Debug, Clone, Serialize)]
+struct GetFrameTree;
+
+impl Method for GetFrameTree {
+    fn identifier(&self) -> Cow<'static, str> {
+        "Page.getFrameTree".into()
+    }
+}
+
+impl Command for GetFrameTree {
+    type Response = serde_json::Value;
+}
+
+/// Per-snapshot bounds for the frame walk. Real pages with more than ~20 iframes
+/// are ad farms; the cap keeps a pathological page from multiplying snapshot
+/// latency (one getFullAXTree round trip per frame).
+const MAX_SNAPSHOT_FRAMES: usize = 20;
+/// Defensive recursion cap for the getFrameTree walk (frames can nest frames).
+const MAX_FRAME_TREE_DEPTH: usize = 8;
+
+/// One row of the snapshot ref table: `@N` (1-based) maps to this entry.
+///
+/// `backendNodeId`s are only meaningful inside their own frame's DOM agent —
+/// for nodes collected from a nested frame the owning frame travels with the
+/// ref so failures can name it, and so a future cross-process attach can route
+/// the command by session instead of silently resolving the wrong node.
+#[derive(Debug, Clone)]
+struct SnapshotRef {
+    backend_node_id: u32,
+    /// frameId from `Page.getFrameTree`; `None` = main document. Not read yet —
+    /// cross-process (OOPIF) attach will route refs by it (frameId → sessionId),
+    /// and it keeps the ref table self-describing about frame ownership.
+    #[allow(dead_code)]
+    frame_id: Option<String>,
+    /// Human-readable frame identity for error messages (see `frame_label`).
+    frame_label: Option<String>,
+}
+
+/// A frame collected from `Page.getFrameTree`.
+#[derive(Debug, Clone)]
+struct FrameInfo {
+    id: String,
+    /// Frame URL as reported by the frame tree. `srcdoc` frames report
+    /// `about:srcdoc` (or empty) rather than a real origin.
+    url: String,
+}
+
+impl FrameInfo {
+    /// Best available human-readable identity: url, then a synthetic marker for
+    /// srcdoc frames (they carry no url of their own — Chrome reports
+    /// `about:srcdoc`).
+    fn label(&self) -> String {
+        let url = self.url.trim();
+        if url.is_empty() || url == "about:srcdoc" {
+            "srcdoc 内联框架".to_string()
+        } else {
+            url.to_string()
+        }
+    }
+}
+
+/// Recursively walk a `Page.getFrameTree` node (`frameTree` object), collecting
+/// every frame in document order: main frame first, then children depth-first.
+fn collect_frames(node: &serde_json::Value, out: &mut Vec<FrameInfo>, depth: usize) {
+    if depth > MAX_FRAME_TREE_DEPTH || out.len() >= MAX_SNAPSHOT_FRAMES {
+        return;
+    }
+    if let Some(id) = node
+        .get("frame")
+        .and_then(|f| f.get("id"))
+        .and_then(|v| v.as_str())
+    {
+        let url = node
+            .get("frame")
+            .and_then(|f| f.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(FrameInfo {
+            id: id.to_string(),
+            url,
+        });
+    }
+    if let Some(children) = node.get("childFrames").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_frames(child, out, depth + 1);
+        }
+    }
+}
+
 /// CDP `DOM.resolveNode` — resolve a `backendNodeId` to a `RemoteObjectId`.
 #[derive(Debug, Clone, Serialize)]
 struct DOMResolveNode {
@@ -362,6 +456,11 @@ fn sort_by_mtime_desc(files: &mut [serde_json::Value]) {
 const MIN_AUTOMATION_WIDTH: u32 = 1280;
 const MIN_AUTOMATION_HEIGHT: u32 = 720;
 
+/// Agent 浏览器窗口的目标尺寸（与 Nuphus 主窗口 1080x720 同量级，略放宽以
+/// 容纳网页工具栏）。实际取值再与屏幕尺寸取 min，避免超出可视区。
+const NUPHUS_WINDOW_WIDTH: u32 = 1280;
+const NUPHUS_WINDOW_HEIGHT: u32 = 800;
+
 /// Detect primary monitor physical size via xcap.
 ///
 /// Falls back to the minimum automation viewport when display enumeration fails
@@ -418,9 +517,10 @@ pub struct BrowserClient {
     browser: Option<Arc<tokio::sync::Mutex<Browser>>>,
     /// Current page
     page: Option<Arc<tokio::sync::Mutex<Page>>>,
-    /// Cached backendNodeIds from last AX tree snapshot (index → backendNodeId).
-    /// @1 → index 0, @2 → index 1, etc.
-    snapshot_backend_ids: Vec<u32>,
+    /// Cached snapshot refs from the last AX tree snapshot (`@1` → index 0, …).
+    /// Each entry carries the owning frame so nested-frame refs stay resolvable
+    /// and failures can name the frame.
+    snapshot_refs: Vec<SnapshotRef>,
     /// Whether the __nuphus helpers have been injected into this page.
     helpers_injected: bool,
     /// Download directory path.
@@ -510,6 +610,23 @@ const NEW_PAGE_TIMEOUT_SECS: u64 = 15;
 /// Budget for the liveness probe inside `instance_is_headless`, which runs on
 /// every launch/attach.
 const LAUNCH_PROBE_TIMEOUT_SECS: u64 = 3;
+/// Budget for the TCP pre-flight against the port recorded in `DevToolsActivePort`
+/// (see `launch`). A live loopback listener is confirmed from the kernel's accept
+/// backlog in microseconds — the handshake completes in the kernel whether or not
+/// the browser process is scheduled — so this budget only decides how long the
+/// *dead* case may stall, and 200ms is still three orders of magnitude above what
+/// a healthy instance needs.
+///
+/// It exists because a dead loopback port is expensive on Windows: measured on the
+/// dev machine, `connect()` to a closed port fails only after ~2.0s (silent drop +
+/// SYN retransmit, not an instant RST). The previous flow paid that twice — the WS
+/// attach and a raw liveness probe — before every cold launch, i.e. ~4s of dead
+/// time on top of a ~0.5s Chrome start.
+///
+/// A/B measured with `examples/cold_open_timing.rs` (stale port file present →
+/// probe runs; file removed → probe skipped): 1.2s vs 0.7s total, i.e. the probe
+/// spends its whole budget exactly as designed and nothing more.
+const ATTACH_PRECHECK_TIMEOUT_MS: u64 = 200;
 /// Budget for the teardown round trips in `close()`.
 const CLOSE_TIMEOUT_SECS: u64 = 5;
 
@@ -517,10 +634,18 @@ const CLOSE_TIMEOUT_SECS: u64 = 5;
 ///
 /// Each AXNode has an optional `children` array of nested AXNodes.
 /// We traverse the full tree and emit `@N [role] "name"` for interactive nodes.
+///
+/// `frame_id`/`frame_label` tag every produced ref with the frame the tree was
+/// fetched for (`None` = main document), so refs stay meaningful beyond the
+/// main frame. The `@N` display index is `refs.len() + 1` — numbering is global
+/// across frames (main frame first), which keeps main-frame-only pages on their
+/// previous numbering.
 fn collect_interactive_nodes(
     nodes: &[serde_json::Value],
-    backend_ids: &mut Vec<u32>,
+    refs: &mut Vec<SnapshotRef>,
     lines: &mut Vec<String>,
+    frame_id: Option<&str>,
+    frame_label: Option<&str>,
 ) {
     for node in nodes {
         // Check if node is ignored (non-interactive wrapper)
@@ -531,7 +656,7 @@ fn collect_interactive_nodes(
         {
             // Still traverse children of ignored nodes (they may contain interactive children)
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-                collect_interactive_nodes(children, backend_ids, lines);
+                collect_interactive_nodes(children, refs, lines, frame_id, frame_label);
             }
             continue;
         }
@@ -561,8 +686,12 @@ fn collect_interactive_nodes(
         // Include if role is interactive and has a backendNodeId
         if !role.is_empty() && INTERACTIVE_ROLES.contains(&role) {
             if let Some(bid) = backend_id {
-                let idx = backend_ids.len() + 1; // 1-based display index
-                backend_ids.push(bid);
+                let idx = refs.len() + 1; // 1-based display index
+                refs.push(SnapshotRef {
+                    backend_node_id: bid,
+                    frame_id: frame_id.map(str::to_string),
+                    frame_label: frame_label.map(str::to_string),
+                });
 
                 let name_display = if name.len() > 60 {
                     let boundary = crate::floor_char_boundary(&name, 60);
@@ -581,10 +710,36 @@ fn collect_interactive_nodes(
 
             // Recurse into children
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-                collect_interactive_nodes(children, backend_ids, lines);
+                collect_interactive_nodes(children, refs, lines, frame_id, frame_label);
             }
         }
     }
+}
+
+/// One frame that could not be captured, kept for the end-of-snapshot
+/// disclosure (see `snapshot_ax_tree`).
+struct SkippedFrame {
+    label: String,
+    reason: String,
+}
+
+/// Build the end-of-snapshot disclosure line: `None` when every frame was
+/// covered, otherwise one line naming each uncovered frame and why. Pure so
+/// the wording — which must make an agent re-plan its view of the page rather
+/// than skim past — stays unit-testable.
+fn format_frame_disclosure(skipped: &[SkippedFrame]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "── ⚠ 以下 {} 个嵌套 frame 未包含在上方快照中：{}",
+        skipped.len(),
+        skipped
+            .iter()
+            .map(|s| format!("{}（{}）", s.label, s.reason))
+            .collect::<Vec<_>>()
+            .join("；")
+    ))
 }
 
 /// Resolve a CSS selector to a `backendNodeId` via CDP DOM.querySelector + DOM.describeNode.
@@ -918,6 +1073,28 @@ fn attach_failure_message(
     }
 }
 
+/// Verdict on an existing CDP connection, combining a command probe with
+/// OS-level evidence about the browser process.
+///
+/// The distinction is the whole point. A failed command probe is *not* proof of
+/// death — CDP event floods or a busy renderer delay the response, and resetting
+/// on that false negative destroys the live page state of a perfectly healthy
+/// session. Death only becomes actionable when it is proven: the Chromium child
+/// we own has exited, or (for an instance we only attached to) the recorded debug
+/// port no longer accepts connections. Both are kernel facts, not guesses from
+/// error text, so they cannot be spoofed by a slow page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionLiveness {
+    /// The probe round-tripped — this connection can serve commands.
+    Alive,
+    /// The probe failed *and* the browser process is provably gone. No command on
+    /// this connection can ever succeed again.
+    Dead,
+    /// The probe failed but the process is alive (or its state is unverifiable).
+    /// Ambiguous: keep what we have.
+    Unresponsive,
+}
+
 impl BrowserClient {
     /// Read the external CDP endpoint from the environment (shared by both constructors).
     fn external_cdp_url_from_env() -> Option<String> {
@@ -956,7 +1133,7 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
-            snapshot_backend_ids: Vec::new(),
+            snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
             download_configured: false,
@@ -979,7 +1156,7 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
-            snapshot_backend_ids: Vec::new(),
+            snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
             download_configured: false,
@@ -1018,62 +1195,97 @@ impl BrowserClient {
             return self.attach_external().await;
         }
 
-        // Idempotency + liveness probe. self.browser may be Some while the underlying CDP
-        // handler is gone (shared Chrome killed by an external process); without any check we
-        // would return Ok(()) and every later call would fail with "receiver is gone". The
-        // probe confirms the happy path cheaply; a non-confirmation leaves the existing
-        // connection in place and lets the operation itself surface a connection error.
+        // Idempotency + liveness classification. self.browser may be Some while the
+        // underlying CDP handler is gone (shared Chrome killed by an external process);
+        // without any check we would return Ok(()) and every later call would fail with
+        // "receiver is gone".
+        //
+        // Death has to be *proven*, never guessed. The original code treated every
+        // failed probe as "keep the connection" and returned Ok(()) — which is why
+        // consumers (browser_open_url, MCP tools) each had to discover the dead
+        // channel on their first real command and carry their own self-heal, paying
+        // 0–9s of dead time on every cold open. A probe that merely fails is
+        // genuinely ambiguous though (a slow page or a CDP event flood delays the
+        // response), so resetting on it alone would destroy live page state.
+        // `classify_connection_liveness` pairs the probe with OS-level evidence:
+        // only a provably gone browser process is relaunched here.
         if self.browser.is_some() {
-            if self.is_connection_alive().await {
-                let upgrade = self.launched_headless == Some(true) && !headless;
-                if !upgrade {
-                    return Ok(()); // Already launched, current mode satisfies the request
+            match self.classify_connection_liveness().await {
+                ConnectionLiveness::Alive => {
+                    let upgrade = self.launched_headless == Some(true) && !headless;
+                    if !upgrade {
+                        return Ok(()); // Already launched, current mode satisfies the request
+                    }
+                    self.close().await?;
                 }
-                self.close().await?;
-            } else {
-                tracing::debug!(
-                    "[Browser] liveness probe did not confirm alive; trusting existing connection"
-                );
-                return Ok(());
+                ConnectionLiveness::Dead => {
+                    // Relaunch here, not in the caller: `get_or_launch` promises a
+                    // client that can actually serve commands, and handing out this
+                    // one would only move the failure to the first command.
+                    tracing::info!(
+                        "[Browser] CDP connection is dead (browser process gone); \
+                         relaunching instead of returning a connection that cannot serve commands"
+                    );
+                    self.close().await?;
+                }
+                ConnectionLiveness::Unresponsive => {
+                    // Ambiguous: the process is still alive (or unverifiable), so the
+                    // page state behind this connection is worth keeping. Let a real
+                    // command surface a genuine failure rather than tearing down a
+                    // session that may be perfectly fine.
+                    tracing::debug!(
+                        "[Browser] liveness probe did not confirm alive but the browser \
+                         process is alive; trusting existing connection"
+                    );
+                    return Ok(());
+                }
             }
         }
 
         // Attach first: if a Chrome with a debugging port is already running for the same profile (an in-app
         // existing instance, leftovers from a previous crash, or another Nuphus process), connect and reuse it —
         // only one Chrome instance per profile is allowed at a time, so a hard launch would inevitably fail.
-        if self.try_attach().await.is_ok() {
-            // A headed request must not ride a headless instance: web_extract / cookies CDP may
-            // have left a headless Chrome resident in this profile (attached instances are not
-            // owned here — close() only drops the connection, the process survives). Probe the
-            // user agent and upgrade: kill the process, then fall through to the headed launch.
-            if !headless && self.instance_is_headless().await.unwrap_or(false) {
-                tracing::info!(
-                    "[Browser] attached to headless instance; upgrading to headed (profile={})",
-                    self.profile_dir.display()
-                );
-                self.close().await?;
-                kill_chrome_for_profile(&self.profile_dir).await?;
-                // close() cleared the local connection; DevToolsActivePort may still point at
-                // the (now dead) instance — attach_target_alive() below detects the dead port
-                // and proceeds to a hard headed launch.
-            } else {
-                return Ok(());
-            }
-        }
+        //
+        // Pre-flight it, because a *stale* DevToolsActivePort is the common case: when the previous Chrome died
+        // (window closed, crash, app restart) the file survives and keeps pointing at a dead port — and probing
+        // a dead loopback port is expensive on Windows (~2s per connect, see ATTACH_PRECHECK_TIMEOUT_MS).
+        // Gating the WS attempt on one cheap TCP probe removes ~4s of dead time from every cold open while
+        // costing the healthy path nothing.
+        let attach_port_live = match Self::devtools_port_of(&self.profile_dir) {
+            Some(port) => Self::loopback_port_alive(port, ATTACH_PRECHECK_TIMEOUT_MS).await,
+            None => false, // no file → no attach target at all
+        };
 
-        // Before deleting locks, confirm the attach target is actually dead: if DevToolsActivePort
-        // still points to a live instance, removing SingletonLock/SingletonSocket would break its
-        // singleton state, and a hard launch on the same profile would exit with code 21. Retry
-        // attach once against the live instance; only delete locks when the instance is dead.
-        if self.attach_target_alive().await {
+        if attach_port_live {
             if self.try_attach().await.is_ok() {
+                // A headed request must not ride a headless instance: web_extract / cookies CDP may
+                // have left a headless Chrome resident in this profile (attached instances are not
+                // owned here — close() only drops the connection, the process survives). Probe the
+                // user agent and upgrade: kill the process, then fall through to the headed launch.
+                if !headless && self.instance_is_headless().await.unwrap_or(false) {
+                    tracing::info!(
+                        "[Browser] attached to headless instance; upgrading to headed (profile={})",
+                        self.profile_dir.display()
+                    );
+                    self.close().await?;
+                    kill_chrome_for_profile(&self.profile_dir).await?;
+                    // close() dropped the connection and the process is gone; the port pre-flighted
+                    // above is dead now, so the flow falls through to the hard headed launch below.
+                } else {
+                    return Ok(());
+                }
+            } else if self.try_attach().await.is_ok() {
+                // Port live but the first attach failed: one retry, unchanged from the previous flow.
                 return Ok(());
+            } else {
+                // The target is verifiably alive, so removing SingletonLock/SingletonSocket would break
+                // its singleton state and a hard launch on the same profile would exit with code 21.
+                return Err(BrowserError::Launch(
+                    "DevToolsActivePort points to a live Chrome instance but CDP attach \
+                     keeps failing; refusing to delete its profile locks"
+                        .into(),
+                ));
             }
-            return Err(BrowserError::Launch(
-                "DevToolsActivePort points to a live Chrome instance but CDP attach \
-                 keeps failing; refusing to delete its profile locks"
-                    .into(),
-            ));
         }
 
         // Clean up stale lock files that can cause Chrome exit code 21
@@ -1123,6 +1335,28 @@ impl BrowserClient {
             .arg("--no-default-browser-check")
             .arg("--disable-blink-features=AutomationControlled")
             .arg("--disable-popup-blocking"); // keep `window.open` flows from being lost mid-workflow
+
+        // ── 窗口形态：贴合 Nuphus 的桌面观感 ──
+        // 理由：Agent 驱动时窗口常被用户当背景，不应像"随手开的网页"占满全屏。
+        // 尺寸取 min(屏幕, NUPHUS 目标尺寸)，并在屏幕更小时回退——不放大到超出屏幕
+        // （Chrome 会把窗口推到屏幕外，反而看不见）。
+        //
+        // 不做的事（刻意）：
+        // - 不加 --app / --kiosk：它们去掉标签页与地址栏，多标签管理（new_tab /
+        //   switch_tab）会失去落点，而这是 Agent 自动化的基础能力。
+        // - 不隐藏窗口：Agent 操作过程需要用户可见，隐藏会让"卡住了"无法自查。
+        let (screen_w, screen_h) = detect_screen_size();
+        let win_w = screen_w.min(NUPHUS_WINDOW_WIDTH);
+        let win_h = screen_h.min(NUPHUS_WINDOW_HEIGHT);
+        config_builder = config_builder
+            .arg(format!("--window-size={win_w},{win_h}"))
+            // 置顶偏移交给系统；仅要求不继承上次退出时的记忆位置感之外的怪尺寸。
+            .arg("--window-position=0,0")
+            // 去掉首次启动残留的滚动条/残留标记，保持渲染干净。
+            .arg("--hide-scrollbars")
+            .arg("--disable-session-crashed-bubble")
+            // 让页面拿到正确的 DPR，避免截图/坐标换算偏移（截图与点击按物理像素）。
+            .arg("--force-device-scale-factor=1");
 
         // Headed mode is user-visible, so retain Chrome's normal GPU, extension, and background
         // behavior. The flags below remain headless-only stability/performance optimizations.
@@ -1512,28 +1746,77 @@ impl BrowserClient {
         }
     }
 
-    /// Probe whether the DevToolsActivePort port is still listened on by a live instance.
+    /// Classify the existing connection (see [`ConnectionLiveness`]).
     ///
-    /// try_attach has already failed at this point; this is a light TCP probe: port
-    /// connectable → instance alive (usually a transient attach failure, locks must not
-    /// be deleted); file missing / parse failure / port unreachable → instance dead
-    /// (crash leftover), locks may be safely deleted for a hard launch.
-    async fn attach_target_alive(&self) -> bool {
-        let port_file = self.profile_dir.join("DevToolsActivePort");
-        let content = match std::fs::read_to_string(&port_file) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let port = match content
-            .lines()
-            .next()
-            .and_then(|l| l.trim().parse::<u16>().ok())
-        {
-            Some(p) => p,
-            None => return false,
-        };
+    /// The probe alone cannot separate "dead" from "slow", so a negative result is
+    /// corroborated with evidence about the browser process before it is trusted:
+    /// - a Chromium child spawned by this client that has exited, or
+    /// - for an instance this client only attached to, a debug port that no longer
+    ///   accepts connections.
+    ///
+    /// When neither is available the verdict is `Unresponsive`, never `Dead` —
+    /// unknown evidence must not license tearing down a live session.
+    pub async fn classify_connection_liveness(&mut self) -> ConnectionLiveness {
+        if self.is_connection_alive().await {
+            return ConnectionLiveness::Alive;
+        }
+        let browser_gone = self.browser_process_evidence_gone().await;
+        Self::verdict_from_process_evidence(browser_gone)
+    }
+
+    /// Positive evidence that the browser process behind this connection is gone.
+    ///
+    /// Two sources, in order of authority:
+    /// - a Chromium child spawned by this client that has exited;
+    /// - for an instance this client only attached to (no child handle), a debug
+    ///   port recorded in the profile dir that no longer accepts connections.
+    ///
+    /// Anything else — no child handle and no port file — is `false`: absence of
+    /// evidence is not evidence of death.
+    async fn browser_process_evidence_gone(&mut self) -> bool {
+        match self.child_process_alive() {
+            Some(alive) => !alive,
+            None => match Self::devtools_port_of(&self.profile_dir) {
+                Some(port) => !Self::loopback_port_alive(port, ATTACH_PRECHECK_TIMEOUT_MS).await,
+                None => false,
+            },
+        }
+    }
+
+    /// Turn "the probe failed" + "is the browser process provably gone?" into a
+    /// verdict. Pure, so the evidence rule can be pinned by a unit test without
+    /// launching a browser.
+    fn verdict_from_process_evidence(browser_gone: bool) -> ConnectionLiveness {
+        if browser_gone {
+            ConnectionLiveness::Dead
+        } else {
+            ConnectionLiveness::Unresponsive
+        }
+    }
+
+    /// Port recorded in the profile's `DevToolsActivePort` file (Chrome writes it when
+    /// launched with `--remote-debugging-port=0`), or `None` when the file is
+    /// missing/unreadable — no attach target exists then.
+    fn devtools_port_of(profile_dir: &std::path::Path) -> Option<u16> {
+        let content = std::fs::read_to_string(profile_dir.join("DevToolsActivePort")).ok()?;
+        Self::parse_devtools_port(&content)
+    }
+
+    /// First line of `DevToolsActivePort` as a port number; anything else → `None`.
+    fn parse_devtools_port(content: &str) -> Option<u16> {
+        content.lines().next()?.trim().parse::<u16>().ok()
+    }
+
+    /// Cheap liveness probe for a loopback debugging port: connectable → a listener exists.
+    ///
+    /// Replaces the former `attach_target_alive`: the caller (see `launch`) now runs this
+    /// *before* any WS attempt, so a stale port costs one bounded probe instead of two full
+    /// OS-level connect timeouts. Deliberately raw TCP (no WS handshake, no CDP command):
+    /// the only question asked here is "is anything listening?", and the kernel answers it
+    /// from the accept backlog even while the browser process is busy.
+    async fn loopback_port_alive(port: u16, timeout_ms: u64) -> bool {
         tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(timeout_ms),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
@@ -1548,9 +1831,20 @@ impl BrowserClient {
         self.helpers_injected = false;
         // @N refs point at the pre-navigation page's backendNodeIds — clear them
         // so a stale ref can never click the wrong element on the new page.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         let page = self.get_or_create_page().await?;
+        Self::goto_page(&page, url).await
+    }
+
+    /// Load `url` into an already-resolved page and report the outcome.
+    ///
+    /// The one navigation implementation, shared by [`Self::navigate`] (which
+    /// picks the page) and [`Self::new_tab`] (which has just claimed or created
+    /// one). Sharing it is what turns `new_tab`'s promise — "return with the
+    /// page sitting at the requested URL" — into behaviour instead of a comment
+    /// that assumed some future caller would finish the job.
+    async fn goto_page(page: &Arc<Mutex<Page>>, url: &str) -> Result<String, BrowserError> {
         let page_guard = page.lock().await;
 
         let before_url = page_guard
@@ -1643,9 +1937,17 @@ impl BrowserClient {
 
     /// AX tree snapshot via CDP `Accessibility.getFullAXTree`.
     ///
-    /// Returns formatted text like `@1 [button] "Submit"` and caches backendNodeIds
+    /// Returns formatted text like `@1 [button] "Submit"` and caches the refs
     /// internally for click/type resolution.
     /// Optional `selector` scopes to a subtree — only elements within that DOM node are collected.
+    ///
+    /// After the main document, every child frame reported by `Page.getFrameTree`
+    /// is walked the same way (frameId-scoped `getFullAXTree`): main-frame refs
+    /// keep their numbering and come first, nested-frame refs follow under a
+    /// header that names the frame. Frames we cannot read (cross-process /
+    /// cross-origin sandboxes, frames that errored or hold no AX nodes) are
+    /// listed explicitly at the end — a snapshot must never silently imply a
+    /// whole page when it only covers part of it.
     async fn snapshot_ax_tree(&mut self, selector: Option<&str>) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
@@ -1690,12 +1992,13 @@ impl BrowserClient {
             })?;
 
         if nodes.is_empty() {
-            self.snapshot_backend_ids.clear();
+            self.snapshot_refs.clear();
             return Ok(String::new());
         }
 
+        // Shared ref table across frames (main frame first — see SnapshotRef).
+        self.snapshot_refs.clear();
         let mut lines: Vec<String> = Vec::new();
-        let mut backend_ids: Vec<u32> = Vec::new();
 
         if let Some(sid) = scope_id {
             // Scoped: find the scope node in the AX tree, then only collect its subtree.
@@ -1704,7 +2007,13 @@ impl BrowserClient {
             match extract_subtree_children(nodes, sid) {
                 Some(found_children) => {
                     tracing::info!("[Browser] AX snapshot scoped: found {} children for backendNodeId={} (AX tree has {} nodes)", found_children.len(), sid, ax_nodes_count);
-                    collect_interactive_nodes(&found_children, &mut backend_ids, &mut lines);
+                    collect_interactive_nodes(
+                        &found_children,
+                        &mut self.snapshot_refs,
+                        &mut lines,
+                        None,
+                        None,
+                    );
                 }
                 None => {
                     tracing::warn!("[Browser] AX snapshot scoped: backendNodeId={} not found in AX tree ({} nodes), falling back to JS snapshot", sid, ax_nodes_count);
@@ -1716,16 +2025,109 @@ impl BrowserClient {
             }
         } else {
             // Full tree (existing behavior)
-            collect_interactive_nodes(nodes, &mut backend_ids, &mut lines);
+            collect_interactive_nodes(nodes, &mut self.snapshot_refs, &mut lines, None, None);
         }
 
-        self.snapshot_backend_ids = backend_ids;
+        // Nested frames: walk the frame tree and collect each readable one.
+        let mut skipped: Vec<SkippedFrame> = Vec::new();
+        let frames = match self.collect_frame_infos(&page_guard).await {
+            Ok(frames) => frames,
+            Err(e) => {
+                // Frame enumeration failing must not break the main-frame snapshot;
+                // we simply cannot say whether frames exist.
+                tracing::warn!("[Browser] frame tree enumeration failed: {}", e);
+                vec![]
+            }
+        };
+        // collect_frame_infos returns document order: [0] is the main frame.
+        let child_frames = frames.into_iter().skip(1).collect::<Vec<_>>();
+        let traversed_frames = child_frames.len().min(MAX_SNAPSHOT_FRAMES);
+        for frame in child_frames.iter().take(traversed_frames) {
+            let label = frame.label();
+            match self.ax_nodes_for_frame(&page_guard, &frame.id).await {
+                Ok(child_nodes) if !child_nodes.is_empty() => {
+                    let mut child_lines: Vec<String> = Vec::new();
+                    collect_interactive_nodes(
+                        &child_nodes,
+                        &mut self.snapshot_refs,
+                        &mut child_lines,
+                        Some(&frame.id),
+                        Some(&label),
+                    );
+                    if child_lines.is_empty() {
+                        skipped.push(SkippedFrame {
+                            label,
+                            reason: "框架内无可交互元素".to_string(),
+                        });
+                        continue;
+                    }
+                    lines.push(format!("── 嵌套 frame：{} ──", label));
+                    lines.extend(child_lines);
+                }
+                Ok(_) => skipped.push(SkippedFrame {
+                    label,
+                    reason: "该框架的可访问性树为空".to_string(),
+                }),
+                Err(e) => skipped.push(SkippedFrame {
+                    label,
+                    reason: format!("无法读取该框架的可访问性树：{}", e),
+                }),
+            }
+        }
+        if child_frames.len() > traversed_frames {
+            skipped.push(SkippedFrame {
+                label: format!("等 {} 个框架", child_frames.len() - traversed_frames),
+                reason: format!("嵌套框架数量超过上限 {}，未逐一采集", MAX_SNAPSHOT_FRAMES),
+            });
+        }
+
+        // Disclosure footer: anything the snapshot did NOT cover must be stated,
+        // never silently dropped — an agent that cannot tell a partial page from
+        // a complete one will misplan every follow-up step.
+        if let Some(footer) = format_frame_disclosure(&skipped) {
+            lines.push(footer);
+        }
 
         if lines.is_empty() {
             return Ok(String::new());
         }
 
         Ok(lines.join("\n"))
+    }
+
+    /// Enumerate the page's frames via CDP `Page.getFrameTree`.
+    ///
+    /// Returns document order: the main frame first, then child frames
+    /// depth-first. Bounded by `MAX_SNAPSHOT_FRAMES` / `MAX_FRAME_TREE_DEPTH`.
+    async fn collect_frame_infos(&self, page: &Page) -> Result<Vec<FrameInfo>, BrowserError> {
+        let resp = page.execute(GetFrameTree).await.map_err(cdp_err)?;
+        let mut frames = Vec::new();
+        if let Some(tree) = resp.result.get("frameTree") {
+            collect_frames(tree, &mut frames, 0);
+        }
+        Ok(frames)
+    }
+
+    /// Fetch the AX nodes of a specific frame via `Accessibility.getFullAXTree`
+    /// with a `frameId`. Only frames the current CDP session can reach answer —
+    /// cross-process (OOPIF) frames reject with an error, which the caller turns
+    /// into a disclosure line.
+    async fn ax_nodes_for_frame(
+        &self,
+        page: &Page,
+        frame_id: &str,
+    ) -> Result<Vec<serde_json::Value>, BrowserError> {
+        let cmd = GetFullAXTree {
+            depth: None,
+            frame_id: Some(frame_id.to_string()),
+        };
+        let resp = page.execute(cmd).await.map_err(cdp_err)?;
+        Ok(resp
+            .result
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// JS DOM traversal snapshot (existing behavior, now fallback-only).
@@ -1818,24 +2220,18 @@ impl BrowserClient {
     pub async fn click(&self, selector: &str) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
-
-        // New AX tree ref: @N (1-based index into snapshot_backend_ids)
+        // New AX tree ref: @N (1-based index into snapshot_refs)
         if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
                 return self
                     .retry_on_stale(|| {
-                        self.click_via_backend_node_id(&page_guard, backend_id, selector)
+                        self.click_via_backend_node_id(
+                            &page_guard,
+                            backend_id,
+                            selector,
+                            frame_label,
+                        )
                     })
                     .await;
             }
@@ -2042,18 +2438,10 @@ impl BrowserClient {
         let coords: String = if let Some(rest) = selector.strip_prefix('@') {
             if let Ok(idx) = rest.parse::<usize>() {
                 // @N AX ref path — resolve backendNodeId, then callFunctionOn for the rect
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
-                let object_id = self.resolve_backend_node(page, backend_id).await?;
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
+                let object_id = self
+                    .resolve_backend_node(page, backend_id, frame_label)
+                    .await?;
                 let cmd = RuntimeCallFunctionOn {
                     function_declaration: format!(
                         "function(){{ const el = this; el.scrollIntoViewIfNeeded(); {} }}",
@@ -2075,7 +2463,8 @@ impl BrowserClient {
                         .unwrap_or("unknown exception");
                     return Err(BrowserError::Execution(format!(
                         "element_center JS exception on {}: {}",
-                        selector, desc
+                        Self::ref_with_frame(selector, frame_label),
+                        desc
                     )));
                 }
                 resp.result
@@ -2162,20 +2551,16 @@ impl BrowserClient {
         // New AX tree ref: @N
         if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
                 return self
                     .retry_on_stale(|| {
-                        self.type_via_backend_node_id(&page_guard, backend_id, selector, text)
+                        self.type_via_backend_node_id(
+                            &page_guard,
+                            backend_id,
+                            selector,
+                            text,
+                            frame_label,
+                        )
                     })
                     .await;
             }
@@ -2365,16 +2750,48 @@ impl BrowserClient {
             || msg.contains("not attached")
     }
 
+    /// Look up a 1-based `@N` snapshot ref → (backendNodeId, owning frame label).
+    /// Shared by click / type / trusted-click so the bounds check lives in exactly
+    /// one place, and every consumer can name the frame a failing ref came from.
+    fn ax_ref(&self, idx: usize) -> Result<(u32, Option<&str>), BrowserError> {
+        if idx < 1 || idx > self.snapshot_refs.len() {
+            return Err(BrowserError::ElementNotFound(
+                format!("@{idx}"),
+                format!("@{} out of range (max @{})", idx, self.snapshot_refs.len()),
+            ));
+        }
+        let entry = &self.snapshot_refs[idx - 1];
+        Ok((entry.backend_node_id, entry.frame_label.as_deref()))
+    }
+
+    /// Render a ref selector with its owning frame for error messages:
+    /// `@7 (frame: https://pay.example.com/…)`, or plain `@7` for the main frame.
+    fn ref_with_frame(selector: &str, frame_label: Option<&str>) -> String {
+        match frame_label {
+            Some(label) => format!("{selector} (frame: {label})"),
+            None => selector.to_string(),
+        }
+    }
+
     /// Click an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
     /// Uses a custom CDP command to avoid chromiumoxide's auto-injection of `executionContextId`,
     /// which conflicts with `objectId` in the CDP protocol.
+    ///
+    /// `frame_label` names the frame the node was collected from (None = main
+    /// document); it only decorates failures — the objectId returned by
+    /// DOM.resolveNode already carries the execution context, so callFunctionOn
+    /// reaches the right frame without extra routing.
     async fn click_via_backend_node_id(
         &self,
         page: &Page,
         backend_node_id: u32,
         selector: &str,
+        frame_label: Option<&str>,
     ) -> Result<String, BrowserError> {
-        let object_id = self.resolve_backend_node(page, backend_node_id).await?;
+        let displayed = Self::ref_with_frame(selector, frame_label);
+        let object_id = self
+            .resolve_backend_node(page, backend_node_id, frame_label)
+            .await?;
 
         let cmd = RuntimeCallFunctionOn {
             function_declaration: "function(){ this.scrollIntoViewIfNeeded(); this.click(); }"
@@ -2398,11 +2815,11 @@ impl BrowserClient {
                 .unwrap_or("unknown exception");
             return Err(BrowserError::Execution(format!(
                 "Click JS exception on {}: {}",
-                selector, desc
+                displayed, desc
             )));
         }
 
-        Ok(format!("Clicked {}", selector))
+        Ok(format!("Clicked {}", displayed))
     }
 
     /// Type text into an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
@@ -2413,8 +2830,12 @@ impl BrowserClient {
         backend_node_id: u32,
         selector: &str,
         text: &str,
+        frame_label: Option<&str>,
     ) -> Result<String, BrowserError> {
-        let object_id = self.resolve_backend_node(page, backend_node_id).await?;
+        let displayed = Self::ref_with_frame(selector, frame_label);
+        let object_id = self
+            .resolve_backend_node(page, backend_node_id, frame_label)
+            .await?;
 
         // Step 1: Focus the target element (scroll into view + clear + focus)
         let focus_func =
@@ -2439,7 +2860,7 @@ impl BrowserClient {
                 .unwrap_or("unknown exception");
             return Err(BrowserError::Execution(format!(
                 "Type JS exception on {}: {}",
-                selector, desc
+                displayed, desc
             )));
         }
 
@@ -2453,24 +2874,35 @@ impl BrowserClient {
             .await
             .map_err(|e| BrowserError::Execution(format!("Input.insertText failed: {}", e)))?;
 
-        Ok(format!("Typed '{}' into {}", text, selector))
+        Ok(format!("Typed '{}' into {}", text, displayed))
     }
 
     /// Resolve a backendNodeId to a RemoteObjectId via CDP DOM.resolveNode.
+    ///
+    /// `frame_label` only decorates the failure with the frame the node was
+    /// collected from — backendNodeIds are per-frame-agent ids, and naming the
+    /// frame is the difference between "node gone" and "this ref lives in a
+    /// frame this session can't reach".
     async fn resolve_backend_node(
         &self,
         page: &Page,
         backend_node_id: u32,
+        frame_label: Option<&str>,
     ) -> Result<RemoteObjectId, BrowserError> {
         let cmd = DOMResolveNode {
             backend_node_id,
             object_group: None,
         };
 
-        let resp = page
-            .execute(cmd)
-            .await
-            .map_err(|e| BrowserError::Execution(format!("DOM.resolveNode failed: {}", e)))?;
+        let resp = page.execute(cmd).await.map_err(|e| {
+            BrowserError::Execution(format!(
+                "DOM.resolveNode failed{}: {}",
+                frame_label
+                    .map(|l| format!(" for a node in frame {l}"))
+                    .unwrap_or_default(),
+                e
+            ))
+        })?;
 
         let object_id_str = resp
             .result
@@ -3063,6 +3495,44 @@ impl BrowserClient {
         }
     }
 
+    /// 把浏览器窗口切到前台（人主动查看时用）。
+    ///
+    /// `Page.bringToFront` 是 CDP 的标准能力：它把该 target 所属的窗口提到前台，
+    /// 跨平台且无需自行枚举窗口句柄——后者在多窗口场景下容易拿错窗口。
+    ///
+    /// 页面尚未创建时先建一个：人被唤起却看不到任何窗口是最差体验，宁可开一张
+    /// 起始页（可被随后 navigate 覆盖）。
+    ///
+    /// ## 为什么自愈放在这一层
+    ///
+    /// 这是唯一**由人**触发的 CDP 操作：点了打不开就是坏了，没有第二次机会
+    /// （nuphus-mcp 那侧的自愈挂在调用方 `run_op_with_reconnect` 上，Tauri 命令
+    /// 没有那一层）。两种失效在用户眼里都是「点了没反应」，故都在此就地恢复：
+    ///
+    /// - **连接已死**（Chrome 被外部关闭或崩溃）→ 重建后重试。`launch` 的探活只
+    ///   回答「确定活着？」，不会自己判死（见其文档），死亡恰恰由这里的失败证明。
+    /// - **缓存页面失效**（人在浏览器里关掉了我们那张标签页）→ 丢弃句柄重开一张。
+    ///
+    /// 连接还活着时不做任何重建：一次失败的操作本身不代表浏览器已死（慢页面、
+    /// 事件洪水都会让单次命令失败），只有错误类型明确时才付出重建代价。
+    pub async fn bring_to_front(&mut self) -> Result<(), BrowserError> {
+        let page = self.get_or_create_page().await?;
+        match activate_page(&page).await {
+            Ok(()) => Ok(()),
+            Err(e) if Self::is_connection_error(&e) => {
+                self.reconnect().await?;
+                let page = self.get_or_create_page().await?;
+                activate_page(&page).await
+            }
+            Err(e) if Self::is_stale_page_error(&e) => {
+                self.page = None;
+                let page = self.get_or_create_page().await?;
+                activate_page(&page).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Execute JavaScript (supports async/await via IIFE wrapping).
     pub async fn evaluate(&self, script: &str) -> Result<serde_json::Value, BrowserError> {
         let page = self.get_page().await?;
@@ -3370,7 +3840,7 @@ impl BrowserClient {
         self.launched_headless = None;
         // Session state must not leak into the next launch: @N refs die with the
         // page, and download behavior has to be re-configured on the new browser.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
         self.helpers_injected = false;
         self.download_configured = false;
         self.download_cdp_ok = false;
@@ -3450,7 +3920,7 @@ impl BrowserClient {
         self.browser = None;
         self.page = None;
         self.launched_headless = None;
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
         self.helpers_injected = false;
         self.download_configured = false;
         self.download_cdp_ok = false;
@@ -3487,8 +3957,111 @@ impl BrowserClient {
         }
     }
 
+    /// Classify failures that only mean *our handle to a page* is stale: the tab was
+    /// closed from inside the browser by the person using it.
+    ///
+    /// Distinct from [`Self::is_connection_error`] in both cause and cure — the
+    /// connection and the window are perfectly alive, so a reconnect would needlessly
+    /// tear down a browser the person is looking at. Re-creating the page handle is
+    /// enough. Matched on protocol wording only (no page-controlled text can reach
+    /// this phrasing), and deliberately narrow: an unrecognized failure is reported
+    /// rather than "fixed" by dropping someone's page.
+    pub fn is_stale_page_error(err: &BrowserError) -> bool {
+        let BrowserError::Execution(msg) = err else {
+            return false;
+        };
+        let msg = msg.to_ascii_lowercase();
+        msg.contains("no target with given id")
+            || msg.contains("target closed")
+            || msg.contains("session not found")
+            || msg.contains("cannot find context")
+    }
+
     /// New tab
+    ///
+    /// 先收编已有的 about:blank 孤儿页（有则导航过去，不再新开）：外链每点一次都
+    /// new_page 会在历史标签外再开一张 blank——每张新页 = 新 renderer 进程（启动
+    /// 耗时 + 常驻内存），孤儿收编是打开耗时与资源占用的双重收益。无孤儿才真正
+    /// 新开。认领页与新建页同一套一次性配置（见 get_or_create_page 的注释）。
+    ///
+    /// 契约：返回时 `self.page` 一定停在 `url` 上。认领分支自己完成导航——早先
+    /// 把它留给"调用方随后会 navigate()"，而唯一的生产调用方（Tauri 的
+    /// `browser_open_url`）并不知情，于是每一次点外链都静默落在一张 blank 上
+    /// （2026-10-15 现场：`landed=about:blank`）。导航走 `goto_page`，与
+    /// `navigate` 同一份实现，不会再分化出两套语义。
     pub async fn new_tab(&mut self, url: Option<&str>) -> Result<String, BrowserError> {
+        let requested = url.unwrap_or("about:blank").to_string();
+
+        // 无参数（= 要一张 blank）：等价于「拿一张可用页」，直接走认领逻辑。
+        if requested == "about:blank" {
+            self.get_or_create_page().await?;
+            return Ok("New tab opened: about:blank".to_string());
+        }
+
+        // 本会话自己持有的页绝不进孤儿候选：点外链不能把 Agent 正在自动化的那张
+        // 页顶掉（这正是「统一到 Agent 浏览器开新标签」的设计前提）。此前扫描声称
+        // 已排除、实际未排除，命中时会被就地导航，等于静默摧毁当前工作页。
+        let own_target_id = match self.page.as_ref() {
+            Some(page) => Some(page.lock().await.target_id().clone()),
+            None => None,
+        };
+
+        // 带参数：先看有没有 blank 孤儿可收编（导航过去），没有才 new_page。
+        // pages() 只读（fetch_targets 会杀死存活 Page 的命令通道，见
+        // is_connection_alive ⚠ 注释）；排除 own_target_id 之外不再有别的前置条件。
+        // 读取块只做只读扫描——self.browser 的不可变借用随块结束归还，
+        // 后面的 self 变更（page 赋值 / ensure_download_behavior）才不冲突。
+        let orphan: Option<Page> = {
+            let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+            let browser_guard = browser.lock().await;
+            let pages = tokio::time::timeout(
+                std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
+                browser_guard.pages(),
+            )
+            .await
+            .map_err(|_| {
+                BrowserError::Connection(
+                    "timed out reading browser targets (CDP unresponsive)".into(),
+                )
+            })?
+            .map_err(cdp_err)?;
+
+            let mut found: Option<Page> = None;
+            for p in &pages {
+                if Some(p.target_id()) == own_target_id.as_ref() {
+                    continue; // 我们自己的工作页，不是孤儿
+                }
+                let u = p
+                    .url()
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_else(|| "about:blank".to_string());
+                if u == "about:blank" {
+                    found = Some(p.clone());
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some(p) = orphan {
+            let page_arc = Arc::new(Mutex::new(p));
+            self.page = Some(page_arc.clone());
+            // New page, new backendNodeId space — stale @N refs must not carry over.
+            self.snapshot_refs.clear();
+            // 即将导航，页内注入的 helpers 会随导航丢失，提前置位以便 batch_exec 重注入。
+            self.helpers_injected = false;
+            {
+                let page_guard = page_arc.lock().await;
+                let _ = page_guard.execute(DOMEnable::default()).await;
+                let _ = Self::inject_anti_detection(&page_guard).await;
+            }
+            self.ensure_download_behavior().await;
+            // 认领的页此刻还是 about:blank —— 由 new_tab 自己加载目标 URL，
+            // 这是本函数契约的一半，不能外包给调用方。
+            Self::goto_page(&page_arc, &requested).await?;
+            return Ok(format!("Reused blank tab for: {requested}"));
+        }
         // Scope the browser borrow + guard: ensure_download_behavior below
         // takes &mut self and must run after they drop.
         let page_arc = {
@@ -3498,20 +4071,31 @@ impl BrowserClient {
             // browser going away) must fail fast with a readable error.
             let page = tokio::time::timeout(
                 std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
-                browser_guard.new_page(url.unwrap_or("about:blank")),
+                // 此分支 requested != "about:blank"（blank 已提前返回）
+                browser_guard.new_page(requested.as_str()),
             )
             .await
             .map_err(|_| {
-                BrowserError::Launch(format!(
+                // 超时 = CDP 无响应，属**连接层**问题。原来标成 Launch，导致
+                // is_connection_error 认不出它，人触发的打开操作因此失去自愈机会。
+                BrowserError::Connection(format!(
                     "Timed out after {NEW_PAGE_TIMEOUT_SECS}s opening a new tab (CDP unresponsive)"
                 ))
             })?
-            .map_err(|e| BrowserError::Launch(e.to_string()))?;
+            // new_page 的失败是 CDP 传输/业务错误，**不是**启动失败。原实现错标成
+            // BrowserError::Launch 有两个后果：
+            //   ① 报错文案误导 —— 现场表现为「Browser launch error: send failed
+            //      because receiver is gone」（2026-10-09 大王报障）；
+            //   ② is_connection_error 只认 Connection / Execution → 分类失败 →
+            //      调用方（browser_open_url）无法自愈，CDP 未启动时点外链必失败，
+            //      而先点 header 入口（走 bring_to_front，有自愈）之后又能用。
+            // 改用 cdp_err：传输类错误映射为 Connection，分类即恢复。
+            .map_err(cdp_err)?;
             Arc::new(Mutex::new(page))
         };
         self.page = Some(page_arc);
         // New page, new backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         // Enable DOM domain for the new tab and register the anti-detection script.
         {
@@ -3525,8 +4109,7 @@ impl BrowserClient {
         // it, so downloads landed in Chrome's default folder. Heal here.
         self.ensure_download_behavior().await;
 
-        let url_str = url.unwrap_or("about:blank");
-        Ok(format!("New tab opened: {}", url_str))
+        Ok(format!("New tab opened: {requested}"))
     }
 
     /// Get all tabs info
@@ -3589,7 +4172,7 @@ impl BrowserClient {
 
         self.page = Some(page_arc);
         // Different tab, different backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         // Same healing as new_tab: attach-then-switch sessions bypass
         // get_or_create_page and would otherwise never configure downloads.
@@ -3651,18 +4234,69 @@ impl BrowserClient {
         let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
 
         let browser_guard = browser.lock().await;
-        // Bounded: same rationale as `new_tab` — fail fast, readable error.
-        let page = tokio::time::timeout(
+
+        // ── 认领已有 about:blank target（孤儿收编）──
+        //
+        // blank 页孤儿是「每次打开/重连都多一张 blank」的根因（2026-10-11 定位）：
+        //   - attach 复用已运行的 Chrome（Nuphus 重启 / 上次会话遗留）→ 直接 new_page
+        //     会在历史标签之外再开一张新 blank，旧页全部变孤儿；
+        //   - 硬启动的 Chrome 自带一张初始 about:blank target，此前同样被跳过再开一张；
+        //   - reconnect 的恢复页同理。
+        // 每张新页 = 一个新 renderer 进程（~100-300ms 启动 + 常驻内存）；认领复用的
+        // 是已在运行的 renderer——打开耗时与资源占用双收益。blank 语义上就是自动化
+        // 闲置页，认领它不碰用户的工作标签（非 blank 页一律不认领）。
+        //
+        // ## 为什么用 `pages()` 而不是 `fetch_targets`
+        // `fetch_targets` 的响应处理会 re-create 每个 target 并丢弃存活 Page 的命令
+        // 通道（见 `is_connection_alive` 的 ⚠ 注释）——本函数被调用时可能还有其它
+        // 存活页，绝不能调它。`pages()` 只读 handler 内部 map，无副作用；attach 路径
+        // 的 target 可见性已由 try_attach 的显式 fetch_targets 保证。
+        //
+        // 认领页必然从未被本会话配置过：配置过的页始终被 self.page 持有，不会走到
+        // 本函数——所以认领分支与 new_page 分支做同一套一次性配置，无重复注册。
+        let pages = tokio::time::timeout(
             std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
-            browser_guard.new_page("about:blank"),
+            browser_guard.pages(),
         )
         .await
         .map_err(|_| {
-            BrowserError::Launch(format!(
-                "Timed out after {NEW_PAGE_TIMEOUT_SECS}s creating a browser page (CDP unresponsive)"
-            ))
+            BrowserError::Connection("timed out reading browser targets (CDP unresponsive)".into())
         })?
-        .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        .map_err(cdp_err)?;
+
+        let mut claimed: Option<Page> = None;
+        for p in &pages {
+            let url = p
+                .url()
+                .await
+                .unwrap_or_default()
+                .unwrap_or_else(|| "about:blank".to_string());
+            if url == "about:blank" {
+                claimed = Some(p.clone());
+                break;
+            }
+        }
+
+        let page = match claimed {
+            Some(p) => p,
+            None => {
+                // Bounded: same rationale as `new_tab` — fail fast, readable error.
+                // 超时/失败标 Connection（连接层）而非 Launch：标错会让
+                // is_connection_error 认不出，bring_to_front / run_op_with_reconnect
+                // 失去自愈（new_tab 同类问题已修，本函数此前漏改）。
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
+                    browser_guard.new_page("about:blank"),
+                )
+                .await
+                .map_err(|_| {
+                    BrowserError::Connection(format!(
+                        "Timed out after {NEW_PAGE_TIMEOUT_SECS}s creating a browser page (CDP unresponsive)"
+                    ))
+                })?
+                .map_err(cdp_err)?
+            }
+        };
 
         let page_arc = Arc::new(Mutex::new(page));
         self.page = Some(page_arc.clone());
@@ -3735,6 +4369,21 @@ fn is_transport_cdp_error(e: &chromiumoxide::error::CdpError) -> bool {
         e,
         CdpError::ChannelSendError(_) | CdpError::Ws(_) | CdpError::Io(_) | CdpError::NoResponse
     )
+}
+
+/// Bring the window owning `page` to the front (CDP `Page.bringToFront`).
+///
+/// A free function rather than a method: `bring_to_front` calls it from recovery
+/// branches that still hold `&mut self`, so it cannot borrow the client.
+async fn activate_page(page: &Arc<Mutex<Page>>) -> Result<(), BrowserError> {
+    use chromiumoxide::cdp::browser_protocol::page::BringToFrontParams;
+
+    let page_guard = page.lock().await;
+    page_guard
+        .execute(BringToFrontParams::default())
+        .await
+        .map(|_| ())
+        .map_err(cdp_err)
 }
 
 /// Wrap a chromiumoxide error preserving the transport-vs-business distinction
@@ -3924,6 +4573,37 @@ mod tests {
         ));
         assert!(!BrowserClient::is_stale_node_error(
             &BrowserError::Execution("Click on '#x' failed: some other error".to_string())
+        ));
+    }
+
+    #[test]
+    fn stale_page_error_classification() {
+        // Target page gone (the person closed that tab) → rebuild the handle only;
+        // the browser and the connection are fine, so a reconnect would be wrong.
+        assert!(BrowserClient::is_stale_page_error(
+            &BrowserError::Execution(
+                "Page.bringToFront failed: No target with given id found".to_string()
+            )
+        ));
+        assert!(BrowserClient::is_stale_page_error(
+            &BrowserError::Execution("Target closed".to_string())
+        ));
+        assert!(BrowserClient::is_stale_page_error(
+            &BrowserError::Execution(
+                "Runtime.evaluate failed: Cannot find context with specified id".to_string()
+            )
+        ));
+        // Connection-class failures are handled by is_connection_error — the two
+        // paths differ in cost (relaunch vs. new page), so they must not overlap.
+        assert!(!BrowserClient::is_stale_page_error(
+            &BrowserError::Connection("send failed because receiver is gone".to_string())
+        ));
+        // A page's own JS exception must never be read as a dead handle: that would
+        // discard the page the person is looking at for no reason.
+        assert!(!BrowserClient::is_stale_page_error(
+            &BrowserError::Execution(
+                "Click JS exception: TypeError: undefined is not a function".to_string()
+            )
         ));
     }
 
@@ -4369,6 +5049,57 @@ document.addEventListener('DOMContentLoaded', function() {
         cleanup_profile(profile_name);
     }
 
+    /// Pre-flight regression: a dead debugging port must be rejected *within budget*.
+    ///
+    /// On Windows `connect()` to a closed loopback port only fails after ~2s (silent drop +
+    /// SYN retransmit, not an instant RST). Without the budget this probe would add that dead
+    /// time to every cold launch — the exact defect it was introduced to remove.
+    #[tokio::test]
+    async fn port_precheck_rejects_dead_port_within_budget() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener); // the port is now (almost certainly) closed
+
+        let started = std::time::Instant::now();
+        assert!(!BrowserClient::loopback_port_alive(port, 200).await);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "probe ignored its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A live listener is confirmed immediately — the budget must never be spent on the
+    /// healthy path (every attach/launch pre-flights through this probe).
+    #[tokio::test]
+    async fn port_precheck_accepts_live_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let started = std::time::Instant::now();
+        assert!(BrowserClient::loopback_port_alive(port, 500).await);
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    }
+
+    /// `DevToolsActivePort` parsing: first line is the port; junk/empty → no attach target.
+    #[test]
+    fn devtools_active_port_parsing() {
+        assert_eq!(
+            BrowserClient::parse_devtools_port("65478\n/devtools/browser/abc\n"),
+            Some(65478)
+        );
+        assert_eq!(BrowserClient::parse_devtools_port(" 9222 \n"), Some(9222));
+        assert_eq!(BrowserClient::parse_devtools_port(""), None);
+        assert_eq!(
+            BrowserClient::parse_devtools_port("not-a-port\n/devtools/x"),
+            None
+        );
+    }
+
     /// Connection-level self-healing: after the Chrome child process is killed (an externally
     /// killed / crashed browser), a direct operation must stay bounded, the liveness probe
     /// reports the dead connection, and `reconnect()` resets + relaunches + restores a usable
@@ -4594,6 +5325,219 @@ setTimeout(function(){ document.getElementById('will-show').style.display = 'blo
 
         client.close().await.ok();
         cleanup_profile("probe_regression");
+    }
+
+    /// Regression: `launch()` must not hand out a connection that provably
+    /// cannot serve commands.
+    ///
+    /// The original code treated every failed liveness probe as "still fine" and
+    /// returned `Ok(())`. A shared Chrome closed by the user therefore left a
+    /// zombie client behind, and every consumer had to discover the dead channel
+    /// on its first real command — `cdp_window.log` shows 0–9 s of dead time on
+    /// every cold open, plus each caller carrying its own reconnect fallback.
+    ///
+    /// The fix keeps the original caution (a *failed probe alone* is ambiguous and
+    /// must NOT tear down a live session) and adds the missing half: positive
+    /// OS-level evidence that the browser process is gone makes death authoritative,
+    /// so `launch()` relaunches instead of lying.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn launch_relaunches_when_browser_process_is_provably_gone() {
+        let mut client = isolated_client("dead_process_relaunch");
+        client.launch(true).await.expect("launch Chrome");
+
+        // A healthy connection must be reported as such — not as dead, and not
+        // torn down (a false positive here would destroy the user's tabs).
+        assert_eq!(
+            client.classify_connection_liveness().await,
+            ConnectionLiveness::Alive
+        );
+
+        // Kill the Chromium child this client spawned: positive, kernel-level
+        // evidence that this connection can never serve another command.
+        if let Some(mut child) = client.child_process.take() {
+            child.kill().await.expect("kill Chrome child");
+            child.wait().await.expect("reap Chrome child");
+        }
+        // Wait for the probe to observe the broken channel (bounded).
+        let mut verdict = client.classify_connection_liveness().await;
+        for _ in 0..20 {
+            if verdict == ConnectionLiveness::Dead {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            verdict = client.classify_connection_liveness().await;
+        }
+        assert_eq!(
+            verdict,
+            ConnectionLiveness::Dead,
+            "a dead Chromium child must be reported as Dead, not left as a zombie connection"
+        );
+
+        // The payoff: launch() now self-heals instead of returning Ok(()) on a
+        // dead connection, so no caller needs its own reconnect fallback.
+        client.launch(true).await.expect("relaunch after death");
+        assert_eq!(
+            client.classify_connection_liveness().await,
+            ConnectionLiveness::Alive
+        );
+
+        client.close().await.ok();
+        cleanup_profile("dead_process_relaunch");
+    }
+
+    /// A failed probe with the browser process still alive must stay
+    /// `Unresponsive`, never `Dead`: resetting there would destroy live page state
+    /// on a false negative (CDP event floods / busy renderer delay the probe).
+    #[test]
+    fn liveness_verdict_requires_positive_evidence() {
+        assert_eq!(
+            BrowserClient::verdict_from_process_evidence(true),
+            ConnectionLiveness::Dead
+        );
+        assert_eq!(
+            BrowserClient::verdict_from_process_evidence(false),
+            ConnectionLiveness::Unresponsive
+        );
+    }
+
+    /// Regression: `new_tab(url)` must leave `self.page` AT `url`.
+    ///
+    /// The orphan-adoption branch used to adopt the blank tab and return success
+    /// without navigating, punting the URL load to a "caller will navigate()"
+    /// that no production caller performed. Field evidence
+    /// (`%APPDATA%\Nuphus\cdp_window.log`, 2026-10-15): three consecutive
+    /// `open_url` calls returned `landed=about:blank` — the browser "opened"
+    /// every link onto a blank page.
+    ///
+    /// Arrangement: one blank page owned by this session (must be left alone) and
+    /// one blank orphan (must be adopted AND navigated).
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn new_tab_lands_on_requested_url_after_adopting_blank_orphan() {
+        let mut client = isolated_client("new_tab_orphan_navigates");
+        client.launch(true).await.expect("launch Chrome");
+
+        // Owned blank page: get_or_create_page creates one because Chrome's startup
+        // tab is chrome://new-tab-page, not about:blank.
+        client
+            .get_or_create_page()
+            .await
+            .expect("create owned page");
+        let owned_target = client
+            .page
+            .as_ref()
+            .expect("page exists")
+            .lock()
+            .await
+            .target_id()
+            .clone();
+
+        // A second blank page, not owned by this session → a true orphan.
+        {
+            let browser = client.browser.as_ref().expect("browser").clone();
+            let orphan = browser
+                .lock()
+                .await
+                .new_page("about:blank")
+                .await
+                .expect("create orphan blank page");
+            let orphan_target = orphan.target_id().clone();
+            assert_ne!(
+                orphan_target, owned_target,
+                "the orphan must be a different tab from the owned one"
+            );
+        }
+
+        let url = fixture_url("new_tab_orphan_navigates", "<h1>adopted</h1>");
+        let message = client
+            .new_tab(Some(&url))
+            .await
+            .expect("new_tab must succeed");
+        assert!(
+            message.starts_with("Reused blank tab for:"),
+            "test must exercise the orphan-adoption branch, got: {message}"
+        );
+
+        let landed = client.current_url().await.expect("current_url");
+        assert_ne!(
+            landed, "about:blank",
+            "new_tab returned success but the adopted page was never navigated"
+        );
+        assert!(
+            landed.starts_with("file:///") && landed.contains("new_tab_orphan_navigates"),
+            "adopted page must sit at the requested URL, got: {landed}"
+        );
+        let title = client
+            .evaluate("() => document.body.textContent.trim()")
+            .await
+            .expect("adopted page must serve its DOM");
+        assert_eq!(title, serde_json::json!("adopted"));
+
+        client.close().await.ok();
+        cleanup_profile("new_tab_orphan_navigates");
+    }
+
+    /// Regression: `new_tab` must never re-purpose the session's own current page.
+    ///
+    /// The orphan scan claimed to exclude `self.page` but never did. When the
+    /// session held a blank page, clicking a link navigated that tab in place —
+    /// silently destroying the page the Agent was automating, which is exactly
+    /// what "open a new tab instead of navigating the current page" forbids.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn new_tab_never_captures_the_sessions_own_page() {
+        let mut client = isolated_client("new_tab_own_page_untouched");
+        client.launch(true).await.expect("launch Chrome");
+
+        client
+            .get_or_create_page()
+            .await
+            .expect("create owned page");
+        let owned = client.page.as_ref().expect("page exists").clone();
+        let owned_target = owned.lock().await.target_id().clone();
+
+        let url = fixture_url("new_tab_own_page_untouched", "<h1>fresh</h1>");
+        client
+            .new_tab(Some(&url))
+            .await
+            .expect("new_tab must succeed");
+
+        // The session moved to a different tab...
+        let new_target = client
+            .page
+            .as_ref()
+            .expect("page exists")
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        assert_ne!(
+            new_target, owned_target,
+            "new_tab must open a tab, not take over the session's current page"
+        );
+        // ...and the old page is untouched.
+        let owned_url = {
+            let guard = owned.lock().await;
+            guard
+                .url()
+                .await
+                .unwrap_or_default()
+                .unwrap_or_else(|| "about:blank".to_string())
+        };
+        assert_eq!(
+            owned_url, "about:blank",
+            "the page the session was holding must not have been navigated"
+        );
+        // The new tab really carries the requested URL.
+        let landed = client.current_url().await.expect("current_url");
+        assert!(
+            landed.starts_with("file:///") && landed.contains("new_tab_own_page_untouched"),
+            "new tab must sit at the requested URL, got: {landed}"
+        );
+
+        client.close().await.ok();
+        cleanup_profile("new_tab_own_page_untouched");
     }
 
     /// Regression: navigate must not hang until the tool-level 30s timeout on a
@@ -4886,5 +5830,282 @@ setTimeout(function(){ document.getElementById('will-show').style.display = 'blo
 
         client.close().await.expect("close");
         cleanup_profile("batch");
+    }
+
+    // ───────────────── iframe / nested frame coverage ─────────────────
+
+    /// Snapshot must cover reachable nested frames, not just the main document,
+    /// and must name the frames it could NOT cover instead of silently dropping
+    /// them. The srcdoc frame inherits the parent origin so it is the
+    /// deterministic "reachable" case; cross-scheme/cross-origin frames are the
+    /// "must at least be disclosed" case.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn snapshot_covers_reachable_iframe_frames() {
+        let inner_url = fixture_url(
+            "frames_inner",
+            "<h2>INNER-FILE-MARKER</h2><button>INNER-FILE-BTN</button>",
+        );
+        let outer = format!(
+            r#"<!doctype html><html><body>
+            <h1>OUTER-MARKER-ALPHA</h1>
+            <button id="outer-btn">OUTER-BUTTON-BETA</button>
+            <iframe srcdoc="<h2>SRCDOC-MARKER-GAMMA</h2><button id='srcdoc-btn'>SRCDOC-BUTTON-EPSILON</button>" width="400" height="150"></iframe>
+            <iframe src="{inner_url}" width="400" height="150"></iframe>
+            </body></html>"#
+        );
+        let url = fixture_url("frames_outer", &outer);
+
+        let mut client = isolated_client("frames_snapshot");
+        client.launch(true).await.expect("launch headless");
+        client.navigate(&url).await.expect("navigate");
+
+        let snap = client.snapshot(false, None).await.expect("snapshot");
+
+        // Main document is still there, unchanged shape.
+        assert!(
+            snap.contains("OUTER-MARKER-ALPHA"),
+            "main-document content missing: {snap}"
+        );
+        assert!(
+            snap.contains("OUTER-BUTTON-BETA"),
+            "main-document button missing: {snap}"
+        );
+
+        // Reachable nested frame (srcdoc) is collected and introduced by a header.
+        assert!(
+            snap.contains("SRCDOC-MARKER-GAMMA"),
+            "nested-frame content missing from snapshot: {snap}"
+        );
+        assert!(
+            snap.contains("嵌套 frame"),
+            "nested-frame header missing: {snap}"
+        );
+
+        // The cross-origin file iframe must never vanish silently: either it was
+        // collected, or the disclosure footer names it. Both are valid Chrome
+        // outcomes; silence is the bug being fixed.
+        let disclosed = snap.contains("未包含在上方快照中");
+        let collected = snap.contains("INNER-FILE-MARKER");
+        assert!(
+            disclosed || collected,
+            "file iframe neither collected nor disclosed: {snap}"
+        );
+
+        // Every listed ref resolves to exactly one frame-owned entry; the @N
+        // numbering is global (main first), so click of a nested ref works.
+        let ref_count = snap.lines().filter(|l| l.starts_with('@')).count();
+        assert_eq!(
+            ref_count,
+            client.snapshot_refs.len(),
+            "ref table and textual @N numbering diverged: {snap}"
+        );
+        assert!(
+            client
+                .snapshot_refs
+                .iter()
+                .any(|r| r.frame_label.as_deref() == Some("srcdoc 内联框架")),
+            "srcdoc refs not tagged with their frame; labels={:?}",
+            client
+                .snapshot_refs
+                .iter()
+                .map(|r| r.frame_label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = client.close().await;
+        cleanup_profile("frames_snapshot");
+    }
+
+    /// Clicking an `@N` ref that lives inside a nested frame must reach the frame.
+    /// The srcdoc button writes to `parent.document.title` (same origin), which
+    /// proves the objectId resolved through the child frame's execution context.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn click_ref_inside_iframe_reaches_frame() {
+        let outer = r#"<!doctype html><html><head><title>outer-title</title></head><body>
+        <h1>OUTER-MARKER-ALPHA</h1>
+        <iframe srcdoc="<button id='srcdoc-btn' onclick=&quot;parent.document.title='SRCDOC-CLICKED'&quot;>SRCDOC-BUTTON-EPSILON</button>" width="400" height="150"></iframe>
+        </body></html>"#;
+        let url = fixture_url("frames_click", outer);
+
+        let mut client = isolated_client("frames_click");
+        client.launch(true).await.expect("launch headless");
+        client.navigate(&url).await.expect("navigate");
+
+        let snap = client.snapshot(false, None).await.expect("snapshot");
+        assert!(
+            snap.contains("SRCDOC-BUTTON-EPSILON"),
+            "nested-frame button missing from snapshot: {snap}"
+        );
+        // Ref index of the nested button: the last @N line that names its role.
+        let nested_idx = client
+            .snapshot_refs
+            .iter()
+            .position(|r| r.frame_label.as_deref() == Some("srcdoc 内联框架"))
+            .expect("a ref tagged with the srcdoc frame");
+        let selector = format!("@{}", nested_idx + 1);
+
+        let result = client.click(&selector).await.expect("click nested ref");
+        assert!(
+            result.contains("Clicked"),
+            "unexpected click result: {result}"
+        );
+
+        let title = client.evaluate("document.title").await.expect("title read");
+        assert_eq!(
+            title.as_str().map(str::trim),
+            Some("SRCDOC-CLICKED"),
+            "nested-frame click did not land in the child frame (title unchanged)"
+        );
+
+        let _ = client.close().await;
+        cleanup_profile("frames_click");
+    }
+
+    /// `collect_frames` walks the frame tree in document order: main frame first,
+    /// then children depth-first.
+    #[test]
+    fn collect_frames_document_order() {
+        let tree = serde_json::json!({
+            "frame": { "id": "main", "url": "https://outer.example/a" },
+            "childFrames": [
+                {
+                    "frame": { "id": "c1", "url": "https://child.example/b" },
+                    "childFrames": [
+                        { "frame": { "id": "c1a", "url": "https://grand.example/c" } }
+                    ]
+                },
+                { "frame": { "id": "c2", "url": "" } }
+            ]
+        });
+        let mut frames = Vec::new();
+        collect_frames(&tree, &mut frames, 0);
+        assert_eq!(
+            frames.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["main", "c1", "c1a", "c2"]
+        );
+        // srcdoc frames report "about:srcdoc" (or nothing); the label normalizes
+        // both to a synthetic marker.
+        assert_eq!(frames[0].label(), "https://outer.example/a");
+        assert_eq!(frames[3].label(), "srcdoc 内联框架");
+        assert_eq!(
+            FrameInfo {
+                id: "x".into(),
+                url: "about:srcdoc".into()
+            }
+            .label(),
+            "srcdoc 内联框架"
+        );
+    }
+
+    /// A pathological page (ad farm) must not multiply the frame walk past the
+    /// cap — the disclosure then says how many frames were left out.
+    #[test]
+    fn collect_frames_respects_cap() {
+        // Wide, shallow tree: 30 sibling frames under the main frame (depth 1,
+        // so the depth cap never fires and the size cap is what must bite).
+        let children: Vec<serde_json::Value> = (0..30)
+            .map(|i| serde_json::json!({ "frame": { "id": format!("c{i}"), "url": "" } }))
+            .collect();
+        let tree = serde_json::json!({
+            "frame": { "id": "main", "url": "https://outer.example/" },
+            "childFrames": children
+        });
+        let mut frames = Vec::new();
+        collect_frames(&tree, &mut frames, 0);
+        assert_eq!(frames.len(), MAX_SNAPSHOT_FRAMES);
+        assert_eq!(frames[0].id, "main", "main frame stays first");
+        assert_eq!(
+            frames.last().map(|f| f.id.as_str()),
+            Some("c18"),
+            "siblings fill the table in document order"
+        );
+    }
+
+    /// `@N` numbering is global across frames (main frame first), and each ref
+    /// stays tagged with its owning frame.
+    #[test]
+    fn interactive_nodes_number_across_frames() {
+        let main_nodes = serde_json::json!([{
+            "role": { "value": "button" },
+            "name": { "value": "OUTER" },
+            "backendDOMNodeId": 11
+        }]);
+        let child_nodes = serde_json::json!([{
+            "role": { "value": "heading" },
+            "name": { "value": "INNER" },
+            "backendDOMNodeId": 22
+        }]);
+        let mut refs = Vec::new();
+        let mut lines = Vec::new();
+        collect_interactive_nodes(
+            main_nodes.as_array().unwrap(),
+            &mut refs,
+            &mut lines,
+            None,
+            None,
+        );
+        collect_interactive_nodes(
+            child_nodes.as_array().unwrap(),
+            &mut refs,
+            &mut lines,
+            Some("f1"),
+            Some("srcdoc 内联框架"),
+        );
+        assert_eq!(
+            lines,
+            vec!["@1 [button] \"OUTER\"", "@2 [heading] \"INNER\""]
+        );
+        assert_eq!(refs[0].backend_node_id, 11);
+        assert_eq!(refs[0].frame_label, None);
+        assert_eq!(refs[1].backend_node_id, 22);
+        assert_eq!(refs[1].frame_label.as_deref(), Some("srcdoc 内联框架"));
+    }
+
+    /// Disclosure wording: absent when everything is covered; one line naming
+    /// every uncovered frame otherwise.
+    #[test]
+    fn frame_disclosure_wording() {
+        assert_eq!(format_frame_disclosure(&[]), None);
+        let skipped = vec![
+            SkippedFrame {
+                label: "https://pay.example/cb".to_string(),
+                reason: "无法读取该框架的可访问性树：Frame not found".to_string(),
+            },
+            SkippedFrame {
+                label: "srcdoc 内联框架".to_string(),
+                reason: "该框架的可访问性树为空".to_string(),
+            },
+        ];
+        let line = format_frame_disclosure(&skipped).expect("footer");
+        assert!(line.contains("未包含在上方快照中"), "{line}");
+        assert!(line.contains("https://pay.example/cb"), "{line}");
+        assert!(
+            line.contains("srcdoc 内联框架（该框架的可访问性树为空）"),
+            "{line}"
+        );
+    }
+
+    /// `@N` lookup is centralized: out-of-range errors carry the max ref count,
+    /// and frame ownership surfaces in decorated selector names.
+    #[test]
+    fn ax_ref_bounds_and_frame_decoration() {
+        let client = isolated_client("ax_ref_unit");
+        let err = client.ax_ref(1).expect_err("empty table must fail");
+        assert!(
+            err.to_string().contains("out of range (max @0)"),
+            "bounds message missing: {err}"
+        );
+        assert_eq!(
+            BrowserClient::ref_with_frame("@7", None),
+            "@7",
+            "main-frame refs stay undecorated"
+        );
+        assert_eq!(
+            BrowserClient::ref_with_frame("@7", Some("https://pay.example/")),
+            "@7 (frame: https://pay.example/)",
+            "nested-frame refs name their frame"
+        );
     }
 }

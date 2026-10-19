@@ -106,6 +106,12 @@ fn report(errors: DiagnosticMessages, warnings: DiagnosticMessages) -> Validatio
     }
 }
 
+/// B15：repeat 固定循环次数的编译期上限。
+/// schema 对 repeat 只有 `minimum: 1`，u32 全域（≈43 亿）都能过 schema 与
+/// 反序列化——正常运行无 tick 预算，误配即静默空转。100000 与 until 循环
+/// `max` 的防御量级一致：覆盖合法批量场景，拦截天文数字误配。
+pub const MAX_LOOP_REPEAT: u32 = 100_000;
+
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
@@ -640,6 +646,19 @@ impl Compiler {
                     }
                     ctx.site(step, "/do/loop/for_each/items", "variable", "variable");
                     ctx.check_var_ref(&fe.items, &step.name);
+                }
+                // B15：repeat 无钳制（schema 仅 minimum=1，u32 可达 43 亿）时
+                // 一次误配会生成天文数字次迭代的合法工作流。编译期拒绝超限值，
+                // 上限沿用 until 循环的 max 默认语义数量级（100000：覆盖合法批量
+                // 重试场景，同时拦住 40 亿级的静默空转）。
+                if let Some(count) = def.repeat {
+                    if count > MAX_LOOP_REPEAT {
+                        ctx.errors.push(format!(
+                            "Loop step '{}': repeat {} 超过上限 {}（过大的固定循环次数通常 \
+                             是误配，请检查数值或改用 until 条件循环）",
+                            step.name, count, MAX_LOOP_REPEAT
+                        ));
+                    }
                 }
                 if let Some(ref until) = def.until {
                     ctx.site(step, "/do/loop/until", "condition", "invalid");

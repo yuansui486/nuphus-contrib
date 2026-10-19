@@ -310,14 +310,14 @@ fn update_jev_table(
     Ok(load_jev(state)?.status())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_jev_config(
     state: State<'_, AppState>,
 ) -> Result<nuphus::config::JevConfigStatus, String> {
     Ok(load_jev(&state)?.status())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_jev_config(
     state: State<'_, AppState>,
     api_key: Option<String>,
@@ -355,7 +355,7 @@ pub fn save_jev_config(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_jev_api_key(state: State<'_, AppState>) -> Result<(), String> {
     update_jev_table(&state, Some(""), None, None, Some(false), None, None, None)?;
     Ok(())
@@ -420,7 +420,7 @@ pub async fn test_jev_connection(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_workflow_enhanced_mode(
     state: State<'_, AppState>,
 ) -> Result<WorkflowEnhancedModeStatus, String> {
@@ -433,7 +433,7 @@ pub fn get_workflow_enhanced_mode(
     Ok(current_workflow_enhanced_status(enabled, configured))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_workflow_enhanced_mode(
     state: State<'_, AppState>,
     enabled: bool,

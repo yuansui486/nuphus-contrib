@@ -6,7 +6,6 @@ import {
   IconBrain,
   IconWorkflow,
   IconSparkles,
-  IconWrench,
   IconFolder,
   IconPlus,
   IconPaperclip,
@@ -19,13 +18,13 @@ import {
 import { IconButton } from '../../ui/Button'
 import { playUiSound, playPopupSound } from '../../ui/sound'
 import type { RefineState } from '../../hooks/useExecutionUI'
-import { formatPrimaryShortcut } from '../../ui/platformShortcut'
 import { MOOD_COLORS } from '../layout/StatusBar'
 import { SecurityPrompt } from '../layout/SecurityPrompt'
 import { StopChoiceDialog } from '../../ui/StopChoiceDialog'
 import { VoiceButton, type VoiceButtonHandle } from './VoiceButton'
 import { useLanguage } from '../../locales'
 import ReferenceBar from './ReferenceBar'
+import { filesToAttachments, isImageName } from './attachments'
 import type { ChatReference, PendingImage, PendingFile, TurnMeta } from '../../core/types'
 import { resolveTurnCalls, resolveTurnDuration } from '../../core/types'
 import {
@@ -37,9 +36,8 @@ import {
   type CustomAgentConfig,
 } from '../lib/api'
 import type { ExecutionStage } from '../../hooks/useExecutionState'
-import { useWorkflowGate } from '../lib/useWorkflowGate'
 import { ApiHealthBadge, apiHealthRailLabel } from './ApiHealthBadge'
-import { EnhancedModeToggle } from '../workflow-canvas/EnhancedModeToggle'
+import { EnhancedModeStatus } from '../workflow-canvas/EnhancedModeStatus'
 
 interface TokenUsageInfo {
   inputTokens: number
@@ -108,13 +106,6 @@ interface ChatInputBarProps {
   onEffortChange: (effort: string | null) => void
   /** 工作流模式（mode chip 第四档） */
   onToggleWorkAgentMode?: () => Promise<void>
-  /** 桌面工具箱（Ctrl+U）显示状态与切换（workflow 模式下在 mode chip 旁显示按钮） */
-  showDesktopToolbar?: boolean
-  onToggleDesktopToolbar?: () => void
-  /** 扳手菜单「工作流画布」：直达画布（续最近草稿或新建空白，App 层执行） */
-  onOpenWorkflowCanvas?: () => void
-  /** 扳手菜单「工作流列表」：打开 WorkflowPage 弹窗（等同 Ctrl+K → 工作流） */
-  onOpenWorkflowList?: () => void
   onModelSwitch: () => void
   /** 权限状态（用于 WORKFLOW 模式权限检查） */
   toolPermissions?: { file_access: boolean; web_search: boolean; system_automation: boolean }
@@ -181,10 +172,6 @@ export function ChatInputBar({
   onSetMode,
   onManageCustomAgents,
   onToggleWorkAgentMode,
-  showDesktopToolbar,
-  onToggleDesktopToolbar,
-  onOpenWorkflowCanvas,
-  onOpenWorkflowList,
   modelLabel,
   modelName,
   effort,
@@ -223,53 +210,8 @@ export function ChatInputBar({
   const executing = executionStage !== 'idle'
   const [localTextareaRef, setLocalTextareaRef] = useState<HTMLTextAreaElement | null>(null)
   const modeSwitchLock = useRef(false)
-  // ── 全局执行闸门（大王铁律：任意执行态禁用 workflow 快捷入口）──
-  // 仅 workflow 模式轮询感知执行态（1.5s）；其它模式 pollMs=0 只挂载查一次，不空转 IPC。
-  // gate.locked 时扳手禁用 + hover 提示原因（后端权威源 wf_gate_status：active_run + Agent busy）
-  const gate = useWorkflowGate(mode === 'workflow' ? 1500 : 0)
-  const gateLocked = gate.locked
-  const gateLockNotice =
-    gate.reason === 'workflow' ? '工作流正在执行中，暂不可用！' : '当前有任务执行中，暂不可用！'
   // ── 工具弹窗（附件/图片/原则/标注 合并入口）──
   const [toolMenuOpen, setToolMenuOpen] = useState(false)
-  /** workflow 扳手菜单（hover/click 展开）：工作流画布 / 工作流列表 / 工具箱（Ctrl+U） */
-  const [wfMenuOpen, setWfMenuOpen] = useState(false)
-  const wfMenuRef = useRef<HTMLDivElement>(null)
-  const wfMenuTimerRef = useRef<number | null>(null)
-  const openWfMenu = useCallback(() => {
-    if (wfMenuTimerRef.current) window.clearTimeout(wfMenuTimerRef.current)
-    setWfMenuOpen(true)
-  }, [])
-  const closeWfMenuSoon = useCallback(() => {
-    if (wfMenuTimerRef.current) window.clearTimeout(wfMenuTimerRef.current)
-    wfMenuTimerRef.current = window.setTimeout(() => setWfMenuOpen(false), 180)
-  }, [])
-  useEffect(
-    () => () => {
-      if (wfMenuTimerRef.current) window.clearTimeout(wfMenuTimerRef.current)
-    },
-    [],
-  )
-  // 外部点击 / Esc 关闭（菜单可点，不能只靠 hover 消失）
-  useEffect(() => {
-    if (!wfMenuOpen) return
-    const onDown = (e: MouseEvent) => {
-      if (wfMenuRef.current && !wfMenuRef.current.contains(e.target as Node)) setWfMenuOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setWfMenuOpen(false)
-    }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [wfMenuOpen])
-  // 执行态锁定时立即收起已开菜单（防止菜单悬空）
-  useEffect(() => {
-    if (gateLocked) setWfMenuOpen(false)
-  }, [gateLocked])
   const toolMenuRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!toolMenuOpen) return
@@ -416,44 +358,22 @@ export function ChatInputBar({
     })()
   }, [])
 
-  function isImagePath(p: string): boolean {
-    const ext = p.split('.').pop()?.toLowerCase()
-    return (
-      ext === 'png' ||
-      ext === 'jpg' ||
-      ext === 'jpeg' ||
-      ext === 'gif' ||
-      ext === 'webp' ||
-      ext === 'bmp'
-    )
+  /** 拖拽内容是否含文件——只有含文件才拦截，纯文本拖拽（如选中文字）不受影响。 */
+  function hasFiles(e: DragEvent): boolean {
+    const types = e.dataTransfer?.types
+    if (!types) return false
+    return Array.from(types).includes('Files')
   }
-  function partitionPaths(paths: string[]): { imagePaths: string[]; otherPaths: string[] } {
-    const imagePaths: string[] = []
-    const otherPaths: string[] = []
-    for (const p of paths) {
-      if (isImagePath(p)) imagePaths.push(p)
-      else otherPaths.push(p)
+
+  /** File[] → 引用栏条目（图片与文档统一入口）。 */
+  async function attachFiles(files: File[]) {
+    const { entries, failures } = await filesToAttachments(files)
+    for (const entry of entries) {
+      if (entry.kind === 'image') onImageAttachRef.current(entry.image)
+      else onFileAttachRef.current?.(entry.file)
     }
-    return { imagePaths, otherPaths }
-  }
-  async function handleDroppedImages(
-    paths: string[],
-    currentInput: string,
-    setInput: (v: string) => void,
-    setDrag: (v: boolean) => void,
-  ) {
-    for (const p of paths) {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core')
-        const name = p.split('\\').pop()?.split('/').pop() || p
-        const raw = await invoke<{ base64: string; mime: string }>('read_image_base64', {
-          imagePath: p,
-        })
-        const dataUrl = `data:${raw.mime || 'image/png'};base64,${raw.base64}`
-        onImageAttachRef.current({ name, dataUrl })
-      } catch (e) {
-        console.error('[DragDrop] read image failed:', p, e)
-      }
+    if (failures.length > 0) {
+      console.error('[Drop] 附件添加失败:', failures.join('; '))
     }
   }
 
@@ -591,6 +511,12 @@ export function ChatInputBar({
   // reasoning_efforts 是唯一能力契约；未声明时不显示可配置旋钮，避免伪造等级。
   const effortAvailable = supportedEfforts.length > 0
 
+  // 下拉的**入口**条件：可配置推理强度，或 workflow 模式下要露增强模式状态行。
+  // 二者分开：effortAvailable 决定「有没有等级可选」，effortMenuAvailable 决定
+  // 「这个 hover 弹窗该不该出现」。模型不声明 reasoning_efforts 时仍需展示增强
+  // 状态行（大王定稿：增强状态行落在推理强度弹窗内的下方），故入口放宽到二选一。
+  const effortMenuAvailable = effortAvailable || mode === 'workflow'
+
   // WORKFLOW mode requires system_automation permission
   const workflowLocked =
     mode === 'workflow' && !!toolPermissions && !toolPermissions.system_automation
@@ -618,55 +544,58 @@ export function ChatInputBar({
   // 执行中不禁用输入框——用户可随时输入消息（发送 = 追加指令，与移动端一致）
   const inputDisabled = workflowLocked
 
-  // ── 拖拽文件：图片走 processImageAttachment，其他插路径 ──
+  // ── 拖拽文件：HTML5 drop 单一通道（图片/文档统一进引用栏）──
+  // 不再使用 Tauri 原生 onDragDropEvent：wry 会先 SetAllowExternalDrop(false) 关掉
+  // 浏览器通道、再自行注册 OLE target，一旦该注册因 webview 子窗口时序失效，
+  // 原生事件与浏览器事件会同时落空（拖拽彻底无响应且静默）。HTML5 通道由浏览器
+  // 内核保证，不依赖 wry 私有注册时机。
   useEffect(() => {
-    let unlisten: (() => void) | null = null
-    let cancelled = false
-
-    import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => {
-        if (cancelled) return
-        getCurrentWindow()
-          .onDragDropEvent(event => {
-            const type = event.payload.type
-            if (type === 'enter' || type === 'over') {
-              setIsDragOver(true)
-            } else if (type === 'leave') {
-              setIsDragOver(false)
-            } else if (type === 'drop') {
-              setIsDragOver(false)
-              const paths = event.payload.paths as string[]
-              if (paths && paths.length > 0) {
-                // Check each path — image files are processed via processImageAttachment
-                const { imagePaths, otherPaths } = partitionPaths(paths)
-                if (imagePaths.length > 0) {
-                  handleDroppedImages(
-                    imagePaths,
-                    inputRef.current,
-                    onInputChangeRef.current,
-                    setIsDragOver,
-                  )
-                }
-                if (otherPaths.length > 0) {
-                  for (const p of otherPaths) {
-                    const name = p.split('\\').pop()?.split('/').pop() || p
-                    onFileAttachRef.current?.({ path: p, name })
-                  }
-                }
-              }
-            }
-          })
-          .then(fn => {
-            unlisten = fn
-          })
-      })
-      .catch(err => {
-        console.error('[DragDrop] 拖拽监听注册失败（Tauri window API 不可用）:', err)
-      })
-
+    let depth = 0
+    const onDragEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      depth += 1
+      setIsDragOver(true)
+    }
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+    }
+    const onDragLeave = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      depth = Math.max(0, depth - 1)
+      if (depth === 0) setIsDragOver(false)
+    }
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return
+      e.preventDefault()
+      depth = 0
+      setIsDragOver(false)
+      const files = Array.from(e.dataTransfer?.files ?? [])
+      if (files.length > 0) void attachFiles(files)
+    }
+    // 拖放默认行为（未 preventDefault 时浏览器会把文件当链接/文本处理）必须拦掉
+    const onWindowDragOver = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault()
+    }
+    const onWindowDrop = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault()
+    }
+    const opts = { capture: true as const }
+    window.addEventListener('dragenter', onDragEnter, opts)
+    window.addEventListener('dragover', onDragOver, opts)
+    window.addEventListener('dragleave', onDragLeave, opts)
+    window.addEventListener('drop', onDrop, opts)
+    window.addEventListener('dragover', onWindowDragOver, opts)
+    window.addEventListener('drop', onWindowDrop, opts)
     return () => {
-      cancelled = true
-      unlisten?.()
+      window.removeEventListener('dragenter', onDragEnter, opts)
+      window.removeEventListener('dragover', onDragOver, opts)
+      window.removeEventListener('dragleave', onDragLeave, opts)
+      window.removeEventListener('drop', onDrop, opts)
+      window.removeEventListener('dragover', onWindowDragOver, opts)
+      window.removeEventListener('drop', onWindowDrop, opts)
     }
   }, [])
 
@@ -809,7 +738,7 @@ export function ChatInputBar({
                       const paths = result.paths || []
                       for (const path of paths) {
                         const name = path.split('\\').pop()?.split('/').pop() || path
-                        if (isImagePath(path)) {
+                        if (isImageName(name)) {
                           const raw = await invoke<{ base64: string; mime: string }>(
                             'read_image_base64',
                             { imagePath: path },
@@ -844,12 +773,15 @@ export function ChatInputBar({
                 }}
                 onKeyDown={e => {
                   // 录音/识别中按 Enter = 说完发送：先冲刷语音会话再发送
-                  // （Ctrl/Cmd+Enter 不参与：它固定是换行，交回 handleKeyDown 处理）
+                  // （Ctrl/Cmd+Enter 不参与：它固定是换行，交回 handleKeyDown 处理；
+                  //   IME 组词态同样不参与——选词确认键交回 handleKeyDown 的守卫放行）
                   if (
                     e.key === 'Enter' &&
                     !e.shiftKey &&
                     !e.ctrlKey &&
                     !e.metaKey &&
+                    !e.nativeEvent.isComposing &&
+                    e.nativeEvent.keyCode !== 229 &&
                     !isProcessing &&
                     voiceRef.current?.isActive()
                   ) {
@@ -904,13 +836,26 @@ export function ChatInputBar({
                     const { open } = await import('@tauri-apps/plugin-dialog')
                     try {
                       const selected = await open({ multiple: true })
-                      if (selected && Array.isArray(selected)) {
-                        const paths = selected as string[]
-                        onInputChange(
-                          input + (input ? '\n' : '') + paths.map(p => `[附件: ${p}]`).join('\n'),
-                        )
-                      } else if (selected) {
-                        onInputChange(input + (input ? '\n' : '') + `[附件: ${selected}]`)
+                      if (!selected) return
+                      // 与拖拽/图片入口同一条通道：一律进引用栏，不再把 [附件: path] 拼进输入框
+                      const paths = Array.isArray(selected)
+                        ? (selected as string[])
+                        : [selected as string]
+                      for (const p of paths) {
+                        const name = p.split('\\').pop()?.split('/').pop() || p
+                        if (isImageName(name)) {
+                          const { invoke } = await import('@tauri-apps/api/core')
+                          const raw = await invoke<{ base64: string; mime: string }>(
+                            'read_image_base64',
+                            { imagePath: p },
+                          )
+                          onImageAttachRef.current({
+                            name,
+                            dataUrl: `data:${raw.mime || 'image/png'};base64,${raw.base64}`,
+                          })
+                        } else {
+                          onFileAttachRef.current?.({ path: p, name })
+                        }
                       }
                     } catch (e) {
                       console.error('文件选择失败:', e)
@@ -1153,82 +1098,6 @@ export function ChatInputBar({
                 </div>
               )}
             </div>
-            {/* ── workflow 工具菜单按钮（扳手，图标不变）：仅 workflow 模式显示。
-                 hover/点击展开三项：工作流画布（直达续编/新建）/ 工作流列表（Ctrl+K 直达）
-                 / 工具箱 Ctrl+U（原点击行为收进菜单）。── */}
-            {mode === 'workflow' && (
-              <EnhancedModeToggle compact disabled={gateLocked || isProcessing} />
-            )}
-            {mode === 'workflow' && (
-              <div
-                className="input-bar-toolbox-wrap"
-                ref={wfMenuRef}
-                onMouseEnter={openWfMenu}
-                onMouseLeave={closeWfMenuSoon}
-              >
-                <IconButton
-                  variant="raw"
-                  className={`input-bar-toolbox-btn${showDesktopToolbar ? ' is-active' : ''}${gateLocked ? ' is-locked' : ''}`}
-                  label={gateLocked ? gateLockNotice : t('wfMenu.title')}
-                  onClick={() => setWfMenuOpen(o => !o)}
-                >
-                  <IconWrench size={13} />
-                </IconButton>
-                {wfMenuOpen &&
-                  (gateLocked ? (
-                    /* 执行态锁定：不提供可用项，仅说明原因（禁止进入画布/列表是闸门铁律） */
-                    <div className="input-bar-toolbox-menu" role="status">
-                      <div className="input-bar-toolbox-lock">{gateLockNotice}</div>
-                    </div>
-                  ) : (
-                    <div
-                      className="input-bar-toolbox-menu"
-                      role="menu"
-                      aria-label={t('wfMenu.title')}
-                    >
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="input-bar-toolbox-item"
-                        onClick={() => {
-                          setWfMenuOpen(false)
-                          onOpenWorkflowCanvas?.()
-                        }}
-                      >
-                        <span>{t('wfMenu.canvas')}</span>
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="input-bar-toolbox-item"
-                        onClick={() => {
-                          setWfMenuOpen(false)
-                          onOpenWorkflowList?.()
-                        }}
-                      >
-                        <span>{t('wfMenu.list')}</span>
-                        <kbd className="input-bar-toolbox-item-key">
-                          {formatPrimaryShortcut('K')}
-                        </kbd>
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        className="input-bar-toolbox-item"
-                        onClick={() => {
-                          setWfMenuOpen(false)
-                          onToggleDesktopToolbar?.()
-                        }}
-                      >
-                        <span>{t('wfMenu.toolbox')}</span>
-                        <kbd className="input-bar-toolbox-item-key">
-                          {formatPrimaryShortcut('U')}
-                        </kbd>
-                      </button>
-                    </div>
-                  ))}
-              </div>
-            )}
             {/* ── model chip：点击切换模型；hover 弹出推理强度选择（默认/low/high/max）── */}
             <div
               className="input-bar-model"
@@ -1238,7 +1107,7 @@ export function ChatInputBar({
             >
               <span className="input-bar-text input-bar-chip" onClick={onModelSwitch}>
                 {modelLabel || modelName || '—'}
-                {effortAvailable && (
+                {effortMenuAvailable && (
                   <IconChevronDown
                     className="input-bar-effort-caret"
                     aria-hidden
@@ -1247,24 +1116,30 @@ export function ChatInputBar({
                   />
                 )}
               </span>
-              {effortAvailable && modelEffortOpen && (
+              {effortMenuAvailable && modelEffortOpen && (
                 <div className="input-bar-effort-menu">
-                  <div
-                    className={`input-bar-effort-option ${!effort ? 'active' : ''}`}
-                    onClick={() => selectEffort(null)}
-                  >
-                    {t('models.reasoningDefault')}
-                  </div>
-                  {supportedEfforts.map(e => (
-                    <div
-                      key={e}
-                      className={`input-bar-effort-option ${effort === e ? 'active' : ''}`}
-                      onClick={() => selectEffort(e)}
-                    >
-                      {e}
-                      {e === 'high' ? ` (${t('models.reasoningHighHint')})` : ''}
-                    </div>
-                  ))}
+                  {effortAvailable && (
+                    <>
+                      <div
+                        className={`input-bar-effort-option ${!effort ? 'active' : ''}`}
+                        onClick={() => selectEffort(null)}
+                      >
+                        {t('models.reasoningDefault')}
+                      </div>
+                      {supportedEfforts.map(e => (
+                        <div
+                          key={e}
+                          className={`input-bar-effort-option ${effort === e ? 'active' : ''}`}
+                          onClick={() => selectEffort(e)}
+                        >
+                          {e}
+                          {e === 'high' ? ` (${t('models.reasoningHighHint')})` : ''}
+                        </div>
+                      ))}
+                    </>
+                  )}
+                  {/* ── 增强模式状态行（只读，无开关）：点击跳设置 → 模型 → 增强判断模型 ── */}
+                  {mode === 'workflow' && <EnhancedModeStatus />}
                 </div>
               )}
             </div>

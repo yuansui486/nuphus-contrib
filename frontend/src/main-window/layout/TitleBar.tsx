@@ -8,6 +8,7 @@ import { useLanguage } from '../../locales'
 interface TitleBarProps {
   onNewChat?: () => void
   agentState?: NuphusAvatarState
+  onOpenUpdate?: () => void
   brand?: string
   brandIcon?: ReactNode
 }
@@ -17,9 +18,11 @@ export function TitleBar({
   agentState = 'idle',
   brand = 'Nuphus',
   brandIcon,
+  onOpenUpdate,
 }: TitleBarProps) {
   const { t } = useLanguage()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [aboutOpen, setAboutOpen] = useState(false)
   const [win, setWin] = useState<Window | null>(null)
   useEffect(() => {
     // 浏览器调试环境无 Tauri 运行时，跳过窗口 API，避免整棵组件树崩溃
@@ -49,7 +52,53 @@ export function TitleBar({
         <div className="title-bar-icon">
           {brandIcon ?? <NuphusAvatar state={agentState} size={20} />}
         </div>
-        <span className="title-bar-brand">{brand}</span>
+        {/* 品牌文字 logo 承接原「应用」入口：hover 弹出 反馈（GitHub 主页）/
+            版本（检查更新）。触发器不做拖动区（交互元素冲突） */}
+        <div
+          className="title-bar-about"
+          onMouseEnter={() => setAboutOpen(true)}
+          onMouseLeave={() => setAboutOpen(false)}
+        >
+          <span
+            className="title-bar-brand title-bar-about-trigger"
+            role="button"
+            tabIndex={0}
+            aria-haspopup="true"
+            aria-expanded={aboutOpen}
+            onClick={() => setAboutOpen(v => !v)}
+            onKeyDown={e => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                setAboutOpen(v => !v)
+              }
+            }}
+          >
+            {brand}
+          </span>
+          {aboutOpen && (
+            <div className="title-bar-about-menu">
+              <a
+                className="title-bar-about-item"
+                href="https://github.com/mrpulor-gh/nuphus"
+                target="_blank"
+                rel="noreferrer"
+              >
+                {t('titleBar.feedback')}
+              </a>
+              <button
+                type="button"
+                className="title-bar-about-item"
+                disabled={!onOpenUpdate}
+                onClick={() => {
+                  setAboutOpen(false)
+                  onOpenUpdate?.()
+                }}
+              >
+                {t('titleBar.checkUpdate')}
+              </button>
+            </div>
+          )}
+        </div>
       </div>
       <span className="title-bar-spacer" data-tauri-drag-region />
       {/* 桌面端：窗口控制按钮 */}

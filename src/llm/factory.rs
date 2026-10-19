@@ -143,170 +143,119 @@ impl ClientFactory {
         self.create_client_for(&provider, &model)
     }
 
-    /// Build a Transport for the given Provider + model.
-    ///
-    /// provider-driven: delegates to `Provider::transport()` which owns its metadata,
-    /// quirks, and transport selection. The factory only handles registry
-    /// lookup — transport construction is the Provider's responsibility.
-    ///
-    /// `registry` 仅用于 OAuth 段的配置文件来源（令牌自动刷新需要回写路径）。
+    /** 模型协议覆盖优先于服务商默认路由，认证来源不参与协议选择。 */
     fn build_transport(
         &self,
         registry: &ModelRegistry,
         provider: &ProviderConfig,
         model_id: &str,
     ) -> Result<Arc<dyn Transport>> {
-        // OAuth 段透明化：配置了 oauth 的段以「新鲜 access token」充当 api_key
-        // 传入 transport（transport 本身不感知 oauth，继续走既有 Bearer 链）。
-        // 未配 oauth / 无文件来源（CLI 内存构造）→ 原样透传，零行为变化。
-        let provider = self.with_fresh_oauth_token(provider, registry.source_path.as_deref());
         let pmeta = ProviderRegistry::builtin()
             .get(provider.provider_type.as_str())
-            .ok_or_else(|| {
-                crate::NuphusError::Config(format!(
-                    "unknown provider type: {}",
-                    provider.provider_type.as_str()
-                ))
-            })?;
-
-        // P4 分派（refactor 设计 §4.3 / §7 P4）：按 pmeta.transport_for(model_id)
-        // 解析出的协议族选择构造器。
-        // - Responses → 新引擎 ResponsesTransport（P4 接线，仅 opencode-go
-        //   responses 模型族会命中；chat/anthropic 路径逐字节不变）。
-        // - ChatCompletions / Anthropic → 继续委托 Provider::transport()
-        //   （现网 13 provider 路径；旧方法退役留后续阶段）。
-        let kind = pmeta.transport_for(model_id);
+            .ok_or_else(|| crate::NuphusError::Config("unknown provider type".into()))?;
+        let model = provider.models.iter().find(|m| m.id == model_id);
+        let kind = model
+            .and_then(|m| m.transport)
+            .unwrap_or_else(|| pmeta.transport_for(model_id));
+        let credentials =
+            provider
+                .oauth
+                .as_ref()
+                .map(|oauth| crate::config::credentials::TokenSource {
+                    config_path: registry.source_path.clone(),
+                    provider: provider.name.clone(),
+                    oauth: oauth.clone(),
+                });
+        let mut cfg = provider.clone();
+        if kind != TransportKind::Responses {
+            if let Some(source) = credentials.clone() {
+                cfg.api_key = std::thread::Builder::new()
+                    .name("oauth-token-refresh".into())
+                    .spawn(move || source.resolve())
+                    .map_err(|_| crate::NuphusError::llm("Could not start OAuth resolver"))?
+                    .join()
+                    .map_err(|_| crate::NuphusError::llm("OAuth resolver failed"))?
+                    .map_err(crate::NuphusError::llm)?;
+            }
+        }
+        let base_url = if cfg.base_url.is_empty() {
+            pmeta.default_base_url().to_string()
+        } else {
+            cfg.base_url.clone()
+        };
+        let auth_header = if cfg.auth_header.is_empty() {
+            pmeta.auth_header().to_string()
+        } else {
+            cfg.auth_header.clone()
+        };
+        let auth_prefix = if cfg.auth_prefix.is_empty() {
+            pmeta.auth_prefix().to_string()
+        } else {
+            cfg.auth_prefix.clone()
+        };
+        let mut quirks = pmeta.quirks();
+        quirks.extra_headers.extend(
+            cfg.extra_headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         match kind {
             TransportKind::Responses => {
-                tracing::info!(
-                    "[factory] build_transport provider={} model={} transport_kind=Responses \
-                     (P4 分派；构造 ResponsesTransport)",
-                    provider.provider_type.as_str(),
-                    model_id
-                );
-                // ResponsesConfig 组装字段来源（对齐 custom/local 的 cfg 优先、
-                // provider 常量兜底模式——与 opencode-go chat 族 transport() 鉴权
-                // 语义一致）：
-                // - base_url：cfg.base_url 非空用 cfg，否则 pmeta.default_base_url()
-                // - api_key / timeout_secs / reasoning_effort：透传 ProviderConfig
-                // - auth_header / auth_prefix：cfg 显式配置优先，否则 pmeta 声明常量
-                // - provider_kind：ProviderConfig.provider_type（已规范化 ProviderKind）
-                // - quirks：pmeta.quirks() 的副本；仅 opencode-go 追加稳定会话 ID
-                //   （x-opencode-session，网关 400 MissingSessionID 根因）。守卫限定：
-                //   即便将来有非 opencode-go provider 走到 Responses 分支也不误加头。
-                let mut quirks = pmeta.quirks();
                 if provider.provider_type == crate::api::ProviderKind::OpenCodeGo {
                     quirks.extra_headers.push((
-                        "x-opencode-session".to_string(),
+                        "x-opencode-session".into(),
                         crate::transports::opencode_session::opencode_session_id(),
                     ));
                 }
                 Ok(Arc::new(ResponsesTransport::new(ResponsesConfig {
-                    base_url: if provider.base_url.is_empty() {
-                        pmeta.default_base_url().to_string()
+                    base_url,
+                    api_key: if credentials.is_some() {
+                        String::new()
                     } else {
-                        provider.base_url.clone()
+                        cfg.api_key.clone()
                     },
-                    api_key: provider.api_key.clone(),
-                    model: model_id.to_string(),
-                    timeout_secs: provider.timeout_secs,
-                    auth_header: if provider.auth_header.is_empty() {
-                        pmeta.auth_header().to_string()
-                    } else {
-                        provider.auth_header.clone()
-                    },
-                    auth_prefix: if provider.auth_prefix.is_empty() {
-                        pmeta.auth_prefix().to_string()
-                    } else {
-                        provider.auth_prefix.clone()
-                    },
-                    provider_kind: Some(provider.provider_type),
+                    model: model_id.into(),
+                    timeout_secs: cfg.timeout_secs,
+                    auth_header,
+                    auth_prefix,
+                    provider_kind: Some(cfg.provider_type),
                     quirks,
-                    reasoning_effort: provider.reasoning_effort.clone(),
+                    reasoning_effort: cfg.reasoning_effort.clone(),
+                    credentials,
+                    options: model.and_then(|m| m.responses.clone()).unwrap_or_default(),
                 })))
             }
-            // ChatCompletions / Anthropic：现网路径逐字节不变（含 anthropic 官方
-            // provider 的 Anthropic transport；不在此新建构造）。
-            other => {
-                tracing::info!(
-                    "[factory] build_transport provider={} model={} transport_kind={:?} \
-                     (委托 Provider::transport 既有路径)",
-                    provider.provider_type.as_str(),
-                    model_id,
-                    other
-                );
-                Ok(pmeta.transport(&provider, model_id))
-            }
-        }
-    }
-
-    /// OAuth 段的令牌注入：返回携带新鲜 access token 的段配置（或原引用内容）。
-    ///
-    /// 三级路径：
-    /// 1. 未配 oauth / 注册表无文件来源（CLI 内存构造）→ 原样返回，零开销。
-    /// 2. 内存令牌未过期（`config::oauth::in_memory_fresh_token`）→ 直接注入，
-    ///    零磁盘 IO、零网络（transport 构建高频路径的主形态）。
-    /// 3. 临期/已过期 → 经独立线程调用 `ensure_fresh_oauth_token`
-    ///    （磁盘刷新 + 落盘）。独立线程是为了与调用方运行时解耦：build_transport
-    ///    是同步函数，可能运行在 tokio worker 上，阻塞式 HTTP 客户端在
-    ///    async 上下文里有运行时嵌套风险，线程隔离一次到位。
-    ///    刷新失败（含 401 → 需重新授权）仅记 warn——不携带任何令牌值——
-    ///    transport 仍按原 api_key 构建，认证失败由请求链路报给上层。
-    ///
-    /// `source_path` 由调用方从**当前注册表**带入（实时源下每次都是最新配置的路径）。
-    fn with_fresh_oauth_token(
-        &self,
-        provider: &ProviderConfig,
-        source_path: Option<&std::path::Path>,
-    ) -> ProviderConfig {
-        let Some(oauth) = provider.oauth.as_ref() else {
-            return provider.clone();
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if let Some(token) = crate::config::oauth::in_memory_fresh_token(oauth, now) {
-            let mut cfg = provider.clone();
-            cfg.api_key = token;
-            return cfg;
-        }
-        let Some(path) = source_path.map(std::path::Path::to_path_buf) else {
-            tracing::warn!(
-                "[factory] provider '{}' 配置了 OAuth 但注册表无配置文件来源，无法自动刷新",
-                provider.name
-            );
-            return provider.clone();
-        };
-        let name = provider.name.clone();
-        // 网络刷新放独立线程：与宿主 async 运行时隔离（见方法注释）
-        let refreshed = std::thread::Builder::new()
-            .name("oauth-token-refresh".to_string())
-            .spawn(move || crate::config::oauth::ensure_fresh_oauth_token(&path, &name))
-            .and_then(|h| {
-                h.join()
-                    .map_err(|_| std::io::Error::other("refresh thread panicked"))
-            });
-        match refreshed {
-            Ok(Ok(token)) => {
-                let mut cfg = provider.clone();
-                cfg.api_key = token;
-                cfg
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    "[factory] provider '{}' OAuth 令牌刷新失败: {e}",
-                    provider.name
-                );
-                provider.clone()
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[factory] provider '{}' OAuth 刷新线程异常: {e}",
-                    provider.name
-                );
-                provider.clone()
-            }
+            other if other == pmeta.transport_for(model_id) => Ok(pmeta.transport(&cfg, model_id)),
+            TransportKind::ChatCompletions => Ok(Arc::new(
+                crate::transports::chat_completions::ChatCompletionsTransport::new(
+                    crate::transports::chat_completions::ChatCompletionsConfig {
+                        name: cfg.provider_type.as_str().into(),
+                        provider_segment: cfg.name.clone(),
+                        base_url,
+                        api_key: cfg.api_key.clone(),
+                        model: model_id.into(),
+                        timeout_secs: cfg.timeout_secs,
+                        auth_header,
+                        auth_prefix,
+                        provider_kind: Some(cfg.provider_type),
+                        quirks,
+                        reasoning_effort: cfg.reasoning_effort.clone(),
+                    },
+                ),
+            )),
+            TransportKind::Anthropic => Ok(Arc::new(
+                crate::transports::anthropic::AnthropicTransport::new(
+                    crate::transports::anthropic::AnthropicConfig {
+                        base_url,
+                        api_key: cfg.api_key.clone(),
+                        model: model_id.into(),
+                        timeout_secs: cfg.timeout_secs,
+                        provider_kind: Some(cfg.provider_type),
+                        reasoning_effort: cfg.reasoning_effort.clone(),
+                        extra_headers: quirks.extra_headers,
+                    },
+                ),
+            )),
         }
     }
 }
@@ -314,6 +263,62 @@ impl ClientFactory {
 mod tests {
     use super::*;
     use crate::api::ProviderKind;
+
+    #[test]
+    fn model_override_roundtrips_without_changing_sibling_or_default_route() {
+        let (dir, path, _) = dual_segment_registry();
+        let factory = ClientFactory::live_at(&path);
+        crate::config::model::set_model_transport(
+            &path,
+            "seg-b",
+            "probe-model",
+            Some(TransportKind::Responses),
+        )
+        .unwrap();
+        let mut registry = factory.registry().unwrap();
+        assert_eq!(registry.providers[0].models[0].transport, None);
+        assert_eq!(
+            registry.providers[1].models[0].transport,
+            Some(TransportKind::Responses)
+        );
+        assert_eq!(
+            factory
+                .build_transport(&registry, &registry.providers[1], "probe-model")
+                .unwrap()
+                .provider_name(),
+            "responses"
+        );
+        registry.source_path = None;
+        registry.providers[1].oauth = Some(crate::config::ProviderOAuth {
+            access_token: "memory-token".into(),
+            expires_at: Some(i64::MAX),
+            ..Default::default()
+        });
+        assert_eq!(
+            factory
+                .build_transport(&registry, &registry.providers[1], "probe-model")
+                .unwrap()
+                .provider_name(),
+            "responses"
+        );
+        crate::config::model::set_model_transport(&path, "seg-b", "probe-model", None).unwrap();
+        let registry = factory.registry().unwrap();
+        assert_ne!(
+            factory
+                .build_transport(&registry, &registry.providers[1], "probe-model")
+                .unwrap()
+                .provider_name(),
+            "responses"
+        );
+        assert!(crate::config::model::set_model_transport(
+            &path,
+            "absent",
+            "probe-model",
+            Some(TransportKind::Responses)
+        )
+        .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// 同 id 双段 fixture，且两段都是 `provider_type = "custom"` —— builtin
     /// 枚举把二者一并折叠成 `ProviderKind::Custom`，只有 providers.toml 段名
@@ -433,5 +438,42 @@ mod tests {
             .is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[tokio::test]
+    async fn oauth_responses_never_falls_back_to_an_api_key() {
+        let (dir, path, _) = dual_segment_registry();
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["providers"].as_array_mut().unwrap()[1]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "oauth".into(),
+                toml::Value::try_from(crate::config::ProviderOAuth {
+                    account_ref: Some("oaiapp_missing".into()),
+                    credential_file: "test-accounts.json".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+        doc["providers"][1]["models"][0]
+            .as_table_mut()
+            .unwrap()
+            .insert("transport".into(), toml::Value::String("responses".into()));
+        std::fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
+        let factory = ClientFactory::live_at(&path);
+        let registry = factory.registry().unwrap();
+        let provider = &registry.providers[1];
+        // The fixture still has sk-b and a custom endpoint. Neither may be
+        // used as a fallback when its OAuth account has no credentials.
+        let transport = factory
+            .build_transport(&registry, provider, "probe-model")
+            .unwrap();
+        assert_eq!(transport.provider_name(), "responses");
+        let error = transport
+            .stream(crate::api::MessageRequest::new("probe-model", vec![]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("OAuth account not found"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

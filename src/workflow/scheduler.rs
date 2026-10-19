@@ -161,18 +161,93 @@ pub struct SchedulerEngine {
     history_guard: std::sync::Mutex<()>,
 }
 
-pub fn has_frontend_step(steps: &[Step]) -> bool {
-    const FRONTEND_PREFIXES: [&str; 2] = ["desktop_", "browser_"];
-    steps.iter().any(|step| match &step.action {
-        Action::Tool { tool, .. } => FRONTEND_PREFIXES
-            .iter()
-            .any(|prefix| tool.starts_with(prefix)),
-        Action::Seq { seq } => has_frontend_step(seq),
-        Action::Loop { def } => has_frontend_step(&def.steps),
-        Action::If { def } => has_frontend_step(&def.then) || has_frontend_step(&def.else_branch),
-        Action::Wait { auto, .. } => has_frontend_step(auto),
-        _ => false,
-    })
+/// 会无限期停下来等人的工具。
+///
+/// 定时的唯一合法拦理由是「工作流能不能在无人介入下跑完」，而不是「它碰不碰界面」。
+/// 后者曾是这里的判据（按 `desktop_` / `browser_` 前缀一刀切），理由是界面自动化需要
+/// 人在场——那个前提是错的：工作流是人 + Agent 一同编译出来的，每一步都是人在场时选定
+/// 的；定时只是把这份已经决定了的人工件按时执行一遍，不需要第二次授权。
+/// 界面自动化本身（尤其 `browser_*`）也并不要求有人盯着。
+///
+/// 三种构造都会让无人值守的定时跑空转，且都已在各自实现里有界（不会挂死）：
+/// - `request_user_input`：`agent::exec_tool::wait_for_user_input_async`，600 × 500ms = 5 分钟硬超时
+/// - `desktop_semantic_execute`：`tools::desktop_approval::authorize` 的 GUI 审批门
+/// - `Wait` 步骤且 `wait` 非空：`executor::step_wait` 的 HUD 暂停轮询，30 分钟超时
+const HUMAN_BLOCKING_TOOLS: &[&str] = &["request_user_input", "desktop_semantic_execute"];
+
+/// 子树里第一个"会停下来等人"的构造，返回可直接展示给用户的原因。
+///
+/// 与 [`human_blocker_in_steps`] 同源：后者只多一层 Call 展开。两处必须用同一套判据，
+/// 否则保存期放行、运行期才发现的漂移会让定时在无人时白跑。
+pub fn human_blocker_in_step(step: &Step) -> Option<String> {
+    match &step.action {
+        Action::Tool { tool, .. } => HUMAN_BLOCKING_TOOLS
+            .contains(&tool.as_str())
+            .then(|| format!("步骤「{}」调用 {}，会停下来等用户", step.name, tool)),
+        // Chat 步骤的工具白名单见 `executor::CHAT_AGENT_ALLOWED_TOOLS`：含全部
+        // desktop_* / browser_*，以及 request_user_input —— Agent 运行时可能选中
+        // 其中任何一个等人的构造，静态无法收窄，一律按需人在场处理。
+        Action::Chat { .. } => Some(format!(
+            "步骤「{}」是 Chat 步骤，其 Agent 白名单含 request_user_input 等会停下来等人的工具",
+            step.name
+        )),
+        Action::Seq { seq } => human_blocker_in_steps(seq),
+        Action::Loop { def } => human_blocker_in_steps(&def.steps),
+        Action::If { def } => {
+            human_blocker_in_steps(&def.then).or_else(|| human_blocker_in_steps(&def.else_branch))
+        }
+        // wait 字段即暂停提示语：为空则不暂停（step_wait 的既有语义），非空则停下来等人点继续。
+        Action::Wait { wait, auto } => {
+            let self_blocker = (!wait.trim().is_empty()).then(|| {
+                format!(
+                    "步骤「{}」是 wait 确认环节，会暂停等用户在 HUD 点继续",
+                    step.name
+                )
+            });
+            self_blocker.or_else(|| human_blocker_in_steps(auto))
+        }
+        _ => None,
+    }
+}
+
+/// 同步子树判定（不含 Call 展开；Call 的目标在异步 store 里）。
+pub fn human_blocker_in_steps(steps: &[Step]) -> Option<String> {
+    steps.iter().find_map(human_blocker_in_step)
+}
+
+/// Call 展开后的人类阻塞点检测（[`human_blocker_in_steps`] + Call 递归展开）。
+///
+/// 调用图必须无环——compiler 的 validate_calls 已在调度入口前静态拒绝循环调用，
+/// 深度上限兜底防御。
+pub async fn human_blocker_with_calls(
+    steps: &[Step],
+    store: &WorkflowStore,
+    depth: u32,
+) -> Option<String> {
+    const MAX_CALL_DEPTH: u32 = 10;
+    if depth > MAX_CALL_DEPTH {
+        return None;
+    }
+    for step in steps {
+        if let Action::Call { call, .. } = &step.action {
+            // 目标缺失/损坏：不能据此拦调度（合法场景：目标稍后创建），
+            // 交由执行期 wf_call 的既有报错路径处理。目标之后被补齐、或子工作流
+            // 被改出等人的构造时，运行期复检（`execute_workflow` 对 Schedule 的
+            // 检查）兜住——绑定是快照，判据必须每次触发都重新算。
+            if let Some(sub_wf) = store.get(call).await {
+                if let Some(reason) =
+                    Box::pin(human_blocker_with_calls(&sub_wf.steps, store, depth + 1)).await
+                {
+                    return Some(reason);
+                }
+            }
+            continue;
+        }
+        if let Some(reason) = human_blocker_in_step(step) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 fn parse_five_field_cron(expression: &str) -> Result<Schedule> {
@@ -262,7 +337,10 @@ impl SchedulerEngine {
     }
 
     pub async fn record_schedule_run(&self, record: ScheduleRunRecord) -> Result<()> {
-        let _guard = self.history_guard.lock().unwrap();
+        let _guard = self
+            .history_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut history = load_schedule_runs_from(&self.history_path);
         history.runs.retain(|item| item.run_id != record.run_id);
         history.runs.insert(0, record);
@@ -270,7 +348,10 @@ impl SchedulerEngine {
     }
 
     pub fn list_schedule_runs(&self) -> PersistedScheduleRuns {
-        let _guard = self.history_guard.lock().unwrap();
+        let _guard = self
+            .history_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         load_schedule_runs_from(&self.history_path)
     }
 
@@ -281,7 +362,10 @@ impl SchedulerEngine {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> Result<usize> {
-        let _guard = self.history_guard.lock().unwrap();
+        let _guard = self
+            .history_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut history = load_schedule_runs_from(&self.history_path);
         let old_len = history.runs.len();
         history.runs.retain(|item| {
@@ -343,10 +427,10 @@ impl SchedulerEngine {
         let workflow = store.get(workflow_id).await.ok_or_else(|| {
             crate::NuphusError::agent(format!("Workflow not found: {workflow_id}"))
         })?;
-        if has_frontend_step(&workflow.steps) {
-            return Err(crate::NuphusError::agent(
-                "Foreground workflows (desktop/browser) cannot use cron scheduling; they require user presence. Run manually instead.".to_string(),
-            ));
+        if let Some(reason) = human_blocker_with_calls(&workflow.steps, store, 0).await {
+            return Err(crate::NuphusError::agent(format!(
+                "无法定时执行：{reason}。定时运行必须能在无人介入下跑完——请去掉该环节，或改用手动运行。"
+            )));
         }
 
         if let Some(interval_minutes) = config.interval_minutes {
@@ -506,6 +590,29 @@ impl SchedulerEngine {
         write_persisted(&self.persist_path, &PersistedSchedules { schedules })
     }
 
+    /// 落盘当前活跃绑定，并把 `retained` 中未活跃的条目原样合并保留。
+    ///
+    /// restore_schedules 用于保住「工作流文件损坏但调度数据有效」的条目：
+    /// 它们无法注册进 tasks（工作流读不出来），但不应被本次落盘物理删除。
+    pub async fn persist_current_with_retained(
+        &self,
+        retained: &HashMap<String, ScheduleBinding>,
+    ) -> Result<()> {
+        let mut schedules: HashMap<String, ScheduleBinding> = self
+            .tasks
+            .read()
+            .await
+            .iter()
+            .map(|(id, task)| (id.clone(), task.binding.clone()))
+            .collect();
+        for (id, binding) in retained {
+            schedules
+                .entry(id.clone())
+                .or_insert_with(|| binding.clone());
+        }
+        write_persisted(&self.persist_path, &PersistedSchedules { schedules })
+    }
+
     pub fn load_persisted() -> PersistedSchedules {
         load_persisted_from(&resolve_persist_path())
     }
@@ -638,6 +745,7 @@ mod tests {
             default: None,
             description: None,
             sensitive,
+            options: None,
         }
     }
 

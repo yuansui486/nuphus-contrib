@@ -39,7 +39,12 @@ impl Provider for GoogleProvider {
             cost_per_million_in: 0.0,
             cost_per_million_out: 0.0,
             reasoning_field: "",
-            reasoning_efforts: &[],
+            // 官方依据（ai.google.dev · OpenAI compatibility，2026-10 核对）：
+            // 兼容端点接受 reasoning_effort，映射表 minimal/low→low、
+            // medium→medium、high→high（2.5 系再映射到 thinking_budget）。
+            // gemini-2.5-pro **不允许** "none"（思考不可关）→ 只列三档；不指定
+            // 时用模型官方默认，故 default_effort 留空。
+            reasoning_efforts: &["low", "medium", "high"],
             default_effort: None,
         }]
     }
@@ -47,7 +52,8 @@ impl Provider for GoogleProvider {
     fn quirks(&self) -> ProviderQuirks {
         ProviderQuirks {
             requires_reasoning_echo: false,
-            supports_reasoning_effort: false,
+            // 官方 OpenAI 兼容端点接受 reasoning_effort（见 models() 注释的依据）。
+            supports_reasoning_effort: true,
             effort_excludes_tools: false,
             sanitize_tools: None,
             extra_headers: vec![],
@@ -62,6 +68,10 @@ impl Provider for GoogleProvider {
     fn transport(&self, cfg: &ProviderConfig, model_id: &str) -> Arc<dyn Transport> {
         Arc::new(ChatCompletionsTransport::new(ChatCompletionsConfig {
             name: "google".to_string(),
+            // 协议/类型 id —— Transport::provider_name 的语义（每个 custom 实例都折叠成 "custom"）
+            // providers.toml 段名 —— 模型级配置（max_tokens 等）必须按段精确查找，
+            // 用类型 id 查会静默查不到（段名是 custom-xxx 而非 custom）。
+            provider_segment: cfg.name.clone(),
             api_key: cfg.api_key.clone(),
             base_url: if cfg.base_url.is_empty() {
                 self.default_base_url().to_string()

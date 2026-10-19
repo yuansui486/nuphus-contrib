@@ -474,3 +474,43 @@ pub(super) fn capture_output(
     }
     Ok(())
 }
+
+/// 从变量池快照中剔除敏感输入（B9 落盘脱敏）。
+///
+/// 语义决策：**剔除键**而非写掩码占位符 —— 掩码（如 "****"）会被 resume 路径
+/// 当作真值回灌进变量池；剔除后恢复时该敏感变量缺失，由本次运行的 inputs
+/// 声明重新解析（resolve_declared_inputs 在 resume 合并之前已注入），
+/// 符合「敏感值要求用户重输」的安全惯例。
+///
+/// 双写位置全覆盖：sensitive 声明项注入变量池时同时写 `inputs` 命名空间与
+/// 顶层（execute_v2 注入逻辑），故两个位置都要剔除。
+pub(super) fn strip_sensitive_from_snapshot(
+    variables: &HashMap<String, serde_json::Value>,
+    sensitive_inputs: &std::collections::HashSet<String>,
+) -> HashMap<String, serde_json::Value> {
+    if sensitive_inputs.is_empty() {
+        // 无敏感声明：零拷贝语义下仍需 clone（调用方要求独立快照），保持原样
+        return variables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+    }
+    variables
+        .iter()
+        .filter(|(k, _)| !sensitive_inputs.contains(*k))
+        .map(|(k, v)| {
+            // inputs 命名空间：剔除对象内的敏感键（对象本身保留非敏感字段）
+            if k == "inputs" {
+                if let Some(obj) = v.as_object() {
+                    let filtered: serde_json::Map<String, serde_json::Value> = obj
+                        .iter()
+                        .filter(|(ik, _)| !sensitive_inputs.contains(*ik))
+                        .map(|(ik, iv)| (ik.clone(), iv.clone()))
+                        .collect();
+                    return (k.clone(), serde_json::Value::Object(filtered));
+                }
+            }
+            (k.clone(), v.clone())
+        })
+        .collect()
+}

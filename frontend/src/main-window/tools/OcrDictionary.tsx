@@ -1,7 +1,7 @@
 // OcrDictionary.tsx — Dictionary OCR
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Button, IconButton } from '../../ui/Button'
-import { IconX, IconSearch, IconInfo } from '../../ui/Icons'
+import { IconX, IconSearch, IconInfo, IconCrosshair } from '../../ui/Icons'
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import('@tauri-apps/api/core')
   return (await invoke(cmd, args)) as T
@@ -118,6 +118,38 @@ export function OcrDictionary({ onClose }: OcrDictionaryProps) {
       pollRef.current = null
     }
   }, [])
+
+  // ── 屏幕吸色（字体颜色）：复用桌面工具条的取色原生遮罩链路 ──
+  // 与「框选截图」走同一套 start_overlay_mask / take_capture_result 协议，
+  // 只是 mode 换成单点拾取的 'color_picker'：用户点屏幕任意一点即得到该点色值。
+  const [pickingColor, setPickingColor] = useState(false)
+  const pickColorFromScreen = useCallback(async () => {
+    if (pickingColor) return
+    setPickingColor(true)
+    stopPolling()
+    try {
+      await tauriInvoke<any>('start_overlay_mask', { mode: 'color_picker' })
+    } catch (e) {
+      console.error('[OcrDict] pickColorFromScreen:', e)
+      setPickingColor(false)
+      return
+    }
+    pollRef.current = setInterval(async () => {
+      try {
+        const raw = await tauriInvoke<any>('take_capture_result')
+        if (raw === null || raw === undefined) return
+        stopPolling()
+        setPickingColor(false)
+        if (raw.cancelled) return
+        const hex: unknown = raw.hex
+        if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex)) setFgColor(hex)
+      } catch (e) {
+        console.error('[OcrDict] pick color poll:', e)
+        stopPolling()
+        setPickingColor(false)
+      }
+    }, 500)
+  }, [pickingColor, stopPolling])
 
   useEffect(() => {
     loadDicts()
@@ -637,7 +669,10 @@ export function OcrDictionary({ onClose }: OcrDictionaryProps) {
       style={{
         display: 'flex',
         flexDirection: 'column',
-        background: 'var(--glass-bg-soft)',
+        // 面板底归位弹窗族语义键 --panel-bg（**主题设置 → 界面不透明度 → 控制面板**滑块
+        // 派生）：原 --glass-bg-soft 的 α 三主题写死，滑块遍历不到它，与取色器面板/
+        // .settings-center-panel 等不同族。backdrop-filter 磨砂观感保留（同 .wfst-panel）。
+        background: 'var(--panel-bg)',
         backdropFilter: 'blur(24px)',
         border: '1px solid var(--glass-4)',
         borderRadius: 20,
@@ -1173,7 +1208,12 @@ export function OcrDictionary({ onClose }: OcrDictionaryProps) {
           <>
             <ParamCard>
               <ParamGroup label="字体颜色">
-                <ColorPicker value={fgColor} onChange={setFgColor} />
+                <ColorPicker
+                  value={fgColor}
+                  onChange={setFgColor}
+                  onPickScreen={pickColorFromScreen}
+                  picking={pickingColor}
+                />
                 <div style={{ display: 'flex', gap: 4, marginTop: 6 }}>
                   <DeltaInput label="R" value={fgDr} onChange={setFgDr} />
                   <DeltaInput label="G" value={fgDg} onChange={setFgDg} />
@@ -1807,7 +1847,19 @@ function PreviewSection({ label, children }: { label: string; children: React.Re
   )
 }
 
-function ColorPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function ColorPicker({
+  value,
+  onChange,
+  onPickScreen,
+  picking,
+}: {
+  value: string
+  onChange: (v: string) => void
+  /** 从屏幕吸色（调用方接入原生单点拾取遮罩）；缺省则不渲染吸色按钮 */
+  onPickScreen?: () => void
+  /** 吸色进行中（遮罩已弹出，按钮进入等待态） */
+  picking?: boolean
+}) {
   return (
     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
       <div
@@ -1843,6 +1895,33 @@ function ColorPicker({ value, onChange }: { value: string; onChange: (v: string)
         onChange={e => onChange(e.target.value)}
         style={{ width: 96, fontFamily: 'var(--font-mono)', fontSize: 'var(--fs-mono)' }}
       />
+      {onPickScreen && (
+        // 吸色按钮：浏览器原生色板只能手选，取不到屏幕上的实际字色 ——
+        // 这里调用原生单点拾取遮罩，点屏幕任意一点即回填该点 16 进制值。
+        <button
+          type="button"
+          onClick={onPickScreen}
+          disabled={picking}
+          title={picking ? '请在屏幕上点击取色（Esc 取消）' : '从屏幕吸取颜色'}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            height: 30,
+            padding: '0 10px',
+            borderRadius: 8,
+            border: '1px solid var(--glass-3)',
+            background: picking ? 'var(--glass-2)' : 'var(--glass-3)',
+            color: picking ? 'var(--spark-muted)' : 'var(--spark-secondary)',
+            fontSize: 'var(--fs-caption)',
+            cursor: picking ? 'default' : 'pointer',
+            flexShrink: 0,
+          }}
+        >
+          <IconCrosshair size={13} />
+          {picking ? '取色中…' : '吸色'}
+        </button>
+      )}
     </div>
   )
 }

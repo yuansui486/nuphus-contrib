@@ -95,6 +95,14 @@ function resolveField(
       return { error: JSON_MSG }
     }
   }
+  if (kind === 'enum') {
+    // 档位白名单前置校验（后端 resolve_declared_inputs 同口径，前端拦截避免整轮失败）
+    const options = spec.options ?? []
+    if (options.length > 0 && !options.includes(text)) {
+      return { error: `值不在档位列表 [${options.join(', ')}]` }
+    }
+    return { value: text }
+  }
   return { value: text }
 }
 
@@ -189,8 +197,30 @@ interface WorkflowInputsFormProps {
   workflowId?: string
 }
 
-/** 声明式输入表单（纯展示：状态由 useWorkflowInputs 提供，便于两个宿主复用） */
+/**
+ * 声明式输入表单（纯展示：状态由 useWorkflowInputs 提供，便于两个宿主复用）
+ *
+ * 控件分派：boolean→checkbox / json→textarea / enum→select 档位下拉（options 白名单）/
+ * path→文本框+「浏览…」文件选择器（目录/文件由 placeholder 语义提示，选择器返回任一）/
+ * 其余→text（sensitive 时 password）。
+ */
 export function WorkflowInputsForm({ specs, state, workflowId }: WorkflowInputsFormProps) {
+  /** path 字段：系统文件选择对话框（与 ChatInputBar 附件入口同一 plugin-dialog 通道） */
+  const browsePath = useCallback(
+    async (name: string) => {
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog')
+        const selected = await open({ multiple: false, directory: false })
+        if (typeof selected === 'string' && selected) {
+          state.setValue(name, selected)
+        }
+      } catch {
+        /* 对话框取消/不可用：保持当前值 */
+      }
+    },
+    [state],
+  )
+
   return (
     <div className="wcf-inputs">
       <div className="wcf-inputs-title">运行前需要填写外部输入</div>
@@ -206,6 +236,8 @@ export function WorkflowInputsForm({ specs, state, workflowId }: WorkflowInputsF
         const kind = kindOf(spec)
         const fieldId = `wcf-input-${spec.name}`
         const error = state.errors[spec.name]
+        const enumOptions = kind === 'enum' ? (spec.options ?? []) : []
+        const enumInvalid = kind === 'enum' && enumOptions.length === 0
         return (
           <div className="wcf-input-field" key={spec.name}>
             <label className="wcf-input-label" htmlFor={fieldId}>
@@ -223,6 +255,26 @@ export function WorkflowInputsForm({ specs, state, workflowId }: WorkflowInputsF
                 checked={state.values[spec.name] === true}
                 onChange={e => state.setValue(spec.name, e.target.checked)}
               />
+            ) : kind === 'enum' ? (
+              enumInvalid ? (
+                <div className="wcf-input-error" role="alert">
+                  声明错误：enum 类型需要提供非空 options 档位列表
+                </div>
+              ) : (
+                <select
+                  id={fieldId}
+                  className="wcf-input-control"
+                  value={String(state.values[spec.name] ?? '')}
+                  onChange={e => state.setValue(spec.name, e.target.value)}
+                >
+                  {!spec.required && <option value="">（不填）</option>}
+                  {enumOptions.map(option => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              )
             ) : kind === 'json' ? (
               <textarea
                 id={fieldId}
@@ -234,6 +286,28 @@ export function WorkflowInputsForm({ specs, state, workflowId }: WorkflowInputsF
                 spellCheck={false}
                 onChange={e => state.setValue(spec.name, e.target.value)}
               />
+            ) : kind === 'path' ? (
+              <div className="wcf-input-pathrow">
+                <input
+                  id={fieldId}
+                  className="wcf-input-control"
+                  type={inputType(spec)}
+                  value={String(state.values[spec.name] ?? '')}
+                  placeholder={placeholderOf(spec)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  onChange={e => state.setValue(spec.name, e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="wcf-input-browse"
+                  onClick={() => void browsePath(spec.name)}
+                  aria-hidden
+                  tabIndex={-1}
+                >
+                  浏览…
+                </button>
+              </div>
             ) : (
               <input
                 id={fieldId}

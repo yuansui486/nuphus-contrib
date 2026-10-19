@@ -58,8 +58,11 @@ fn unwrap_result(value: serde_json::Value) -> Result<serde_json::Value, String> 
 
 /// 手动桌面命令统一取锁（单次调用期间持有）。
 ///
-/// 日志用 debug 级：`desktop_mouse_position` 在工具页是 60ms 轮询（被拒期间
-/// 每帧一条 warn 会淹没日志），拒绝本身由调用方按需呈现给用户。
+/// 日志用 debug 级：手动命令可能被高频轮询（如坐标读数），被拒期间每帧一条 warn
+/// 会淹没日志；拒绝本身由调用方按需呈现给用户。
+///
+/// **只读命令不得取锁**（判据见 `desktop_mouse_position` 的文档）：取锁会让它在
+/// 执行体运行期间直接失效，而只读查询与执行体之间并不存在资源冲突。
 fn acquire_manual(
     state: &State<'_, AppState>,
     label: &str,
@@ -74,11 +77,16 @@ fn acquire_manual(
 }
 
 /// Mouse current position — returns { x, y }
+///
+/// **豁免资源门（2026-10-17 修正）**：实现只是一次只读的 `GetCursorPos`
+/// （`desktop-api/src/input/mouse.rs:50`），不写入鼠标/键盘、不抓屏、不碰浏览器 CDP，
+/// 不存在并发死锁路径。取锁的后果是**执行中坐标读数直接失效**
+/// （`automation_busy: 任务执行正在被占用`），而「边看坐标边让任务跑」正是常见用法。
+///
+/// 判据与 `desktop_clipboard_read_file_paths`（下方）同一条：**只读且不碰独占外设即豁免**。
+/// 若日后改为 `SetCursorPos` 等写操作，**必须补回取锁**（`desktop_clipboard_write` 即范例）。
 #[tauri::command]
-pub async fn desktop_mouse_position(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    let _lease = acquire_manual(&state, "desktop_mouse_position")?;
+pub async fn desktop_mouse_position() -> Result<serde_json::Value, String> {
     let client = nuphus::desktop::DesktopClient::new();
     let raw = client.mouse_position().await.map_err(|e| e.to_string())?;
     unwrap_result(raw)

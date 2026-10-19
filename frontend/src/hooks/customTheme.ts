@@ -275,7 +275,7 @@ export function parseCustomThemeJSON(text: string): CustomThemeParseResult {
   }
   const obj = data as Record<string, unknown>
   const base = obj.base
-  if (base !== 'dark' && base !== 'light' && base !== 'tech') {
+  if (base !== 'dark' && base !== 'light' && base !== 'fresh') {
     return { ok: false, reason: 'invalid-structure' }
   }
   const overrides = obj.overrides

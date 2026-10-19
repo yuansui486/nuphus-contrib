@@ -4,7 +4,7 @@ use nuphus::memory::{EnforceLevel, Tenet, TenetPriority, TenetSource, TenetStore
 use serde_json::json;
 
 /// 获取所有原则
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_tenets() -> Result<serde_json::Value, String> {
     let store = TenetStore::new();
     let items: Vec<serde_json::Value> = store
@@ -30,7 +30,7 @@ pub fn get_tenets() -> Result<serde_json::Value, String> {
 }
 
 /// 添加一条原则
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_tenet(content: String, priority: Option<String>) -> Result<(), String> {
     if content.trim().is_empty() {
         return Err("原则内容不能为空".into());
@@ -65,7 +65,7 @@ pub fn add_tenet(content: String, priority: Option<String>) -> Result<(), String
 }
 
 /// 删除（软删除）一条原则
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_tenet(id: String) -> Result<bool, String> {
     let mut store = TenetStore::new();
     store

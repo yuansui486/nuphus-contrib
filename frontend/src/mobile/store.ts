@@ -343,66 +343,6 @@ function applyEvent(state: ChatState, ev: NuphusEvent): ChatState {
         },
       }
 
-    case 'assistant_progress': {
-      if (
-        !state.activity.running ||
-        state.refining ||
-        !ev.text.trim() ||
-        !ev.session_id ||
-        !ev.turn_id
-      )
-        return state
-      const canRecover =
-        state.activity.progressScopeRecovery === 'awaiting' &&
-        !state.activity.session_id &&
-        !state.activity.turn_id
-      if (
-        !canRecover &&
-        (state.activity.session_id !== ev.session_id || state.activity.turn_id !== ev.turn_id)
-      )
-        return state
-      const activity = canRecover
-        ? {
-            ...state.activity,
-            session_id: ev.session_id,
-            turn_id: ev.turn_id,
-            progressScopeRecovery: undefined,
-          }
-        : state.activity
-      // A history replay can establish the scope too, without duplicating its bubble.
-      if (state.messages.some(m => m.message_id === ev.message_id)) return { ...state, activity }
-      const messages = state.messages.slice()
-      const last = messages[messages.length - 1]
-      const draft =
-        last?.role === 'assistant' && last.streaming
-          ? messages.pop()!
-          : {
-              id: rid(),
-              role: 'assistant' as const,
-              content: '',
-              streaming: true,
-              timestamp: ev.timestamp,
-            }
-      messages.push(
-        {
-          id: ev.message_id,
-          reply_id: draft.id,
-          message_id: ev.message_id,
-          kind: 'progress',
-          role: 'assistant',
-          content: ev.text,
-          timestamp: ev.timestamp,
-          streaming: false,
-        },
-        ev.replaces_draft
-          ? { ...draft, content: '', timestamp: ev.timestamp }
-          : draft.content
-            ? draft
-            : { ...draft, timestamp: ev.timestamp },
-      )
-      return { ...state, activity, messages }
-    }
-
     case 'llm_text_delta': {
       // 非执行中忽略：息屏/切应用返回后积压的旧轮次 delta 重放时，
       // running 已为 false（execution_completed 先到）→ 忽略，防创建孤立空气泡。
@@ -554,6 +494,8 @@ function applyEvent(state: ChatState, ev: NuphusEvent): ChatState {
         startedAtMs: ev.meta?.startedAtMs ?? state.activity.metaStartedAtMs,
       }
       if (!state.refining && result) {
+        // 与 leader 同构：completed 后最终回复覆盖流式定稿（progress 机制已移除，
+        // 消息流里只剩流式累积的 assistant 草稿）。
         const lastIdx = messages.length - 1
         const last = messages[lastIdx]
         if (last && last.role === 'assistant' && last.kind !== 'progress') {

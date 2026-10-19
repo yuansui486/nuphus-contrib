@@ -83,6 +83,7 @@
   .title-bar-right.title-bar-mobile-controls {
     display: flex !important;
   }
+  /* 移动端无 hover 语义；品牌 logo 承接的弹层入口随品牌常显，不隐藏 */
   .title-bar-left {
     gap: 6px !important;
   }

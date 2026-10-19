@@ -13,6 +13,8 @@
 //!   桌面主程序 task progress --id <...> --token <T> --summary "..." [--endpoint <url>]
 //!   桌面主程序 task done     --id <...> --token <T> --summary "..." [--report <绝对路径>] [--endpoint <url>]
 //!   桌面主程序 task blocked  --id <...> --token <T> --reason "..." [--endpoint <url>]
+//!   桌面主程序 task cancel   --id <...> --token <T> --reason "..." [--endpoint <url>]
+//!                              （任务作废终态——派发方/用户取消在途任务时的收口；不进 brief 契约）
 //!
 //! 设计取舍（方案 v8 四章，随迁不变）：
 //! - Rust reqwest blocking 直发 UTF-8 JSON —— 根除 cmd/PowerShell curl 的 GBK 编码坑；
@@ -51,6 +53,7 @@ fn usage() -> &'static str {
   桌面主程序 task progress --id <...> --token <T> --summary \"...\" [--endpoint <url>]
   桌面主程序 task done     --id <...> --token <T> --summary \"...\" [--report <绝对路径>] [--endpoint <url>]
   桌面主程序 task blocked  --id <...> --token <T> --reason \"...\" [--endpoint <url>]
+  桌面主程序 task cancel   --id <...> --token <T> --reason \"...\" [--endpoint <url>]
 
 公共参数:
   --id       外部任务 id（必须为 {agent}::{task_id} 格式，门铃据此归组）
@@ -125,9 +128,10 @@ pub fn run_task_cli(args: &[String]) -> ExitCode {
                     .filter(|v| !v.is_empty()),
             ),
             "blocked" => ("blocked", required("reason")?, None),
+            "cancel" => ("cancelled", required("reason")?, None),
             other => {
                 return Err(format!(
-                    "未知任务动词「{other}」（ready|progress|done|blocked）"
+                    "未知任务动词「{other}」（ready|progress|done|blocked|cancel）"
                 ))
             }
         };

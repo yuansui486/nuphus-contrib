@@ -48,3 +48,35 @@ it('localizes progress and keeps a completed node completed at an inclusive brea
   ])
   dispose()
 })
+
+it('marks a cancelled run_completed as warning, not success', () => {
+  let flush: FrameRequestCallback = () => {}
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+    flush = callback
+    return 1
+  })
+  vi.stubGlobal('cancelAnimationFrame', vi.fn())
+  const snapshots: RunStatusSnapshot[] = []
+  const dispose = subscribeRunStatus(
+    'wf',
+    snapshot => snapshots.push(snapshot),
+    (key, ...args) => {
+      let text = editorEn[key] ?? key
+      args.forEach((value, index) => {
+        text = text.replace(`{${index}}`, () => value)
+      })
+      return text
+    },
+  )
+  const emit = (payload: Record<string, unknown>) => {
+    bridge.receive({ payload })
+    flush(0)
+  }
+  emit({ event: 'run_started', workflow_id: 'wf' })
+  emit({ event: 'run_completed', run_id: 'r1', status: 'Cancelled' })
+  const latest = snapshots[snapshots.length - 1]
+  const terminal = latest.timeline[latest.timeline.length - 1]
+  expect(terminal.level).toBe('warning')
+  expect(terminal.message).toContain('Cancelled')
+  dispose()
+})

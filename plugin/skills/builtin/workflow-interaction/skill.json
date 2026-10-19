@@ -1,0 +1,13 @@
+{
+  "name": "workflow-interaction",
+  "displayName": "工作流交互手册",
+  "description": "探索与操作真实界面的交互细则：目标绑定、语义观察与分页、增强模式（desktop_agent_step）交接、输入与提交纪律、稳定 locator 固化、用户交互粒度、截图卫生。系统提示词只保留原则，操作细则一律在此。",
+  "version": "1.0.0",
+  "author": "Nuphus",
+  "keywords": ["workflow", "交互", "探索", "语义", "增强模式", "输入", "桌面"],
+  "triggers": {
+    "auto_suggest": true,
+    "context_hints": ["desktop", "semantic", "observe", "agent_step", "探索", "点击", "输入", "绑定"]
+  },
+  "data_sources": []
+}

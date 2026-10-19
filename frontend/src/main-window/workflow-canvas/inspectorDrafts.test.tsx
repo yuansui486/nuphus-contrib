@@ -152,4 +152,24 @@ describe('canvas inspector drafts', () => {
     })
     expect(store.dirty).toBe(true)
   })
+
+  it('invalidateAll drops only dirty drafts; clean entries survive for value refresh', async () => {
+    const store = new InspectorDraftStore()
+    const commit = vi.fn()
+    render(
+      <InspectorDraftContext.Provider value={{ store, nodeId: 'a' }}>
+        <Field name="ID" value="old" commit={commit} />
+      </InspectorDraftContext.Provider>,
+    )
+    // 脏草稿：undo 前未提交的编辑
+    fireEvent.change(screen.getByLabelText('ID'), { target: { value: 'dirty' } })
+    expect(store.dirty).toBe(true)
+    store.invalidateAll()
+    expect(store.dirty).toBe(false)
+    // 清理过的 key，flush 不再回写旧文本（撤销结果不被覆盖）
+    await act(async () => {
+      expect(await store.flush()).toBeNull()
+    })
+    expect(commit).not.toHaveBeenCalled()
+  })
 })

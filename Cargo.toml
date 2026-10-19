@@ -105,3 +105,28 @@ overflow-checks = false
 # 抓走视觉预处理循环的大头，比全关检查安全。若后续要更狠可再评估 2。
 [profile.dev]
 opt-level = 1
+
+# ── release 构建的机器下限 ─────────────────────────────────────────
+# 背景（第三方用户实测，0.2.30）：
+#   ① 先崩在 rustc 自身栈溢出 —— STATUS_STACK_BUFFER_OVERRUN (0xC0000409)；
+#      抬 RUST_MIN_STACK 后越过（见 .cargo/config.toml）。
+#   ② 随即崩在 LLVM 内存耗尽 —— rustc-LLVM ERROR: out of memory。
+#      `cargo check` 和 dev 构建全程正常，只有 opt-level=3 的优化阶段超内存。
+#   0.2.30 的 crate 体积比 0.2.29 更大，优化阶段的峰值内存随之上移。
+#
+# 取 opt-level = 2：实测能完成构建，内存占用明显低于 3；桌面应用负载下
+# 运行性能差异可忽略。codegen-units 提到 32 让单个生成单元更小，进一步
+# 压低优化期并发内存峰值（Cargo 默认 release 为 16）。
+#
+# 若将来代码继续膨胀导致 2 也撑不住，下一档是 opt-level = "s"；再不行就该
+# 拆分 crate，而不是一路降优化——那时是在用性能给架构还债。
+[profile.release]
+opt-level = 2
+codegen-units = 32
+
+# desktop-api 源码仅 ~200 KB，编译内存小，但它是视觉预处理（perceive 的
+# resize / 归一化 / 张量拼装）的真正热点，对 opt-level 敏感。
+# 单独放回 3：大 crate 继续用 2 保构建成功，热点小 crate 吃满优化。
+# 这也是为什么它没跟主 crate 一起降档 —— 降优化是为了省内存，不是为了省性能。
+[profile.release.package.desktop-api]
+opt-level = 3

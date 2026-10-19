@@ -38,6 +38,11 @@ impl ModelSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
+    /** None 使用服务商默认协议；显式值按模型覆盖。 */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<super::provider::TransportKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses: Option<super::provider::ResponseOptions>,
     #[serde(default)]
     pub alias: Vec<String>,
     #[serde(default)]
@@ -84,6 +89,49 @@ fn default_true() -> bool {
     true
 }
 
+/** 原子修改模型路由；保留模型能力、OAuth 配置以及其他服务商的同名模型。 */
+pub fn set_model_transport(
+    path: &std::path::Path,
+    provider: &str,
+    model: &str,
+    transport: Option<super::provider::TransportKind>,
+) -> std::result::Result<(), String> {
+    let _guard = super::lock_provider_config();
+    let mut doc: toml::Value = std::fs::read_to_string(path)
+        .map_err(|_| "Could not read provider configuration")?
+        .parse()
+        .map_err(|_| "Invalid provider configuration")?;
+    super::normalize_provider_document(&mut doc);
+    let entry = doc
+        .get_mut("providers")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|ps| {
+            ps.iter_mut()
+                .find(|p| p.get("name").and_then(toml::Value::as_str) == Some(provider))
+        })
+        .and_then(|p| p.get_mut("models"))
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|ms| {
+            ms.iter_mut()
+                .find(|m| m.get("id").and_then(toml::Value::as_str) == Some(model))
+        })
+        .and_then(toml::Value::as_table_mut)
+        .ok_or("Provider/model not found")?;
+    if let Some(transport) = transport {
+        entry.insert(
+            "transport".into(),
+            toml::Value::try_from(transport).map_err(|_| "Invalid transport")?,
+        );
+    } else {
+        entry.remove("transport");
+    }
+    super::write_provider_config(
+        path,
+        &toml::to_string_pretty(&doc).map_err(|_| "Could not encode providers")?,
+    )
+    .map_err(|_| "Could not save model transport".into())
+}
+
 /// Single Provider configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -121,18 +169,31 @@ fn default_timeout() -> u64 {
     300
 }
 
-/// OAuth2 通用接入配置（Authorization Code + PKCE，本地回调）。
-///
-/// 五个配置项（authorize_url/token_url/client_id/scopes/use_pkce + redirect_port）
-/// 由用户在表单填写（Agent 可代填 providers.toml）；三个令牌字段是运行时状态：
-/// 落盘经 DPAPI 加密（`enc:` 前缀，与 api_key 同款），from_toml 读入即透明解密。
-///
-/// 演进关系：`transports/responses/config.rs` 的 ResponsesConfig 注明 OAuth 令牌
-/// 走 credentials 服务是 P3 方向；当前以段内加密存储落地（不过早抽象），届时
-/// 令牌的「读取出口」收敛到 `config::oauth::ensure_fresh_oauth_token` 一处，上层
-/// 无需感知存储形态即可平移。
+/** 通用 OAuth 授权参数与凭据引用。额外授权参数支持一次性 nonce；OIDC 验签由
+ * oauth_flow 执行。凭据既可保存为配置内密文，也可引用独立账号文件；读取和刷新
+ * 经 credentials::TokenSource 处理，协议路由不依赖认证来源。
+ */
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderOAuth {
+    /** 独立凭据文件中的账号引用；普通 OAuth 可继续在配置中保存加密令牌。 */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_ref: Option<String>,
+    #[serde(default)]
+    pub credential_file: String,
+    #[serde(default)]
+    pub extra_authorize_params: BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_token_params: BTreeMap<String, String>,
+    #[serde(default)]
+    pub verify_id_token: bool,
+    #[serde(default)]
+    pub jwks_url: String,
+    #[serde(default)]
+    pub issuer: String,
+    #[serde(default)]
+    pub dynamic_client_registration: bool,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
     pub authorize_url: String,
     pub token_url: String,
     pub client_id: String,
@@ -157,7 +218,10 @@ pub struct ProviderOAuth {
 }
 
 impl ProviderOAuth {
-    /// ���个授权配置项是否齐备（发起授权登录的前置条件）。
+    pub fn has_credentials(&self) -> bool {
+        self.account_ref.as_ref().is_some_and(|id| !id.is_empty()) || !self.access_token.is_empty()
+    }
+    /// 每个授权配置项是否齐备（发起授权登录的前置条件）。
     /// 令牌字段不参与判定——它们是登录产物，不是配置。
     pub fn config_complete(&self) -> bool {
         !self.authorize_url.trim().is_empty()
@@ -442,6 +506,20 @@ pub struct Capabilities {
     /// 视频生成模型所属服务商（旧配置为空时按模型 ID 兼容解析）
     #[serde(default)]
     pub video_generation_provider: String,
+    /// 网页搜索源（空 = 未启用，走内置免费五源聚合）。
+    ///
+    /// 与其它能力字段的关键差别：这里绑定的**不是模型**，而是服务商段名
+    /// （`provider_type = "deepseek"` 的段）—— DeepSeek Search 是服务商级
+    /// HTTP API（`POST /v1/tools/search`），不经过任何模型。
+    /// 字段取名 `provider` 语义会与 `{kind}_provider` 的「模型归属」混淆，
+    /// 故作 `web_search_source`：值即段名。
+    ///
+    /// 语义（用户勾选后优先使用）：
+    /// - 非空 → `web_search` 首先调用该段对应的官方搜索 API；
+    /// - 仅在该 API 报错（429/402 欠费/401/网络）时才降级到免费五源聚合；
+    /// - 空 → 完全等价于旧行为，schema 里也不出现该选项。
+    #[serde(default)]
+    pub web_search_source: String,
     /// ChatAgent 默认最大推理轮数（不配则 15）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_agent_max_iterations: Option<u32>,
@@ -513,6 +591,7 @@ impl ModelRegistry {
                 }
             }
         }
+        super::normalize_provider_document(&mut doc);
         let mut registry: Self = serde::Deserialize::deserialize(doc.clone())
             .map_err(|e| crate::NuphusError::Config(format!("parse config failed: {e}")))?;
         registry.source_path = Some(std::path::PathBuf::from(path));
@@ -582,6 +661,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("DEEPSEEK_MODEL")
                         .unwrap_or_else(|_| "deepseek-flash".to_string()),
                     alias: vec!["deepseek".to_string()],
@@ -616,6 +697,8 @@ impl ModelRegistry {
                 auth_prefix: "".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("KIMI_MODEL")
                         .unwrap_or_else(|_| "kimi-for-coding".to_string()),
                     alias: vec!["kimi".to_string()],
@@ -650,6 +733,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("MINIMAX_MODEL")
                         .unwrap_or_else(|_| "MiniMax-M2.7".to_string()),
                     alias: vec!["minimax".to_string()],
@@ -685,6 +770,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("QWEN_MODEL").unwrap_or_else(|_| "qwen-plus".to_string()),
                     alias: vec!["qwen".to_string()],
                     max_tokens: None,
@@ -718,6 +805,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("ZHIPU_MODEL").unwrap_or_else(|_| "glm-4-flash".to_string()),
                     alias: vec!["zhipu".to_string()],
                     max_tokens: None,
@@ -751,6 +840,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: std::env::var("BYTEDANCE_MODEL")
                         .unwrap_or_else(|_| "doubao-1-5-pro-32k".to_string()),
                     alias: vec!["bytedance".to_string()],
@@ -1017,6 +1108,8 @@ impl ModelRegistry {
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: model,
                     alias: vec![],
                     max_tokens: None,
@@ -1444,6 +1537,8 @@ id = "m1"
                 auth_prefix: "Bearer ".to_string(),
                 timeout_secs: 300,
                 models: vec![ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: "deepseek-v4-flash".to_string(),
                     alias: vec!["deepseek".to_string(), "default".to_string()],
                     max_tokens: None,
@@ -1577,6 +1672,8 @@ vision_provider = "custom"
             models: models
                 .iter()
                 .map(|(id, aliases)| ModelEntry {
+                    transport: None,
+                    responses: None,
                     id: id.to_string(),
                     alias: aliases.iter().map(|s| s.to_string()).collect(),
                     max_tokens: None,
@@ -1611,6 +1708,8 @@ vision_provider = "custom"
         provider.models = models
             .iter()
             .map(|(id, window)| ModelEntry {
+                transport: None,
+                responses: None,
                 id: id.to_string(),
                 alias: Vec::new(),
                 max_tokens: None,
@@ -1778,6 +1877,8 @@ vision_provider = "custom"
         provider.models = models
             .iter()
             .map(|(id, vision, image_gen, max_tokens)| ModelEntry {
+                transport: None,
+                responses: None,
                 id: id.to_string(),
                 alias: Vec::new(),
                 max_tokens: *max_tokens,

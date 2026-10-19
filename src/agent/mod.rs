@@ -224,6 +224,17 @@ pub struct ReactAgent {
     pub reminders: ReminderQueue,
     /// Workflow engine reference (injected by Runtime for workflow_run tool)
     pub(crate) workflow_engine: Option<Arc<tokio::sync::RwLock<crate::workflow::WorkflowEngine>>>,
+    /// 一次性模型切换提示账本——比对基准：上次**实际使用过**的 (provider, model)
+    /// 绑定（即上次 build_request 真正发请求时用的绑定）。这是「模型是否真的变了」
+    /// 的唯一基准，不是「上一次切换动作的绑定」。初值取创建时的 config 绑定
+    /// （= 当前激活模型），避免 agent 重建后对当前模型做无副作用的重配时产生空提示；
+    /// 首次 build_request 后即被真实使用绑定覆盖。
+    pub(crate) last_used_binding: Option<(String, String)>,
+    /// 挂起中的模型切换提示。Some(binding) = 下次 build_request() 需在 messages
+    /// 末尾一次性追加「当前模型已切换至…」并立即清零。切换动作只在此登记
+    /// （queue_model_notice），绝不直接写入 session.messages；未发消息则一直挂起，
+    /// 不因时间流逝丢失（无定时器/轮询）。
+    pub(crate) pending_model_notice: Option<(String, String)>,
 }
 
 /// Detect if user input has an explicit "execution tone" (imperative/command), not query/discussion/thinking.
@@ -251,6 +262,10 @@ impl ReactAgent {
         } else {
             None
         };
+        // 一次性模型切换提示账本初值：创建时的 config 绑定 = 当前激活模型，作为
+        // 「上次实际使用」的首个基准（见 last_used_binding 字段注释）。必须在 config
+        // 移入结构体前克隆，否则 use-after-move。
+        let last_used_binding = Some((config.provider.clone(), config.model.clone()));
         Self {
             llm,
             tools,
@@ -281,6 +296,8 @@ impl ReactAgent {
             exec_agent_pool: HashMap::new(),
             reminders: ReminderQueue::new(),
             workflow_engine: None,
+            last_used_binding,
+            pending_model_notice: None,
         }
     }
 
@@ -339,12 +356,45 @@ impl ReactAgent {
         self.task_runs = Some(reg);
     }
 
+    /// 登记一次性模型切换提示（挂起态）——切换命令的唯一落点。
+    ///
+    /// 语义（配套 `pending_model_notice` / `last_used_binding` 字段注释）：
+    /// - 比对字段 = (provider, model) 双字段；基准 = 上次**实际使用过**的绑定
+    ///   （`last_used_binding`），不是上一次切换动作的绑定。
+    /// - 新绑定 == 基准 → 撤销挂起（切回曾用绑定不提示；含 agent 重建后对当前
+    ///   激活模型做无副作用重配的场景）。
+    /// - 基准为 None（无任何使用记录）或绑定已变 → 挂起，等下次 build_request
+    ///   一次性消费。未发消息则一直挂起，不因时间流逝丢失（无定时器/轮询）。
+    /// - 绝不写入 session.messages——注入由 build_request 以 transient 形态完成。
+    pub fn queue_model_notice(&mut self, provider: &str, model: &str) {
+        let binding = (provider.to_string(), model.to_string());
+        if self.last_used_binding.as_ref() == Some(&binding) {
+            self.pending_model_notice = None;
+        } else {
+            self.pending_model_notice = Some(binding);
+        }
+    }
+
     /// Build API request with merged system prompt (L0+L2+L1 as single message)
     pub(crate) fn build_request(
         &mut self,
         merged_system_prompt: &str,
     ) -> crate::api::MessageRequest {
-        let messages = self.session.to_api_messages(self.config.supports_vision);
+        let mut messages = self.session.to_api_messages(self.config.supports_vision);
+        // 一次性模型切换提示：仅进当次请求体（transient），绝不入 session.messages
+        // （否则每轮重发，未达一次性目标）。消费即清零并刷新「上次实际使用」基准；
+        // 同一 react 轮后续迭代再次调用不得追加。role=user 与旧 push_system 经
+        // to_api_messages 序列化后的线上形态一致（session 内 System → user）。
+        if let Some((provider, model)) = self.pending_model_notice.take() {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "当前模型已切换至 {}（provider: {}）",
+                    model, provider
+                ),
+            }));
+            self.last_used_binding = Some((provider, model));
+        }
         let tools = self
             .cached_tools_schemas
             .get_or_insert_with(|| {
@@ -620,6 +670,14 @@ impl ReactAgent {
                                 default_note: pending.default_note.clone(),
                                 default_stage: pending.default_stage.clone(),
                             });
+                            // H3：等待用户输入不是执行——HUD 从前序工具的 running 计时
+                            // 转为等待语义（workflow_wait 无 auto-hide，常驻到用户响应，
+                            // 等待结束后由下方 done 收尾，不会永停计时）。
+                            emitter.emit(NuphusEvent::HudUpdate {
+                                text: "等待用户输入".into(),
+                                phase: "workflow_wait".into(),
+                                step_kind: None,
+                            });
                         }
                     }
                     let value = exec_tool::wait_for_user_input_async(
@@ -631,15 +689,32 @@ impl ReactAgent {
                     .await;
                     match value {
                         Some(v) => {
+                            // H3：等待结束，HUD 从 workflow_wait 收尾（done 无害：
+                            // 15s auto-hide，随后由后续工具/轮次事件接管）
+                            if let Some(ref emitter) = self.exec_emitter {
+                                emitter.emit(NuphusEvent::HudUpdate {
+                                    text: "输入已收到".into(),
+                                    phase: "done".into(),
+                                    step_kind: None,
+                                });
+                            }
                             // 非文本类型返回 JSON 字符串，解析后传给 LLM 以便直接使用 path/region 等字段
                             let parsed: serde_json::Value =
                                 serde_json::from_str(&v).unwrap_or(serde_json::Value::String(v));
                             return Ok(ToolResult::success(parsed.to_string()));
                         }
                         None => {
+                            // H3：取消/超时同样收尾，HUD 不停在 workflow_wait
+                            if let Some(ref emitter) = self.exec_emitter {
+                                emitter.emit(NuphusEvent::HudUpdate {
+                                    text: "输入已取消".into(),
+                                    phase: "done".into(),
+                                    step_kind: None,
+                                });
+                            }
                             return Ok(ToolResult::failure(
                                 "用户未提供输入或操作已取消".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -716,6 +791,142 @@ impl ReactAgent {
 mod tests {
     use super::*;
     use crate::session::ContentBlock;
+    use async_trait::async_trait;
+
+    // ═══ 一次性模型切换提示账本 ═══
+
+    /// 测试用 ApiClient：账本逻辑不发起真实请求，只需满足 ReactAgent::new 签名。
+    struct NoopApiClient;
+
+    #[async_trait]
+    impl ApiClient for NoopApiClient {
+        async fn stream(
+            &self,
+            _request: crate::api::MessageRequest,
+        ) -> crate::Result<Vec<crate::api::AssistantEvent>> {
+            Ok(vec![])
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        fn provider_kind(&self) -> crate::api::ProviderKind {
+            crate::api::ProviderKind::MiniMax
+        }
+
+        fn provider_name(&self) -> &str {
+            ""
+        }
+    }
+
+    /// 构造指定绑定的最小 Agent（last_used 初值 = 该绑定）。
+    fn agent_with_binding(provider: &str, model: &str) -> ReactAgent {
+        let config = AgentConfig {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ..AgentConfig::default()
+        };
+        ReactAgent::new(Arc::new(NoopApiClient), ToolRegistry::builtin(), config)
+    }
+
+    #[test]
+    fn test_queue_notice_pends_when_binding_changed() {
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.queue_model_notice("provider-b", "model-2");
+        assert_eq!(
+            agent.pending_model_notice,
+            Some(("provider-b".to_string(), "model-2".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_queue_notice_provider_only_change_pends() {
+        // 双字段比对：同模型跨 provider 必须挂起
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.queue_model_notice("provider-b", "model-1");
+        assert_eq!(
+            agent.pending_model_notice,
+            Some(("provider-b".to_string(), "model-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_queue_notice_same_binding_no_pend() {
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.queue_model_notice("provider-a", "model-1");
+        assert_eq!(agent.pending_model_notice, None);
+    }
+
+    #[test]
+    fn test_queue_notice_revokes_on_switch_back() {
+        // last_used=(A,M1)：依次 queue (B,M2)、(A,M1) 且不发消息 → 最终挂起 None
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.queue_model_notice("provider-b", "model-2");
+        assert!(agent.pending_model_notice.is_some());
+        agent.queue_model_notice("provider-a", "model-1");
+        assert_eq!(agent.pending_model_notice, None);
+    }
+
+    #[test]
+    fn test_queue_notice_none_last_used_pends() {
+        // 无任何使用记录（last_used=None）时首次 queue → 产生挂起
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.last_used_binding = None;
+        agent.queue_model_notice("provider-a", "model-1");
+        assert_eq!(
+            agent.pending_model_notice,
+            Some(("provider-a".to_string(), "model-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_build_request_consumes_notice_once_and_keeps_session_intact() {
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        agent.session_mut().push_user("问题".to_string());
+        agent.queue_model_notice("provider-b", "model-2");
+        let session_len = agent.session().len();
+
+        // 首次：messages 末一次性追加提示（transient）
+        let req1 = agent.build_request("sys");
+        let last = req1.messages.last().expect("messages 非空");
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"],
+            "当前模型已切换至 model-2（provider: provider-b）"
+        );
+        // 消费即清零 + 刷新「上次实际使用」基准
+        assert_eq!(agent.pending_model_notice, None);
+        assert_eq!(
+            agent.last_used_binding,
+            Some(("provider-b".to_string(), "model-2".to_string()))
+        );
+        // session.messages 长度不变（提示绝不落库）
+        assert_eq!(agent.session().len(), session_len);
+
+        // 再次调用不得再追加
+        let req2 = agent.build_request("sys");
+        assert_eq!(req2.messages.len(), req1.messages.len() - 1);
+        assert!(
+            !req2.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("当前模型已切换至"))),
+            "第二次 build_request 不得再含切换提示"
+        );
+        assert_eq!(agent.session().len(), session_len);
+    }
+
+    #[test]
+    fn test_build_request_without_pending_has_no_notice() {
+        let mut agent = agent_with_binding("provider-a", "model-1");
+        let req = agent.build_request("sys");
+        assert!(
+            !req.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("当前模型已切换至"))),
+            "无挂起时不得注入切换提示"
+        );
+    }
 
     #[test]
     fn test_default_config() {

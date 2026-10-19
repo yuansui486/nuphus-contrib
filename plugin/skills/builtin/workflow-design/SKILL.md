@@ -8,18 +8,7 @@ tags: [workflow, 设计, 编排, schema, 调试, 闭环]
 # 工作流设计经验手册
 
 > 完整工作流编排能力：步骤 schema、变量语法、条件表达式、params 固化、外部输入声明、设计模式、验证闭环、经验闭环。
-> L2 提示词只给阶段门禁与交互纪律；本文档是可执行的方法论全集。
-
-## 执行过程沟通
-
-目标明确时直接推进，不必重新确认表单；但开始实际操作前先用
-`workflow_report_progress(message)` 简述打算，随后继续执行。重要发现、进入运行或验证、
-遇到问题或改变方法时主动说明已确认的现状和下一步；长任务约 30 秒或连续 6 次业务调用
-没有正文时补一次简短说明，不逐工具播报。汇报不等待用户确认，不替代最终回复；
-关键信息缺失才使用 `request_user_input`。使用用户的语言，不复制 reasoning 或工具日志。
-`workflow_report_progress` 只用于开发会话交流，不能写入保存工作流的执行步骤。
-
----
+> 分工：执行沟通纪律与输入骨架判定在系统提示词 L2；界面交互细则在 skill: workflow-interaction；本文只管编排设计与验证闭环。
 
 ## 〇、编排闭环总览
 
@@ -32,10 +21,7 @@ tags: [workflow, 设计, 编排, schema, 调试, 闭环]
   └─ [馈] 跑通后 ui_maps_save_experience 提炼经验；新异常回写 params.json exceptions
 ```
 
-**任务输入形态（先识别再走闭环）**：
-- 用户输入带 `[意图表单→工作流]` 前缀，或来自 `request_user_input(step_form)` 的 `{stage, steps}`：这些阶段/子步骤是**用户确认的意图骨架**。表单阶段 = 流程主线分组（写入 workflow.json 保留为用户心智的阶段注释）；**每个子步骤 = 一条探索任务**，逐条走 [探]→[固]→[设]→[验]；骨架为权威输入，不得重新向用户收集流程、整体重构或丢弃补录 steps。
-- 自由对话描述：目标、应用和预期结果已足够明确时直接探索，不为了形式完整强制询问意图表单；只有关键业务意图确实缺失时才询问。用户主动选择表单时使用 `request_user_input(input_type="step_form", default_stage=当前阶段名)`。
-- 表单行意图是纯文本，无工具参数；稳定的语义定位器、窗口身份和视觉锚点规则由你探索后固化进 `params.json` / `with`，不保存本次捕获 ID 或绝对坐标常量。
+输入形态（意图骨架 vs 自由对话）的判定与处理在系统提示词 L2「输入即骨架」；表单行意图是纯文本、无工具参数，稳定的语义定位器、窗口身份和视觉锚点规则由你探索后固化进 `params.json` / `with`，不保存本次捕获 ID 或绝对坐标常量。
 
 ---
 
@@ -159,11 +145,12 @@ seq / loop / if 容器同样支持 on_error；子步骤失败且容器设置了 
 | 字段 | 必填 | 说明 |
 |------|------|------|
 | `name` | ✅ | 输入名，即变量名 |
-| `type` | 可选 | `"string"`(默认) / `"number"` / `"boolean"` / `"path"` / `"json"`。决定启动控件和运行契约；执行层严格校验 JSON 类型，**不做隐式转换** |
+| `type` | 可选 | `"string"`(默认) / `"number"` / `"boolean"` / `"path"` / `"json"` / `"enum"`。决定启动控件和运行契约；执行层严格校验 JSON 类型，**不做隐式转换** |
 | `required` | 可选 | 默认 `false`；`required` 且无 `default` 时未填 → 启动按钮被禁用并给出原因，后端同样在执行前报错 |
-| `default` | 可选 | 未填时生效的兜底值（启动表单预填该值，可直接改） |
+| `default` | 可选 | 未填时生效的兜底值（启动表单预填该值，可直接改；enum 时必须 ∈ options） |
 | `description` | 可选 | 表单内的填写说明 |
 | `sensitive` | 可选 | 默认 `false`，见「敏感输入」 |
+| `options` | 仅 enum 必填 | 档位白名单（如 `["普通","后台"]`）；非空且不含空档位，default 必须命中，运行时值 ∈ options 否则报错。**仅 type=enum 允许携带**，其它类型带 options 视为声明错误。启动表单渲染为下拉框 |
 
 ### 取值优先级与引用
 
@@ -209,7 +196,7 @@ seq / loop / if 容器同样支持 on_error；子步骤失败且容器设置了 
 | 工作流列表 / 设置中心的「运行」 | 运行确认弹窗按声明渲染输入表单（未声明 inputs 时弹窗与原来完全一致） |
 | 画布「运行」与 `R` 快捷键 | 共用同一输入表单，声明了 inputs 时先收集再启动，不绕过必填 |
 
-- **断点续连**：暂停快照在输入注入**之后**恢复，本次新填的输入对快照中已有的同名变量**不生效**（续跑保持上下文一致），UI 暂不提示；需要换值 → 让工作流从头执行。
+- **断点续连**：暂停快照在输入注入**之后**恢复，本次新填的输入对快照中已有的同名变量**不生效**（续跑保持上下文一致）；运行确认弹窗在可续跑（Paused/Error）时自动显示该提示，需要换值 → 让工作流从头执行。
 - **子工作流**：`call.with.inputs` 先按父变量池解析模板，再按目标工作流声明执行必填、默认值和类型校验；声明项写入子流程的 `inputs.x` 与顶层 `x`。旧工作流的未声明映射仍只写顶层。
 - **定时任务**：`schedule_cron add` 可传 `inputs` 对象，只接受目标已声明字段；显式值形成本地快照，声明默认值不固化并在每次触发时读取当前版本。敏感值在 Windows 通过 DPAPI 加密，macOS/Linux 沿用明文降级，但列表和日志均不展示值。
 - cron 固定为五字段格式，并使用 IANA 时区（如 `Asia/Shanghai`、`America/New_York`）；非法表达式或时区会在注册时直接失败，DST 由时区数据库处理。
@@ -293,7 +280,7 @@ workflow_validate（编译校验：步骤合法性/工具名/必填/变量引用
 
 验收：跑通 ∧ workflow_run 真实成功一次 ∧ 降级不丢数据不重复提交 ∧ 无临时 token/candidate ID/自由坐标或敏感数据残留。
 
-**运行时故障恢复**：失败 → 识别阻塞（验证码/弹窗/登录态/网络）→ 就地解决（browser_*/desktop_* 同会话，状态保留）→ 同 id 续跑。同一步骤同阻塞连续 3 次失败 → 停止，用 completed_steps 汇报。
+**运行时故障恢复**：细则见 skill: workflow-recovery（阻塞识别、就地解决、同 id 断点续连、3 次重试上限）。设计缺陷才改文件；运行时阻塞就地解决。
 
 ---
 
@@ -320,7 +307,7 @@ workflow_validate（编译校验：步骤合法性/工具名/必填/变量引用
 | 场景 | 首选 | 备选 |
 |------|------|------|
 | 定位网页元素 | `browser_snapshot` → @eN ref | screenshot + OCR |
-| 定位桌面控件 | `desktop_semantic_observe` 读取 UIA/Accessibility 候选 | Vision → perceive 精确坐标 |
+| 定位桌面控件 | `desktop_semantic_observe` 读取 UIA/Accessibility 候选（细则见 workflow-interaction） | Vision → perceive 精确坐标 |
 | 固化桌面动作 | 保存候选返回的 `workflow_step`，运行时调用 `desktop_semantic_action` | 保存视觉锚点/重新识别流程，每次捕获后由本地解析当前目标，不固化旧坐标 |
 | 桌面布局解析 | UIA/Accessibility 语义树 | Vision 全窗口语义分析 |
 | 定位桌面文字 | UIA/Accessibility 控件名称 | Vision 划定功能区 → `desktop_find_text`（需字库） |
@@ -328,7 +315,7 @@ workflow_validate（编译校验：步骤合法性/工具名/必填/变量引用
 | 验证状态 | snapshot + chat 语义判断 | extract 文本匹配 |
 | 查经验 | ui_maps_search 两级检索 | Read ui-maps JSON |
 
-**桌面语义动作**：先检查当前实际工具列表。存在 `desktop_agent_step` 时以它作为新的桌面动作选择入口；普通模式有语义工具时先调用 `desktop_semantic_observe`，从有限候选中执行并验证。写入工作流时只保存返回的稳定 `workflow_step`，禁止保存临时 `candidate_id` 或 `observation_token`。当前平台未提供语义工具或目标应用不暴露有效 UIA/Accessibility 控件时，使用实际可用的截图、OCR、YOLO 和鼠标路径；不要调用或重试不存在的工具。macOS 的纯 Accessibility 操作仅需辅助功能权限，截图和视觉识别才需要录屏权限；权限缺失时说明授权位置，返回后重试，不循环调用。
+**桌面语义动作**：细则见 skill: workflow-interaction（目标绑定、增强模式、输入与回执纪律）。要点：写入工作流时只保存返回的稳定 `workflow_step`，禁止保存临时 `candidate_id` 或 `observation_token`；当前平台未提供语义工具或目标应用不暴露有效 UIA/Accessibility 控件时，使用实际可用的截图、OCR、YOLO 和鼠标路径；不要调用或重试不存在的工具。
 
 **坐标体系**：确需使用 `desktop_mouse` 时采用该工具声明的桌面坐标；以本地截图工具返回的比例和原点完成像素转换，不由模型估算。macOS Retina 截图像素不等于桌面逻辑坐标，外接屏也可能具有负坐标原点。
 
@@ -346,7 +333,7 @@ workflow_validate（编译校验：步骤合法性/工具名/必填/变量引用
 | 依靠恢复窗口尺寸复用旧坐标（W2） | 稳定 locator 重新定位，或新捕获后本地解析视觉锚点 |
 | 探索阶段写步骤（W3） | 核心路径手动跑通后才设计 |
 | if contains 文案做登录检测 | chat 语义判断 + screenshot |
-| 忘记 SPA 状态残留 | 新流程前重置（about:blank / resize 固化尺寸） |
+| 忘记 SPA 状态残留 | 新流程前重置（浏览器导航 `about:blank`；桌面不做 resize/搬窗，按 W2 用稳定 locator 重定位） |
 | tooltip OCR 截到其他窗口 | 先 desktop_window_info 拿客户区边界，截图限域 |
 | 重试重复提交表单 | 重试前检测状态，已完成步骤跳过 |
 | 纯色/低纹理模板匹配误报 | find_image 模板需含纹理；用 region 限定加速 |

@@ -263,7 +263,7 @@ fn run_download(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stt_download_model(app: AppHandle) -> Result<(), String> {
     if DOWNLOAD_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("stt_download_busy".to_string());

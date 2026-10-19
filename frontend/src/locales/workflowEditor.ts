@@ -2,6 +2,14 @@ import { workflowCanvasCopy } from './workflowCanvasCopy'
 /** Workflow editing messages; identifiers never depend on the display language. */
 const messages: Record<string, [string, string]> = {
   'toolbar.more': ['更多', 'More'],
+  'toolbar.screenshot': ['截图', 'Capture'],
+  'toolbar.picker': ['选区', 'Region'],
+  'toolbar.mousePos': ['鼠标', 'Cursor'],
+  'toolbar.colorPicker': ['取色', 'Pick color'],
+  'toolbar.ocr': ['字典', 'OCR'],
+  'toolbar.registerApp': ['登记应用', 'Register app'],
+  // 内置工具页入口（工具条列末）。与 toolbar.ocr 的「字典」区分：这里指 PDF/图片/视频等内置工具。
+  'toolbar.tools': ['内置工具', 'Built-in tools'],
   'problem.resize': ['调整底部面板高度', 'Resize bottom panel'],
   'problem.resizeHint': [
     '拖动或按上下方向键调整高度；双击恢复默认',
@@ -388,4 +396,16 @@ export const editorZh = Object.fromEntries(
 )
 export const editorEn = Object.fromEntries(
   Object.entries(messages).map(([key, value]) => [`workflowEditor.${key}`, value[1]]),
+)
+/** DesktopToolbar 的 hover 标签也走 workflowEditor 词条（与画布共享 toolbar.* 命名空间）；
+ *  这里同时导出**不带前缀**的视图，供非 workflowEditor 前缀的组件直接 t(key) 消费 */
+export const toolbarZh = Object.fromEntries(
+  Object.entries(messages)
+    .filter(([key]) => key.startsWith('toolbar.'))
+    .map(([key, value]) => [key, value[0]]),
+)
+export const toolbarEn = Object.fromEntries(
+  Object.entries(messages)
+    .filter(([key]) => key.startsWith('toolbar.'))
+    .map(([key, value]) => [key, value[1]]),
 )

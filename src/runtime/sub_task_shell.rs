@@ -26,20 +26,11 @@ pub fn flush_output_lines(
     }
 }
 
+use crate::tools::background_tasks as bg;
 use std::io::BufRead;
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-
-/// 长任务阈值（秒）。
-///
-/// `timeout_secs` 超过此值的调用被视为长任务（Release 构建 / 全量测试 /
-/// 大下载）：超时后**不终止**进程，因为杀掉会让已完成的编译产物与测试
-/// 进度全部作废，下次从零重跑。
-///
-/// 未超过的按原行为杀掉止损 —— 卡死的短命令继续跑只会占资源。
-///
-/// 取 300s（5 分钟）的依据：普通命令的合理上限远低于此；而 `tool_timeout`
-/// 给 system_shell 的桶是 1800s，真正需要"不杀"的长任务必然远超 300s。
-const LONG_TASK_THRESHOLD_SECS: u64 = 300;
 
 /// Execute system_shell with line-by-line streaming, pushing stdout/stderr to frontend in real-time
 pub fn stream_shell_blocking(
@@ -47,6 +38,10 @@ pub fn stream_shell_blocking(
     timeout_secs: u64,
     call_id: &str,
     emitter: &Arc<dyn EventEmitter>,
+    // 调用方显式要求保留在后台（取消时只解除等待，不杀进程树）
+    background: bool,
+    // 共享取消标志句柄（与宿主持有的是同一个实例）
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> ToolResult {
     // ── Create piped process ──
     #[cfg(windows)]
@@ -95,6 +90,32 @@ pub fn stream_shell_blocking(
         Err(e) => return ToolResult::failure(format!("Failed to spawn shell: {}", e)),
     };
 
+    // ── 登记进进程级后台任务清单：启动即登记。登记之前那一小段窗口里，谁都杀不了它 ──
+    let registry = bg::global();
+    let task_id = registry.next_task_id();
+    let log_path = bg::open_log_file(&task_id);
+    let task = bg::BackgroundTask {
+        id: task_id.clone(),
+        tool: "system_shell".to_string(),
+        command: bg::truncate_command(command),
+        pid: child.id(),
+        started_at_ms: bg::now_ms(),
+        retain: background,
+        output_path: log_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+    };
+    registry.register(task.clone());
+
+    // stdout / stderr 各一个**独立追加句柄**指向同一日志文件（File 不实现 Clone，
+    // 共用一个句柄会让两个读者线程互抢文件偏移）
+    let stdout_sink = log_path
+        .as_deref()
+        .and_then(|p| std::fs::File::options().append(true).open(p).ok())
+        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+    let stderr_sink = log_path
+        .as_deref()
+        .and_then(|p| std::fs::File::options().append(true).open(p).ok())
+        .map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+
     // ── Channel: reader threads → main thread ──
     let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
 
@@ -115,6 +136,11 @@ pub fn stream_shell_blocking(
                     buf.pop();
                 }
                 let line = String::from_utf8_lossy(&buf).to_string();
+                if let Some(sink) = &stdout_sink {
+                    if let Ok(mut f) = sink.lock() {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
                 if tx.send((line, false)).is_err() {
                     break;
                 }
@@ -139,6 +165,11 @@ pub fn stream_shell_blocking(
                     buf.pop();
                 }
                 let line = String::from_utf8_lossy(&buf).to_string();
+                if let Some(sink) = &stderr_sink {
+                    if let Ok(mut f) = sink.lock() {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
                 if tx.send((line, true)).is_err() {
                     break;
                 }
@@ -153,43 +184,100 @@ pub fn stream_shell_blocking(
     let mut line_buf: Vec<(String, bool)> = Vec::new();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    // 超过这个时长的调用方意图是长任务（构建 / 全量测试 / 大下载），
-    // 超时后不终止进程；短命令仍按原行为杀掉，避免卡死的命令泄漏。
-    // 判据用调用方自己传的 timeout_secs：传 180（默认）是普通命令，
-    // 传 600+ 说明调用方明知这是长任务。
-    let is_long_task = timeout_secs > LONG_TASK_THRESHOLD_SECS;
 
     loop {
         let now = std::time::Instant::now();
+
+        // 取消：**先解除等待**。本循环每轮最多阻塞 50ms，故取消响应上限就是 50ms。
+        // 让子进程真正停下来的是下面的杀进程树，不是这里。
+        if crate::tools::definitions::is_cancelled(&cancel_flag) {
+            flush_output_lines(emitter, call_id, &mut line_buf);
+            if background {
+                // 显式保留：只解除等待，进程照跑
+                registry.set_retain(&task.id, true);
+                // HUD 收尾（A·H1）：等待解除，工具调用结束；进程转后台存活。
+                emitter.emit(NuphusEvent::HudUpdate {
+                    text: "system_shell — 已转入后台".into(),
+                    phase: "done".into(),
+                    step_kind: None,
+                });
+                let notice = bg::CancellationNotice::retained(
+                    command,
+                    Some(task.pid),
+                    task.output_path.clone(),
+                );
+                tracing::info!("[BG] stream shell 取消（后台保留）: pid={}", task.pid);
+                return bg::cancelled_result(full_stdout, &notice);
+            }
+            let killed = bg::kill_process_tree(task.pid);
+            registry.unregister(&task.id);
+            bg::discard_log(&task);
+            let notice = match &killed {
+                Ok(()) => bg::CancellationNotice::terminated(command, Some(task.pid)),
+                Err(e) => {
+                    tracing::error!("[BG] 取消时终止进程树失败 pid={}: {e}", task.pid);
+                    bg::CancellationNotice::wait_released_without_kill("system_shell")
+                }
+            };
+            tracing::info!(
+                "[BG] stream shell 取消（前台，已终止）: pid={} ok={}",
+                task.pid,
+                killed.is_ok()
+            );
+            return bg::cancelled_result(full_stdout, &notice);
+        }
+
         if now >= deadline {
             flush_output_lines(emitter, call_id, &mut line_buf);
-            if !is_long_task {
-                // 短命令：杀掉止损。卡死的命令继续跑只会占资源。
+            // 超时：**按显式声明分流**（与 leader 路径 system_shell 同一条规则）。
+            // - background=false（默认）：终止，卡死的命令不该占资源。
+            // - background=true（调用方声明长任务）：不杀，登记保留 + 到点看门狗兜底。
+            if !background {
                 let _ = child.kill();
+                registry.unregister(&task.id);
+                bg::discard_log(&task);
                 return ToolResult {
                     success: false,
                     output: Some(full_stdout),
                     error: Some(format!(
-                        "命令超时 ({}s)，已终止。可增加 timeout 参数重试。",
+                        "命令已超过等待上限 ({}s)，已终止。如需长任务请显式声明 background=true，或增大 timeout 参数重试。",
                         timeout_secs
                     )),
                     exit_code: None,
                 };
             }
-            // 长任务：**不杀**。杀掉会让已完成的编译产物/测试进度全部作废，
+            // 显式保留：**不杀**。杀掉会让已完成的编译产物/测试进度全部作废，
             // 下次从零重跑 —— 一次 5-6 分钟的活被切成无数段，每段都从零开始。
             //
             // 安全性：`child` 是局部变量，函数返回时 drop，但 std Child 的 drop
             // **不会**终止进程；stdout/stderr 已 `take()` 移交给 reader 线程，
             // 管道不会关闭，reader 继续读到进程自然结束，无句柄泄漏、无僵尸。
+            //
+            // 登记为保留项：进程必须可被查询/结束，并且必须告诉 Agent「别重跑」。
+            registry.set_retain(&task.id, true);
+            // HUD 收尾（A·H1）：工具调用在此结束（ToolResult 返回），但进程仍在
+            // 后台跑——批量收尾层对 system_shell 不发收尾（避免误报「失败」），
+            // 由本函数在三个结局点各自如实收尾。转后台不是失败，用 done 让
+            // running 计时停下。
+            emitter.emit(NuphusEvent::HudUpdate {
+                text: format!("{} — 已转入后台", "system_shell"),
+                phase: "done".into(),
+                step_kind: None,
+            });
             return ToolResult {
                 success: false,
                 output: Some(full_stdout),
                 error: Some(format!(
-                    "命令已超过等待上限 ({}s)，**仍在后台继续运行**（未终止）。\n\
-                     已产生的输出保留在原处（若重定向到文件，稍后直接读取）。\n\
+                    "命令已超过等待上限 ({}s)，**仍在后台继续运行**（未终止，因为调用方声明了 background=true）。\n\
+                     进程 PID {}（任务 {}）已登记为保留的后台任务。\n\
+                     输出持续追加到：{}\n\
+                     最长存活 {} 分钟，到点由系统兜底结束；期间可随时结束它（面板，或 Agent 侧 process_kill 按 PID 结束）。\n\
                      勿重复执行同一命令 —— 重复触发会让长任务从零重跑。",
-                    timeout_secs
+                    timeout_secs,
+                    task.pid,
+                    task.id,
+                    task.output_path.as_deref().unwrap_or("(未开启输出文件)"),
+                    bg::MAX_TASK_LIFETIME_SECS / 60
                 )),
                 exit_code: None,
             };
@@ -222,6 +310,19 @@ pub fn stream_shell_blocking(
                 flush_output_lines(emitter, call_id, &mut line_buf);
                 let status = child.wait().ok();
                 let success = status.map(|s| s.success()).unwrap_or(false);
+                registry.unregister(&task.id);
+                bg::discard_log(&task);
+                // HUD 收尾（A·H1）：正常退出路径，与主轮 done/error 语义对齐
+                let (phase, desc) = if success {
+                    ("done", "完成")
+                } else {
+                    ("error", "失败")
+                };
+                emitter.emit(NuphusEvent::HudUpdate {
+                    text: format!("system_shell — {}", desc),
+                    phase: phase.into(),
+                    step_kind: None,
+                });
                 return if success {
                     ToolResult::success(full_stdout)
                 } else {
@@ -241,6 +342,7 @@ pub fn stream_shell_blocking(
 pub async fn execute_shell_streaming(
     call: &crate::ToolCall,
     emitter: &Arc<dyn EventEmitter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> ToolResult {
     let command = call
         .params
@@ -253,18 +355,32 @@ pub async fn execute_shell_streaming(
         .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(180);
+    // background 缺省 false（前台，取消杀进程树）；保留必须显式声明
+    let background = call
+        .params
+        .get("background")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let call_id = call.id.clone();
     let emitter = emitter.clone();
 
     tracing::info!(
         command = %command.chars().take(100).collect::<String>(),
         timeout = timeout_secs,
+        background = background,
         "shell execution start"
     );
     let shell_start = std::time::Instant::now();
 
     match tokio::task::spawn_blocking(move || {
-        stream_shell_blocking(&command, timeout_secs, &call_id, &emitter)
+        stream_shell_blocking(
+            &command,
+            timeout_secs,
+            &call_id,
+            &emitter,
+            background,
+            cancel_flag,
+        )
     })
     .await
     {

@@ -44,8 +44,10 @@ impl Provider for XaiProvider {
                 cost_per_million_in: 2.0,
                 cost_per_million_out: 6.0,
                 reasoning_field: "reasoning_content",
-                reasoning_efforts: &[],
-                default_effort: None,
+                // 官方依据（docs.x.ai · Reasoning，2026-10 核对）：grok-4.6 与
+                // 4.7 支持 low/medium/high/xhigh（默认 high，不可关闭思考）。
+                reasoning_efforts: &["low", "medium", "high", "xhigh"],
+                default_effort: Some("high"),
             },
             ModelDef {
                 id: "grok-4.5",
@@ -60,8 +62,10 @@ impl Provider for XaiProvider {
                 cost_per_million_in: 2.0,
                 cost_per_million_out: 6.0,
                 reasoning_field: "reasoning_content",
-                reasoning_efforts: &[],
-                default_effort: None,
+                // 官方：grok-4.5 = low/medium/high（默认 high；xhigh 仅 4.6+，
+                // 低档模型上传 xhigh 被按 high 处理）。
+                reasoning_efforts: &["low", "medium", "high"],
+                default_effort: Some("high"),
             },
             ModelDef {
                 id: "grok-4.3",
@@ -76,8 +80,10 @@ impl Provider for XaiProvider {
                 cost_per_million_in: 1.25,
                 cost_per_million_out: 2.5,
                 reasoning_field: "reasoning_content",
-                reasoning_efforts: &[],
-                default_effort: None,
+                // grok-4.3 早于 xhigh（官方摘要表未列 4.3 的档位；AI SDK 文档记
+                // none/low/medium/high）。取保守交集 low/medium/high。
+                reasoning_efforts: &["low", "medium", "high"],
+                default_effort: Some("high"),
             },
             ModelDef {
                 id: "grok-build-0.1",
@@ -92,15 +98,38 @@ impl Provider for XaiProvider {
                 cost_per_million_in: 1.0,
                 cost_per_million_out: 2.0,
                 reasoning_field: "reasoning_content",
+                // grok-build-0.1（Grok Build 预览版）官方未公布 effort 枚举，
+                // 按「不发明档位」留空；用户仍可在 providers.toml 手配 effort 下发。
                 reasoning_efforts: &[],
                 default_effort: None,
             },
         ]
     }
 
+    fn quirks(&self) -> ProviderQuirks {
+        ProviderQuirks {
+            requires_reasoning_echo: false,
+            // 官方 Chat Completions 接受 reasoning_effort（docs.x.ai 示例
+            // chat.create(model=..., reasoning_effort="high")）。
+            supports_reasoning_effort: true,
+            effort_excludes_tools: false,
+            sanitize_tools: None,
+            extra_headers: vec![],
+            forbidden_request_fields: &[],
+            max_tokens_field: MaxTokensField::MaxTokens,
+            user_agent: None,
+            content_tool_tags: &[],
+            cache_hit_field: "",
+        }
+    }
+
     fn transport(&self, cfg: &ProviderConfig, model_id: &str) -> Arc<dyn Transport> {
         Arc::new(ChatCompletionsTransport::new(ChatCompletionsConfig {
             name: "xai".to_string(),
+            // 协议/类型 id —— Transport::provider_name 的语义（每个 custom 实例都折叠成 "custom"）
+            // providers.toml 段名 —— 模型级配置（max_tokens 等）必须按段精确查找，
+            // 用类型 id 查会静默查不到（段名是 custom-xxx 而非 custom）。
+            provider_segment: cfg.name.clone(),
             api_key: cfg.api_key.clone(),
             base_url: if cfg.base_url.is_empty() {
                 self.default_base_url().to_string()

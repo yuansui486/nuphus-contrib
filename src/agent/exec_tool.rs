@@ -455,6 +455,13 @@ pub async fn execute_tool_only(
 
     let elapsed_ms = exec_start.elapsed().as_millis() as u64;
     tracing::info!(tool = %tool, duration_ms = elapsed_ms, success = result.success, "tool execution end");
+
+    // desktop_vision 失败升级：计费/密钥类（重试无意义）→ 一次性 UI 横幅。
+    // 限流/图片过大/其它不升级（重试有意义或原因不明）；成功即复位闸门。
+    if tool == "desktop_vision" {
+        maybe_emit_vision_banner(emitter, &result);
+    }
+
     // If on_line callback is provided, emit output line by line
     if let Some(cb) = &on_line {
         if let Some(ref output) = result.output {
@@ -471,9 +478,145 @@ pub async fn execute_tool_only(
     result
 }
 
+/// desktop_vision 计费/密钥类失败横幅的一次性闸门：
+/// true = 当前这轮连续失败已提醒过；desktop_vision 成功一次即复位——
+/// 横幅语义是「本轮失败连的第一次提醒」，而非进程终身一次（修好后再坏仍会提醒）。
+static VISION_BANNER_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// desktop_vision 失败的 UI 横幅升级（重试无意义类才发，与限流区分）。
+///
+/// 分类复用 vision_ocr::classify_vision_error_text（对最终透传文案判别：模板判别
+/// 短语优先，不被 raw body 关键词噪声劫持——限流文案里上游恰好提到 quota 也不能
+/// 误弹计费横幅）。emitter 缺席（无 UI 场景）时跳过且**不置闸门**——失败文本本身
+/// 仍随 ToolResult 如实透传给 Leader，横幅只是附加的用户感知通道。
+fn maybe_emit_vision_banner(emitter: Option<&dyn EventEmitter>, result: &ToolResult) {
+    use std::sync::atomic::Ordering;
+
+    if result.success {
+        VISION_BANNER_SHOWN.store(false, Ordering::SeqCst);
+        return;
+    }
+    let Some(error) = result.error.as_deref() else {
+        return;
+    };
+    let kind = crate::desktop::vision_ocr::classify_vision_error_text(error);
+    if !matches!(
+        kind,
+        crate::desktop::vision_ocr::VisionErrorKind::Auth
+            | crate::desktop::vision_ocr::VisionErrorKind::Billing
+    ) {
+        return;
+    }
+    let Some(em) = emitter else {
+        return;
+    };
+    if VISION_BANNER_SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(message) = crate::desktop::vision_ocr::vision_banner_message(kind) {
+        em.emit(NuphusEvent::Warning {
+            code: "vision_auth_billing".to_string(),
+            message,
+            attempt: None,
+            max_attempts: None,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 捕获型 emitter：记录收到的 NuphusEvent 供断言（横幅测试用）
+    struct CapturingEmitter(std::sync::Mutex<Vec<NuphusEvent>>);
+
+    impl EventEmitter for CapturingEmitter {
+        fn emit(&self, event: NuphusEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn warning_count(emitter: &CapturingEmitter) -> usize {
+        emitter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, NuphusEvent::Warning { .. }))
+            .count()
+    }
+
+    /// 横幅闸门全序列（单一测试函数保证共享静态闸门的状态确定）：
+    /// Auth 失败→1 条；连续 Auth 失败→仍 1 条；成功→复位；
+    /// 再次 Auth 失败→第 2 条；限流失败→不加条；emitter 缺席→不加条且不置闸门。
+    #[test]
+    fn vision_banner_once_per_failure_streak() {
+        use crate::desktop::vision_ocr::format_vision_error;
+        use crate::desktop::vision_ocr::{classify_vision_error, VisionErrorContext};
+        use std::sync::atomic::Ordering;
+
+        // 前置：清零闸门（其它测试可能已置位）
+        VISION_BANNER_SHOWN.store(false, Ordering::SeqCst);
+
+        let auth_error = format_vision_error(
+            classify_vision_error(Some(401), "Invalid API key"),
+            &VisionErrorContext {
+                model: "m".to_string(),
+                provider: "p".to_string(),
+                follow_leader: false,
+            },
+            "Invalid API key",
+            Some(401),
+        );
+        let rate_limit_error = format_vision_error(
+            classify_vision_error(Some(429), "rate limit"),
+            &VisionErrorContext {
+                model: "m".to_string(),
+                provider: "p".to_string(),
+                follow_leader: false,
+            },
+            "rate limit",
+            Some(429),
+        );
+
+        let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
+
+        // ① Auth 失败 → 首次提醒
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::failure(auth_error.clone()));
+        assert_eq!(warning_count(&emitter), 1);
+
+        // ② 连续 Auth 失败 → 闸门拦下，不重复轰炸
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::failure(auth_error.clone()));
+        assert_eq!(warning_count(&emitter), 1);
+
+        // ③ 成功 → 复位闸门
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::success("识别文本"));
+        assert!(!VISION_BANNER_SHOWN.load(Ordering::SeqCst));
+
+        // ④ 修好后再坏 → 仍会提醒（第 2 条）
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::failure(auth_error.clone()));
+        assert_eq!(warning_count(&emitter), 2);
+
+        // ⑤ 限流失败 → 不升级横幅（闸门保持 ④ 的置位状态，不受影响）
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::failure(rate_limit_error));
+        assert_eq!(warning_count(&emitter), 2);
+        assert!(VISION_BANNER_SHOWN.load(Ordering::SeqCst));
+
+        // ⑥ emitter 缺席 → 跳过且**不消耗闸门**：先经成功复位，再无 UI 调用，
+        //    闸门必须仍是 false（否则无 UI 场景会把横幅额度提前烧掉）
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::success("识别文本"));
+        assert!(!VISION_BANNER_SHOWN.load(Ordering::SeqCst));
+        maybe_emit_vision_banner(
+            None,
+            &ToolResult::failure("图像理解调用失败：API 密钥无效或未授权"),
+        );
+        assert_eq!(warning_count(&emitter), 2);
+        assert!(!VISION_BANNER_SHOWN.load(Ordering::SeqCst));
+
+        // ⑦ 有 UI 后再次 Auth 失败 → 正常提醒（证明 ⑥ 未把额度烧掉）
+        maybe_emit_vision_banner(Some(&emitter), &ToolResult::failure(auth_error));
+        assert_eq!(warning_count(&emitter), 3);
+    }
 
     #[test]
     fn test_build_security_warning_generic_contains_reason() {

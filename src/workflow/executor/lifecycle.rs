@@ -79,9 +79,19 @@ impl Executor {
             // ── 暂停前保存变量快照 ──
             if let (Some(store), Some(vars)) = (store, variables) {
                 if let Some(mut wf) = store.get(workflow_id).await {
+                    // B9 落盘脱敏：从本次定义的 inputs 声明取 sensitive 名单，
+                    // 快照写入前剔除敏感键（暂停点天然持有 wf，无需额外传参）。
+                    let sensitive_inputs: std::collections::HashSet<String> = wf
+                        .inputs
+                        .iter()
+                        .filter(|spec| spec.sensitive)
+                        .map(|spec| spec.name.clone())
+                        .collect();
                     if let Some(ref mut rec) = wf.last_run_mut() {
-                        let snapshot: HashMap<String, serde_json::Value> =
-                            vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                        let snapshot = super::variables::strip_sensitive_from_snapshot(
+                            vars,
+                            &sensitive_inputs,
+                        );
                         if !snapshot.is_empty() {
                             rec.variables_snapshot = snapshot;
                         }

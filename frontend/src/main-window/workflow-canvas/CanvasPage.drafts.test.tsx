@@ -135,7 +135,6 @@ vi.mock('./ScopedEditDialog', () => ({
     </div>
   ),
 }))
-vi.mock('./EnhancedModeToggle', () => ({ EnhancedModeToggle: () => null }))
 vi.mock('./WorkflowSwitcher', () => ({ WorkflowSwitcher: () => null }))
 vi.mock('./WorkflowInputsEditor', () => ({
   WorkflowInputsEditor: ({
@@ -149,7 +148,10 @@ vi.mock('./WorkflowInputsEditor', () => ({
       <button onClick={() => onApply([{ name: 'new_input', type: 'string' }])}>应用测试输入</button>
     ) : null,
 }))
-vi.mock('../workflow/WorkflowScheduleDialog', () => ({ WorkflowScheduleDialog: () => null }))
+vi.mock('../workflow/WorkflowScheduleDialog', () => ({
+  WorkflowScheduleDialog: ({ open }: { open: boolean }) =>
+    open ? <div data-testid="schedule-dialog" /> : null,
+}))
 vi.mock('../workflow/WorkflowInputsForm', () => ({
   WorkflowInputsDialog: () => null,
   NO_INPUT_SPECS: [],
@@ -187,6 +189,38 @@ function shortcut() {
 }
 
 describe('Canvas save coordination', () => {
+  it('keeps the visible schedule action disabled when the backend cannot schedule', async () => {
+    await renderCanvas(
+      <CanvasBackendContext.Provider value={{ ...legacyCanvasBackend, scheduling: false }}>
+        <CanvasPage workflowId="wf" onClose={() => {}} />
+      </CanvasBackendContext.Provider>,
+    )
+    const buttons = screen.getAllByRole('button', { name: '定时' })
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0]).toBeDisabled()
+    fireEvent.click(buttons[0])
+    expect(screen.queryByTestId('schedule-dialog')).not.toBeInTheDocument()
+  })
+
+  it('saves versioned edits before opening the promoted schedule action', async () => {
+    await renderCanvas(
+      <CanvasBackendContext.Provider value={{ ...legacyCanvasBackend, versioned: true }}>
+        <CanvasPage workflowId="wf" onClose={() => {}} />
+      </CanvasBackendContext.Provider>,
+    )
+    await openNode('first')
+    fireEvent.change(panel('first').getByLabelText(/^名称/), {
+      target: { value: 'Scheduled edit' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '定时' }))
+    expect(await screen.findByText('保存当前编辑后设置定时运行？')).toBeInTheDocument()
+    expect(screen.queryByTestId('schedule-dialog')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(mocks.save).toHaveBeenCalledTimes(1))
+    expect(mocks.save.mock.calls[0][0].steps[0].name).toBe('Scheduled edit')
+    expect(await screen.findByTestId('schedule-dialog')).toBeInTheDocument()
+  })
+
   it('passes workbench scope and safe intent text to the composer without running or closing', async () => {
     const receiveIntent = vi.fn()
     const close = vi.fn()
@@ -276,8 +310,15 @@ describe('Canvas save coordination', () => {
     const actions = screen.getByLabelText('画布操作')
     expect(primary.parentElement).toBe(actions.parentElement)
     expect(screen.queryByText('增强模式')).not.toBeInTheDocument()
-    expect(within(primary).getByRole('button', { name: '保存' })).toBeInTheDocument()
-    expect(within(primary).getByRole('button', { name: '运行' })).toBeInTheDocument()
+    // 2026-10-17：保存 / 运行移出工具栏（无 header 挂载点时降级回工具栏末尾，
+    // 但不再是主行的成员）。这里只钉「主行继续承载标题与徽标」这一契约。
+    expect(within(primary).queryByRole('button', { name: '保存' })).toBeNull()
+    expect(within(primary).queryByRole('button', { name: '运行' })).toBeNull()
+    // 降级路径下四项仍可用（本测试无 header 挂载点）
+    const fallback = document.querySelector('.workflow-workbench-actions-group') as HTMLElement
+    expect(fallback).toBeTruthy()
+    expect(within(fallback).getByRole('button', { name: '保存' })).toBeInTheDocument()
+    expect(within(fallback).getByRole('button', { name: '运行' })).toBeInTheDocument()
     expect(within(actions).getByRole('button', { name: '节点调试' })).toBeInTheDocument()
     expect(document.querySelector('.wfc-title')).toHaveAttribute(
       'title',

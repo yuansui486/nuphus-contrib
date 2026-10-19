@@ -1,97 +1,255 @@
-/* DesktopToolbar — 桌面工具浮窗条样式 v2 */
+/* DesktopToolbar — 桌面工具条样式 v4 */
 /* 暗色主题匹配 tokens.css 设计系统 */
 
-/* ── 主工具条 ── */
+/* ── Dock：右侧固定按钮列 + hover 逐次显形 ──
+   列排布直接落在 dock 上：竖向 flex + gap 4px + 右对齐，逐条对齐
+   chat-messages.css 的 .chat-header-right。按钮等宽 30px，故 flex-end 与
+   center 视觉等价 —— 取 flex-end 与 header 保持一致。
 
-.desktop-toolbar {
+   热区纪律：dock 的盒子 **就是** 这一列按钮的真实盒子（30px 宽 × 列高），
+   没有额外 padding / margin / inset / height 撑大。按钮默认态只降 opacity，
+   仍占布局盒且 pointer-events 正常 —— 用 pointer-events:none 或 display:none
+   会让 hover 永远触发不了，整列变成永不显形的死 UI。 */
+
+.desktop-toolbar-dock {
   position: fixed;
-  z-index: 9999;
+  /* 右缘对齐 header 图标列：.chat-header 的 right:16px + padding:4px = 20px。
+     依据 chat-messages.css:48,55（当前文件实际值，非记忆值）。 */
+  right: 20px;
+  /* 视觉重心略高于几何中线（大王 2026-10-17 定：整体上移） */
+  top: 45%;
+  transform: translateY(-50%);
+  /* 层级与 .chat-header-left / .chat-header-right 同为10（chat-messages.css:66）。
+   2026-10-12 大王钦定：工具条不是弹窗，不该有任何「压过别的浮层」的特权；
+   但也不必比 header 更低——两者同属常驻 chrome，同层内按 DOM 顺序压住即可。
+   10 之上依次是：思考条 40 / 工具条自身遮罩 200 / island 260 / cmd-palette 300 /
+   右键菜单 3000 / 模型页遮罩 10000，以及 input-bar 50、后台任务面板 52、
+   设置类 60~90、确认弹窗 150 —— 用户正在用的任何弹窗都在工具条之上。
+   刻意不用 pointer-events:none（会让 hover 永不触发、整列变死 UI，
+   见文件头「热区纪律」）。 */
+  z-index: 10;
   display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 4px 6px;
-  border-radius: 10px;
-  background: var(--glass-bg, rgba(14, 14, 20, 0.92));
-  border: 1px solid var(--glass-2, rgba(255, 255, 255, 0.06));
-  box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.3) inset,
-    0 4px 24px rgba(0, 0, 0, 0.5),
-    0 0 0 1px rgba(255, 255, 255, 0.06);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  pointer-events: auto;
   user-select: none;
   font-family: var(--font-ui, system-ui, sans-serif);
-  animation: toolbarFadeIn 0.15s ease-out;
 }
 
-/* ── 拖拽把手 ── */
-/* 共享实现见 styles/panel-drag.css 的 .panel-grip（单一实现点，此处不再保留副本） */
+/* ── 工具按钮 ──
+   逐字复用 chat-messages.css 里 .chat-header-settings-btn / -appearance-btn /
+   -browser-btn 的配方（30×30 / 1px var(--border) / --panel-bg 62% 磨砂 +
+   blur(8px) saturate(1.2) / radius 8 / --spark-secondary，hover 抬到 85% 档）：
+   与 header 右列同一视觉语言。chat-messages.css 里那三条规则本身**不在本文件**
+   合并或改写 —— opacity-system.test.ts 按单选择器取它们的声明块。
 
-/* ── 工具按钮 ── */
+   与 header 配方的一处**刻意**差异：transition 不再用 `all`，改为显式列出。
+   `all` 会把 transition-delay 一并套到背景/颜色上，按钮自身的 hover 提亮会跟着
+   吃错峰延迟（末位按钮延迟 200ms，鼠标扫过去明显发木）；显式列出才能只给
+   opacity / transform 错峰，背景与颜色即时反馈。
+
+   错峰实现：序号由 JSX 侧以 --stagger-delay 注入（CSS 变量，不在 JS 里做定时器）。
+   默认态 delay 归零 → 鼠标移出时整列**同时**快速收起，不会有逐个拖尾；
+   只有 hover 进入时才按 --stagger-delay 从上到下依次显形。 */
 
 .desktop-toolbar-btn {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  height: 28px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--spark-tertiary, var(--fg-3));
+  justify-content: center;
+  position: relative;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
   cursor: pointer;
-  font-size: var(--fz-sm);
-  font-family: inherit;
-  white-space: nowrap;
+  border-radius: 8px;
+  /* 默认态：保留布局盒 + 正常命中，只做视觉隐藏 */
+  opacity: 0;
+  /* 从右侧滑入：dock 贴右缘，X 轴位移才符合「从边上抽出来」的物理直觉；
+     旧版 translateY(-4px) 只有 4px 且方向与停靠边无关，观感接近纯淡入。 */
+  transform: translate3d(10px, 0, 0) scale(0.96);
+  /* 收起：180ms + 加速曲线，比显形慢一档，避免边缘扫过时闪烁 */
   transition:
-    background 0.12s,
-    color 0.12s,
-    box-shadow 0.12s;
+    opacity 0.18s cubic-bezier(0.4, 0, 1, 1),
+    transform 0.18s cubic-bezier(0.4, 0, 1, 1),
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+  /* 收起无延迟（反模式：快速划过多米诺式逐个消失）；值序与上面 transition 同序 */
+  transition-delay: 0ms;
+  will-change: opacity, transform;
 }
+
+/* 显形：整列同时渐显（渐显渐隐，不做逐个错峰 —— 错峰在防抖+常驻语义下只会
+   让「3s 常驻」的起点模糊）。.is-shown 由 DesktopToolbar 的进出去抖逻辑挂上/摘掉。
+   只给 opacity / transform 上过渡时长，背景/颜色仍走快档，hover 提亮不拖沓。 */
+.desktop-toolbar-dock.is-shown .desktop-toolbar-btn {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  /* 显形：150ms easeOutExpo（--ease-out 起手极快），跟手不拖沓。
+     时长写在显形态而非默认态，是为了让「进」比「出」快一档。 */
+  transition:
+    opacity 0.15s var(--ease-out),
+    transform 0.15s var(--ease-out),
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+  transition-delay: 0ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-toolbar-btn {
+    /* 降级：只切 opacity，不位移（瞬时出现，避免整列闪动） */
+    transform: none;
+    transition: opacity var(--transition-fast);
+    transition-delay: 0ms;
+    will-change: auto;
+  }
+  /* 显形态选择器特异性更高（0,3,0 > 0,1,0），必须把 transition 一并覆盖，
+     否则降级只作用于收起、显形仍走 150ms 位移 */
+  .desktop-toolbar-dock.is-shown .desktop-toolbar-btn {
+    transform: none;
+    transition: opacity var(--transition-fast);
+  }
+}
+
 .desktop-toolbar-btn:hover {
-  background: var(--glass-1, rgba(255, 255, 255, 0.06));
-  color: var(--spark-secondary, var(--fg-2));
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  border-color: var(--glass-3);
+  color: var(--spark-primary);
 }
-.desktop-toolbar-btn:active {
-  background: var(--glass-2, rgba(255, 255, 255, 0.1));
+/* 按压缩放必须叠加在入场位移之上；选择器带 dock.is-shown 前缀是为了压过
+   .desktop-toolbar-dock.is-shown .desktop-toolbar-btn 的 transform（0,3,0 > 0,2,0）。
+   未显形时按钮不可见，:active 本就无从触发，故不再单独写低特异性版本。 */
+.desktop-toolbar-dock.is-shown .desktop-toolbar-btn:active {
+  transform: translate3d(0, 0, 0) scale(0.94);
 }
 .desktop-toolbar-btn.active {
   color: var(--accent);
-  background: rgba(110, 203, 245, 0.08);
-  box-shadow: 0 0 0 1px rgba(110, 203, 245, 0.2);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
 }
+
+/* ── 工具按钮 hover 浮层 ──
+   按钮列只有 30px 宽（「截图 / 选区 / 鼠标 / 取色 / 字典」放不下），常态隐藏；
+   hover 时绝对定位向左浮出，既给出名称又不撑开按钮列宽度 / 不扩大热区。
+
+   浮层是**唯一的提示通道**：主行名称 + 副行快捷键（或说明）。
+   按钮上不再挂 title —— 原生的灰框提示会和本浮层同时出现，同一个按钮两套提示。
+   所以 `aria-label` 仍然保留（读屏与无浮层场景的可访问名），title 全部去掉。 */
 
 .desktop-toolbar-label {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 8px);
+  /* 收起时退回到按钮一侧 4px，展开时归位 —— 与整列同为 X 轴方向 */
+  transform: translateY(-50%) translateX(4px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--fg-1);
   font-size: var(--fz-xs);
   line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 0.12s var(--ease-out),
+    transform 0.12s var(--ease-out),
+    visibility 0.12s;
+}
+/* 副行（快捷键 / 说明）：弱化一档，与主行拉开层次 */
+.desktop-toolbar-label-hint {
+  color: var(--spark-tertiary);
+  font-size: var(--fs-micro);
+  font-family: var(--font-mono);
+  line-height: 1;
+}
+.desktop-toolbar-btn:hover .desktop-toolbar-label {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) translateX(0);
+}
+.desktop-toolbar-btn:focus-visible .desktop-toolbar-label {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) translateX(0);
 }
 
-/* ── 分隔线 ── */
+/* ── 鼠标坐标：读数 + 关闭（一组，常驻）──
+   **不受 hover 显隐约束**：整列平时 opacity:0，坐标若跟着隐藏，用户一移开鼠标
+   去看读数就什么都看不见（2026-10-09 报障）。故本组只要渲染就可见。
 
-.desktop-toolbar-divider {
-  width: 1px;
-  height: 20px;
-  background: var(--glass-2, rgba(255, 255, 255, 0.06));
-  margin: 0 2px;
-  flex-shrink: 0;
+   定位：整组绝对定位向左浮出（包含块是 position:fixed 的 dock），不参与按钮列
+   排版 —— 否则坐标读数的宽度会把 30px 的列和 dock 热区一起撑宽，违反热区纪律。
+   读数与关闭钮在同一行（原实现把关闭排在列末、落在读数下方）。 */
+
+.desktop-toolbar-pos-group {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 8px);
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 1;
 }
-
-/* ── 鼠标坐标显示 ── */
 
 .desktop-toolbar-pos {
-  padding: 3px 8px;
-  border-radius: 5px;
-  background: rgba(110, 203, 245, 0.08);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
   color: var(--accent);
   font-size: var(--fz-xs);
   font-family: var(--font-mono, 'JetBrains Mono', monospace);
   white-space: nowrap;
-  border: none;
+  border: 1px solid var(--border);
   cursor: pointer;
-  transition: background 0.12s;
+  transition: background var(--transition-fast);
 }
 .desktop-toolbar-pos:hover {
-  background: rgba(110, 203, 245, 0.15);
+  background: color-mix(in srgb, var(--panel-bg) 100%, transparent);
+}
+/* 被拒态：资源门拒绝（典型 automation_busy）时读数位改显示原因。
+   用 --error 以示「这不是坐标，是错误」，仍可点击关闭。 */
+.desktop-toolbar-pos--error {
+  color: var(--error);
+  cursor: default;
+}
+
+/* 关闭钮：与读数同一行的收尾控件，视觉沿用同一份磨砂配方（不占列、不吃错峰） */
+.desktop-toolbar-pos-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--error);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.desktop-toolbar-pos-close:hover {
+  background: color-mix(in srgb, var(--panel-bg) 100%, transparent);
 }
 
 /* ── 加载遮罩 ── */
@@ -99,7 +257,12 @@
 .desktop-toolbar-overlay {
   position: fixed;
   inset: 0;
-  z-index: 9998;
+  /* 工具条自身的加载遮罩：必须高于 dock（45），否则盖不住触发它的按钮列。
+     但不得高于用户自己的弹窗族——它是工具条内部态，用户若在别处开了弹窗，
+     这个遮罩不该盖住它（dock 降级后 9998 仍会压住 compact 150 / cmd-palette 300）。
+     200 = 与既有全屏遮罩族（msg/设置 200、chat-input 200）同层：高于内容层、
+     低于 island 260 / cmd-palette 300 / 菜单 3000 / 遮罩 10000。 */
+  z-index: 200;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -140,18 +303,22 @@
 /* ── 结果浮窗 ── */
 
 .desktop-toolbar-result {
-  z-index: 9999;
+  /* 结果浮窗：本工具主动发起的产物，随其 overlay（200）一同在 portal 内渲染，
+     只需高于 overlay 自身即可。**刻意不设 9999**——它曾在 dock 降级后仍压住
+     用户的弹窗族，而结果弹窗是「可关掉的轻提示」，没有压过一切的理由。
+     201 = 紧贴 overlay 之上的同层位，低于 island 260 / 菜单 3000 / 遮罩 10000。 */
+  z-index: 201;
   position: relative;
   width: 440px;
   max-height: 360px;
   display: flex;
   flex-direction: column;
   border-radius: 20px;
-  background: var(--glass-bg-soft, rgba(10, 10, 18, 0.82));
+  /* 主题弹窗背景（--modal-bg，与主窗弹窗族同键、受「界面不透明度」滑块管辖）。
+     此前用 --glass-bg-soft + blur(24px) 磨砂玻璃，与主窗弹窗视觉脱节（2026-10-11）。 */
+  background: var(--modal-bg);
   border: 1px solid var(--glass-4, rgba(255, 255, 255, 0.08));
   box-shadow: var(--shadow-modal, 0 8px 48px rgba(0, 0, 0, 0.6));
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
   animation: toolbarFadeIn 0.12s ease-out;
   overflow: hidden;
 }

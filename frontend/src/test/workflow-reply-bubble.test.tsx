@@ -33,24 +33,8 @@ Object.defineProperty(window.Element.prototype, 'scrollTo', { value: () => {}, w
 
 const records: ChatMessage[] = [
   { id: 'user', role: 'user', content: '完成临时文件任务。', timestamp: 1 },
-  {
-    id: 'p1',
-    reply_id: 'draft',
-    message_id: 'p1',
-    role: 'assistant',
-    kind: 'progress',
-    content: '先检查文件。',
-    timestamp: 2,
-  },
-  {
-    id: 'p2',
-    reply_id: 'draft',
-    message_id: 'p2',
-    role: 'assistant',
-    kind: 'progress',
-    content: '正在验证结果。',
-    timestamp: 3,
-  },
+  { id: 'a1', role: 'assistant', content: '先检查文件。', timestamp: 2 },
+  { id: 'a2', role: 'assistant', content: '正在验证结果。', timestamp: 3 },
   { id: 'draft', role: 'assistant', content: '任务已完成。', timestamp: 4, runtime: 'done' },
 ]
 const body = '先检查文件。\n\n正在验证结果。\n\n任务已完成。'
@@ -77,9 +61,10 @@ describe('single workflow reply bubble', () => {
     expect(screen.getAllByRole('button', { name: '复制' })).toHaveLength(1)
     expect(screen.getAllByRole('button', { name: '点评' })).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: '复制' }))
+    // 连续 assistant 合并为单气泡（对齐 leader），复制/点评取完整回复文本
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(body))
   })
-  it('desktop retains the same bubble while more progress arrives and hides an empty stopped draft', () => {
+  it('desktop retains the same bubble while more streaming text arrives and hides an empty stopped draft', () => {
     const emptyDraft = { ...records[3], content: '' }
     const view = render(desktop([records[0], records[1], emptyDraft]))
     const bubble = view.container.querySelector('.message-bubble.assistant')

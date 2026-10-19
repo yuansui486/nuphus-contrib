@@ -219,6 +219,7 @@ impl ResponsesStreamParser {
                 Ok(events)
             }
 
+            "response.incomplete" => Err(NuphusError::llm("Responses inference was incomplete")),
             "response.failed" => Err(Self::failed_error(
                 "response.failed",
                 data.pointer("/response/error").unwrap_or(data),

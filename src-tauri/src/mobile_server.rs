@@ -2037,6 +2037,7 @@ async fn get_model_config<R: tauri::Runtime>(
                         })
                     };
                     models.push(nuphus::api::ModelInfo {
+                        transport: model.transport,
                         id: model.id.clone(),
                         provider: provider.name.clone(),
                         alias: model.alias.clone(),
@@ -2598,7 +2599,7 @@ pub async fn mobile_server_ensure(
 }
 
 /// 查询 server 状态（含 token 与局域网 URL，供 P3 设置页展示/生成二维码）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn mobile_server_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<MobileServerStatus, String> {
@@ -2606,7 +2607,7 @@ pub fn mobile_server_status(
 }
 
 /// 重新生成 token 并持久化；运行中的 server 即刻用新 token 鉴权（旧 token 失效）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn mobile_token_regenerate(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let new_token = generate_token();
     *state.mobile_token.write().map_err(|e| e.to_string())? = new_token.clone();
@@ -2626,7 +2627,7 @@ pub fn mobile_token_regenerate(state: tauri::State<'_, AppState>) -> Result<Stri
 /// 设置页「保存」可能被随手点击，无条件轮换会立即踢掉所有已配对手机
 /// （401 循环，用户侧表现为反复「配对失效」）。salt 哈希不可直接比较，
 /// 用 verify_password 对照存量哈希判定同一密码。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn mobile_password_set(
     state: tauri::State<'_, AppState>,
     password: String,

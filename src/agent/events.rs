@@ -34,17 +34,6 @@ pub enum NuphusEvent {
         started_at_ms: Option<u64>,
     },
 
-    /// User-facing workflow commentary, never raw model reasoning.
-    AssistantProgress {
-        session_id: String,
-        turn_id: String,
-        message_id: String,
-        text: String,
-        timestamp: u64,
-        /// Commit the currently streamed native text rather than duplicate it.
-        replaces_draft: bool,
-    },
-
     /// Tool call start (from_task: true when executed by ExecuteAgent, for frontend to distinguish)
     ToolCallStart {
         call_id: String,
@@ -336,7 +325,7 @@ pub enum NuphusEvent {
 
     // ── 会话镜像（手机跟随桌面当前视图）──
     /// 当前会话已切换（桌面 rail 或手机遥控任一路径触发）。
-    /// 手机��收到后重拉 /history 即呈现桌面当前会话——手机不维护独立会话状态。
+    /// 手机端收到后重拉 /history 即呈现桌面当前会话——手机不维护独立会话状态。
     SessionChanged {
         /// 切换后的当前会话 id
         session_id: String,
@@ -353,6 +342,20 @@ pub enum NuphusEvent {
     /// 桌面端收到后执行本地 handleNewChat（清聊天区回欢迎页，执行中自守卫）；
     /// 手机端本机发送前已先行清视图（幂等）。
     NewChatBroadcast,
+
+    // ── 后台任务账本变化（跨工具调用存活的子进程）──
+    /// 进程级后台任务账本的结构变了：登记 / 保留意图翻转 / 注销（含看门狗强杀
+    /// 超期、退出清算、面板手动结束）。前端据此重拉清单并刷新保留项数字。
+    ///
+    /// **为什么必须事件驱动**：`retain` 翻转发生在**工具执行中**（超时/取消那一刻），
+    /// 而「执行转空闲」信号往往在之后才到；两者一旦错过或顺序颠倒，保留项数字
+    /// 就永远停在 0，直到用户刷新页面。此前唯一的可靠触发点是挂载校准——
+    /// 那正是「发起任务后看不见胶囊，刷新才出现」的症状。
+    ///
+    /// 载荷刻意为空：账本是后端唯一真相，前端收到后走既有 IPC 重拉，
+    /// 不在事件里冗余快照（避免两处口径 + 事件体随条目数膨胀）。
+    /// 失联期间可丢弃（非 essential）：界面回来时挂载校准会补上。
+    BackgroundTasksChanged,
 }
 
 // ── Helper types ──
@@ -386,6 +389,35 @@ pub struct StepOutput {
 /// Risk level — re-exported from api::types for backward compatibility
 pub use crate::api::types::RiskLevel;
 
+impl NuphusEvent {
+    /// 主界面（webview）失联期间仍然必须放行的事件。
+    ///
+    /// 判定口径：HUD 是**另一个 Tauri 窗口**（主 webview 死了它可能还活着），
+    /// 以及「任务生命周期边界 / 错误 / 需要用户交互」的事件——这些漏一个，
+    /// 用户回来看到的就是错乱的状态。高频道进度事件（文本增量、工具输出行、
+    /// 任务快照等）在失联期间全部丢弃：它们对已死的界面毫无价值，却正是
+    /// 「往死 webview 里狂发 JS」错误洪水（线上 46 条/秒）的来源。
+    pub fn is_essential_when_ui_dead(&self) -> bool {
+        matches!(
+            self,
+            Self::HudUpdate { .. }
+                | Self::ExecutionCompleted { .. }
+                | Self::ExecutionError { .. }
+                | Self::LeaderDone { .. }
+                | Self::Error { .. }
+                | Self::Warning { .. }
+                | Self::UserInputRequest { .. }
+                | Self::SecurityCheck { .. }
+                | Self::TaskRuns { .. }
+                | Self::SessionChanged { .. }
+                | Self::SessionInfo { .. }
+                | Self::MessageAccepted { .. }
+                | Self::DirectResponse { .. }
+                | Self::NewChatBroadcast
+        )
+    }
+}
+
 // ── EventEmitter trait ──
 
 /// Event emitter trait.
@@ -412,6 +444,70 @@ mod tests {
         assert_eq!(parsed.goal, "读取 Cargo.toml");
         assert_eq!(parsed.tools, vec!["Read"]);
         assert_eq!(parsed.success_criteria, "获取项目依赖列表");
+    }
+
+    /// UI 失联期间的事件分级：边界/错误/交互/HUD 必须放行，进度流必须丢弃。
+    /// （丢错一个边界事件 → 用户回来看到状态错乱；放错一个进度事件 →
+    ///  就是往死 webview 里继续撞，错误洪水由此而来。）
+    #[test]
+    fn essential_vs_noise_when_ui_dead() {
+        assert!(
+            NuphusEvent::ExecutionCompleted {
+                step_index: 0,
+                output: StepOutput {
+                    step_index: 0,
+                    result_message: String::new(),
+                    artifacts: vec![],
+                    tool_calls_count: 0,
+                },
+                total_duration_ms: 0,
+                total_calls: 0,
+                meta: None,
+            }
+            .is_essential_when_ui_dead(),
+            "执行完成是生命周期边界，必须放行"
+        );
+        assert!(
+            NuphusEvent::Warning {
+                code: "ui_reconnected".into(),
+                message: String::new(),
+                attempt: None,
+                max_attempts: None,
+            }
+            .is_essential_when_ui_dead(),
+            "Warning（含恢复通知）必须放行"
+        );
+        assert!(
+            NuphusEvent::HudUpdate {
+                text: "任务执行中".into(),
+                phase: "running".into(),
+                step_kind: None,
+            }
+            .is_essential_when_ui_dead(),
+            "HUD 是独立窗口，主 webview 死后可能仍可见"
+        );
+        assert!(
+            NuphusEvent::TaskRuns { runs: vec![] }.is_essential_when_ui_dead(),
+            "TaskRuns 是快照语义，恢复态依赖它重建任务面板"
+        );
+        assert!(
+            !NuphusEvent::LlmTextDelta {
+                text: "你".into(),
+                is_thinking: false,
+                from_task: false,
+            }
+            .is_essential_when_ui_dead(),
+            "文本增量是纯进度流，失联期间必须丢弃"
+        );
+        assert!(
+            !NuphusEvent::ToolOutputLine {
+                call_id: "c1".into(),
+                line: "stdout line".into(),
+                is_stderr: false,
+            }
+            .is_essential_when_ui_dead(),
+            "工具输出行是最高频的洪水来源，必须丢弃"
+        );
     }
 
     #[test]

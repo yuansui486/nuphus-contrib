@@ -956,7 +956,7 @@ mod tests {
         assert!(err.contains("yt-dlp"), "unexpected error: {err}");
         eprintln!(
             "[verify] invalid-url error OK: {}",
-            &err[..err.len().min(200)]
+            &err[..nuphus::utils::floor_char_boundary(&err, 200)]
         );
     }
 

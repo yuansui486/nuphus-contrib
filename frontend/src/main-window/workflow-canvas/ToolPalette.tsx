@@ -57,6 +57,7 @@ const TOOL_LABELS: Record<string, string> = {
   desktop_find_color: '屏幕查找颜色',
   desktop_find_multi_color: '屏幕多点颜色定位',
   desktop_find_text: '屏幕查找文字',
+  desktop_wait_for: '等待画面状态',
   // ── 网页操作（browser_ 前缀族 + 网络访问三件套）──
   browser_navigate: '打开网页',
   browser_snapshot: '读取页面元素',

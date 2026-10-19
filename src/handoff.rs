@@ -48,6 +48,8 @@ pub enum HandoffStatus {
     Done,
     /// 受阻 —— 同 Done 语义
     Blocked,
+    /// 取消 —— 任务作废终态（派发方经 CLI cancel 收口，或外部 Agent 上报）；同 Done 语义
+    Cancelled,
 }
 
 impl HandoffStatus {
@@ -57,6 +59,7 @@ impl HandoffStatus {
             "ready" => Some(Self::Ready),
             "done" => Some(Self::Done),
             "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -67,6 +70,7 @@ impl HandoffStatus {
             Self::Ready => "ready",
             Self::Done => "done",
             Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -98,11 +102,11 @@ struct HandoffState {
     token: String,
     /// server 实际监听端口；None = server 未启动/启动失败（优雅降级）
     bound_port: Option<u16>,
-    /// done/blocked 待注入队列（FIFO）
+    /// done/blocked/cancelled 待注入队列（FIFO）
     terminal_events: Vec<HandoffEvent>,
     /// progress 待注入表：id → 最新一条（折叠语义）
     progress_events: HashMap<String, HandoffEvent>,
-    /// 已接受过 done/blocked 的 id 集合 —— 终态幂等：
+    /// 已接受过 done/blocked/cancelled 的 id 集合 —— 终态幂等：
     /// 同 id 的终态事件只接受一次，重复 POST 直接忽略（仍回 200，避免客户端重试风暴）
     terminal_ids: HashSet<String>,
 }
@@ -181,7 +185,7 @@ impl HandoffState {
                 // 折叠：同 id 覆盖旧值，天然只保留最新一条（ready 视作进度类，可心跳重发）
                 self.progress_events.insert(id, event);
             }
-            HandoffStatus::Done | HandoffStatus::Blocked => {
+            HandoffStatus::Done | HandoffStatus::Blocked | HandoffStatus::Cancelled => {
                 // 终态幂等：同 id 已接受过终态则忽略，保证「注入恰好一次」
                 if !self.terminal_ids.insert(id) {
                     return Ok(());
@@ -214,7 +218,7 @@ impl HandoffState {
         out
     }
 
-    /// 是否仍有待注入的终态事件（done/blocked）——非消费窥视，见
+    /// 是否仍有待注入的终态事件（done/blocked/cancelled）——非消费窥视，见
     /// [`crate::handoff::has_pending_terminal`]。
     fn has_pending_terminal(&self) -> bool {
         !self.terminal_events.is_empty()
@@ -300,7 +304,7 @@ pub fn drain_for_injection() -> Vec<HandoffEvent> {
     with_state(|s| s.drain_for_injection())
 }
 
-/// 是否仍有**待注入的终态事件**（done/blocked）——非消费窥视。
+/// 是否仍有**待注入的终态事件**（done/blocked/cancelled）——非消费窥视。
 ///
 /// 轮次结束点的唤醒重放用（S2）：被推迟的唤醒若已被上一轮的轮次边界注入消化
 /// （`drain_for_injection` 取走终态事件），就不该再为它补开一轮

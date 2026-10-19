@@ -65,7 +65,7 @@ fn ensure_output_pdf(path: &str) -> Result<PathBuf, String> {
 }
 
 /// 合并多个 PDF 为单个文件（lopdf 官方合并方式：renumber + 重建 Catalog/Pages）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_merge(
     input_paths: Vec<String>,
     output_path: String,
@@ -315,7 +315,7 @@ pub async fn pdf_compress(
 }
 
 /// 获取 PDF 页数
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_page_count(path: String) -> Result<serde_json::Value, String> {
     let input = ensure_input_file(&path)?;
     let doc = Document::load(&input).map_err(|e| format!("加载 PDF 失败：{}", e))?;
@@ -331,7 +331,7 @@ pub fn pdf_page_count(path: String) -> Result<serde_json::Value, String> {
 ///   1. pdf.js 桥：通过桌面壳 webview 的 getTextContent 提取，支持 CID 字体
 ///   2. lopdf extract_text：覆盖 TJ 数组 / 十六进制串 / 引号操作符
 ///   3. 渲染 + OCR：扫描件兜底（仅全部页无文本层时触发）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_extract_text(path: String, max_pages: Option<u32>) -> Result<serde_json::Value, String> {
     let input = ensure_input_file(&path)?;
     let doc = Document::load(&input).map_err(|e| format!("加载 PDF 失败：{}", e))?;
@@ -464,7 +464,7 @@ pub fn pdf_extract_text(path: String, max_pages: Option<u32>) -> Result<serde_js
 }
 /// 图片转 PDF：多张图片各占一页（页面尺寸 = 图片像素，1px:1pt），
 /// 经 lopdf embed_image 嵌入图片流（JPEG 走 DCTDecode，其余 FlateDecode）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_images_to_pdf(
     input_paths: Vec<String>,
     output_path: String,
@@ -571,7 +571,7 @@ pub fn pdf_images_to_pdf(
 
 /// 提取 PDF 指定页：按 1-based 页码抽取到新 PDF（页面与依赖对象保留，
 /// 旧 Pages/Catalog 由 prune 清理）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_extract_pages(
     input_path: String,
     pages: Vec<u32>,
@@ -654,7 +654,7 @@ pub fn pdf_extract_pages(
 
 /// 旋转 PDF 页面：degrees 90/180/270（累积到现有 /Rotate）。
 /// pages 缺省 = 全部页；提供时仅旋转指定 1-based 页。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_rotate(
     input_path: String,
     output_path: String,

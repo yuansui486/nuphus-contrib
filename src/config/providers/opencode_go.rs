@@ -10,7 +10,7 @@ impl Provider for OpenCodeGoProvider {
         "opencode-go"
     }
     fn display_name(&self) -> &'static str {
-        "OpenCode Go 套餐"
+        "OpenCode Go"
     }
     fn default_base_url(&self) -> &'static str {
         "https://opencode.ai/zen/go/v1"
@@ -638,6 +638,10 @@ impl Provider for OpenCodeGoProvider {
         ));
         Arc::new(ChatCompletionsTransport::new(ChatCompletionsConfig {
             name: "opencode-go".to_string(),
+            // 协议/类型 id —— Transport::provider_name 的语义（每个 custom 实例都折叠成 "custom"）
+            // providers.toml 段名 —— 模型级配置（max_tokens 等）必须按段精确查找，
+            // 用类型 id 查会静默查不到（段名是 custom-xxx 而非 custom）。
+            provider_segment: cfg.name.clone(),
             api_key: cfg.api_key.clone(),
             base_url: if cfg.base_url.is_empty() {
                 self.default_base_url().to_string()

@@ -3,9 +3,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 // Shelf 退出持久化经 commands::process::shelf::persist_and_mirror（元数据行+镜像一并落盘）
+use nuphus::agent::events::EventEmitter;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+mod command_conventions;
 mod commands;
 mod emitter;
 mod ext_agent;
@@ -23,9 +25,41 @@ mod speech;
 mod splash;
 mod startup_guard;
 mod state;
+mod ui_watchdog;
 mod utils;
 mod video;
 mod workbench;
+
+/// 桌面工具热键映射：`Ctrl+1/2/3` → 工具模式。
+///
+/// 热键字符串由 `global-hotkey` 归一化输出（形如 `control+Digit1`），
+/// 这里按「含 control、不含 shift/alt/super、末段为数字键」做匹配，
+/// 避免依赖具体大小写或 `Digit` 前缀的写法。
+///
+/// 返回 `Some("screenshot" | "picker" | "color_picker")`，其余情况 `None`
+/// （交回工作流控制热键处理）。
+fn desktop_tool_for_hotkey(key: &str) -> Option<&'static str> {
+    let lower = key.to_ascii_lowercase();
+    // 修饰键写法兼容 `ctrl` 与 `control`（库的归一化输出用 control，用户写法常用 ctrl）
+    let has_ctrl = lower
+        .split('+')
+        .any(|t| matches!(t.trim(), "ctrl" | "control"));
+    if !has_ctrl {
+        return None;
+    }
+    // 带其它修饰键的组合不属于工具热键（例如 Ctrl+Shift+1）
+    if lower.contains("shift") || lower.contains("alt") || lower.contains("super") {
+        return None;
+    }
+    let last = lower.rsplit('+').next()?.trim();
+    let digit = last.strip_prefix("digit").unwrap_or(last);
+    match digit {
+        "1" => Some("screenshot"),
+        "2" => Some("picker"),
+        "3" => Some("color_picker"),
+        _ => None,
+    }
+}
 
 /// Win11 系统圆角：main 窗口是无装饰窗口（tauri.conf.json `decorations: false`），
 /// 四角默认裁成直角。这里向 DWM 声明圆角偏好，由系统按 Win11 规范裁剪四角。
@@ -166,10 +200,29 @@ fn main() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
+                        let key = shortcut.to_string();
+                        // ── 桌面工具热键（Ctrl+1/2/3）：唤起主窗并交给前端执行对应工具 ──
+                        // 与工作流控制热键（Ctrl+Q / Ctrl+Shift+Q）分流：工具热键不依赖
+                        // 运行中的工作流，任何时候都该可用。
+                        if let Some(tool) = desktop_tool_for_hotkey(&key) {
+                            tracing::info!("[Hotkey] {} 唤起桌面工具: {}", key, tool);
+                            if let Some(main) = app.get_webview_window("main") {
+                                let _ = main.show();
+                                let _ = main.unminimize();
+                                let _ = main.set_focus();
+                            }
+                            if let Err(e) = app.emit(
+                                "desktop-tool-hotkey",
+                                serde_json::json!({ "tool": tool, "source": "global-shortcut" }),
+                            ) {
+                                tracing::warn!("[Hotkey] 派发工具热键失败: {e}");
+                            }
+                            return;
+                        }
+
                         let state = app.state::<crate::state::AppState>();
                         let engine = state.workflow_engine.clone();
                         let signals = state.signals.clone();
-                        let key = shortcut.to_string();
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let active_id = nuphus::workflow::hud_control::active_id(&signals);
@@ -235,6 +288,7 @@ fn main() {
             commands::set_workflow_enhanced_mode,
             commands::switch_model,
             commands::set_model_context_window,
+            commands::set_model_transport,
             commands::set_relation,
             commands::get_agent_models,
             commands::get_effective_model,
@@ -276,6 +330,10 @@ fn main() {
             // -- 数据目录（只读列举；路径解析 + 存在性判定）--
             commands::list_data_dirs,
             commands::interrupt,
+            // -- 后台任务（跨工具调用存活的子进程）--
+            commands::list_background_tasks,
+            commands::kill_background_task,
+            commands::count_retained_background_tasks,
             commands::pause_execution,
             commands::continue_execution,
             commands::append_instruction,
@@ -326,6 +384,11 @@ fn main() {
             commands::create_custom_provider,
             commands::update_custom_provider,
             commands::remove_custom_provider,
+            commands::chatgpt_accounts,
+            commands::chatgpt_login,
+            commands::chatgpt_cancel_login,
+            commands::chatgpt_models,
+            commands::chatgpt_logout,
             commands::oauth_begin,
             commands::oauth_status,
             commands::oauth_logout,
@@ -335,6 +398,8 @@ fn main() {
             macos_permissions::open_macos_permission_settings,
             commands::set_capability,
             commands::set_capability_binding,
+            commands::get_vision_resolution,
+            commands::test_vision_model,
             commands::set_model_supports_vision,
             commands::set_model_supports_image_generation,
             commands::get_context_limit,
@@ -455,10 +520,10 @@ fn main() {
             commands::dict_ocr::dict_remove_char,
             commands::dict_ocr::save_temp_image,
             commands::dict_ocr::read_image_base64,
+            commands::dropped_files::save_dropped_file,
             commands::dict_ocr::dict_list,
             commands::dict_ocr::dict_load,
             commands::dict_ocr::dict_delete,
-            commands::toggle_main_window_topmost,
             commands::finish_startup,
             commands::splash_status_update,
             commands::splash_skip_download,
@@ -467,11 +532,13 @@ fn main() {
             commands::overlay_magnifier_region,
             commands::overlay_capture_confirm,
             commands::overlay_capture_done,
+            commands::overlay_capture_save_only,
             commands::overlay_capture_cancel,
             commands::overlay_pick_color,
             commands::take_capture_result,
             // -- HUD overlay --
             commands::hud::hud_update,
+            commands::ui_link::ui_heartbeat,
             commands::hud::hud_hide,
             commands::hud::hud_pause,
             commands::hud::hud_resume,
@@ -491,8 +558,6 @@ fn main() {
             commands::read_file_base64,
             commands::open_path,
             commands::reveal_path,
-            // -- 画布导出落盘（UI 原型图：明确告知绝对路径，替代静默下载）--
-            commands::save_prototype_png,
             // -- 用户图片入库（皮肤背景/头像：复制进应用数据目录，前端只存路径）--
             commands::save_user_image,
             // -- 内置工具命令（PDF/图片/视频；内部机制，非 agent 工具调用项） --
@@ -522,6 +587,9 @@ fn main() {
             commands::tools::voice::voice_clone,
             // -- 外链：桌面端 WebView 不处理 target="_blank"，交系统浏览器 --
             commands::open_external,
+            // -- Agent 浏览器窗口：把 CDP 那个 Chrome 提到前台（人要看/要示范时）--
+            commands::browser_show_window,
+                        commands::browser_open_url,
             // -- Document render service (pdf.js in main webview) --
             render::commands::pdf_render_done,
             render::commands::pdf_render_error,
@@ -558,8 +626,13 @@ fn main() {
             // 这里创建后立即隐藏，保持 splash→main 启动流程不变
             // （见 tauri issue #14643 / wry issue #1639）。
             if let Some(main) = app.get_webview_window("main") {
-                // Windows 会为无装饰、可缩放窗口默认保留左/右/下非客户区，
-                // 浅色主题下表现为黑边。关闭阴影后 Tao 仍保留四边/四角缩放命中。
+                // 窗口阴影**保持关闭**（2026-10-09 二次定案，勿再打开）：
+                // · 打开 = Tao 在 WM_NCCALCSIZE 按 inset 收紧客户区、由 DWM 画投影，同时必然
+                //   带来一条 1px 深色边框线（浅色主题下尤其刺眼）。大王的裁决：**偶尔找不到
+                //   窗口边，好过一直有这条令人难受的黑边**。
+                // · 关闭的代价：无投影——窗口压在白色背景上时边界不显眼。取舍已知且已接受。
+                // 若将来要「有边界感但不要黑边」，正确做法是 CSS 侧一圈**主题化内描边**（不碰
+                // DWM），而不是重新打开这个开关。
                 #[cfg(target_os = "windows")]
                 if let Err(error) = main.set_shadow(false) {
                     tracing::warn!("Failed to disable main window shadow: {error}");
@@ -619,7 +692,16 @@ fn main() {
                         tracing::warn!("Failed to register global shortcut {}: {}", key, e);
                     });
                 }
-                tracing::info!("Global shortcuts: Ctrl+Q(pause/resume) Ctrl+Shift+Q(stop)");
+                // 桌面工具热键：Ctrl+1 截图 / Ctrl+2 选区 / Ctrl+3 取色。
+                // 单独注册并逐个告警：某个被系统占用时不影响其余两个。
+                for key in ["Ctrl+1", "Ctrl+2", "Ctrl+3"] {
+                    gs.register(key).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to register desktop tool shortcut {}: {}", key, e);
+                    });
+                }
+                tracing::info!(
+                    "Global shortcuts: Ctrl+Q(pause/resume) Ctrl+Shift+Q(stop) Ctrl+1(截图) Ctrl+2(选区) Ctrl+3(取色)"
+                );
             }
 
             // ── 随包只读资产落盘 ──
@@ -709,7 +791,7 @@ fn main() {
                 let llm_config = state.runtime.lock()
                     .ok()
                     .and_then(|g| g.llm_config.clone())
-                    .filter(|c| !c.model.is_empty() && !c.api_key.is_empty());
+                    .filter(|c| !c.model.is_empty() && (!c.api_key.is_empty() || commands::config::llm::oauth_segment(&c.provider)));
 
                 if let Some(cfg) = llm_config {
                     let registry = nuphus::config::ModelRegistry::from_single(
@@ -720,7 +802,12 @@ fn main() {
                         cfg.reasoning_effort.clone(),
                     );
                     let factory = nuphus::llm::ClientFactory::new(registry);
-                    match factory.create_main_client() {
+                    let client = if commands::config::llm::oauth_segment(&cfg.provider) {
+                        nuphus::llm::ClientFactory::live().create_client_for(&cfg.provider, &cfg.model)
+                    } else {
+                        factory.create_main_client()
+                    };
+                    match client {
                         Ok(client) => {
                             tauri::async_runtime::block_on(async {
                                 let mut engine = state.workflow_engine.write().await;
@@ -756,8 +843,9 @@ fn main() {
                         // ── 资源门：定时触发的 workflow 同样是执行体 ──
                         // 与 Agent 轮次 / 录制会话 / 手动工具互斥（同一把资源锁，非新的状态源）。
                         // 拿不到即**明确跳过本次**（不排队、不等下一 tick 的隐式重试），记 warn。
-                        // 注：cron 注册时已拒绝含 desktop_/browser_ 步骤的工作流
-                        // （has_frontend_step），此处互斥的是「执行体并行」本身。
+                        // 注：cron 注册与每次触发都只拦"会停下来等人"的构造
+                        // （human_blocker_with_calls），界面自动化步骤不受限制；
+                        // 此处互斥的是「执行体并行」本身。
                         let (gate_lease, execution_owner) = match crate::resource_gate::acquire_execution_body_with_owner(
                             &state.automation_gate,
                             &format!("schedule_run:{workflow_id}"),
@@ -811,8 +899,10 @@ fn main() {
                             ).await;
                             return;
                         }
-                        // For scheduled execution, tool schemas are not available (no Tauri state access)
-                        // Pass empty vec — ChatAgent steps will work but without tool definitions
+                        // 定时执行无外部 tool_schemas，传 None 让 execute_workflow 的
+                        // registry 兜底生效（engine.tools 已在 setup 中 set_tools 注入，
+                        // 时序上先于任何 cron 触发）。chat 步骤的白名单过滤在
+                        // step_chat_agent 内完成，与 UI/Agent 源共用同一安全边界。
                         let previous_run_id = workflow.run_history.first().map(|run| run.run_id.clone());
                         let started_at = chrono::Utc::now();
                         let schedule_run_id = uuid::Uuid::new_v4().to_string();
@@ -838,7 +928,7 @@ fn main() {
                                 .execute_workflow(
                                     &workflow_id_for_exec,
                                     tool_exec,
-                                    Some(vec![]),
+                                    None,
                                     None,
                                     (!inputs.is_empty()).then_some(inputs),
                                     false,
@@ -1137,12 +1227,56 @@ fn main() {
             // 强行显示主窗 + 关 splash，用户永远不会被锁在 splash 上。
             crate::startup_guard::spawn(app.handle().clone());
 
+            // ── 后台任务看门狗（最后的保障）──
+            // 每个周期强杀存活超过 MAX_TASK_LIFETIME_SECS 的后台任务（含保留项）：
+            // 保障是时间驱动的，不依赖用户打开面板。
+nuphus::tools::background_tasks::start_watchdog();
+
+            // ── 界面自愈看门狗 ──
+            // 事件静默期（窗口闲置）也要巡检：心跳停摆 90s 判死后，先自动重载主界面，
+            // 仍不恢复则弹原生对话框给出「重新加载 / 重启」出口——用户不再被锁在
+            // 透明/空白窗口里（2026-10-15 用户报告，详见 ui_watchdog 头注）。
+            crate::ui_watchdog::spawn(app.handle().clone());
+
+            // ── 账本变更 → 双推事件（事件驱动的显示链路，2026-10-11）──
+            // lib crate 的账本不能依赖 bin crate 的发射器（反向依赖会成环），
+            // 故在此注入闭包：账本结构一变就广播 BackgroundTasksChanged，
+            // 桌面面板与手机端各自重拉清单。重复注入以首次为准（幂等）。
+{
+                let app_handle = app.handle().clone();
+                nuphus::tools::background_tasks::set_ledger_change_notifier(Box::new(
+                    move || {
+                        // State 借用 app_handle，故在闭包体内现取现用（不能提到闭包外
+                        // 再 move handle —— 借用与移动互斥）。每次通知都重新构造
+                        // CompoundEmitter：mobile_ws_tx 可能在这之后才启动，
+                        // 构造期读取才能拿到手机端通道。
+                        let state = app_handle.state::<state::AppState>();
+                        crate::emitter::CompoundEmitter::new(app_handle.clone(), &state)
+                            .emit(nuphus::agent::events::NuphusEvent::BackgroundTasksChanged);
+                    },
+                ));
+            }
+
             Ok(())
         })
         .build(context)
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // ── 退出清算：任何退出路径（窗口关闭 / 托盘退出 / 系统会话结束）都要清账 ──
+        // 账本是进程级单例，随进程消失；不清算的话子进程会变成无人可管、无处可见的
+        // 孤儿（重启后既不在面板里，也没有任何东西知道它还在跑）。会话切换
+        // （runtime 重建）不触发这里——清理只锚定「应用是否退出」。
+        if matches!(event, tauri::RunEvent::Exit) {
+            let killed = nuphus::tools::background_tasks::global().kill_all();
+            if !killed.is_empty() {
+                tracing::info!(
+                    "[BG] 退出清算：终止 {} 个后台任务（含保留项）：{:?}",
+                    killed.len(),
+                    killed.iter().map(|t| &t.id).collect::<Vec<_>>()
+                );
+            }
+        }
         if let tauri::RunEvent::WindowEvent {
             label,
             event: win_event,
@@ -1185,4 +1319,66 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::desktop_tool_for_hotkey;
+
+    /// 三个工具热键必须各自命中，且互不串位（顺序即 Ctrl+1/2/3）。
+    #[test]
+    fn maps_digits_to_distinct_tools() {
+        assert_eq!(
+            desktop_tool_for_hotkey("control+Digit1"),
+            Some("screenshot")
+        );
+        assert_eq!(desktop_tool_for_hotkey("control+Digit2"), Some("picker"));
+        assert_eq!(
+            desktop_tool_for_hotkey("control+Digit3"),
+            Some("color_picker")
+        );
+        let all = [
+            desktop_tool_for_hotkey("control+Digit1"),
+            desktop_tool_for_hotkey("control+Digit2"),
+            desktop_tool_for_hotkey("control+Digit3"),
+        ];
+        assert_eq!(all.iter().filter(|v| v.is_some()).count(), 3);
+        assert_eq!(
+            all.iter()
+                .filter_map(|v| *v)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "三个热键必须映射到三个不同工具"
+        );
+    }
+
+    /// 大小写与显示写法都要兼容：库输出的归一化串与用户可见写法语义相同。
+    #[test]
+    fn accepts_case_and_plain_digit_forms() {
+        assert_eq!(desktop_tool_for_hotkey("Control+Digit2"), Some("picker"));
+        assert_eq!(desktop_tool_for_hotkey("control+2"), Some("picker"));
+        assert_eq!(desktop_tool_for_hotkey("CTRL+DIGIT3"), Some("color_picker"));
+    }
+
+    /// 带其它修饰键、缺 Ctrl、非 1-3 数字都不属于工具热键（交回工作流热键处理）。
+    #[test]
+    fn rejects_other_combinations() {
+        assert_eq!(desktop_tool_for_hotkey("control+shift+Digit1"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+alt+Digit1"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+super+Digit1"), None);
+        assert_eq!(desktop_tool_for_hotkey("shift+Digit1"), None);
+        assert_eq!(desktop_tool_for_hotkey("Digit1"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+Digit4"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+Digit0"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+q"), None);
+        assert_eq!(desktop_tool_for_hotkey(""), None);
+    }
+
+    /// 工作流热键不得被误判成工具热键（Ctrl+Q / Ctrl+Shift+Q 仍归工作流控制）。
+    #[test]
+    fn workflow_hotkeys_are_not_tool_hotkeys() {
+        assert_eq!(desktop_tool_for_hotkey("control+q"), None);
+        assert_eq!(desktop_tool_for_hotkey("control+shift+q"), None);
+    }
 }

@@ -1,6 +1,6 @@
 //! Windows 原生遮罩（Win32 分层窗口）。
 //!
-//! 移植自 shot 项目 `shot/src/main.rs`（纯 FFI、零第三方依赖、Windows 实测通过）。
+//! 纯 FFI、零第三方依赖、Windows 实测通过。
 //! 平台无关部分（`Sel` / `Phase` / `Op` / `App` / `normalize` / `apply_node` /
 //! 节点与按钮布局）**不在此重复实现**，一律复用
 //! [`crate::commands::capture::geometry`] 与 [`crate::commands::capture::state`]。
@@ -34,7 +34,7 @@
 //!              → ⑤ run_overlay 返回 OverlayOutcome（抓屏/落盘由 session 层负责）
 //! ```
 //!
-//! # 硬约束（违反任意一条都会重演 shot 的历史事故）
+//! # 硬约束（违反任意一条都会重演历史事故）
 //!
 //! | # | 约束 |
 //! |---|------|
@@ -45,19 +45,19 @@
 //! | H5 | 渲染只在 tick；输入路径零同步 ULW（否则消息洪泛、桌面锁死） |
 //! | H6 | 钩子内零 IO；日志一律走 `tracing`（不写盘、不缓冲刷盘） |
 //!
-//! # 与 shot 的移植差异
+//! # 与早期版本的实现差异
 //!
 //! 1. **无全局 `static mut APP`**：`App` 由本模块的 `OverlayState` 持有
 //!    （见 `static mut OVERLAY` 的 SAFETY 说明）。
-//! 2. **不抓屏**：`capture_original` / `BitBlt` 不移植，冻结帧由参数传入；
+//! 2. **不抓屏**：抓屏原语不在此实现，冻结帧由参数传入；
 //!    屏幕尺寸同样取自参数（不再 `GetSystemMetrics`），避免 DPI 虚拟化误差。
 //! 3. **不落盘**：裁剪 PNG / GDI+ / 输出目录 / 后台写盘线程全部移除，
 //!    确认后只把选区交给调用方（session 层用 xcap 冻结帧裁剪编码）。
-//! 4. **不退出宿主进程**：shot 走 `ExitProcess`，这里只销毁本模块的窗口、
-//!    卸载钩子并返回 —— 宿主 Tauri 进程必须继续存活。
-//! 5. **日志用 `tracing`**：移除 shot 的内存缓冲 + 文件写盘日志。
-//! 6. **无兜底热键**：`RegisterHotKey` 不移植（ESC 钩子 + 180s 硬超时已覆盖）。
-//! 7. 移除 shot 的 `SHOT_DEBUG_BOUNDS` 环境变量调试转储，改为 `tracing::debug`。
+//! 4. **不退出宿主进程**：只销毁本模块的窗口、卸载钩子并返回 ——
+//!    宿主 Tauri 进程必须继续存活。
+//! 5. **日志用 `tracing`**：不做内存缓冲 + 文件写盘日志。
+//! 6. **无兜底热键**：`RegisterHotKey` 不引入（ESC 钩子 + 180s 硬超时已覆盖）。
+//! 7. 不提供环境变量调试转储，调试输出统一走 `tracing::debug`。
 //! 8. 新增 `WM_SETCURSOR` 直接应答：光标完全由输入钩子里的 `SetCursor` 驱动，
 //!    禁止 `DefWindowProc` 用类光标覆盖（类光标显式置 NULL）。
 #![allow(dead_code)]
@@ -350,6 +350,17 @@ const VK_RBUTTON: i32 = 0x02;
 const VK_MBUTTON: i32 = 0x04;
 const VK_RETURN: u32 = 0x0D;
 const VK_SPACE: u32 = 0x20;
+// 方向键微调：确认相位下整框平移（按住可连发，Shift 加速）
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
+const VK_SHIFT: i32 = 0x10;
+/// `KBDLLHOOKSTRUCT.flags` 的 key-up 位（置位 = 松开事件，不重复处理）。
+const LLKHF_UP: u32 = 0x80;
+/// 方向键单次微调步长（物理像素）；按住 Shift 时 ×10。
+const NUDGE_STEP_PX: i32 = 1;
+const NUDGE_STEP_FAST_PX: i32 = 10;
 
 // ---- 窗口样式 ----
 const WS_POPUP: u32 = 0x8000_0000;
@@ -462,7 +473,7 @@ struct OverlayState {
 ///
 /// 1. **访问面天然单线程**：`WH_MOUSE_LL` / `WH_KEYBOARD_LL` 的回调由系统投递到
 ///    *安装钩子的那个线程* 的消息队列，因此钩子、`WM_TIMER` tick 与消息循环
-///    必在同一条线程上**串行**执行 —— 与 shot 的 `static mut APP` 语义完全一致。
+///    必在同一条线程上**串行**执行 —— 与单线程消息循环的语义完全一致。
 /// 2. **钩子内禁止一切可能阻塞的操作**：`Mutex::lock` 是一次潜在等待
 ///    （锁竞争 / 优先级反转），而 `std::sync::Mutex` 不可重入 —— 低级钩子会在
 ///    任意消息泵边界插入执行，一旦出现「持锁期间泵消息 → 钩子重入 → 再取同一把锁」
@@ -719,7 +730,7 @@ unsafe fn window_bounds(hwnd: Hwnd) -> Option<Sel> {
     r.to_sel()
 }
 
-/// hover 候选过滤（shot 备份 V1 的判定集，8 条一条不改）：
+/// hover 候选过滤（判定集固定为 8 条，一条不改）：
 /// 自身窗口 / 不可见 / 最小化 / 有所有者 / 工具窗口 / 非根窗口 / 被 cloaked / shell 类。
 /// 少任意一条都会出现「鼠标明明在窗口上却 fallback 全屏」。
 unsafe fn is_hover_candidate(hwnd: Hwnd) -> bool {
@@ -843,12 +854,24 @@ extern "system" fn ll_mouse(code: i32, w: usize, l: isize) -> isize {
                 let (px, py) = (info.pt.x, info.pt.y);
                 match w as u32 {
                     WM_MOUSEMOVE => {
+                        let moved = ov.app.last_mouse.x != px || ov.app.last_mouse.y != py;
                         ov.app.last_mouse = Point { x: px, y: py };
                         resolve_cursor(&ov.app, px, py);
                         ov.app.on_move(px, py, ov.screen_w, ov.screen_h);
-                        // 单点拾取 HUD（放大镜/色值）跟随鼠标：Hover 相位下 `on_move`
-                        // 不动状态、也不置脏，这里显式置脏（重绘仍由 tick 16ms 合并）。
-                        if ov.point_pick {
+                        // 放大镜跟随鼠标：Hover 相位下 `on_move` 不改选区、也不置脏，
+                        // 必须在这里显式置脏（重绘仍由 tick 16ms 合并）。
+                        //
+                        // 是否需要刷由 `paint::phase_tracks_mouse` 判定 —— 与绘制分支
+                        // **同一真源**。此前这里只判 `point_pick`，框选类的放大镜画了
+                        // 却不刷新 → 「放大镜不跟随鼠标」（2026-10-17 大王报障）。
+                        // 仅在鼠标真的位移时置脏，避免同位置重复消息白刷帧。
+                        if moved
+                            && super::paint::phase_tracks_mouse(
+                                ov.app.phase,
+                                ov.point_pick,
+                                ov.pick_color,
+                            )
+                        {
                             ov.app.dirty = true;
                         }
                     }
@@ -904,22 +927,49 @@ extern "system" fn ll_mouse(code: i32, w: usize, l: isize) -> isize {
     }
 }
 
-/// 低级键盘钩子：ESC 取消；回车/空格 = 确认（仅在确认/调整态生效）。
+/// 低级键盘钩子：ESC 取消；回车/空格 = 确认（仅在确认/调整态生效）；
+/// 方向键 = 确认态整框微调（Shift 加速）。
+///
+/// 被消费的按键返回 1（不再传给下层应用）—— 否则方向键会同时滚动下层窗口。
 extern "system" fn ll_kbd(code: i32, w: usize, l: isize) -> isize {
     unsafe {
         if code == HC_ACTION && l != 0 {
             let info = &*(l as *const KbdLLHook);
             if let Some(ov) = overlay() {
+                // 只处理按下的那一次；松开事件直接放行（不重复移动）。
+                let is_down = info.flags & LLKHF_UP == 0;
                 match info.vk {
                     VK_ESCAPE => request_exit(ov, ExitAct::Cancel),
-                    VK_RETURN | VK_SPACE => {
-                        if matches!(
-                            ov.app.phase,
-                            Phase::Confirm | Phase::Moving | Phase::Adjusting
-                        ) {
-                            ov.app.enter_exiting();
-                            request_exit(ov, ExitAct::Confirm);
+                    VK_RETURN | VK_SPACE
+                        if is_down
+                            && matches!(
+                                ov.app.phase,
+                                Phase::Confirm | Phase::Moving | Phase::Adjusting
+                            ) =>
+                    {
+                        ov.app.enter_exiting();
+                        request_exit(ov, ExitAct::Confirm);
+                    }
+                    VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
+                        // Shift 取系统真值（钩子回调里读比解析 flags 组合更可靠）
+                        let step = if (GetAsyncKeyState(VK_SHIFT) as u16 & 0x8000) != 0 {
+                            NUDGE_STEP_FAST_PX
+                        } else {
+                            NUDGE_STEP_PX
+                        };
+                        let (dx, dy) = match info.vk {
+                            VK_LEFT => (-step, 0),
+                            VK_RIGHT => (step, 0),
+                            VK_UP => (0, -step),
+                            _ => (0, step),
+                        };
+                        if is_down {
+                            ov.app.nudge(dx, dy);
                         }
+                        // 遮罩是模态表面：方向键**一律吞掉**。
+                        // 不吞的话未固定选区（Hover）时方向键会漏到下层应用滚动页面。
+                        // HUD 的节点/按钮位置由绘制时的 recompute_hud 自动跟随新选区。
+                        return 1;
                     }
                     _ => {}
                 }

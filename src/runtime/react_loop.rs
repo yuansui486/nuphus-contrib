@@ -23,6 +23,32 @@ impl super::Runtime {
     ) -> crate::Result<crate::AgentOutput> {
         tracing::info!("Agent starting task: {} (resume={})", input, resume);
 
+        if let Some(factory) = &self.agent.client_factory {
+            let registry = factory.registry()?;
+            let supports_vision = crate::config::resolve_capability(
+                &registry,
+                Some(&self.agent.config.provider),
+                &self.agent.config.model,
+                |model| model.supports_vision,
+                false,
+            );
+            let vision_model = if !registry.capabilities.vision.is_empty() {
+                Some(registry.capabilities.vision.clone())
+            } else if supports_vision {
+                Some(self.agent.config.model.clone())
+            } else {
+                None
+            };
+            if self.agent.config.supports_vision != supports_vision
+                || self.agent.config.vision_model != vision_model
+            {
+                self.agent.config.supports_vision = supports_vision;
+                self.agent.config.vision_model = vision_model;
+                self.agent.cached_l1_prompt = None;
+                self.agent.cached_merged_system_prompt = None;
+            }
+        }
+
         let loop_start = std::time::Instant::now();
 
         // ── 执行态：进入主循环 → Running（追加指令可被本轮迭代边界 drain）──
@@ -1160,74 +1186,73 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         );
                         continue;
                     }
-                    if !matches!(alert, ProtectionAlert::SameFileReadOveruse { .. }) {
+
+                    // ── 死循环预警级（连续 3 次同参重复）─────────────────────────
+                    // 只提醒、不拦截：exec 流给用户看，reminder 给模型下一轮看。
+                    // 本次工具照常执行（预警 ≠ 终止），到第 5 次重复才由终止块处理。
+                    if matches!(alert, ProtectionAlert::DeadLoopWarning { .. }) {
                         self.agent.emit_exec(&format!(
                             "// WARN: {}: {}",
                             alert.label(),
                             alert.to_session_warning()
                         ));
-                    }
-                    if let Some(reminder) = alert.to_force_output_reminder() {
-                        if !has_used_write_file && user_wants_file {
+                        if let Some(reminder) = alert.to_force_output_reminder() {
                             self.agent.reminders.enqueue(
                                 reminder.to_string(),
                                 3,
                                 ReminderPriority::Critical,
                                 ReminderCategory::DeviationCorrect,
                             );
-                            self.agent.emit_exec("// forcing LLM to produce output now");
-                            // Check if this is a repeat — DeadLoop means we've already warned
-                            if matches!(alert, ProtectionAlert::DeadLoop { .. }) {
-                                continue;
+                        }
+                        // 不 continue：落到下方照常执行本次工具（预警 ≠ 终止）
+                    } else {
+                        // ── 终止路径（DeadLoop：连续 5 次同参重复）────────────────
+                        // 唯一例外：用户要文件但尚未产出文件 → 给模型最后一轮机会
+                        // 产文件（原有语义，保留）。
+                        self.agent.emit_exec(&format!(
+                            "// WARN: {}: {}",
+                            alert.label(),
+                            alert.to_session_warning()
+                        ));
+                        if let Some(reminder) = alert.to_force_output_reminder() {
+                            if !has_used_write_file && user_wants_file {
+                                self.agent.reminders.enqueue(
+                                    reminder.to_string(),
+                                    3,
+                                    ReminderPriority::Critical,
+                                    ReminderCategory::DeviationCorrect,
+                                );
+                                self.agent.emit_exec("// forcing LLM to produce output now");
+                                if matches!(alert, ProtectionAlert::DeadLoop { .. }) {
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    self.agent.session.push_assistant_internal(vec![
-                        crate::session::ContentBlock::Text {
-                            text: format!("任务完成（共执行 {} 步）", self.agent.steps.len()),
-                            reasoning: None,
-                        },
-                    ]);
-                    // Leader completion: emit HudUpdate done + ExecutionCompleted + LeaderDone
-                    if let Some(ref emitter) = self.agent.exec_emitter {
-                        let total_duration = loop_start.elapsed().as_millis() as u64;
-                        let tool_calls_count = self.agent.steps.len();
-                        let result_msg = format!("任务完成（共执行 {} 步）", tool_calls_count);
-                        emitter.emit(NuphusEvent::HudUpdate {
-                            text: "任务完成".into(),
-                            phase: "done".into(),
-                            step_kind: None,
-                        });
-                        emitter.emit(NuphusEvent::ExecutionCompleted {
-                            step_index: 0,
-                            output: crate::agent::events::StepOutput {
+                        // 诚实失败：这是被保护机制强制终止，不是任务完成——旧文案
+                        // 「任务完成」会同时误导用户与上游台账。
+                        let dead_loop_msg = alert.to_session_warning();
+                        self.agent.emit_exec(&format!("// {}", dead_loop_msg));
+                        // 终止必须发收敛事件（与用户中断路径同一模式）：前端 useEvents
+                        // 依赖 execution_error 复位 isProcessing/completed/mood；仅
+                        // emit_exec 是纯日志，UI 会永久停在执行中态。
+                        if let Some(ref emitter) = self.agent.exec_emitter {
+                            emitter.emit(NuphusEvent::HudUpdate {
+                                text: "已终止：防死循环机制介入".into(),
+                                phase: "error".into(),
+                                step_kind: None,
+                            });
+                            emitter.emit(NuphusEvent::ExecutionError {
                                 step_index: 0,
-                                result_message: result_msg,
-                                artifacts: vec![],
-                                tool_calls_count,
-                            },
-                            total_duration_ms: total_duration,
-                            total_calls: tool_calls_count,
-                            meta: Some({
-                                let mut m = self.agent.turn_meta.clone();
-                                m.finish(
-                                    total_duration,
-                                    tool_calls_count,
-                                    self.agent.session.context_occupancy(),
-                                );
-                                m
-                            }),
-                        });
-                        emitter.emit(NuphusEvent::LeaderDone {
-                            message: "任务完成".into(),
+                                error: dead_loop_msg.clone(),
+                            });
+                        }
+                        return Ok(crate::AgentOutput {
+                            message: dead_loop_msg,
+                            success: false,
+                            steps: self.agent.steps.clone(),
+                            retry_session: None,
                         });
                     }
-                    return Ok(crate::AgentOutput {
-                        message: format!("任务完成（共执行 {} 步）", self.agent.steps.len()),
-                        success: true,
-                        steps: self.agent.steps.clone(),
-                        retry_session: None,
-                    });
                 }
 
                 self.agent.emit_exec(&format!(
@@ -1582,11 +1607,14 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
             if ctx_window > 200_000 {
                 let ctx_tokens = self.agent.session.api_input_tokens;
 
-                // Attention dilution warning — once per refine cycle
+                // Attention dilution warning — once per refine cycle.
+                // 文案只给「系统给不了的信息」（上下文占用量）+ 时序要求：措辞是「在最终交付
+                // 之前写入记忆」，与交付终止律（prompt.rs 的 L0_RUNTIME）对齐——旧文案的
+                // 「建议立即执行」会让模型在交出最终回复之后再去调工具，把交付降级。
                 if !self.agent.context_hint_shown && ctx_tokens > 200_000 {
                     self.agent.session.push_user_internal(
                         format!(
-                            "[系统提示词] 当前上下文实际用量 {}K / 模型窗口 {}K tokens。\n\n注意力权重优先级：系统提示词 > 当前目标 > 推理链路 > 工具输出 > 历史对话。长上下文极易导致系统提示词（Constitution/身份/规则）被稀释遗忘，需主动回顾。\n\n建议立即执行 leader_memory_update 持久化当前阶段、关键决策、阻塞项。此后可继续，复杂子任务请用 task_dispatch 隔离。",
+                            "[系统提示词] 当前上下文 {}K / {}K tokens。如需跨会话保留结论，请在最终交付之前写入记忆。",
                             ctx_tokens / 1_000,
                             ctx_window / 1_000,
                         )
@@ -1595,12 +1623,13 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                     self.agent.last_memory_hint_at = ctx_tokens;
                 }
 
-                // Periodic memory save reminder — every ~100K tokens
+                // Periodic memory save reminder — every ~100K tokens（与首次提示用同一句：
+                // 同一机制出现两种措辞，等于又变成两套规则）。
                 let next_milestone = ((self.agent.last_memory_hint_at / 100_000) + 1) * 100_000;
                 if ctx_tokens >= next_milestone {
                     self.agent.session.push_user_internal(
                         format!(
-                            "[系统提示词] 当前上下文实际用量 {}K / 模型窗口 {}K tokens。建议执行 leader_memory_update 保存当前阶段的关键决策和进度，避免注意力稀释后丢失上下文。",
+                            "[系统提示词] 当前上下文 {}K / {}K tokens。如需跨会话保留结论，请在最终交付之前写入记忆。",
                             ctx_tokens / 1_000,
                             ctx_window / 1_000,
                         )
@@ -1666,4 +1695,4 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
 }
 
 // detect_frustration removed — replaced by LLM thinking-based emotion detection.
-// Trigger: src/agent/prompt.rs (build_l2_leader) instructs LLM to read prompts/emotion_guide.md when needed.
+// Trigger: src/agent/prompt.rs (build_l2_leader) instructs LLM to read plugin/knowledge/nuphus-self/emotion_guide.md when needed.

@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { CanvasWorkbenchPage } from './CanvasWorkbenchPage'
 import { CanvasWorkbenchLoading } from './CanvasWorkbenchLoading'
 
-// 三个 tab 页面均改为 lazy 拆包：测试中用轻量桩替换真实模块，
-// 避免把工作流画布 / UI 原型画布的依赖（@xyflow/react、motion 等）拖进 jsdom。
+// 画布页 lazy 拆包：测试中用轻量桩替换真实模块，
+// 避免把工作流画布的依赖（@xyflow/react 等）拖进 jsdom。
 vi.mock('../lib/api', () => ({
   listWorkflows: vi.fn(async () => [{ id: 'wf-1', status: 'draft', updated_at: 1 }]),
   wfSave: vi.fn(async () => ({ saved: true })),
@@ -15,14 +15,8 @@ vi.mock('../workflow-canvas/CanvasPage', () => ({
     <div data-testid="canvas-page">{workflowId}</div>
   ),
 }))
-vi.mock('../tools/ToolsPage', () => ({
-  ToolsPage: () => <div data-testid="tools-page" />,
-}))
-vi.mock('../canvases/ui-prototype/UiPrototypeCanvas', () => ({
-  UiPrototypeCanvas: () => <div data-testid="prototype-canvas" />,
-}))
 
-describe('CanvasWorkbenchPage 首帧反馈与 tab 拆包', () => {
+describe('CanvasWorkbenchPage 首帧反馈与单形态画布', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })
@@ -34,23 +28,16 @@ describe('CanvasWorkbenchPage 首帧反馈与 tab 拆包', () => {
     expect(container.querySelector('.page-loading')).not.toHaveAttribute('data-tauri-drag-region')
   })
 
-  it('加载中及三个标签页始终保留独立拖动区，不覆盖按钮或页面内容', async () => {
+  it('加载期与画布就绪后始终保留独立拖动区，不覆盖按钮或页面内容', async () => {
     const onClose = vi.fn()
     const { container } = render(<CanvasWorkbenchPage onClose={onClose} />)
     const drag = container.querySelector('header [data-tauri-drag-region]')
     expect(drag).not.toBeNull()
     expect(drag?.childElementCount).toBe(0)
-    for (const [label, testId] of [
-      ['工作流编辑', 'canvas-page'],
-      ['UI 原型', 'prototype-canvas'],
-      ['工具', 'tools-page'],
-    ]) {
-      if (testId !== 'canvas-page') fireEvent.click(screen.getByRole('button', { name: label }))
-      await screen.findByTestId(testId)
-      expect(container.querySelector('header [data-tauri-drag-region]')).toBe(drag)
-      expect(container.querySelector('[data-tauri-drag-region] button')).toBeNull()
-      expect(screen.getByTestId(testId).closest('[data-tauri-drag-region]')).toBeNull()
-    }
+    await screen.findByTestId('canvas-page')
+    expect(container.querySelector('header [data-tauri-drag-region]')).toBe(drag)
+    expect(container.querySelector('[data-tauri-drag-region] button')).toBeNull()
+    expect(screen.getByTestId('canvas-page').closest('[data-tauri-drag-region]')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
     expect(onClose).toHaveBeenCalledOnce()
   })
@@ -59,31 +46,18 @@ describe('CanvasWorkbenchPage 首帧反馈与 tab 拆包', () => {
     render(<CanvasWorkbenchPage onClose={() => {}} />)
 
     // 首帧断言：无 Provider 时 useLanguage 回退到 zh，'common.loading' = '加载中...'
-    expect(screen.getByRole('button', { name: 'UI 原型' })).toBeInTheDocument()
     expect(screen.getByText('加载中...')).toBeInTheDocument()
 
     // 收尾：等在 act 内落地的异步状态，避免 act 警告
     await waitFor(() => expect(screen.getByTestId('canvas-page')).toBeInTheDocument())
   })
 
-  it('工作流画布 chunk 就绪后接管加载态', async () => {
+  it('画布不再有工作类型切换条（工具页已移出为独立界面）', async () => {
     render(<CanvasWorkbenchPage onClose={() => {}} />)
     await waitFor(() => expect(screen.getByTestId('canvas-page')).toBeInTheDocument())
-  })
-
-  it('切换 tab 只挂载对应页面，不残留其它 tab 内容', async () => {
-    render(<CanvasWorkbenchPage onClose={() => {}} />)
-    await waitFor(() => expect(screen.getByTestId('canvas-page')).toBeInTheDocument())
-    expect(screen.queryByTestId('prototype-canvas')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('tools-page')).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'UI 原型' }))
-    await waitFor(() => expect(screen.getByTestId('prototype-canvas')).toBeInTheDocument())
-    expect(screen.queryByTestId('canvas-page')).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: '工具' }))
-    await waitFor(() => expect(screen.getByTestId('tools-page')).toBeInTheDocument())
-    expect(screen.queryByTestId('prototype-canvas')).not.toBeInTheDocument()
+    // 工具入口属于桌面工具条，画布内不得残留任何工具 tab 按钮
+    expect(screen.queryByRole('button', { name: '工具' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '工作流编辑' })).not.toBeInTheDocument()
   })
 
   it('传入 workflowId 时直接编辑该工作流，跳过自选草稿', async () => {

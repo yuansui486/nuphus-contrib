@@ -21,6 +21,7 @@ struct MockApiClient {
     responses: Vec<AssistantEvent>,
     model_name: String,
     provider_kind: ProviderKind,
+    requests: Mutex<Vec<MessageRequest>>,
 }
 
 impl MockApiClient {
@@ -29,6 +30,7 @@ impl MockApiClient {
             responses,
             model_name: "mock-model".to_string(),
             provider_kind: ProviderKind::MiniMax,
+            requests: Mutex::new(vec![]),
         }
     }
 
@@ -42,15 +44,17 @@ impl MockApiClient {
 
 #[async_trait]
 impl ApiClient for MockApiClient {
-    async fn stream(&self, _request: MessageRequest) -> crate::Result<Vec<AssistantEvent>> {
+    async fn stream(&self, request: MessageRequest) -> crate::Result<Vec<AssistantEvent>> {
+        self.requests.lock().unwrap().push(request);
         Ok(self.responses.clone())
     }
 
     async fn stream_with_cancellation(
         &self,
-        _request: MessageRequest,
+        request: MessageRequest,
         _cancel_flag: &AtomicBool,
     ) -> crate::Result<Vec<AssistantEvent>> {
+        self.requests.lock().unwrap().push(request);
         Ok(self.responses.clone())
     }
 
@@ -119,6 +123,87 @@ fn make_mock_tool_registry() -> ToolRegistry {
 
 fn make_mock_llm() -> Arc<dyn ApiClient> {
     Arc::new(MockApiClient::text("Hello from mock"))
+}
+
+/** 复用同一会话时，视觉开关必须按精确 provider 绑定影响实际发出的图片消息。 */
+#[tokio::test]
+async fn reused_runtime_refreshes_vision_before_serializing_images() {
+    let dir = std::env::temp_dir().join(format!("nuphus-视觉-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("providers.toml");
+    let write_config = |supports_vision: bool| {
+        let config = format!(
+            r#"model = "shared-model"
+[[providers]]
+name = "other-account"
+provider_type = "custom"
+api_key = "test-only"
+base_url = "https://example.invalid/v1"
+[[providers.models]]
+id = "shared-model"
+supports_vision = true
+[[providers]]
+name = "selected-account"
+provider_type = "custom"
+api_key = "test-only"
+base_url = "https://example.invalid/v1"
+[[providers.models]]
+id = "shared-model"
+supports_vision = {supports_vision}
+"#
+        );
+        std::fs::write(&path, config).unwrap();
+    };
+    write_config(false);
+    let llm = Arc::new(MockApiClient::text("已收到"));
+    let mut runtime = RuntimeBuilder::new()
+        .llm(llm.clone())
+        .tools(make_mock_tool_registry())
+        .config(RuntimeConfig {
+            agent_config: crate::agent::AgentConfig {
+                model: "shared-model".into(),
+                provider: "selected-account".into(),
+                enable_memory: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .client_factory(crate::llm::ClientFactory::live_at(&path))
+        .build()
+        .unwrap();
+    let session_id = runtime.session().id.clone();
+    let image = "data:image/png;base64,test-fixture";
+    let cancel = AtomicBool::new(false);
+    for enabled in [false, true, false] {
+        write_config(enabled);
+        let output = runtime
+            .run("识别图片", &Some(vec![image.into()]), &cancel)
+            .await
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(runtime.session().id, session_id);
+        assert_eq!(runtime.agent().config().supports_vision, enabled);
+        assert_eq!(
+            runtime.agent().config().vision_model.as_deref(),
+            enabled.then_some("shared-model")
+        );
+        let requests = llm.requests.lock().unwrap();
+        let request = requests.last().expect("模型必须收到请求");
+        assert!(request
+            .merged_system
+            .as_ref()
+            .unwrap()
+            .contains(&format!("supports_vision: {enabled}")));
+        let has_image = request.messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block["type"] == "image_url" && block["image_url"]["url"] == image)
+            })
+        });
+        assert_eq!(has_image, enabled, "图片必须跟随当前账号的视觉开关");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

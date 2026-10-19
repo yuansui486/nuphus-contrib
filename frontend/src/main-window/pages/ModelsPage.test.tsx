@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { listen } from '@tauri-apps/api/event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -30,6 +30,7 @@ vi.mock('../lib/api', () => ({
   switchModel: vi.fn(),
   getSupportedProviders: vi.fn(),
   getCapabilities: vi.fn(),
+  getVisionResolution: vi.fn(),
   setCapability: vi.fn(),
   listModels: vi.fn(),
   listProviderModels: vi.fn(),
@@ -41,6 +42,7 @@ vi.mock('../lib/api', () => ({
   getProviderContext: vi.fn(),
   setAgentModel: vi.fn(),
   setModelContextWindow: vi.fn(),
+  setModelTransport: vi.fn(),
   setModelSupportsVision: vi.fn(),
   setModelSupportsImageGeneration: vi.fn(),
   setCapabilityBinding: vi.fn(),
@@ -88,8 +90,11 @@ import {
   getCurrentConfig,
   getProviderBaseUrl,
   getProviderContext,
+  getVisionResolution,
   listModels,
   refreshProviderModels,
+  setModelSupportsVision,
+  setModelTransport,
   sttStatus,
 } from '../lib/api'
 
@@ -118,6 +123,15 @@ function provider(over: Partial<ProviderInfoStub> & { id: string }): ProviderInf
 
 let providerList: ProviderInfoStub[] = []
 
+/**
+ * 左栏（aside.models-rail）内查询：热门模型 chip 里也有 DeepSeek 等品牌名，
+ * 「按名称查按钮」会同时命中左栏服务商条目与 chip。左栏条目一律限定范围查找，
+ * 断言意图不变（仍然点的是左栏那个服务商）。
+ */
+function withinRail() {
+  return within(document.querySelector('.models-rail') as HTMLElement)
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(listProviderModels).mockReset()
@@ -144,6 +158,15 @@ beforeEach(() => {
     tts: '',
     voice: '',
     chat_agent_max_iterations: null,
+  } as never)
+  // 图像理解生效路径（后端权威）：组件挂载即拉取，必须给 resolved 值。
+  // mock 里缺这个导出时，报错发生在**属性访问**阶段（不是 Promise 拒绝），
+  // 组件内 .catch(() => {}) 拦不住 → 整个 ModelsPage 渲染崩，该文件全挂。
+  vi.mocked(getVisionResolution).mockResolvedValue({
+    strategy: 'none',
+    model: '',
+    provider: '',
+    leader_model: '',
   } as never)
   vi.mocked(getAgentModels).mockResolvedValue({
     leader: '',
@@ -522,7 +545,7 @@ describe('ModelsPage 自定义模型（Custom 配置入口 → 创建具名实�
     )
 
     // 官方 provider 页不回归：只读名称 + 原有密钥栏，无自定义四字段表单
-    fireEvent.click(screen.getByRole('button', { name: /DeepSeek/ }))
+    fireEvent.click(withinRail().getByRole('button', { name: /DeepSeek/ }))
     await waitFor(() => expect(screen.queryByLabelText('自定义名称')).not.toBeInTheDocument())
     expect(container.querySelector('.models-provider-current-name')?.textContent).toBe('DeepSeek')
     expect(screen.getByLabelText('API 密钥')).toBeInTheDocument()
@@ -537,12 +560,12 @@ describe('ModelsPage 自定义模型（Custom 配置入口 → 创建具名实�
   it('本地模型独立成组，不出现在云端「模型提供商」列表里', async () => {
     providerList = [
       provider({ id: 'deepseek', name: 'DeepSeek', base_url: 'https://api.deepseek.com' }),
-      provider({ id: 'opencode-go', name: 'Opencode GO 套餐', base_url: 'https://go.example/v1' }),
+      provider({ id: 'opencode-go', name: 'OpenCode Go', base_url: 'https://go.example/v1' }),
       provider({ id: 'local', name: 'Local', base_url: 'http://localhost:11434/v1' }),
     ]
 
     const { container } = render(<ModelsPage onClose={() => {}} />)
-    await screen.findByRole('button', { name: /DeepSeek/ })
+    await withinRail().findByRole('button', { name: /DeepSeek/ })
 
     const groups = [...container.querySelectorAll('.models-rail-group')].map(g => ({
       title: g.querySelector('.models-rail-group-title')?.textContent?.trim() ?? '',
@@ -561,7 +584,7 @@ describe('ModelsPage 自定义模型（Custom 配置入口 → 创建具名实�
     expect(cloud).toBeDefined()
     expect(cloud?.items.some(i => /local/i.test(i))).toBe(false)
     // 远程网关（Opencode GO）仍属模型提供商
-    expect(cloud?.items).toContain('Opencode GO 套餐')
+    expect(cloud?.items).toContain('OpenCode Go')
   })
 
   // ════════════════════════════════════════════════════════════════
@@ -878,7 +901,12 @@ describe('ModelsPage 连接反馈与快速切换', () => {
     fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
     await screen.findByText('model-two')
   }
-  const row = (name: string) => screen.getByText(name).closest('[role="button"]') as HTMLElement
+  const card = (name: string) => screen.getByTestId(`model-card-${name}`)
+  // 卡片不再是可点行：切换的唯一入口是底行「启用」按钮（真实 button，原生支持
+  // Enter/Space）。整卡点击切换已移除——切换会写盘+插系统消息+付费探测，
+  // 误触成本高，显式按钮比扫读误触安全。
+  const useBtn = (name: string) =>
+    within(card(name)).getByRole('button', { name: /^(切换|使用中|切换中…)$/ })
 
   it('连接成功明确提示数量，并在修改参数后清除过时提示', async () => {
     await openModels()
@@ -906,7 +934,7 @@ describe('ModelsPage 连接反馈与快速切换', () => {
     const pending = deferred<ReturnType<typeof brief>[]>()
     vi.mocked(listProviderModels).mockReturnValue(pending.promise)
     fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
-    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek' }))
+    fireEvent.click(withinRail().getByRole('button', { name: 'DeepSeek' }))
     await act(async () => pending.resolve([brief('stale-model')]))
     expect(screen.queryByText('stale-model')).not.toBeInTheDocument()
     expect(screen.queryByText(/已获取到/)).not.toBeInTheDocument()
@@ -918,29 +946,31 @@ describe('ModelsPage 连接反馈与快速切换', () => {
     await detect()
     const pending = deferred<string>()
     vi.mocked(switchModel).mockReturnValue(pending.promise)
-    fireEvent.click(row('model-two'))
+    fireEvent.click(useBtn('model-two'))
     expect(screen.getByText('正在切换到 model-two…')).toBeInTheDocument()
-    expect(row('model-two')).toHaveAttribute('aria-busy', 'true')
-    expect(row('model-two')).not.toHaveClass('active')
-    fireEvent.click(row('model-one'))
+    expect(card('model-two')).toHaveAttribute('aria-busy', 'true')
+    expect(useBtn('model-two')).toBeDisabled()
+    expect(card('model-two')).not.toHaveClass('is-active')
+    fireEvent.click(useBtn('model-one'))
     expect(switchModel).toHaveBeenCalledTimes(1)
     await act(async () => pending.resolve('ok'))
-    expect(row('model-two')).toHaveClass('active')
+    expect(card('model-two')).toHaveClass('is-active')
+    expect(useBtn('model-two')).toHaveTextContent('使用中')
     expect(screen.getByText('已切换到 model-two')).toBeInTheDocument()
     expect(onChanged).toHaveBeenCalledTimes(1)
   })
 
-  it('切换失败保留原选择，支持 Enter 和空格切换', async () => {
+  it('切换失败保留原选择（启用按钮为原生 button，键盘可用）', async () => {
     await openModels()
     await detect()
     vi.mocked(switchModel).mockResolvedValueOnce('ok')
-    fireEvent.keyDown(row('model-one'), { key: 'Enter' })
-    await waitFor(() => expect(row('model-one')).toHaveClass('active'))
+    fireEvent.click(useBtn('model-one'))
+    await waitFor(() => expect(card('model-one')).toHaveClass('is-active'))
     vi.mocked(switchModel).mockRejectedValueOnce(new Error('保存失败'))
-    fireEvent.keyDown(row('model-two'), { key: ' ' })
+    fireEvent.click(useBtn('model-two'))
     await screen.findByText('保存失败')
-    expect(row('model-one')).toHaveClass('active')
-    expect(row('model-two')).not.toHaveClass('active')
+    expect(card('model-one')).toHaveClass('is-active')
+    expect(card('model-two')).not.toHaveClass('is-active')
   })
 
   it('输入密钥时复用 configureLlm，重复选择仍可保存修改后的连接参数', async () => {
@@ -948,12 +978,12 @@ describe('ModelsPage 连接反馈与快速切换', () => {
     await detect()
     vi.mocked(configureLlm).mockResolvedValue('ok')
     fireEvent.change(screen.getByLabelText('模型 API Key'), { target: { value: 'test-key' } })
-    fireEvent.click(row('model-two'))
-    await waitFor(() => expect(row('model-two')).toHaveClass('active'))
+    fireEvent.click(useBtn('model-two'))
+    await waitFor(() => expect(card('model-two')).toHaveClass('is-active'))
     fireEvent.change(screen.getByLabelText('模型 API URL'), {
       target: { value: 'https://new.example/v1' },
     })
-    fireEvent.click(row('model-two'))
+    fireEvent.click(useBtn('model-two'))
     await waitFor(() => expect(configureLlm).toHaveBeenCalledTimes(2))
     expect(configureLlm).toHaveBeenLastCalledWith(
       'test-key',
@@ -979,4 +1009,274 @@ describe('ModelsPage 连接反馈与快速切换', () => {
     unmount()
     expect(unlistenMock).toHaveBeenCalled()
   })
+})
+
+// ── 卡片化模型列表：收藏 / 能力 chip / 排序 ────────────────────────────────
+describe('ModelsPage 模型卡片（收藏 / 能力 / 排序）', () => {
+  const brief = (id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    supports_streaming: true,
+    supports_vision: false,
+    supports_audio: false,
+    supports_image_generation: false,
+    ...over,
+  })
+  async function openModels() {
+    localStorage.clear()
+    providerList.push(
+      provider({
+        id: 'custom-fast',
+        name: '快速中转站',
+        display_name: '快速中转站',
+        provider_type: 'custom',
+        base_url: 'https://relay.example/v1',
+      }),
+    )
+    render(<ModelsPage onClose={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: '快速中转站' }))
+  }
+  async function detect(ids: Array<Record<string, unknown>>) {
+    vi.mocked(listProviderModels).mockResolvedValue(ids as never)
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    // 等连接结果真正落成卡片（mock resolve 是异步的），否则后续断言抢跑
+    await waitFor(() =>
+      expect(document.querySelectorAll('.model-card-grid > .model-card')).toHaveLength(ids.length),
+    )
+  }
+  const card = (name: string) => screen.getByTestId(`model-card-${name}`)
+  const gridOrder = () =>
+    [...document.querySelectorAll('.model-card-grid > .model-card')].map(
+      el => el.querySelector('.model-card-name')?.textContent ?? '',
+    )
+  const useBtn = (name: string) =>
+    within(card(name)).getByRole('button', { name: /^(切换|使用中|切换中…)$/ })
+
+  it('点收藏星形只写本地偏好，不调用任何 IPC', async () => {
+    await openModels()
+    await detect([brief('model-one')])
+    fireEvent.click(within(card('model-one')).getByRole('button', { name: /收藏/ }))
+    expect(JSON.parse(localStorage.getItem('nuphus_favorite_models') || '{}')).toEqual({
+      'custom-fast': ['model-one'],
+    })
+    expect(within(card('model-one')).getByRole('button', { name: /收藏/ })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    expect(setModelSupportsVision).not.toHaveBeenCalled()
+    expect(switchModel).not.toHaveBeenCalled()
+  })
+
+  it('列表排序：收藏 > 用过 > 未使用（「用过」= 最近切换痕迹，非当前模型）', async () => {
+    await openModels()
+    await detect([brief('a'), brief('b'), brief('c'), brief('d')])
+    expect(gridOrder()).toEqual(['a', 'b', 'c', 'd'])
+    // 切到 b：b 进入「用过」，置顶
+    vi.mocked(switchModel).mockResolvedValue('ok')
+    fireEvent.click(useBtn('b'))
+    await waitFor(() => expect(card('b')).toHaveClass('is-active'))
+    await waitFor(() => expect(gridOrder()).toEqual(['b', 'a', 'c', 'd']))
+    // 收藏 d：d 置顶，b（用过）次之，其余原序
+    fireEvent.click(within(card('d')).getByRole('button', { name: /收藏/ }))
+    await waitFor(() => expect(gridOrder()).toEqual(['d', 'b', 'a', 'c']))
+  })
+
+  it('能力 chip：可切换项是按钮（点了写后端），只读项是纯文本', async () => {
+    vi.mocked(listModels).mockResolvedValue([
+      {
+        id: 'm1',
+        provider: 'custom-fast',
+        alias: [],
+        supports_streaming: true,
+        supports_vision: false,
+        supports_audio: false,
+        supports_image_generation: false,
+        reasoning_efforts: ['low', 'high', 'max'],
+      },
+    ] as never)
+    await openModels()
+    await detect([brief('m1', { supports_vision: false })])
+    // 等 list_models 的 ModelInfo 合入后，推理 chip 出现且为只读（span，不是 button）
+    const reasoningLabel = await within(card('m1')).findByText('文本推理')
+    const reasoningChip = reasoningLabel.closest('.cap-chip') as HTMLElement
+    expect(reasoningLabel.closest('button')).toBeNull()
+    expect(reasoningChip).toHaveClass('is-on')
+    expect(reasoningChip.querySelector('.cap-chip-detail')).toHaveTextContent('3 档')
+    // 视觉 chip 可点击：写入 set_model_supports_vision(true)
+    fireEvent.click(within(card('m1')).getByRole('button', { name: /图像理解/ }))
+    await waitFor(() =>
+      expect(setModelSupportsVision).toHaveBeenCalledWith('custom-fast', 'm1', true),
+    )
+  })
+
+  it('「使用中」全局唯一：同 id 模型跨 provider 时只标生效归属那一张卡', async () => {
+    // 当前生效模型 = (deepseek, dup-model)；二中转也有一个同名 dup-model。
+    // 「使用中」一个模型一个 provider，没有第二个——同 id 不得让两张卡同时点亮。
+    vi.mocked(getCurrentConfig).mockResolvedValue({
+      model: 'dup-model',
+      provider: 'deepseek',
+      base_url: '',
+      has_key: true,
+      configured_providers: ['deepseek'],
+    } as never)
+    providerList.push(
+      provider({
+        id: 'custom-two',
+        name: '二中转',
+        display_name: '二中转',
+        provider_type: 'custom',
+        base_url: 'https://relay2.example/v1',
+      }),
+    )
+    vi.mocked(listProviderModels).mockImplementation(
+      async () =>
+        [
+          {
+            id: 'dup-model',
+            supports_streaming: true,
+            supports_vision: false,
+            supports_audio: false,
+            supports_image_generation: false,
+          },
+        ] as never,
+    )
+    // deepseek 是非 custom 的已配置 provider：进页自动同步走 refresh_provider_models
+    vi.mocked(refreshProviderModels).mockResolvedValue({
+      models: [
+        {
+          id: 'dup-model',
+          supports_streaming: true,
+          supports_vision: false,
+          supports_audio: false,
+          supports_image_generation: false,
+        },
+      ],
+      report: null,
+    } as never)
+    render(<ModelsPage onClose={() => {}} />)
+    // deepseek 段：生效归属那张卡 = 使用中
+    fireEvent.click(await withinRail().findByRole('button', { name: /DeepSeek/ }))
+    await waitFor(() =>
+      expect(document.querySelectorAll('.model-card-grid > .model-card')).toHaveLength(1),
+    )
+    expect(card('dup-model')).toHaveClass('is-active')
+    expect(within(card('dup-model')).getByRole('button', { name: '使用中' })).toBeInTheDocument()
+    // 切到二中转段：同 id 卡片不得点亮（生效归属是 deepseek，不是它）。
+    // custom 段不自动同步（设计如此），走「连接测试」拿列表。
+    fireEvent.click(screen.getByRole('button', { name: '二中转' }))
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    await waitFor(() =>
+      expect(document.querySelectorAll('.model-card-grid > .model-card')).toHaveLength(1),
+    )
+    expect(card('dup-model')).not.toHaveClass('is-active')
+    expect(within(card('dup-model')).getByRole('button', { name: '切换' })).toBeInTheDocument()
+  })
+
+  it('模型卡片网格不设内滚动（页面宿主自己滚，避免双滚动条）', async () => {
+    await openModels()
+    await detect([brief('a'), brief('b')])
+    const grid = document.querySelector('.model-card-grid') as HTMLElement
+    expect(grid.getAttribute('style')).toBeNull()
+  })
+})
+
+// ── 热门模型快捷 chip：点击 = 填筛选框，复用同一套筛选路径 ──────────────────
+describe('ModelsPage 热门模型快捷 chip', () => {
+  const brief = (id: string) => ({
+    id,
+    supports_streaming: true,
+    supports_vision: false,
+    supports_audio: false,
+    supports_image_generation: false,
+  })
+  const IDS = ['gpt-4o', 'gpt-5', 'deepseek-chat', 'claude-opus-4-20250514']
+
+  async function openModels() {
+    localStorage.clear()
+    providerList.push(
+      provider({
+        id: 'custom-fast',
+        name: '快速中转站',
+        display_name: '快速中转站',
+        provider_type: 'custom',
+        base_url: 'https://relay.example/v1',
+      }),
+    )
+    render(<ModelsPage onClose={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: '快速中转站' }))
+  }
+  async function detect() {
+    vi.mocked(listProviderModels).mockResolvedValue(IDS.map(brief) as never)
+    fireEvent.click(screen.getByRole('button', { name: '连接测试' }))
+    await waitFor(() =>
+      expect(document.querySelectorAll('.model-card-grid > .model-card')).toHaveLength(IDS.length),
+    )
+  }
+  const gridOrder = () =>
+    [...document.querySelectorAll('.model-card-grid > .model-card')].map(
+      el => el.querySelector('.model-card-name')?.textContent ?? '',
+    )
+  const filterBox = () => screen.getByPlaceholderText('筛选模型…')
+  // chip 与左栏服务商按钮可能同名（如 DeepSeek），故限定在热门区内取
+  const chip = (label: string) =>
+    within(document.querySelector('.models-hot-row') as HTMLElement).getByRole('button', {
+      name: label,
+    })
+
+  it('点 chip：片段填进筛选框、列表只剩命中模型、该 chip 点亮', async () => {
+    await openModels()
+    await detect()
+    fireEvent.click(chip('GPT'))
+    expect(filterBox()).toHaveValue('gpt')
+    await waitFor(() => expect(gridOrder()).toEqual(['gpt-4o', 'gpt-5']))
+    expect(chip('GPT')).toHaveClass('is-active')
+    expect(chip('DeepSeek')).not.toHaveClass('is-active')
+  })
+
+  it('手输两个关键词（空格分隔）：任一命中即显示（OR）', async () => {
+    await openModels()
+    await detect()
+    fireEvent.change(filterBox(), { target: { value: 'gpt claude' } })
+    await waitFor(() => expect(gridOrder()).toEqual(['gpt-4o', 'gpt-5', 'claude-opus-4-20250514']))
+    // 手输内容不等于任何 chip 的片段串 → 没有 chip 处于选中态
+    expect(document.querySelectorAll('.models-hot-chip.is-active')).toHaveLength(0)
+  })
+
+  it('单关键词行为不变：大小写无关 + 首尾与多余空格容错', async () => {
+    await openModels()
+    await detect()
+    fireEvent.change(filterBox(), { target: { value: '  GPT-5  ' } })
+    await waitFor(() => expect(gridOrder()).toEqual(['gpt-5']))
+  })
+
+  it('无命中时空态仍回显原始输入', async () => {
+    await openModels()
+    await detect()
+    fireEvent.change(filterBox(), { target: { value: 'zzz' } })
+    // 空态文案把原始输入原样回显（.models-empty 是页内共用类，按文字定位避免误命中）
+    await waitFor(() => expect(screen.getByText(/zzz/)).toBeInTheDocument())
+  })
+})
+
+it('模型协议写入精确服务商并可恢复默认', async () => {
+  vi.mocked(listModels).mockResolvedValue([
+    {
+      id: 'test-model',
+      provider: 'deepseek',
+      transport: 'responses',
+      alias: [],
+      reasoning_efforts: [],
+    },
+  ] as never)
+  vi.mocked(listProviderModels).mockResolvedValue(['test-model'] as never)
+  render(<ModelsPage onClose={() => {}} />)
+  const select = await screen.findByRole('combobox', { name: 'test-model 协议' })
+  expect(select).toHaveValue('responses')
+  fireEvent.change(select, { target: { value: 'anthropic' } })
+  await waitFor(() =>
+    expect(setModelTransport).toHaveBeenCalledWith('deepseek', 'test-model', 'anthropic'),
+  )
+  fireEvent.change(select, { target: { value: '' } })
+  await waitFor(() =>
+    expect(setModelTransport).toHaveBeenCalledWith('deepseek', 'test-model', null),
+  )
 })

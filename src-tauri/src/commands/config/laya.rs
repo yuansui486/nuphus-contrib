@@ -135,12 +135,12 @@ fn update_laya_table(
     Ok(load_laya(state)?.status())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_laya_config(state: State<'_, AppState>) -> Result<LayaConfigStatus, String> {
     Ok(load_laya(&state)?.status())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_laya_config(
     state: State<'_, AppState>,
     base_url: String,
@@ -173,7 +173,7 @@ pub fn save_laya_config(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_laya_api_key(state: State<'_, AppState>) -> Result<(), String> {
     update_laya_table(&state, Some(""), None, None, None, None, None, None)?;
     Ok(())

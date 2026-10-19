@@ -186,7 +186,7 @@ describe('AppearancePanel 外观浮窗', () => {
     expect(cards.map(c => c.querySelector('.apnp-preset-name')?.textContent)).toEqual([
       '深邃蓝黑',
       '简白',
-      '深渊冷光',
+      '晨雾清新',
     ])
     // active 唯一且落在当前基底上
     const active = cards.filter(c => c.classList.contains('active'))
@@ -208,7 +208,7 @@ describe('AppearancePanel 外观浮窗', () => {
     expect(cards[2].classList.contains('active')).toBe(true)
     expect(cards[2].querySelector('.apnp-preset-check')).toBeInTheDocument()
     // 基底落盘（全局链路不被浮窗化改变）
-    expect(localStorage.getItem('nuphus_theme')).toBe('tech')
+    expect(localStorage.getItem('nuphus_theme')).toBe('fresh')
   })
 
   it('挂着自定义主题时点预设卡：背景同步离开主题快照（回到系统预设态）', async () => {
@@ -724,8 +724,8 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
   },
   light: {
     '--accent': '#111111',
-    '--surface-0': '#e8e8ea',
-    '--surface-1': '#f4f4f6',
+    '--surface-0': '#ffffff',
+    '--surface-1': '#f7f7f8',
     '--fg-1': '#1a1a1a',
     '--fg-2': '#444444',
     '--msg-user-bg': '#f0f0f2',
@@ -735,18 +735,18 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
     '--modal-bg': 'rgba(251, 251, 252, 0.75)',
     '--skin-bg-opacity': '0.4',
   },
-  tech: {
-    '--accent': '#7c6ff7',
-    '--surface-0': '#020408',
-    '--surface-1': '#060810',
-    '--fg-1': '#eeeff4',
-    '--fg-2': '#c4c8d4',
-    '--msg-user-bg': '#0c1020',
-    '--msg-assistant-bg': '#060810',
-    '--input-bg': '#080a14',
-    '--panel-bg': 'rgba(6, 8, 16, 0.95)',
-    '--modal-bg': 'rgba(6, 8, 16, 0.85)',
-    '--skin-bg-opacity': '0.3',
+  fresh: {
+    '--accent': '#0b7a52',
+    '--surface-0': '#edf5f0',
+    '--surface-1': '#ffffff',
+    '--fg-1': '#12251b',
+    '--fg-2': '#37503f',
+    '--msg-user-bg': '#d9f0e2',
+    '--msg-assistant-bg': '#ffffff',
+    '--input-bg': '#ffffff',
+    '--panel-bg': 'rgba(255, 255, 255, 0.97)',
+    '--modal-bg': 'rgba(255, 255, 255, 0.95)',
+    '--skin-bg-opacity': '0.35',
   },
 }
 
@@ -757,12 +757,12 @@ const EXPECTED: Record<string, { colors: string[]; sliders: number[] }> = {
     sliders: [100, 100, 90, 80, 35],
   },
   light: {
-    colors: ['#111111', '#e8e8ea', '#f4f4f6', '#1a1a1a', '#444444'],
+    colors: ['#111111', '#ffffff', '#f7f7f8', '#1a1a1a', '#444444'],
     sliders: [100, 100, 85, 75, 40],
   },
-  tech: {
-    colors: ['#7c6ff7', '#020408', '#060810', '#eeeff4', '#c4c8d4'],
-    sliders: [100, 100, 95, 85, 30],
+  fresh: {
+    colors: ['#0b7a52', '#edf5f0', '#ffffff', '#12251b', '#37503f'],
+    sliders: [100, 100, 97, 95, 35],
   },
 }
 
@@ -776,7 +776,7 @@ const opacitySliderValues = (r: RenderResult): number[] =>
     Number(el.value),
   )
 
-/** 切到指定系统预设卡（index 0=dark 1=light 2=tech） */
+/** 切到指定系统预设卡（index 0=dark 1=light 2=fresh） */
 async function switchPreset(r: RenderResult, index: number) {
   await act(async () => {
     fireEvent.click(presetCards(r)[index])
@@ -810,7 +810,7 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     vi.unstubAllGlobals()
   })
 
-  it('dark → 简白 → dark → tech：颜色区与滑块每步都等于当前主题的生效值', async () => {
+  it('dark → 简白 → dark → 清新：颜色区与滑块每步都等于当前主题的生效值', async () => {
     const view = await renderPanel()
 
     // 初始（dark）
@@ -825,9 +825,9 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     expect(colorTokenValues(view)).toEqual(EXPECTED.dark.colors)
     expect(opacitySliderValues(view)).toEqual(EXPECTED.dark.sliders)
 
-    await switchPreset(view, 2) // → tech（第三主题同样立即跟随）
-    expect(colorTokenValues(view)).toEqual(EXPECTED.tech.colors)
-    expect(opacitySliderValues(view)).toEqual(EXPECTED.tech.sliders)
+    await switchPreset(view, 2) // → 清新（第三主题同样立即跟随）
+    expect(colorTokenValues(view)).toEqual(EXPECTED.fresh.colors)
+    expect(opacitySliderValues(view)).toEqual(EXPECTED.fresh.sliders)
   })
 
   it('纯净预设态：切系统主题不产生预览草稿（无「放弃修改」、无内联覆盖残留）', async () => {
@@ -840,7 +840,7 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     for (const key of OPACITY_COLOR_KEYS) {
       expect(document.documentElement.style.getPropertyValue(key)).toBe('')
     }
-    expect(document.documentElement.getAttribute('data-theme')).toBe('tech')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('fresh')
   })
 
   it('拖过气泡滑块后切系统主题：按新基底 computed α 重解析，不停在拖动值', async () => {
@@ -859,9 +859,9 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
     expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe('')
 
-    // 再切 tech 仍跟随（持久 dirty 意图 ≠ 覆盖可跨主题残留）
+    // 再切清新仍跟随（持久 dirty 意图 ≠ 覆盖可跨主题残留）
     await switchPreset(view, 2)
-    expect(opacitySliderValues(view)).toEqual(EXPECTED.tech.sliders)
+    expect(opacitySliderValues(view)).toEqual(EXPECTED.fresh.sliders)
   })
 
   it('已保存自定义主题激活态：自身 overrides 优先；切系统预设卡后回落基底', async () => {
@@ -894,7 +894,7 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
           base: 'dark',
           overrides: { '--msg-user-bg': 'rgba(21, 34, 56, 0.6)' },
         },
-        { id: 'ct-dst', name: '目标', base: 'light', overrides: { '--surface-0': '#e8e8ea' } },
+        { id: 'ct-dst', name: '目标', base: 'light', overrides: { '--surface-0': '#ffffff' } },
       ]),
     )
     localStorage.setItem('nuphus_custom_active', 'ct-src')

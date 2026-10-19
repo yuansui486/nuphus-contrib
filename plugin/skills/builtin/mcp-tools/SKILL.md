@@ -39,9 +39,30 @@ servers.yaml 配置了新 server 但不确定其工具签名时，运行时自�
 
 ## 已配置的 Server
 
-以下列表来自 `plugin/mcp/servers.yaml`。配置变更后需同步更新本文档。
+以下列表来自实际合并后的配置（`plugin/mcp/servers.yaml` + 本机私有覆盖）。配置变更后需同步更新本文档。
 
-**当前无已配置的 server**。按需在 `servers.yaml` 的 `servers:` 下添加条目，格式见该文件头部注释。
+**两层配置（合并读取，同名时本机层覆盖通用层）**：
+
+| 层 | 路径 | 用途 | 是否入库 |
+|---|---|---|---|
+| 通用层 | `plugin/mcp/servers.yaml` | 随仓基础配置，可随发布版携带 | 是 |
+| 本机层 | `<数据目录>/mcp/servers.local.yaml` | 仅本机可用的 server（本机路径/私有端点/个人工具） | **否** |
+
+`<数据目录>` 即 `crate::utils::nuphus_data_dir()`：Windows 为 `%APPDATA%\.nuphus`，
+macOS 为 `~/Library/Application Support/.nuphus`，Linux 为 `~/.local/share/.nuphus`。
+
+**本机私有配置格式**（与通用层完全一致）：
+
+```yaml
+servers:
+  <server-key>:
+    command: "npx"
+    args: ["-y", "<package>", "mcp"]
+    timeout_ms: 120000
+    auto_start: false
+```
+
+当前本机已配置的 server 以运行时实际合并结果为准（`list_mcp_servers` 可查）。
 
 ## 常用 Server 速查
 

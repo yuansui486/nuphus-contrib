@@ -215,7 +215,7 @@ pub struct SttStatusResult {
     pub cloud_configured: bool,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stt_status(state: State<'_, AppState>) -> SttStatusResult {
     let phase = lock_session(&state.speech.session)
         .map(|s| s.phase.as_str())
@@ -248,7 +248,7 @@ pub fn stt_status(state: State<'_, AppState>) -> SttStatusResult {
 
 // ── Session control ───────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stt_start(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     // Availability gate first — cheap filesystem + device probes.
     // Cloud-first routing: capabilities.stt resolvable → cloud engine (local
@@ -283,7 +283,7 @@ pub fn stt_start(app: AppHandle, state: State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stt_stop(state: State<'_, AppState>) -> Result<(), String> {
     let mut slot = lock_session(&state.speech.session)?;
     match slot.phase {
@@ -299,7 +299,7 @@ pub fn stt_stop(state: State<'_, AppState>) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stt_cancel(state: State<'_, AppState>) -> Result<(), String> {
     let slot = lock_session(&state.speech.session)?;
     if let Some(cancel) = &slot.cancel {

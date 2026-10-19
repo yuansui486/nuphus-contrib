@@ -91,6 +91,14 @@ describe('.app-shell 两行 grid —— 行放置必须结构性可靠', () => {
     const block = shellCss.slice(shellCss.indexOf('.app-shell'))
     expect(block).not.toMatch(/grid-(row|column|area)\s*:[^;]*!important/)
   })
+
+  it('通配行放置规则不得携带 z-index（2026-10-14 层叠事故回归）', () => {
+    // .app-shell > * 的 z-index:1 会按源码顺序覆盖后载入样式表（chat.css）里
+    // 同特异性选择器的显式 z-index——ExecutionTraceFloating（z-index:200，
+    // .app-shell 直接子级）被拍平到 1，portal 到 body 的弹窗反而盖在其上。
+    const rule = /\.app-shell\s*>\s*\*\s*\{([^}]*)\}/.exec(shellCss)?.[1] ?? ''
+    expect(rule).not.toMatch(/z-index/)
+  })
 })
 
 describe('不得给推测出的类名补行放置规则（.mobile-notice 死代码回归）', () => {

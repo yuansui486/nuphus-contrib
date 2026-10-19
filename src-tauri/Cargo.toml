@@ -1,6 +1,6 @@
 [package]
 name = "nuphus-desktop"
-version = "0.2.26"
+version = "0.2.30"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/mrpulor-gh/nuphus"
@@ -106,21 +106,23 @@ sha2 = "0.10"
 # Existing dependency graph already uses ring; protect Workbench schedule inputs on Unix.
 ring = "0.17"
 
-tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+# unstable：浏览器壳+子 webview 架构需要 WindowBuilder / WebviewBuilder / add_child
+# （tauri 2.x 这几项均在 unstable 之后；Manager::get_window/windows/get_webview 同理）。
+# 版本已锁 2.11.5（Cargo.lock），API 面漂移风险可控。见 docs/browser-shell-arch.md。
+tauri = { version = "2", features = ["tray-icon", "protocol-asset", "unstable"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2.11.0"
 tauri-plugin-process = "2.3.1"
 
-# Windows API（emitter.rs 置前不抢焦点：SetWindowPos + SWP_NOACTIVATE；
-# canvas_export.rs 读 User Shell Folders 的 Downloads 值：RegGetValueW）
+# Windows API（emitter.rs 置前不抢焦点：SetWindowPos + SWP_NOACTIVATE）
 # 用 windows-sys 而非 windows crate——tauri 内部依赖 windows-sys，
 # 避免 windows_core 多版本导致 Param trait 类型冲突。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Registry",
+    "Win32_UI_Shell",
     # 无边框窗口的 Win11 系统圆角（DwmSetWindowAttribute + CORNER_PREFERENCE）
     "Win32_Graphics_Dwm",
     # ── 以下为截图新链路（commands/capture/）所需，见 docs/capture-refactor-plan.md ──

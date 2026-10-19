@@ -25,6 +25,14 @@ fn input_not_sent(error: impl std::fmt::Display) -> crate::NuphusError {
     ))
 }
 
+/// 两帧 RGB 数据是否画面一致。
+///
+/// 逐字节精确比对：等待类场景不做容差（容差会让「几乎没变」被判成变化，
+/// 产生假阳性提前返回）。长度不同 = 区域尺寸变了 = 视为不一致。
+fn frames_identical(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
 // enigo 0.2: text/key/scroll 是 Keyboard/Mouse trait 方法，调用需 import（Linux/macOS）
 // Direction 用全路径 enigo::Direction（避免 unused import）
 #[cfg(not(windows))]
@@ -184,7 +192,7 @@ impl DesktopClient {
     }
 
     /// Mouse move — cross-platform (Win32 native / macOS enigo)
-    pub async fn mouse_move(&self, x: i32, y: i32, _duration: f64) -> Result<Value> {
+    pub async fn mouse_move(&self, x: i32, y: i32) -> Result<Value> {
         input::mouse::move_to(x, y).await?;
         Self::result_ok(
             serde_json::json!({ "status": "dispatched", "verified": false, "x": x, "y": y }),
@@ -926,7 +934,9 @@ impl DesktopClient {
                         let resp = serde_json::json!({ "text": text, "engine": "vision" });
                         Self::result_ok(resp)
                     }
-                    Err(e) => Self::result_err(format!("视觉模型调用失败: {e}")),
+                    // 单层化：vision_ocr 已产出结构化错误文案（含模型/provider/跟随态/
+                    // 分类出路），此处直接透传，不再叠加「视觉模型调用失败: 」前缀。
+                    Err(e) => Self::result_err(e),
                 }
             }
             _ => {
@@ -1399,45 +1409,120 @@ impl DesktopClient {
         Ok(serde_json::json!({"found": false, "x": 0, "y": 0, "confidence": 0.0}))
     }
 
-    /// Find color — search for specific color on screen
+    /// 把内存帧（RGBA）转换为 RGB 序列，供颜色查找函数消费。
+    fn frame_to_rgb(frame: &Frame) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(frame.pixels.len() / 4 * 3);
+        for px in frame.pixels.chunks_exact(4) {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        rgb
+    }
+
+    /// 区域值 → (x, y, w, h)；缺省或非法值按 (0,0,0,0)（=全图）处理
+    fn region_parts(region: Option<&Value>) -> (i32, i32, u32, u32) {
+        match region {
+            Some(r) => (
+                r.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                r.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                r.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                r.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            ),
+            None => (0, 0, 0, 0),
+        }
+    }
+
+    /// 按区域做内存截图（不落盘），返回 (帧, 原始区域)。
+    /// `region` 为 None 时截全屏；有值时仅截该区域（省内存与时间）。
+    async fn capture_region_frame(
+        &self,
+        region: Option<&Value>,
+    ) -> Result<(Frame, (i32, i32, u32, u32))> {
+        let (rx, ry, rw, rh) = Self::region_parts(region);
+        let scope = if rw > 0 && rh > 0 {
+            Scope::Element {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            }
+        } else {
+            Scope::Fullscreen
+        };
+        let dummy_target = Target::Tui {
+            hwnd: 0,
+            title: String::new(),
+        };
+        let frame = capture::capture(&dummy_target, scope).await?;
+        Ok((frame, (rx, ry, rw, rh)))
+    }
+
+    /// Find color — search for specific color on screen（内存帧，不落盘）
     pub async fn find_color(
         &self,
         color: &str,
         region: Option<Value>,
         direction: Option<&str>,
     ) -> Result<Value> {
-        let captures_dir = Self::captures_dir()?;
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-        let screenshot_path = captures_dir.join(format!("find_color_{}.png", timestamp));
-        let screenshot_path_str = screenshot_path.display().to_string();
-
-        let (region_x, region_y, region_w, region_h) = match region {
-            Some(r) => {
-                let x = r.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let y = r.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let w = r.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let h = r.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                (x, y, w, h)
-            }
-            None => (0, 0, 0, 0),
-        };
-
+        let (frame, (region_x, region_y, _, _)) =
+            self.capture_region_frame(region.as_ref()).await?;
+        let rgb = Self::frame_to_rgb(&frame);
+        // 帧本身即搜索范围（区域截图时已是区域内容，全屏时是整屏）
         let direction_val = direction.unwrap_or("left_top");
-
-        self.screenshot(Some(&screenshot_path_str), None).await?;
-
-        super::vision::find_color(
-            &screenshot_path_str,
+        let raw = super::vision::find_color(
+            &rgb,
+            frame.width,
+            frame.height,
             color,
-            region_x,
-            region_y,
-            region_w,
-            region_h,
+            0,
+            0,
+            0,
+            0,
             direction_val,
-        )
+        )?;
+        Ok(Self::rebase_region_coords(raw, region_x, region_y))
     }
 
-    /// Find multi-color — find color pattern
+    /// 区域截图命中的局部坐标 → 屏幕坐标（x/y 加区域原点；matches 逐条换算）。
+    /// 仅命中时换算——`found:false` 的占位坐标 (0,0) 不是命中点，不得偏移。
+    fn rebase_region_coords(mut value: Value, region_x: i32, region_y: i32) -> Value {
+        if region_x == 0 && region_y == 0 {
+            return value;
+        }
+        if value.get("found").and_then(|v| v.as_bool()) != Some(true) {
+            return value;
+        }
+        if let Some(obj) = value.as_object_mut() {
+            for key in ["x", "y"] {
+                if let Some(v) = obj.get(key).and_then(|v| v.as_i64()) {
+                    let shifted = if key == "x" {
+                        v + i64::from(region_x)
+                    } else {
+                        v + i64::from(region_y)
+                    };
+                    obj.insert(key.to_string(), serde_json::json!(shifted));
+                }
+            }
+            if let Some(matches) = obj.get_mut("matches").and_then(|m| m.as_array_mut()) {
+                for m in matches {
+                    if let Some(m_obj) = m.as_object_mut() {
+                        for key in ["x", "y"] {
+                            if let Some(v) = m_obj.get(key).and_then(|v| v.as_i64()) {
+                                let shifted = if key == "x" {
+                                    v + i64::from(region_x)
+                                } else {
+                                    v + i64::from(region_y)
+                                };
+                                m_obj.insert(key.to_string(), serde_json::json!(shifted));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        value
+    }
+
+    /// Find multi-color — find color pattern（内存帧，不落盘；区域截图）
     pub async fn find_multi_color(
         &self,
         anchor: &str,
@@ -1446,41 +1531,28 @@ impl DesktopClient {
         min_match_ratio: Option<f64>,
         direction: Option<&str>,
     ) -> Result<Value> {
-        let captures_dir = Self::captures_dir()?;
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-        let screenshot_path = captures_dir.join(format!("find_multi_color_{}.png", timestamp));
-        let screenshot_path_str = screenshot_path.display().to_string();
-
-        let (region_x, region_y, region_w, region_h) = match region {
-            Some(r) => {
-                let x = r.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let y = r.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let w = r.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let h = r.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                (x, y, w, h)
-            }
-            None => (0, 0, 0, 0),
-        };
-
+        let (frame, (region_x, region_y, _, _)) =
+            self.capture_region_frame(region.as_ref()).await?;
+        let rgb = Self::frame_to_rgb(&frame);
         let ratio = min_match_ratio.unwrap_or(0.9);
         let direction_val = direction.unwrap_or("left_top");
-
-        self.screenshot(Some(&screenshot_path_str), None).await?;
-
-        super::vision::find_multi_color(
-            &screenshot_path_str,
+        let raw = super::vision::find_multi_color(
+            &rgb,
+            frame.width,
+            frame.height,
             anchor,
             offsets,
             ratio,
-            region_x,
-            region_y,
-            region_w,
-            region_h,
+            0,
+            0,
+            0,
+            0,
             direction_val,
-        )
+        )?;
+        Ok(Self::rebase_region_coords(raw, region_x, region_y))
     }
 
-    /// Find text — dictionary-based sliding window text search
+    /// Find text — dictionary-based sliding window text search（内存帧，不落盘；区域截图）
     ///
     /// Supports multi-word combination search, separated by `|`, e.g. "系统|文件|统文"
     pub async fn find_text(
@@ -1490,35 +1562,14 @@ impl DesktopClient {
         region: Option<Value>,
         sim_threshold: Option<f32>,
     ) -> Result<Value> {
-        let captures_dir = Self::captures_dir()?;
-        std::fs::create_dir_all(&captures_dir)
-            .map_err(|e| crate::NuphusError::Tool(format!("创建截图目录失败: {e}")))?;
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
-        let screenshot_path = captures_dir.join(format!("find_text_{}.png", timestamp));
-        let screenshot_path_str = screenshot_path.display().to_string();
-
-        let (region_x, region_y, _region_w, _region_h) = match region.clone() {
-            Some(r) => {
-                let x = r.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let y = r.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                let w = r.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let h = r.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                (x, y, w, h)
-            }
-            None => (0, 0, 0, 0),
-        };
-
-        // Screenshot
-        self.screenshot(Some(&screenshot_path_str), region.clone())
-            .await?;
-
-        // Load screenshot
-        let (sw, sh, pixels) = super::vision::load_image_rgb(&screenshot_path_str)
-            .map_err(|e| crate::NuphusError::Tool(format!("读取截图失败: {e}")))?;
+        let (frame, (region_x, region_y, _, _)) =
+            self.capture_region_frame(region.as_ref()).await?;
+        let rgb = Self::frame_to_rgb(&frame);
+        let (sw, sh, pixels) = (frame.width, frame.height, &rgb);
 
         // Auto-detect foreground color
         use crate::desktop::dict_ocr;
-        let analysis = dict_ocr::analyze_region(&pixels, sw, sh);
+        let analysis = dict_ocr::analyze_region(pixels, sw, sh);
         let fg = dict_ocr::ColorSpec::new(
             analysis.foreground.r,
             analysis.foreground.g,
@@ -1589,7 +1640,7 @@ impl DesktopClient {
         let mut hits = Vec::new();
 
         for tmpl in &templates_to_search {
-            let results = dict_ocr::search_screen(&pixels, sw, sh, tmpl, &fg, min_sim);
+            let results = dict_ocr::search_screen(pixels, sw, sh, tmpl, &fg, min_sim);
             for r in results {
                 hits.push(Match {
                     x: r.x,
@@ -1677,7 +1728,6 @@ impl DesktopClient {
         }
 
         let found = !all_matches.is_empty();
-        let _ = std::fs::remove_file(&screenshot_path);
         let hint = if !found {
             Some("未在屏幕区域中找到目标文字。原因可能：1) 字库中不含需要的字符（请先用桌面取字添加到字库）；2) 文字未显示在截取区域内；3) 颜色或背景干扰导致匹配失败。")
         } else {
@@ -1690,6 +1740,127 @@ impl DesktopClient {
             "match_count": all_matches.len(),
             "fallback_hint": hint,
         }))
+    }
+
+    /// 等待画面状态变化。
+    ///
+    /// condition:
+    /// - `change`：区域画面与基线不同即满足（等待界面响应、弹窗出现）
+    /// - `stable`：区域画面与基线相同且保持 `stable_ms` 不变化（等待动画结束、加载完成）
+    /// - `color`：区域中出现指定颜色即满足（等待某个元素渲染出来）
+    ///
+    /// 轮询检查（默认 200ms 间隔）；超时返回 `met:false`（这是数据不是错误——
+    /// 调用方可据此走分支），网络/权限等真实异常才返回 `Err`。
+    /// region 为 None 时用全屏；`sim` 仅用于 color 条件的颜色容差。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wait_for(
+        &self,
+        condition: &str,
+        region: Option<Value>,
+        color: Option<&str>,
+        timeout_ms: u64,
+        interval_ms: u64,
+        stable_ms: u64,
+    ) -> Result<Value> {
+        let interval = interval_ms.max(50);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let recent = std::time::Duration::from_millis(stable_ms.max(interval));
+
+        // 基线帧：change 需要先取一次基准（stable 用相邻帧递进比对，无需基线）
+        let mut baseline: Option<Vec<u8>> = None;
+        if condition == "change" {
+            let (frame, _) = self.capture_region_frame(region.as_ref()).await?;
+            baseline = Some(Self::frame_to_rgb(&frame));
+        }
+
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_pixels: Option<Vec<u8>> = None;
+        let mut polls: u64 = 0;
+
+        loop {
+            polls += 1;
+            let timed_out = std::time::Instant::now() >= deadline;
+
+            match condition {
+                "change" => {
+                    let (frame, (rx, ry, _, _)) =
+                        self.capture_region_frame(region.as_ref()).await?;
+                    let pixels = Self::frame_to_rgb(&frame);
+                    let met = match &baseline {
+                        Some(base) => !frames_identical(base, &pixels),
+                        None => false,
+                    };
+                    if met {
+                        return Self::result_ok(serde_json::json!({
+                            "met": true, "condition": condition, "polls": polls,
+                            "region": { "x": rx, "y": ry },
+                        }));
+                    }
+                }
+                "stable" => {
+                    let (frame, (rx, ry, _, _)) =
+                        self.capture_region_frame(region.as_ref()).await?;
+                    let pixels = Self::frame_to_rgb(&frame);
+                    let same_as_last = last_pixels
+                        .as_ref()
+                        .map(|last| frames_identical(last, &pixels))
+                        .unwrap_or(false);
+                    if same_as_last {
+                        let since = *stable_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= recent {
+                            return Self::result_ok(serde_json::json!({
+                                "met": true, "condition": condition, "polls": polls,
+                                "stable_ms": recent.as_millis(),
+                                "region": { "x": rx, "y": ry },
+                            }));
+                        }
+                    } else {
+                        stable_since = Some(std::time::Instant::now());
+                    }
+                    last_pixels = Some(pixels);
+                }
+                "color" => {
+                    let spec = color.ok_or_else(|| {
+                        crate::NuphusError::Tool("wait_for condition=color 需要 color 参数".into())
+                    })?;
+                    let (frame, (rx, ry, _, _)) =
+                        self.capture_region_frame(region.as_ref()).await?;
+                    let rgb = Self::frame_to_rgb(&frame);
+                    let raw = super::vision::find_color(
+                        &rgb,
+                        frame.width,
+                        frame.height,
+                        spec,
+                        0,
+                        0,
+                        0,
+                        0,
+                        "left_top",
+                    )?;
+                    if raw.get("found").and_then(|v| v.as_bool()) == Some(true) {
+                        let hit = Self::rebase_region_coords(raw, rx, ry);
+                        return Self::result_ok(serde_json::json!({
+                            "met": true, "condition": condition, "polls": polls,
+                            "x": hit.get("x").cloned().unwrap_or(serde_json::json!(0)),
+                            "y": hit.get("y").cloned().unwrap_or(serde_json::json!(0)),
+                        }));
+                    }
+                }
+                other => {
+                    return Self::result_err(format!(
+                        "未知 wait_for condition: {other}（change / stable / color）"
+                    ));
+                }
+            }
+
+            if timed_out {
+                return Self::result_ok(serde_json::json!({
+                    "met": false, "condition": condition, "polls": polls,
+                    "timeout_ms": timeout_ms,
+                }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+        }
     }
 
     /// Get dictionary directory

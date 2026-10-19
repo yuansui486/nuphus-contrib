@@ -63,7 +63,8 @@ export function ProblemsPanel({
   nameOf,
 }: ProblemsPanelProps) {
   const { t } = useLanguage()
-  const [collapsed, setCollapsed] = useState(false)
+  // 默认收起（点击 toggle / tab 展开）；运行开始与 replay 仍自动展开（下方两个 effect）
+  const [collapsed, setCollapsed] = useState(true)
   const [mainTab, setMainTab] = useState<'problems' | 'logs'>('problems')
   const [problemTab, setProblemTab] = useState<ProblemCategory | 'all'>('all')
   const [historyIndex, setHistoryIndex] = useState(0)

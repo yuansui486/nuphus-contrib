@@ -50,6 +50,8 @@ $ReleaseApi = 'https://api.github.com/repos/mrpulor-gh/nuphus'
 $ApiProxy   = $(if ($env:NUPHUS_GITHUB_PROXY) { $env:NUPHUS_GITHUB_PROXY } else { '' })
 # 传输镜像（只加速、不承担可信度）：每个字节都要与 Release API 的 digest 对账
 $MirrorUrls = @('https://gh-proxy.com', 'https://cors.isteed.cc')
+# 共享下载内核：curl --resolve 锁快节点直连（IWR 走域名会落慢节点、大文件停滞，见其头注）
+. (Join-Path $PSScriptRoot 'lib\mirror-download.ps1')
 
 # ── Gitee 镜像仓（国内直连下载点）───────────────────────────────────────────
 $GiteeOwner    = 'nuphus'
@@ -195,10 +197,18 @@ function Get-Asset($assetName, $ver) {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Step "download $assetName <- $($s.Label)"
         try {
-            $req = @{ Uri = $s.Uri; OutFile = $tmp; UseBasicParsing = $true; TimeoutSec = 1200 }
-            # 镜像必须直连（叠本地代理会被限速）；只有裸 GitHub 域名才按需走代理
-            if ($s.Label -eq 'github' -and $ApiProxy) { $req['Proxy'] = $ApiProxy }
-            Invoke-WebRequest @req | Out-Null
+            # 镜像走共享内核（curl --resolve 锁快节点直连）；IWR 走域名会落慢节点、
+            # 大资产（>40MB）还会无征兆停滞（2026-10-15 实测，见 lib 头注）
+            if ($s.Label -like 'mirror*') {
+                if (-not (Invoke-MirrorDownload -Url $s.Uri -OutFile $tmp)) {
+                    throw "mirror download failed after retries: $($s.Uri)"
+                }
+            } else {
+                # 裸 GitHub 域名按需走本地代理（镜像绝不叠代理，叠了限速回 40 KB/s）
+                $req = @{ Uri = $s.Uri; OutFile = $tmp; UseBasicParsing = $true; TimeoutSec = 1200 }
+                if ($ApiProxy) { $req['Proxy'] = $ApiProxy }
+                Invoke-WebRequest @req | Out-Null
+            }
             if (-not (Test-Path $tmp)) { throw 'download produced no file' }
             $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
             if ($actual -ne $expected) { Remove-Item $tmp -Force; throw "sha256 mismatch from $($s.Label)" }

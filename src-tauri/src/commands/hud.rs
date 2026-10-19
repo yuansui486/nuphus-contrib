@@ -405,13 +405,13 @@ mod tests {
 }
 
 /// Tauri command: update HUD from frontend or agent
-#[tauri::command]
+#[tauri::command(async)]
 pub fn hud_update(app: AppHandle, text: String, phase: String) {
     show(&app, &text, &phase);
 }
 
 /// Tauri command: hide HUD
-#[tauri::command]
+#[tauri::command(async)]
 pub fn hud_hide(app: AppHandle) {
     hide(&app);
 }

@@ -98,10 +98,19 @@ interface IconButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: IconVariant
   label: string
   showLabel?: boolean
+  /**
+   * 是否输出原生 `title`（默认 true = 用 label 兜底提示）。
+   * 调用方已有自己的 hover 浮层时必须传 false —— 否则原生灰框与浮层
+   * 会同时出现，同一个按钮两套提示。
+   */
+  nativeTitle?: boolean
 }
 
 export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
-  ({ variant = 'default', label, showLabel, children, className, ...rest }, ref) => {
+  (
+    { variant = 'default', label, showLabel, nativeTitle = true, children, className, ...rest },
+    ref,
+  ) => {
     return (
       <button
         ref={ref}
@@ -111,7 +120,7 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
           .filter(Boolean)
           .join(' ')}
         aria-label={label}
-        title={showLabel ? undefined : label}
+        title={showLabel || !nativeTitle ? undefined : label}
         {...rest}
       >
         {children}

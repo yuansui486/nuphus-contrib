@@ -377,12 +377,12 @@ impl ToolRegistry {
                     }
                     "move" => {
                         let (x, y) = point.ok_or("移动缺少目标")?;
-                        client.mouse_move(x, y, 0.0).await
+                        client.mouse_move(x, y).await
                     }
                     "scroll" => {
                         if let Some((x, y)) = point {
                             client
-                                .mouse_move(x, y, 0.0)
+                                .mouse_move(x, y)
                                 .await
                                 .map_err(native_action_error)
                                 .and_then(ensure_dispatch_response)?;
@@ -715,6 +715,50 @@ impl ToolRegistry {
                 .map_err(|_| "find_multi_color 超时（30秒）".to_string())
                 .and_then(|join| join.map_err(|e| format!("find_multi_color 线程异常: {e}")))
                 .and_then(Self::wrap_desktop_result)
+            }
+            "desktop_wait_for" => {
+                let condition = params
+                    .get("condition")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("change")
+                    .to_string();
+                let region = params.get("region").cloned();
+                let color = params
+                    .get("color")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let timeout_ms = params
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10_000);
+                let interval_ms = params
+                    .get("interval_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(200);
+                let stable_ms = params
+                    .get("stable_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(500);
+                if timeout_ms == 0 || timeout_ms > 300_000 {
+                    return Err("wait_for timeout_ms 必须在 1-300000 之间".into());
+                }
+                let client = client.clone();
+
+                // 等待本身有上限（timeout_ms ≤ 300s），外层再给 30s 余量防帧抓取超时
+                let waited = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms.saturating_add(30_000)),
+                    client.wait_for(
+                        &condition,
+                        region,
+                        color.as_deref(),
+                        timeout_ms,
+                        interval_ms,
+                        stable_ms,
+                    ),
+                )
+                .await
+                .map_err(|_| format!("wait_for 执行超时（内部上限 {} ms）", timeout_ms))?;
+                Self::wrap_desktop_result(waited)
             }
             "desktop_find_text" => {
                 let dict_name = params

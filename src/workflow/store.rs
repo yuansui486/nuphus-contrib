@@ -723,10 +723,16 @@ impl WorkflowStore {
         }
         drop(has_backup);
 
-        // 原子写入（先写临时文件再 rename）
-        let tmp_path = wf_dir.join("workflow.json.tmp");
+        // 原子写入（先写临时文件再 rename）。
+        // B10：tmp 文件名带唯一后缀——两个并发 save（节流保存 vs 暂停快照）共用
+        // 固定名会交错写同名 tmp，后写者 rename 时可能搬走前写者的半成品。
+        let tmp_path = wf_dir.join(format!("workflow.json.tmp.{}", uuid::Uuid::new_v4()));
         tokio::fs::write(&tmp_path, &json).await?;
-        tokio::fs::rename(&tmp_path, &final_path).await?;
+        if let Err(error) = tokio::fs::rename(&tmp_path, &final_path).await {
+            // rename 失败清理孤儿 tmp，避免垃圾文件累积
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
 
         // ── 清理旧备份：保留最近 3 个 ──
         self.prune_backups(&wf_dir, 3).await;
@@ -741,6 +747,11 @@ impl WorkflowStore {
     }
 
     /// 清理旧备份文件，保留最近 `max` 个
+    ///
+    /// B7（防误删收紧）：只匹配 save() 真实产出的备份命名 `workflow.{YYYYMMDD_HHMMSS}.json`，
+    /// 而非任意 `workflow.*.json`。宽松匹配会把用户导出的中缀文件
+    /// （如 `workflow.说明.export.json`）或同名工作流的导出件误判为备份删掉。
+    /// 时间戳格式校验同时保证「字典序 = 时间序」的排序前提仍然成立。
     async fn prune_backups(&self, wf_dir: &Path, max: usize) {
         let mut backups: Vec<String> = match tokio::fs::read_dir(wf_dir).await {
             Ok(mut entries) => {
@@ -749,11 +760,7 @@ impl WorkflowStore {
                     match entries.next_entry().await {
                         Ok(Some(entry)) => {
                             let name = entry.file_name().to_string_lossy().to_string();
-                            // 匹配 backup 文件：workflow.{ts}.json
-                            if name.starts_with("workflow.")
-                                && name.ends_with(".json")
-                                && name != "workflow.json"
-                            {
+                            if Self::is_run_backup_name(&name) {
                                 names.push(name);
                             }
                         }
@@ -775,6 +782,31 @@ impl WorkflowStore {
                 tracing::debug!("Pruned old backup: {}", old);
             }
         }
+    }
+
+    /// 精确匹配 save() 写出的备份命名：`workflow.{14位时间戳}.json`
+    /// （save() L719：`format!("workflow.{}.json", ts)`，ts = `%Y%m%d_%H%M%S`）
+    fn is_run_backup_name(name: &str) -> bool {
+        let stem = match name.strip_suffix(".json") {
+            Some(stem) => stem,
+            None => return false,
+        };
+        let ts = match stem.strip_prefix("workflow.") {
+            Some(ts) => ts,
+            None => return false,
+        };
+        // %Y%m%d_%H%M%S：8 数字 + 下划线 + 6 数字 = 15 字符
+        ts.len() == 15
+            && ts.as_bytes()[8] == b'_'
+            && ts.chars().enumerate().all(
+                |(i, c)| {
+                    if i == 8 {
+                        c == '_'
+                    } else {
+                        c.is_ascii_digit()
+                    }
+                },
+            )
     }
 
     /// 删除工作流
@@ -816,10 +848,16 @@ impl WorkflowStore {
             .collect();
 
         let json = serde_json::to_string_pretty(&summaries)?;
-        let tmp_path = self.root.join("index.json.tmp");
+        // B10：唯一 tmp 名，防并发 flush_index 交错写同名 tmp（同 save() 处理）
+        let tmp_path = self
+            .root
+            .join(format!("index.json.tmp.{}", uuid::Uuid::new_v4()));
         let final_path = self.root.join("index.json");
         tokio::fs::write(&tmp_path, &json).await?;
-        tokio::fs::rename(&tmp_path, &final_path).await?;
+        if let Err(error) = tokio::fs::rename(&tmp_path, &final_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error.into());
+        }
 
         *self.summary_cache.write().await = summaries;
 
@@ -893,6 +931,84 @@ mod tests {
         assert_eq!(list.len(), 0);
 
         // 清理
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    // ── B7：备份剪枝只认 save() 真实备份命名 ──
+
+    #[test]
+    fn is_run_backup_name_matches_only_save_output_format() {
+        use super::WorkflowStore;
+        // save() 真实产物：%Y%m%d_%H%M%S = 8 数字 + '_' + 6 数字
+        assert!(WorkflowStore::is_run_backup_name(
+            "workflow.20260114_103000.json"
+        ));
+        assert!(!WorkflowStore::is_run_backup_name("workflow.json"));
+        // 用户导出件 / 旧宽松匹配会误删的形状：一律不认
+        assert!(!WorkflowStore::is_run_backup_name(
+            "workflow.说明.export.json"
+        ));
+        assert!(!WorkflowStore::is_run_backup_name("workflow.export.json"));
+        assert!(!WorkflowStore::is_run_backup_name(
+            "workflow.backup_before_x.json"
+        ));
+        assert!(!WorkflowStore::is_run_backup_name("workflow.123.json"));
+        assert!(!WorkflowStore::is_run_backup_name(
+            "workflow.20260114_1030.json"
+        ));
+        assert!(!WorkflowStore::is_run_backup_name(
+            "workflow.20260114-103000.json"
+        ));
+        assert!(!WorkflowStore::is_run_backup_name(
+            "other.20260114_103000.json"
+        ));
+    }
+
+    /// 回归：prune 只删 `workflow.{ts}.json` 形状的备份，
+    /// 用户/导出的非备份命名文件（如 workflow.backup_before_x.json）必须保留
+    #[tokio::test]
+    async fn prune_backups_keeps_non_backup_named_files() {
+        let root = tmp_root();
+        let store = WorkflowStore::with_root(root.clone());
+        let wf = Workflow::new("prune_guard");
+        let wf_dir = root.join(&wf.id);
+        std::fs::create_dir_all(&wf_dir).unwrap();
+
+        // 3 个真实备份（触发 >max 剪枝）+ 2 个受保护命名文件
+        for ts in ["20260101_000001", "20260101_000002", "20260101_000003"] {
+            std::fs::write(wf_dir.join(format!("workflow.{ts}.json")), "{}").unwrap();
+        }
+        std::fs::write(wf_dir.join("workflow.backup_before_x.json"), "{}").unwrap();
+        std::fs::write(wf_dir.join("workflow.说明.export.json"), "{}").unwrap();
+
+        store.prune_backups(&wf_dir, 2).await;
+
+        let remaining: Vec<String> = std::fs::read_dir(&wf_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            remaining.contains(&"workflow.backup_before_x.json".to_string()),
+            "非备份命名文件不得被剪枝删除: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"workflow.说明.export.json".to_string()),
+            "导出件不得被剪枝删除: {remaining:?}"
+        );
+        // 最旧的一个真实备份被剪掉
+        assert!(
+            !remaining.contains(&"workflow.20260101_000001.json".to_string()),
+            "超出 max 的最旧备份应被剪掉: {remaining:?}"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|n| n.starts_with("workflow.2026"))
+                .count(),
+            2,
+            "保留最近 2 个真实备份: {remaining:?}"
+        );
+
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

@@ -57,7 +57,7 @@ describe('en.ts 不得残留 GBK 乱码 / 中文漏翻', () => {
   it('③ ↑↓ / ° / § 等常用符号没有被啃成乱码（历史三类残码）', () => {
     const byKey = new Map(en.map(e => [e.key, e.value]))
     // 残码特征字符：鈫 戔 啌 掳 搂 鈻 鈼 銆 鈥 冫
-    const marks = /[鈫戔啌掳搂鈻鈼銆鈥冫]/
+    const marks = /[鈫戔啌掳搖鈻鈼銆鈥冫鈹€鈺愨晲鉁]/
     const dirty = [...byKey].filter(([, v]) => marks.test(v)).map(([k]) => k)
     expect(dirty).toEqual([])
     // 正向钉住三处语义（值必须真的是这些符号，不是被替换成别的）

@@ -57,6 +57,33 @@ alias = ["deepseek-pro"]
 context_window = 1000000
 supports_streaming = true
 
+# ──────────────────────────────────────────────────────────────────────
+# [capabilities] —— 按能力绑定模型 / 服务
+# ──────────────────────────────────────────────────────────────────────
+# 以下字段留空 = 该能力未启用（各自有明确的回落语义，见注释）。
+# 通常无需手写：桌面端「设置 → 模型 → 图像音频模型」会写入这里。
+#
+# [capabilities]
+# vision = "deepseek-flash"        # 图像理解模型（空 = 跟随主模型）
+# image_generation = "..."         # 图片生成模型（空 = 工具报错）
+# video_generation = "..."         # 视频生成模型（空 = 工具报错）
+#
+# web_search_source —— 网页搜索 / 抓取源（空 = 未启用）
+#
+#   值是 **provider 段名**，不是模型 id：DeepSeek 的 Search / Fetch 都是
+#   服务商级 HTTP API（POST /v1/tools/search、/v1/tools/fetch），不经过模型。
+#
+#   未启用 → web_search / web_extract 只走内置免费方案。
+#   已启用 → 两者都先调该段官方 API，仅在其报错 / 限流 / 欠费时才降级：
+#            web_search  → 免费五源聚合（GitHub / MDN / 维基 / Bing / DDG）
+#            web_extract → 直连 → CDP 渲染 → Jina 镜像
+#            降级事实会写进返回结果头部。
+#
+#   官方 Search / Fetch 均按成功请求计费（各 1000 次 5 元），
+#   无结果与失败请求不计费。
+#
+# web_search_source = "deepseek"
+
 [[providers]]
 name = "kimi"
 provider_type = "kimi"
@@ -139,3 +166,13 @@ supports_streaming = true
 vision = ""
 stt = ""
 tts = ""
+
+# ─── Refine · 会话提炼 ────────────────────────────────────────────────
+#   large_force_threshold : 大窗口（context_window > 600K）强制提炼线，比例 0~1。
+#                           可调范围 0.50 ~ 0.80，默认 0.50（即范围下限）。
+#                           仅 Large 档生效；256K~600K 固定 0.80，≤256K 固定 0.75。
+#                           设置面板的滑杆直接写这里，无需手改。
+# ──────────────────────────────────────────────────────────────────────
+
+[refine]
+large_force_threshold = 0.5

@@ -133,6 +133,9 @@ export interface SessionAPI {
   canvasWorkflowId: string | null
   openCanvas: (id?: string | null) => void
   closeCanvas: () => void
+  /** 内置工具页：独立全屏界面（已从画布移出，入口在桌面工具条末尾） */
+  showTools: boolean
+  setShowTools: (v: boolean) => void
 
   // ── Execution ──
   showExecTrace: boolean
@@ -295,12 +298,10 @@ export interface SessionAPI {
   // ── Command palette & keyboard ──
   cmdPaletteOpen: boolean
   focusSignal: number
-  showDesktopToolbar: boolean
   regionPickerMode: 'picker' | 'capture' | 'ocr' | null
   expandedCalls: Set<string>
   setCmdPaletteOpen: (v: boolean | ((prev: boolean) => boolean)) => void
   setFocusSignal: (v: number | ((prev: number) => number)) => void
-  setShowDesktopToolbar: (v: boolean | ((prev: boolean) => boolean)) => void
   setRegionPickerMode: (v: 'picker' | 'capture' | 'ocr' | null) => void
   setExpandedCalls: (v: Set<string> | ((prev: Set<string>) => Set<string>)) => void
 
@@ -332,8 +333,8 @@ export interface SessionAPI {
   liveCalls: number
 
   // ── Handlers ──
-  /** 返回发送的真实结果（画布等外部入口据此回执，见 nuphus:send-result）。
-   *  sendId 由调用方指定（画布 requestId）时替代内部生成的 uuid —— 后端受理事件
+  /** 返回发送的真实结果。
+   *  sendId 由调用方指定时替代内部生成的 uuid —— 后端受理事件
    *  按同一 sendId 精确对齐（见 message_accepted），缺省时行为不变。
    *  appendedHint：调用方自有语境的「已受理为追加指令」补充文案（如「运行工作流」入口
    *  需要说明工作流不会立即启动）；缺省用通用追加提示。 */
@@ -632,7 +633,7 @@ export function useSession(): SessionAPI {
         execUI.setPlanData(null)
         execUI.setGoal(input.slice(0, 120))
       }
-      // 调用方指定的 sendId（画布 requestId）优先：后端受理事件按它精确对齐；
+      // 调用方指定的 sendId 优先：后端受理事件按它精确对齐；
       // 未指定（输入框发送等）沿用内部 uuid，行为不变。
       const effectiveSendId = sendId || crypto.randomUUID()
       // ⚠️ 追加指令（执行中发送）绝不覆盖 streamingMsgId：它指向正在流式的
@@ -920,6 +921,17 @@ export function useSession(): SessionAPI {
         },
       },
       {
+        id: 'tools',
+        label: t('cmd.tools'),
+        desc: t('cmd.toolsDesc'),
+        category: t('cmd.category.shortcuts'),
+        action: () => {
+          setCmdPaletteOpen(false)
+          // 内置工具页：独立全屏界面（与桌面工具条列末入口同一开关）
+          modals.setShowTools(true)
+        },
+      },
+      {
         id: 'soul',
         label: t('cmd.soul'),
         desc: t('cmd.soulDesc'),
@@ -1093,7 +1105,6 @@ export function useSession(): SessionAPI {
   const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false)
   const [focusSignal, setFocusSignal] = useState(0)
   const [executionCounter, setExecutionCounter] = useState(0)
-  const [showDesktopToolbar, setShowDesktopToolbar] = useState(false)
   const [regionPickerMode, setRegionPickerMode] = useState<'picker' | 'capture' | 'ocr' | null>(
     null,
   )
@@ -1243,12 +1254,10 @@ export function useSession(): SessionAPI {
     // Command palette & keyboard
     cmdPaletteOpen,
     focusSignal,
-    showDesktopToolbar,
     regionPickerMode,
     expandedCalls,
     setCmdPaletteOpen,
     setFocusSignal,
-    setShowDesktopToolbar,
     setRegionPickerMode,
     setExpandedCalls,
 

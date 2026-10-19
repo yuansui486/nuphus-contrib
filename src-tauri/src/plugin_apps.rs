@@ -409,7 +409,7 @@ fn install_zip_to(apps_root: &Path, archive_path: &Path) -> Result<PluginManifes
 // Tauri commands：安装器（4）
 // ============================================================================
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_app_install(path: String) -> Result<PluginManifest, String> {
     install_zip_to(&apps_root(), Path::new(&path))
 }
@@ -538,7 +538,7 @@ pub struct PluginWorkflowRunResult {
     pub error: Option<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_app_list() -> Result<Vec<PluginAppSummary>, String> {
     let apps_root = apps_root();
     let reg = load_registry_from(&apps_root);
@@ -567,7 +567,7 @@ pub fn plugin_app_list() -> Result<Vec<PluginAppSummary>, String> {
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_app_uninstall(id: String) -> Result<(), String> {
     // id 双重防线：注册表 key 必为安装时校验过的合法 id，此处再校验防调用方直传逃逸
     if !valid_plugin_id(&id) {
@@ -586,7 +586,7 @@ pub fn plugin_app_uninstall(id: String) -> Result<(), String> {
     save_registry_to(&apps_root, &reg)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_app_set_enabled(id: String, enabled: bool) -> Result<(), String> {
     if !valid_plugin_id(&id) {
         return Err(format!("插件 id 非法: {id}"));
@@ -661,7 +661,7 @@ fn pack_plugin_dir(src_dir: &Path, dest_path: &Path) -> Result<(), String> {
 }
 
 /// 将已安装插件目录导出为 .nuph 包（创作侧导出闭环：安装 → 打包分享）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_app_pack(id: String, dest_path: String) -> Result<(), String> {
     if !valid_plugin_id(&id) {
         return Err(format!("插件 id 非法: {id}"));
@@ -741,7 +741,7 @@ const SAMPLE_TEMPLATES: &[(&str, &[(&str, &str)])] = &[
 /// 白名单校验：sample_id ∈ {hello-plugin, agent-chat}，非法拒绝；
 /// 目标目录已存在且非空 → 拒绝覆盖（防止误伤用户已有工作）。
 /// 返回写出目录的绝对路径。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_export_sample(sample_id: String, dest_dir: String) -> Result<String, String> {
     let template = SAMPLE_TEMPLATES
         .iter()
@@ -850,22 +850,22 @@ fn kv_keys_at(apps_root: &Path, id: &str) -> Result<Vec<String>, String> {
     Ok(keys)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_kv_get(id: String, key: String) -> Result<Option<serde_json::Value>, String> {
     kv_get_at(&apps_root(), &id, &key)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_kv_set(id: String, key: String, value: serde_json::Value) -> Result<(), String> {
     kv_set_at(&apps_root(), &id, &key, value)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_kv_delete(id: String, key: String) -> Result<(), String> {
     kv_delete_at(&apps_root(), &id, &key)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn plugin_kv_keys(id: String) -> Result<Vec<String>, String> {
     kv_keys_at(&apps_root(), &id)
 }
@@ -876,7 +876,7 @@ pub fn plugin_kv_keys(id: String) -> Result<Vec<String>, String> {
 
 /// 保存当前生效主题快照到 AppState 内存（/plugins-shared/theme.css 渲染源）。
 /// useTheme 任一主题变化（内置切换 / 自定义保存 / 滑块拖动）时调用。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn theme_snapshot_save(
     state: tauri::State<'_, AppState>,
     base: String,
@@ -1088,13 +1088,13 @@ async fn run_plugin_chat_isolated(
     } else {
         nuphus::ToolRegistry::leader()
     };
+    // 独立 cancel_flag：每调用新实例；command drop / IPC 断 → future 整体取消即停
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     leader_tools.set_signals(tools.signals().clone());
+    leader_tools.set_cancel_flag(cancel_flag.clone());
     if let Some(gate) = tools.automation_gate() {
         leader_tools.set_automation_gate(gate);
     }
-
-    // 独立 cancel_flag：每调用新实例；command drop / IPC 断 → future 整体取消即停
-    let cancel_flag = Arc::new(AtomicBool::new(false));
 
     let run_fut = async {
         let mut runtime = RuntimeBuilder::new()

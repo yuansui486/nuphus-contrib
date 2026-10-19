@@ -541,7 +541,9 @@ impl super::SubTaskRunner {
                         match &self.event_emitter {
                             Some(emitter) => {
                                 crate::runtime::sub_task_shell::execute_shell_streaming(
-                                    &call, emitter,
+                                    &call,
+                                    emitter,
+                                    tools.cancel_flag(),
                                 )
                                 .await
                             }
@@ -566,6 +568,29 @@ impl super::SubTaskRunner {
 
                 for (call, result, duration_ms) in batch_results {
                     let tool_name = call.tool.as_str();
+                    // ── HUD 收尾（A·H1）：needs_hud 工具的 running 在 L411 发出，
+                    // 此前没有任何 done/error 收尾 → HUD 停在「执行中」持续计时。
+                    // 主轮路径的成对收尾在 agent/mod.rs:704-718，本路径绕过它。
+                    //
+                    // system_shell **排除**：它有三种「工具调用结束但进程仍在跑」
+                    // 的结局（超时转后台 / 取消保留 / 显式 background），发 error
+                    // 「失败」会把仍在工作的后台任务说成失败；其收尾由
+                    // sub_task_shell.rs 自身负责（转后台 → done「已转入后台」，
+                    // 正常退出 → done/error）。
+                    if (tool_name.starts_with("desktop_") || tool_name.starts_with("browser_"))
+                        && tool_name != "system_shell"
+                    {
+                        let (phase, desc) = if result.success {
+                            ("done", "完成")
+                        } else {
+                            ("error", "失败")
+                        };
+                        self.emit(NuphusEvent::HudUpdate {
+                            text: format!("{} — {}", call.tool, desc),
+                            phase: phase.into(),
+                            step_kind: None,
+                        });
+                    }
                     let is_cacheable = matches!(
                         tool_name,
                         "Read" | "Glob" | "Grep" | "Diff" | "get_system_info" | "get_env" | "think"

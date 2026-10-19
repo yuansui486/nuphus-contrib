@@ -803,6 +803,8 @@ mod tests {
 
     fn model_entry(id: &str, supports_image_generation: bool) -> ModelEntry {
         ModelEntry {
+            transport: None,
+            responses: None,
             id: id.to_string(),
             alias: vec![],
             max_tokens: None,

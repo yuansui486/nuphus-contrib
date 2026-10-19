@@ -10,9 +10,6 @@
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-/// Global always-on-top state
-static ALWAYS_ON_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Whether overlay window has been created (lazy init)
 static OVERLAY_CREATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -30,17 +27,6 @@ pub static STARTUP_FINISHED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // ── Main window control ──
-
-#[tauri::command]
-pub async fn toggle_main_window_topmost(app: AppHandle) -> Result<bool, String> {
-    let new_state = !ALWAYS_ON_TOP.load(std::sync::atomic::Ordering::SeqCst);
-    if let Some(win) = app.get_webview_window("main") {
-        win.set_always_on_top(new_state)
-            .map_err(|e| format!("设置窗口置顶失败: {e}"))?;
-    }
-    ALWAYS_ON_TOP.store(new_state, std::sync::atomic::Ordering::SeqCst);
-    Ok(new_state)
-}
 
 /// Called by frontend when initialization is complete.
 /// Closes the splash window and shows the main window.
@@ -341,11 +327,10 @@ pub async fn overlay_capture_confirm(
         _ => None,
     };
 
-    // 一律从 PRE_SCREENSHOT 冻结帧裁剪 —— 行业标准做法：overlay 显示的就是冻结帧，
+    // 一律从 PRE_SCREENSHOT 冻结帧裁剪 —— 这是本链路的既定准则：overlay 显示的就是冻结帧，
     // 用户照着它选框，产物必须取自同一张图，否则「看到的」与「截到的」不一致。
-    // 参考实现：Flameshot（CaptureWidget 持 m_context.screenshot，选区坐标 x
-    // screenshot.devicePixelRatio() 后从冻结图裁剪）；ShareX（AvaloniaRegionCaptureRequest
-    // 的 Frozen screenshot + Physical-pixel desktop bounds）。
+    // 关键点：选区坐标是屏幕物理像素，冻结帧也是物理像素口径，二者直接对齐、无需按
+    // 缩放比换算；任何 DPI 缩放都必须在这一步之前就已完成。
     // 历史实现在 screenshot 模式下 hide overlay -> sleep(120ms) -> 重新抓屏：那会让正在
     // 移除的 overlay（冻结帧 + 遮罩 + 选区描边）与真实桌面一起入图 —— 糊、重影、框线三症。
     let (pw, ph, pixels) = {
@@ -451,6 +436,49 @@ pub async fn overlay_capture_done(
     Ok(())
 }
 
+/// User picked「保存」on the capture confirm bar — copy the PNG to the Desktop.
+///
+/// 语义（2026-10-11 用户定案）：「✓ 确认」= 截图进对话（引用栏）；「保存」= 留一份
+/// 在**桌面**方便用户其它用途（分享 / 拖进别的应用）。PNG 原件在
+/// overlay_capture_confirm 时已落盘截图目录，这里只是**复制**一份到
+/// `Desktop/Nuphus截图_<时间戳>.png`——原件不动，确认 / 重新选择链路不受影响。
+/// 不写 CAPTURE_RESULT（与 done / save_only 的收尾一样清现场 + 恢复主窗）。
+#[tauri::command]
+pub async fn overlay_capture_save_only(app: AppHandle, path: String) -> Result<String, String> {
+    // 源文件必须存在：confirm 落盘失败时前端拿不到 captureResult，正常到不了这里；
+    // 真遇到（手工清了截图目录等）就明确报错，不静默。
+    let src = std::path::PathBuf::from(&path);
+    if !src.is_file() {
+        return Err(format!("截图文件不存在: {path}"));
+    }
+
+    let desktop = dirs::desktop_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "无法定位桌面目录".to_string())?;
+    std::fs::create_dir_all(&desktop).map_err(|e| format!("创建桌面目录失败: {e}"))?;
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let dest = desktop.join(format!("Nuphus截图_{ts}.png"));
+
+    std::fs::copy(&src, &dest).map_err(|e| format!("保存到桌面失败: {e}"))?;
+    let dest_str = dest.display().to_string();
+
+    *CAPTURE_RESULT.lock().expect("store saved-only flag") =
+        Some(serde_json::json!({ "saved_only": true, "path": dest_str }));
+
+    *PRE_SCREENSHOT
+        .lock()
+        .expect("clear pre-screenshot after save-only") = None;
+
+    hide_overlay(&app);
+
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+
+    Ok(dest_str)
+}
+
 /// Pick color — read specified pixel color from pre-screenshot, store directly in CAPTURE_RESULT and hide overlay
 #[tauri::command]
 pub async fn overlay_pick_color(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
@@ -491,7 +519,7 @@ pub async fn overlay_pick_color(app: AppHandle, x: i32, y: i32) -> Result<(), St
 }
 
 /// Take screenshot result (for polling) — called by main window, cleared after consumption
-#[tauri::command]
+#[tauri::command(async)]
 pub fn take_capture_result() -> Result<Option<serde_json::Value>, String> {
     Ok(CAPTURE_RESULT.lock().expect("take capture result").take())
 }

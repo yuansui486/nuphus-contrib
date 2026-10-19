@@ -76,7 +76,7 @@ import '../../styles/themes.css'
 const THEMES = [
   { id: 'dark' as ThemeId, bg: '#12121a', accent: '#3b82f6' },
   { id: 'light' as ThemeId, bg: '#f0f4f8', accent: '#2563eb' },
-  { id: 'tech' as ThemeId, bg: '#020408', accent: '#7c6ff7' },
+  { id: 'fresh' as ThemeId, bg: '#edf5f0', accent: '#0b7a52' },
 ]
 
 /* 自定义主题可编辑的核心色 token → 人话标签（名称 + 括号内效果说明） */

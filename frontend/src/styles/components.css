@@ -38,6 +38,16 @@
      并不一致（多一层强调色径向渐变），这正是"应用 head 和 body 背景不同步"的来源。
      底色上移到 #root 后，标题栏、聊天区、body 三段必然同色。 */
   background: transparent;
+  /* 窗口最外圈：一圈**主题化** 1px 内描边 —— 窗口压在白色背景（例如它下面的浏览器）
+     上时仍能看清边界。
+     为什么用 inset box-shadow 而不是 border/outline：它不参与布局计算，不会把内容挤
+     出 1px；`inset 0 0 0 1px` 也是本仓库既有写法（chat-input.css / chat-terminal.css）。
+     为什么不用系统投影：那要打开 DWM 无装饰阴影，代价是一条 1px 深色边框线（浅色主题
+     下刺眼），已被裁决关闭 —— 见 src-tauri/src/main.rs:507 的两次定案。
+     色走 --line-2（"常规边框"档）：简白 = rgba(0,0,0,.10) ≈ #e6e6e6 浅灰细线，
+     深色/科技主题各按自己的 token 取值，三主题都不会变成"黑边"。
+     嫌淡/嫌重只改这一个 token —— 换成 --line-3 更清楚，换成 --line-1 更轻。 */
+  box-shadow: inset 0 0 0 1px var(--line-2);
 }
 /* 标题栏：落在命名行 titlebar（按名字定位，与源码顺序无关）。 */
 .app-shell > header.title-bar {
@@ -57,13 +67,21 @@
    - SkinBackdrop（portal → body）、AppContextMenu（portal → body）、
      AppIsland（portal → 锚点/body）、CommandPalette / WorkflowTaskPanel /
      TenetsDialog / AnnotationsDialog / ExecutionTraceFloating（均 fixed 或 portal）
-  结论：进 content 行的实质只有 chat-area 一项；其余要么是标题栏，要么是
-   fixed/portal（行放置对其布局无任何影响，给它们 content 行只是保证它们不被
-   "auto 放置"丢进 titlebar 行所占的第一行）。故本条规则不需要任何排除项 ——
-   这正是删掉那条按不存在类名写的 `.mobile-notice{grid-row:1/3}` 的原因。 */
+   结论：进 content 行的实质只有 chat-area 一项；其余要么是标题栏，要么是
+    fixed/portal（行放置对其布局无任何影响，给它们 content 行只是保证它们不被
+    "auto 放置"丢进 titlebar 行所占的第一行）。故本条规则不需要任何排除项 ——
+    这正是删掉那条按不存在类名写的 `.mobile-notice{grid-row:1/3}` 的原因。
+   ⚠️ z-index 不放在通配规则上（2026-10-14 事故）：通配 z-index:1 会按源码顺序
+    覆盖后载入样式表（chat.css）里同特异性选择器的显式 z-index —— 内联渲染为
+    .app-shell 直接子级的全屏 overlay（ExecutionTraceFloating，z-index:200）
+    被拍平到 1，ChatPanel 经 portal 挂 body 的弹窗（z 200/9999）反而盖在其上。
+    z-index 只给真实需要层叠的内容元素（chat-area/title-bar 见下方各自规则）。 */
 .app-shell > * {
   grid-column: 1;
   grid-row: content;
+}
+/* chat-area 是实质的内容行元素，需要一个高于皮肤背景（z-index:0）的层叠位 */
+.app-shell > .chat-area {
   z-index: 1;
 }
 /* ── 皮肤背景（唯一渲染点，见 ui/SkinBackdrop.tsx）──
@@ -110,6 +128,11 @@
   /* position: relative 保留 —— 标题栏内的绝对定位后代（如 island 落点）依赖它；
      皮肤背景已不由本元素绘制（见上方 .app-skin-backdrop）。 */
   position: relative;
+  /* z-index:1：压过皮肤背景层（.app-skin-backdrop z-index:0）——原先由
+      .app-shell > * 通配提供，通配上的 z-index 已因层叠事故移除（见上）。
+      2 而非 1：chat-area 在 DOM 中位于本元素之后且同为 z-index:1，
+      同层级后者的内容会盖住标题栏的 hover 弹层（「应用」菜单） */
+  z-index: 2;
 }
 .title-bar-left {
   display: flex;
@@ -124,6 +147,89 @@
 .title-bar-spacer {
   flex: 1;
   height: 100%;
+}
+/* ── 品牌 logo hover 弹层（原「应用」入口由品牌文字承接）──
+   弹窗复用 input-tool-menu 体系（8px 圆角 / line-1 / shadow-elevated /
+   menuPopIn / item surface-hover 动效），从品牌文字左对齐向下弹。
+   z-index：标题栏是 .app-shell 内 z-index:1 的层叠上下文，弹层 210 需盖过
+   chat-area（同为 1 层内），又低于全屏 overlay（200+ 同级内相对次序） */
+.title-bar-about {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.title-bar-about-trigger {
+  cursor: pointer;
+  user-select: none;
+  border-radius: var(--radius-1);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.title-bar-about-trigger:hover,
+.title-bar-about-trigger:focus-visible {
+  /* 保持品牌色相，仅提亮（若改 color 会把 spark-primary 盖成前景色，视觉变暗） */
+  filter: brightness(1.25);
+  outline: none;
+}
+.title-bar-about-menu {
+  position: absolute;
+  /* 零间隙贴死触发器：hover 从触发器滑向弹窗若隔空隙，父容器的 mouseleave
+     会在鼠标穿越间隙时立即触发 → 弹窗在鼠标到达前关闭（hover 失联）。
+     视觉下坠感由弹窗内 padding-top 承担 */
+  top: 100%;
+  left: 0;
+  min-width: 152px;
+  padding: 8px 4px 4px;
+  background: var(--void-primary);
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  box-shadow: var(--shadow-elevated);
+  z-index: 210;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  animation: menuPopIn 0.12s var(--ease-out);
+}
+.title-bar-about-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--fg-2);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.title-bar-about-item:hover:not(:disabled),
+.title-bar-about-item:focus-visible {
+  background: var(--surface-hover);
+  color: var(--fg-1);
+  outline: none;
+}
+.title-bar-about-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* keyframes 就近兜底：menuPopIn 定义在懒加载的 chat-input.css / api-health.css，
+   标题栏属首屏渲染，不能依赖它们的注入时序 */
+@keyframes menuPopIn {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .title-bar-icon {
   display: flex;
@@ -1014,6 +1120,35 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 弹窗内模型名后的收藏星标：紧跟名称，accent 描边小星（与设置页卡片星形同义，
+   未收藏不渲染）。尺寸对准 GO 徽章，不与名称文字混排错位。 */
+.model-popup-fav {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  color: var(--accent);
+  vertical-align: middle;
+  user-select: none;
+}
+/* GO 网关徽标：模型名旁小字标注 opencode-go，与官方厂商同 id 模型区分。
+   注意 margin-left 必须有：名称 span 是 nowrap 行内内容，没有它徽标会与
+   模型 id 直接贴字（deepseek-flashGO）。设置页卡片版为 .model-card-go。 */
+.model-go-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  padding: 0 4px;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+  user-select: none;
+}
 .model-provider-model-meta {
   display: flex;
   flex-wrap: wrap;
@@ -1033,23 +1168,37 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* GO 网关模型徽标：模型名旁小字标注 opencode-go，与官方厂商同 id 模型区分。
-   低调样式（细字 + 描边），不抢主文本、不与 active 选中色冲突。 */
-.model-go-badge {
-  display: inline-flex;
-  align-items: center;
-  margin-left: 5px;
-  padding: 0 4px;
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
-  color: var(--fg-3);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 500;
-  line-height: 1.5;
-  letter-spacing: 0.02em;
-  vertical-align: middle;
-  user-select: none;
+/* ── 内置工具页：独立全屏宿主（App 层挂载；已从画布移出）──
+   与 .models-page-host 同档层级（2500），压过画布（100）与设置中心（60~90 组）。
+   内部 .tools-page 本身是 fixed inset:0 且自带顶栏，这里只做层级与描边兜底，
+   不改它的布局契约。 */
+.tools-page-host {
+  position: fixed;
+  inset: 0;
+  z-index: 2500;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-0);
+}
+
+/* 窗口最外圈：主题化 1px 内描边（同 .app-shell / .models-page-host 的窗口描边契约）
+
+   ⚠️ 绘制方式必须用**子元素覆盖层**而不是宿主的 ::after：
+   内部 `.tools-page` 自身是 `position: fixed; z-index: 200`（tools.css:8-12），
+   它建立了独立的堆叠上下文并压过宿主的任何 ::after（伪元素的 z-index 只在
+   宿主堆叠上下文内比较，宿主自身若无 z-index 就整体被盖）。画布宿主
+   `.canvas-workbench-host` 的子元素不建堆叠上下文，故它的 ::after 能生效 ——
+   两者不能照抄同一写法。
+
+   故把描边画在 `.tools-page` 自己的 ::after 上：同级堆叠上下文内 z-index:50
+   高于内部全部内容层，且 pointer-events:none 不挡交互。 */
+.tools-page-host > .tools-page::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  pointer-events: none;
 }
 
 /* ── Canvas unified workbench: direct full-screen editor surface ── */
@@ -1060,6 +1209,19 @@
   display: flex;
   flex-direction: column;
   background: var(--surface-0);
+}
+
+/* 窗口最外圈：主题化 1px 内描边（同 .app-shell 的窗口描边契约；绘制方式与理由
+   见 preview-overlay.css 的 .pv-page::after —— 顶层是实色工作台 Header，box-shadow
+   会被盖断，故用覆盖层伪元素画全圈）。Suspense 占位（CanvasWorkbenchLoading）与本
+   宿主同类名，加载期同样带描边。 */
+.canvas-workbench-host::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  pointer-events: none;
 }
 /* 外壳 chunk 加载中的占位：复用全局 .page-loading，撑满宿主高度以居中显示 */
 .canvas-workbench-host > .page-loading {
@@ -1098,21 +1260,4 @@
 }
 .canvas-workbench-host .wfc-page .wfc-toolbar {
   z-index: 1;
-}
-.canvas-workbench-host .workflow-workbench-header {
-  position: relative;
-  z-index: 10;
-}
-
-/* Embedded tools stay inside the canvas workbench body; never cover the shared Header. */
-.canvas-workbench-host .tools-page--embedded {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  min-height: 0;
-}
-.canvas-workbench-host .workflow-workbench-body--tools {
-  position: relative;
-  z-index: 0;
-  overflow: hidden;
 }

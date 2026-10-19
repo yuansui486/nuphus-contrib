@@ -2,20 +2,16 @@
 //!
 //! Endpoint rule (refactor design §4.5): `{base}/responses`（base 去尾斜杠）。
 
-use crate::config::provider::ProviderQuirks;
+use crate::config::provider::{ProviderQuirks, ResponseOptions};
 
-/// Responses Transport configuration。
-///
-/// 结构沿既有 transport Config 模式：base_url/model/timeout/auth(header+prefix)/
-/// quirks。Codex 变体差异（OAuth 令牌、extra headers、额外头）P3/P6 通过
-/// `api_key`/`quirks.extra_headers` 与后续 AuthMaterial 字段承载，不引入第二个引擎
-/// （设计 §4.4 Codex 注记）。
+/** Responses 传输配置：请求约束和每次请求的凭据来源独立声明。 */
 #[derive(Debug, Clone)]
 pub struct ResponsesConfig {
+    pub credentials: Option<crate::config::credentials::TokenSource>,
+    pub options: ResponseOptions,
     /// API endpoint base（不含 `/responses` 后缀；末尾斜杠会被剥离）
     pub base_url: String,
-    /// API key。P3 将扩展 AuthMaterial（OAuth 令牌走 credentials 服务，
-    /// 设计 §4.2），届时本字段与 auth 双轨并存。
+    /** 未配置动态凭据来源时使用的静态 API Key。 */
     pub api_key: String,
     /// Model name
     pub model: String,
@@ -56,6 +52,8 @@ mod tests {
             provider_kind: None,
             quirks: ProviderQuirks::default(),
             reasoning_effort: None,
+            credentials: None,
+            options: Default::default(),
         };
         assert_eq!(cfg.endpoint(), "https://api.openai.com/v1/responses");
     }
@@ -72,6 +70,8 @@ mod tests {
             provider_kind: None,
             quirks: ProviderQuirks::default(),
             reasoning_effort: None,
+            credentials: None,
+            options: Default::default(),
         };
         assert_eq!(cfg.endpoint(), "https://example.com/responses");
     }

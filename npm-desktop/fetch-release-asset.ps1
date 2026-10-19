@@ -4,10 +4,11 @@
     预下载 GitHub Release 资产到 npm-desktop/downloads/<ver>/ 并做 sha256 对账。
 
 .DESCRIPTION
-    存在理由：publish.ps1 / sync-gitee-release.ps1 的下载段走 Invoke-WebRequest，
+    存在理由：publish.ps1 / sync-gitee-release.ps1 的下载段若走 Invoke-WebRequest，
     PS 5.1 下大资产（>40MB）会无征兆停滞在同一字节数，或 .tmp 涨到约 48MB 后
     删档归零循环（校验失败即删的设计叠加 IWR 停滞 = 死循环）。
-    本脚本用 curl.exe（Start-Process 调用，镜像直连 / 仅 GitHub 源走本地代理），
+    本脚本与 publish/sync 共用 lib/mirror-download.ps1 内核：curl --resolve 锁快节点直连
+    （2026-10-15 实测：走域名 32 KB/s vs 锁节点 1.3-2.5 MB/s），仅 GitHub 源走本地代理；
     逐资产与 Release API 的 sha256 digest 对账，全部通过才算成功。
     成功后 publish.ps1 / sync-gitee-release.ps1 加 -SkipDownload 即可续跑。
 
@@ -42,6 +43,9 @@ if (-not $Version) {
 $Downloads = Join-Path $PSScriptRoot ("downloads\{0}" -f $Version)
 New-Item -ItemType Directory -Force -Path $Downloads | Out-Null
 
+# 共享下载内核：curl --resolve 锁快节点直连（与 publish.ps1 / sync-gitee-release.ps1 同一份）
+. (Join-Path $PSScriptRoot 'lib\mirror-download.ps1')
+
 # token 只在内存：不落盘、不打印（git-pr-protocol SKILL §4 红线）
 $fill = "host=github.com`nprotocol=https`n`n" | git credential fill
 $tok = ($fill | Select-String '^password=').Line -replace '^password=',''
@@ -66,14 +70,17 @@ foreach ($name in $want) {
     $ok = $false
     foreach ($src in @("https://gh-proxy.com/https://github.com/mrpulor-gh/nuphus/releases/download/v$Version/$name", "https://github.com/mrpulor-gh/nuphus/releases/download/v$Version/$name")) {
         $isMirror = $src -like '*gh-proxy*'
-        # Start-Process 调 curl：stderr 不进 PowerShell error stream，天然免疫
-        # ErrorActionPreference=Stop 下的 NativeCommandError（SKILL §7.7 第 8 条）
-        $curlArgs = @('-sL', '--fail', '--max-time', '1200', '-o', $out)
-        if (-not $isMirror) { $curlArgs += @('-k', '--http1.1', '-x', 'http://127.0.0.1:2081') }
-        $curlArgs += $src
         $from = if ($isMirror) { 'mirror' } else { 'github+proxy' }
-        $p = Start-Process -FilePath 'curl.exe' -ArgumentList $curlArgs -Wait -PassThru -NoNewWindow
-        if ($p.ExitCode -eq 0 -and (Test-Path $out)) {
+        if ($isMirror) {
+            # 镜像走共享内核（curl --resolve 锁快节点直连 + 断点续传）
+            $downloaded = Invoke-MirrorDownload -Url $src -OutFile $out
+        } else {
+            # 裸 GitHub 域名：走本地代理（curl -x）；stderr 不进 PS error stream（SKILL §7.7）
+            $curlArgs = @('-sL', '--fail', '--max-time', '1200', '-o', $out, '-k', '--http1.1', '-x', 'http://127.0.0.1:2081', $src)
+            $p = Start-Process -FilePath 'curl.exe' -ArgumentList $curlArgs -Wait -PassThru -NoNewWindow
+            $downloaded = ($p.ExitCode -eq 0)
+        }
+        if ($downloaded -and (Test-Path $out)) {
             $actual = (Get-FileHash -Path $out -Algorithm SHA256).Hash.ToLower()
             if ($actual -ne $expect) {
                 Write-Warn "$name sha256 mismatch from $from - removing"
@@ -85,7 +92,7 @@ foreach ($name in $want) {
             $ok = $true
             break
         }
-        Write-Warn "$name curl failed from $from (exit $($p.ExitCode)) - trying next source"
+        Write-Warn "$name download failed from $from - trying next source"
     }
     if (-not $ok) { $failed += $name }
 }

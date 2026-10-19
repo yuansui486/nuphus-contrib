@@ -4,7 +4,7 @@ use nuphus::agent::goal_types::RelationConfig;
 use tauri::State;
 
 /// 持久化身份配置并更新 relation_cache（桌面端 SoulPage 保存 / 启动迁移时调用）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_relation(state: State<'_, AppState>, relation: RelationConfig) -> Result<(), String> {
     let config_dir = state
         .llm_config_path

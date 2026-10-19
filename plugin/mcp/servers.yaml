@@ -1,6 +1,11 @@
 # MCP Server Configuration
 # Nuphus reads it at startup and lazily connects to servers on first use.
 #
+# 两层配置（合并读取，同名 key 以本机层为准）：
+#   1. 本文件：通用配置，随仓入库、可随发布版携带
+#   2. <数据目录>/mcp/servers.local.yaml：本机私有配置，不入库、不随发布版携带
+#      （数据目录见「设置 → 数据目录」；Windows 通常为 %APPDATA%\.nuphus）
+#
 # Format:
 #   servers:
 #     <server-key>:
@@ -19,7 +24,8 @@
 #       env:
 #         GITHUB_PERSONAL_ACCESS_TOKEN: "<token>"
 #
-# 当前无已配置的 server。按需在 servers 下添加条目；
+# 当前通用层无已配置的 server。通用 server 在 servers 下添加条目；
+# 仅本机可用的 server 请写入 servers.local.yaml（勿提交）。
 # 接入方式见 skill: mcp-tools（skill_read mcp-tools）。
 
 servers: {}

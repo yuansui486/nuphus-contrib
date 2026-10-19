@@ -13,6 +13,7 @@ import { IconBrushCleaning, IconEye, IconEyeOff, IconPlug } from '../../ui/Icons
 import { Button } from '../../ui/Button'
 import { FormRow } from '../../ui/PageLayout'
 import { CompactModal } from '../layout/CompactModal'
+import { useLanguage } from '../../locales'
 import {
   clearLayaApiKey,
   getLayaConfig,
@@ -25,14 +26,123 @@ const DEFAULT_BASE_URL = 'http://127.0.0.1:8000'
 const DEFAULT_TIMEOUT_MS = 10_000
 const DEFAULT_MAX_RETRIES = 2
 
-function connectionMessage(result: LayaConnectionStatus | string): string {
+type TFunc = (key: string, ...args: string[]) => string
+
+/** 词条取值：字典命中 → 用字典文案；未命中 → 用中文兜底（与 JevSettings 同模式）。 */
+const tr = (t: TFunc, key: string, fallback: string): string => {
+  const v = t(key)
+  return v === key ? fallback : v
+}
+
+/** 页内文案表：按当前语言生成，键名稳定。 */
+function makeTXT(t: TFunc) {
+  return {
+    enabledState: tr(t, 'laya.enabledState', '已启用'),
+    disabledState: tr(t, 'laya.disabledState', '未启用'),
+    offState: tr(t, 'laya.offState', '已关闭'),
+    notTestedNote: tr(
+      t,
+      'laya.notTestedNote',
+      '本功能未在开发环境中完成端到端实测（缺少可运行 Laya 的机器），协议对接依据 Laya 源码实现，尚未经过真实模型验证。投入使用前请按实际部署自行验证并按需修改。',
+    ),
+    exclusiveNote: tr(
+      t,
+      'laya.exclusiveNote',
+      '另请注意：Jev 与 Laya 各自独立配置，同一时刻只有一个生效，Jev 已配置 API Key 时优先生效。',
+    ),
+    enableLabel: tr(t, 'laya.enableLabel', '启用 Laya 决策后端'),
+    enableHint: tr(
+      t,
+      'laya.enableHint',
+      '关闭时不会联系任何 Laya 服务，增强模式仍按既有的 Jev 或主模型逻辑运行。',
+    ),
+    enableAria: tr(t, 'laya.enableAria', '启用 Laya 决策后端'),
+    baseUrlLabel: tr(t, 'laya.baseUrlLabel', '服务地址'),
+    baseUrlHint: tr(
+      t,
+      'laya.baseUrlHint',
+      '自托管 Laya 服务地址，默认本机 8000 端口；非本机地址必须使用 HTTPS。',
+    ),
+    baseUrlAria: tr(t, 'laya.baseUrlAria', 'Laya 服务地址'),
+    modelLabel: tr(t, 'laya.modelLabel', '模型'),
+    modelHint: tr(
+      t,
+      'laya.modelHint',
+      '可填 english、multilingual、typed-decisions；留空则由 Laya 路由按语言自动选择。',
+    ),
+    modelPlaceholder: tr(t, 'laya.modelPlaceholder', '留空即自动路由'),
+    modelAria: tr(t, 'laya.modelAria', 'Laya 模型'),
+    configured: tr(t, 'laya.configured', '已配置'),
+    apiKeyHint: tr(
+      t,
+      'laya.apiKeyHint',
+      '自托管 Laya 通常无需 Key，仅当服务端设置了 LAYA_API_KEY 时才需要填写。',
+    ),
+    apiKeyPlaceholderSet: tr(t, 'laya.apiKeyPlaceholderSet', '已配置；输入新密钥可覆盖'),
+    apiKeyPlaceholderEmpty: tr(t, 'laya.apiKeyPlaceholderEmpty', '通常留空'),
+    apiKeyAria: tr(t, 'laya.apiKeyAria', 'Laya API Key'),
+    showKey: tr(t, 'laya.showKey', '显示'),
+    hideKey: tr(t, 'laya.hideKey', '隐藏'),
+    showKeyAria: tr(t, 'laya.showKeyAria', '显示 Laya API Key'),
+    hideKeyAria: tr(t, 'laya.hideKeyAria', '隐藏 Laya API Key'),
+    clearKeyTitle: tr(t, 'laya.clearKeyTitle', '清除已保存的 Laya API Key'),
+    clearKeyAria: tr(t, 'laya.clearKeyAria', '清除已保存的 Laya API Key'),
+    timeoutLabel: tr(t, 'laya.timeoutLabel', '请求超时（毫秒）'),
+    timeoutHint: tr(
+      t,
+      'laya.timeoutHint',
+      '单次请求的最长等待时间，范围 100–120000。CPU 推理需要适当放宽。',
+    ),
+    timeoutAria: tr(t, 'laya.timeoutAria', 'Laya 请求超时'),
+    retriesLabel: tr(t, 'laya.retriesLabel', '最大重试次数'),
+    retriesHint: tr(t, 'laya.retriesHint', '只对可重试的临时错误生效，范围 0–10。'),
+    retriesAria: tr(t, 'laya.retriesAria', 'Laya 最大重试次数'),
+    fallbackLabel: tr(t, 'laya.fallbackLabel', 'Laya 不可用时回退主模型'),
+    fallbackHint: tr(
+      t,
+      'laya.fallbackHint',
+      '服务请求失败时，由主模型继续从同一有限候选动作空间选择。',
+    ),
+    fallbackAria: tr(t, 'laya.fallbackAria', '回退到主模型'),
+    saveBtn: tr(t, 'laya.saveBtn', '保存配置'),
+    testBtn: tr(t, 'laya.testBtn', '测试连接'),
+    clearModalTitle: tr(t, 'laya.clearModalTitle', '清除 API Key'),
+    cancel: tr(t, 'laya.cancel', '取消'),
+    confirmClear: tr(t, 'laya.confirmClear', '确认清除'),
+    clearModalBody: tr(
+      t,
+      'laya.clearModalBody',
+      '确定清除已保存的 Laya API Key？服务地址和模型配置会保留。',
+    ),
+    // ── 反馈消息（函数型，带 {0} 占位符）──
+    connOk: tr(t, 'laya.connOk', '服务可达'),
+    connRouted: (m: string) =>
+      t('laya.connRouted', m) === 'laya.connRouted'
+        ? `服务可达（路由到 ${m}）`
+        : t('laya.connRouted', m),
+    connStatus: (s: string) =>
+      t('laya.connStatus', s) === 'laya.connStatus' ? `连接状态：${s}` : t('laya.connStatus', s),
+    errNeedBaseUrl: tr(t, 'laya.errNeedBaseUrl', '请输入 Laya 服务地址'),
+    errTimeoutRange: tr(t, 'laya.errTimeoutRange', '请求超时必须介于 100 与 120000 毫秒之间'),
+    errRetriesRange: tr(t, 'laya.errRetriesRange', '最大重试次数必须是 0 到 10 之间的整数'),
+    errNoConfig: tr(t, 'laya.errNoConfig', '后端未返回 Laya 配置'),
+    saveOk: tr(t, 'laya.saveOk', 'Laya 配置已保存'),
+    errNoTestResult: tr(t, 'laya.errNoTestResult', '后端未返回连接测试结果'),
+    clearOk: tr(t, 'laya.clearOk', 'Laya API Key 已清除'),
+  }
+}
+
+function connectionMessage(
+  result: LayaConnectionStatus | string,
+  TXT: ReturnType<typeof makeTXT>,
+): string {
   if (typeof result === 'string') return result
   if (result.message) return result.message
   const status = result.status.toLowerCase()
   if (['ok', 'ready', 'available', 'connected'].includes(status)) {
-    return result.model ? `服务可达（路由到 ${result.model}）` : '服务可达'
+    return result.model ? TXT.connRouted(result.model) : TXT.connOk
   }
-  return `连接状态：${result.status}`
+  return TXT.connStatus(result.status)
 }
 
 function connectionOk(result: LayaConnectionStatus | string): boolean {
@@ -43,6 +153,8 @@ function connectionOk(result: LayaConnectionStatus | string): boolean {
 }
 
 export function LayaBackendPanel() {
+  const { t } = useLanguage()
+  const TXT = makeTXT(t)
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL)
   const [model, setModel] = useState('')
   const [enabled, setEnabled] = useState(false)
@@ -78,7 +190,6 @@ export function LayaBackendPanel() {
         // （本机 8000、无 Key、10s 超时）。真的用不了会在保存或测试时暴露，
         // 那时用户已经明确表达了意图，报错才有意义。
       })
-      .finally(() => alive && setLoading(false))
     return () => {
       alive = false
     }
@@ -86,17 +197,17 @@ export function LayaBackendPanel() {
 
   const validate = (): boolean => {
     if (!baseUrl.trim()) {
-      setFeedback({ ok: false, message: '请输入 Laya 服务地址' })
+      setFeedback({ ok: false, message: TXT.errNeedBaseUrl })
       return false
     }
     const timeout = Number(timeoutMs)
     if (!Number.isFinite(timeout) || timeout < 100 || timeout > 120_000) {
-      setFeedback({ ok: false, message: '请求超时必须介于 100 与 120000 毫秒之间' })
+      setFeedback({ ok: false, message: TXT.errTimeoutRange })
       return false
     }
     const retries = Number(maxRetries)
     if (!Number.isInteger(retries) || retries < 0 || retries > 10) {
-      setFeedback({ ok: false, message: '最大重试次数必须是 0 到 10 之间的整数' })
+      setFeedback({ ok: false, message: TXT.errRetriesRange })
       return false
     }
     return true
@@ -116,10 +227,10 @@ export function LayaBackendPanel() {
         maxRetries: Number(maxRetries),
         fallbackToPrimaryModel,
       })
-      if (!config) throw new Error('后端未返回 Laya 配置')
+      if (!config) throw new Error(TXT.errNoConfig)
       setHasKey(Boolean(config.has_key))
       setApiKey('')
-      setFeedback({ ok: true, message: 'Laya 配置已保存' })
+      setFeedback({ ok: true, message: TXT.saveOk })
     } catch (error) {
       setFeedback({ ok: false, message: String(error) })
     } finally {
@@ -133,8 +244,8 @@ export function LayaBackendPanel() {
     setTesting(true)
     try {
       const result = await testLayaConnection()
-      if (!result) throw new Error('后端未返回连接测试结果')
-      setFeedback({ ok: connectionOk(result), message: connectionMessage(result) })
+      if (!result) throw new Error(TXT.errNoTestResult)
+      setFeedback({ ok: connectionOk(result), message: connectionMessage(result, TXT) })
     } catch (error) {
       setFeedback({ ok: false, message: String(error) })
     } finally {
@@ -149,7 +260,7 @@ export function LayaBackendPanel() {
       setHasKey(false)
       setApiKey('')
       setShowClearConfirm(false)
-      setFeedback({ ok: true, message: 'Laya API Key 已清除' })
+      setFeedback({ ok: true, message: TXT.clearOk })
     } catch (error) {
       setFeedback({ ok: false, message: String(error) })
     } finally {
@@ -162,21 +273,15 @@ export function LayaBackendPanel() {
       <div className="decision-settings-summary">
         <span className={`decision-settings-dot${enabled ? ' is-ready' : ''}`} />
         <div>
-          <strong>{enabled ? '已启用' : '未启用'}</strong>
-          <p>
-            本功能未在开发环境中完成端到端实测（缺少可运行 Laya 的机器），协议对接依据 Laya
-            源码实现，尚未经过真实模型验证。投入使用前请按实际部署自行验证并按需修改。
-          </p>
-          <p>
-            另请注意：Jev 与 Laya 各自独立配置，同一时刻只有一个生效，Jev 已配置 API Key
-            时优先生效。
-          </p>
+          <strong>{enabled ? TXT.enabledState : TXT.disabledState}</strong>
+          <p>{TXT.notTestedNote}</p>
+          <p>{TXT.exclusiveNote}</p>
         </div>
       </div>
 
       <FormRow
-        label="启用 Laya 决策后端"
-        hint="关闭时不会联系任何 Laya 服务，增强模式仍按既有的 Jev 或主模型逻辑运行。"
+        label={TXT.enableLabel}
+        hint={TXT.enableHint}
         control={
           <label className="decision-fallback-toggle">
             <input
@@ -184,41 +289,40 @@ export function LayaBackendPanel() {
               checked={enabled}
               disabled={loading}
               onChange={event => setEnabled(event.target.checked)}
-              aria-label="启用 Laya 决策后端"
+              aria-label={TXT.enableAria}
             />
-            <span>{enabled ? '已启用' : '已关闭'}</span>
+            <span>{enabled ? TXT.enabledState : TXT.offState}</span>
           </label>
         }
       />
 
       <FormRow
         stacked
-        label="服务地址"
-        hint="自托管 Laya 服务地址，默认本机 8000 端口；非本机地址必须使用 HTTPS。"
+        label={TXT.baseUrlLabel}
+        hint={TXT.baseUrlHint}
         control={
           <input
             className="compact-input"
             value={baseUrl}
             disabled={loading}
             onChange={event => setBaseUrl(event.target.value)}
-            placeholder={DEFAULT_BASE_URL}
-            aria-label="Laya 服务地址"
+            aria-label={TXT.baseUrlAria}
           />
         }
       />
 
       <FormRow
         stacked
-        label="模型"
-        hint="可填 english、multilingual、typed-decisions；留空则由 Laya 路由按语言自动选择。"
+        label={TXT.modelLabel}
+        hint={TXT.modelHint}
         control={
           <input
             className="compact-input"
             value={model}
             disabled={loading}
             onChange={event => setModel(event.target.value)}
-            placeholder="留空即自动路由"
-            aria-label="Laya 模型"
+            placeholder={TXT.modelPlaceholder}
+            aria-label={TXT.modelAria}
           />
         }
       />
@@ -228,10 +332,10 @@ export function LayaBackendPanel() {
         label={
           <span className="models-field-label">
             <IconPlug size={12} className="icon-prefix" /> API Key
-            {hasKey && <span className="model-badge label-badge">已配置</span>}
+            {hasKey && <span className="model-badge label-badge">{TXT.configured}</span>}
           </span>
         }
-        hint="自托管 Laya 通常无需 Key，仅当服务端设置了 LAYA_API_KEY 时才需要填写。"
+        hint={TXT.apiKeyHint}
         control={
           <div className="models-key-row">
             <div className="models-key-field">
@@ -241,18 +345,18 @@ export function LayaBackendPanel() {
                 value={apiKey}
                 disabled={loading}
                 onChange={event => setApiKey(event.target.value)}
-                placeholder={hasKey ? '已配置；输入新密钥可覆盖' : '通常留空'}
-                aria-label="Laya API Key"
+                placeholder={hasKey ? TXT.apiKeyPlaceholderSet : TXT.apiKeyPlaceholderEmpty}
+                aria-label={TXT.apiKeyAria}
               />
               <button
                 type="button"
                 className="models-key-eye"
                 onClick={() => setShowKey(value => !value)}
                 tabIndex={-1}
-                title={showKey ? '隐藏' : '显示'}
-                aria-label={showKey ? '隐藏 Laya API Key' : '显示 Laya API Key'}
+                title={showKey ? TXT.showKey : TXT.hideKey}
+                aria-label={showKey ? TXT.hideKeyAria : TXT.showKeyAria}
               >
-                {showKey ? <IconEyeOff size={14} /> : <IconEye size={14} />}
+                {showKey ? <IconEyeOff size={13} /> : <IconEye size={13} />}
               </button>
             </div>
             {hasKey && (
@@ -261,8 +365,8 @@ export function LayaBackendPanel() {
                 className="models-key-clear"
                 onClick={() => setShowClearConfirm(true)}
                 disabled={clearing}
-                title="清除已保存的 Laya API Key"
-                aria-label="清除已保存的 Laya API Key"
+                title={TXT.clearKeyTitle}
+                aria-label={TXT.clearKeyAria}
               >
                 <IconBrushCleaning size={13} />
               </button>
@@ -274,8 +378,8 @@ export function LayaBackendPanel() {
       <div className="decision-policy-grid">
         <FormRow
           stacked
-          label="请求超时（毫秒）"
-          hint="单次请求的最长等待时间，范围 100–120000。CPU 推理需要适当放宽。"
+          label={TXT.timeoutLabel}
+          hint={TXT.timeoutHint}
           control={
             <input
               className="compact-input"
@@ -286,15 +390,15 @@ export function LayaBackendPanel() {
               value={timeoutMs}
               disabled={loading}
               onChange={event => setTimeoutMs(event.target.value)}
-              aria-label="Laya 请求超时"
+              aria-label={TXT.timeoutAria}
             />
           }
         />
 
         <FormRow
           stacked
-          label="最大重试次数"
-          hint="只对可重试的临时错误生效，范围 0–10。"
+          label={TXT.retriesLabel}
+          hint={TXT.retriesHint}
           control={
             <input
               className="compact-input"
@@ -305,15 +409,15 @@ export function LayaBackendPanel() {
               value={maxRetries}
               disabled={loading}
               onChange={event => setMaxRetries(event.target.value)}
-              aria-label="Laya 最大重试次数"
+              aria-label={TXT.retriesAria}
             />
           }
         />
       </div>
 
       <FormRow
-        label="Laya 不可用时回退主模型"
-        hint="服务请求失败时，由主模型继续从同一有限候选动作空间选择。"
+        label={TXT.fallbackLabel}
+        hint={TXT.fallbackHint}
         control={
           <label className="decision-fallback-toggle">
             <input
@@ -321,20 +425,21 @@ export function LayaBackendPanel() {
               checked={fallbackToPrimaryModel}
               disabled={loading}
               onChange={event => setFallbackToPrimaryModel(event.target.checked)}
-              aria-label="回退到主模型"
+              aria-label={TXT.fallbackAria}
             />
-            <span>{fallbackToPrimaryModel ? '已启用' : '已关闭'}</span>
+            <span>{fallbackToPrimaryModel ? TXT.enabledState : TXT.offState}</span>
           </label>
         }
       />
 
       <div className="decision-settings-actions">
         <Button variant="primary" size="sm" loading={saving} onClick={() => void save()}>
-          保存
+          <IconPlug size={13} />
+          {TXT.saveBtn}
         </Button>
         <Button variant="ghost" size="sm" loading={testing} onClick={() => void test()}>
           <IconPlug size={13} />
-          测试连接
+          {TXT.testBtn}
         </Button>
         {feedback && (
           <span
@@ -353,20 +458,20 @@ export function LayaBackendPanel() {
       <CompactModal
         open={showClearConfirm}
         onClose={() => setShowClearConfirm(false)}
-        title="清除 API Key"
+        title={TXT.clearModalTitle}
         size="sm"
         footer={
           <>
             <Button variant="ghost" size="sm" onClick={() => setShowClearConfirm(false)}>
-              取消
+              {TXT.cancel}
             </Button>
             <Button variant="danger" size="sm" loading={clearing} onClick={() => void clear()}>
-              确认清除
+              {TXT.confirmClear}
             </Button>
           </>
         }
       >
-        <p>确定清除已保存的 Laya API Key？服务地址和模型配置会保留。</p>
+        <p>{TXT.clearModalBody}</p>
       </CompactModal>
     </>
   )

@@ -882,9 +882,15 @@ async fn handle_device_socket(state: AppState, socket: WebSocket, device_id: Str
                         }
                     }
                     None => {
+                        // 按字符边界截断：设备消息是 JSON（含中文），裸字节切片
+                        // 会在多字节字符中间 panic。
+                        let mut end = text.len().min(200);
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
                         tracing::warn!(
                             "[relay] device sent unparsable msg: {}",
-                            &text[..text.len().min(200)]
+                            &text[..end]
                         );
                     }
                 }

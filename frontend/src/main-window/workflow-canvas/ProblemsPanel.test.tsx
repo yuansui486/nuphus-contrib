@@ -29,6 +29,8 @@ describe('workflow bottom panel', () => {
       fieldPath: '/do/with/text',
     }))
     const { rerender } = render(<ProblemsPanel {...emptyProps} problems={problems} />)
+    // 默认收起：先展开再断言列表内容
+    fireEvent.click(screen.getByRole('button', { name: '展开底部面板' }))
     expect(screen.getByText('外部输入 contact 尚未声明')).toBeInTheDocument()
     expect(screen.queryByText('raw contact')).not.toBeInTheDocument()
     fireEvent.click(screen.getAllByRole('button', { name: '展开问题详情' })[0])
@@ -41,6 +43,7 @@ describe('workflow bottom panel', () => {
   })
   it('resizes by keyboard, persists expansion height and resets on double click', () => {
     render(<ProblemsPanel {...emptyProps} />)
+    fireEvent.click(screen.getByRole('button', { name: '展开底部面板' }))
     const handle = screen.getByRole('separator')
     expect(handle).toHaveAttribute('aria-valuenow', '220')
     fireEvent.keyDown(handle, { key: 'ArrowUp' })
@@ -60,6 +63,8 @@ describe('workflow bottom panel', () => {
         <ProblemsPanel {...emptyProps} />
       </div>,
     )
+    // 默认收起：先展开使 separator 渲染
+    fireEvent.click(screen.getByRole('button', { name: '展开底部面板' }))
     const handle = screen.getByRole('separator')
     handle.setPointerCapture = vi.fn()
     handle.hasPointerCapture = () => true
@@ -91,6 +96,8 @@ describe('workflow bottom panel', () => {
         />
       </LangProvider>,
     )
+    // 默认收起：先展开再断言列表与 separator
+    fireEvent.click(screen.getByRole('button', { name: 'Expand bottom panel' }))
     expect(screen.getByText('External input contact is not declared')).toBeInTheDocument()
     expect(screen.getByRole('separator', { name: 'Resize bottom panel' })).toBeInTheDocument()
   })
@@ -148,5 +155,19 @@ describe('workflow bottom panel', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: /运行日志/ }))
     expect(screen.getByText('读取文件 · 读取完成')).toBeInTheDocument()
+  })
+
+  it('starts collapsed and expands on click', () => {
+    render(<ProblemsPanel {...emptyProps} />)
+    // 收起态：toggle（aria-expanded=false）与 tab 栏可见，面板主体（列表/分隔条）不渲染
+    const toggle = screen.getByRole('button', { name: '展开底部面板' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByRole('tablist')).toBeInTheDocument()
+    expect(screen.queryByRole('separator')).not.toBeInTheDocument()
+    expect(screen.queryByText(/外部输入|暂无问题/)).not.toBeInTheDocument()
+    // 点击 tab 展开
+    fireEvent.click(screen.getByRole('button', { name: /问题/ }))
+    expect(screen.getByRole('separator')).toBeInTheDocument()
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
   })
 })

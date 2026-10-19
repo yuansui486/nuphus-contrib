@@ -46,7 +46,7 @@ fn ensure_knowledge_engine(
 
 // ── Tauri 命令 ──
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn search_knowledge(
     state: State<'_, AppState>,
     query: String,
@@ -69,7 +69,7 @@ pub fn search_knowledge(
     Ok(engine.search(&req))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_knowledge(state: State<'_, AppState>) -> Result<Vec<KnowledgeHit>, String> {
     let engine_guard = ensure_knowledge_engine(state.inner())?;
     let engine = engine_guard
@@ -86,7 +86,7 @@ pub fn list_knowledge(state: State<'_, AppState>) -> Result<Vec<KnowledgeHit>, S
     Ok(engine.search(&req))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_knowledge_tags(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let engine_guard = ensure_knowledge_engine(state.inner())?;
     let engine = engine_guard
@@ -98,7 +98,7 @@ pub fn list_knowledge_tags(state: State<'_, AppState>) -> Result<Vec<String>, St
     Ok(engine.all_tags())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_knowledge(state: State<'_, AppState>, rel_path: String) -> Result<bool, String> {
     let engine_guard = ensure_knowledge_engine(state.inner())?;
     let engine = engine_guard

@@ -4,7 +4,7 @@
 //! 画布命令（wf_validate / wf_save / wf_run）：IR 唯一真源，保存前强制权威校验。
 
 use nuphus::workflow::compiler::{Compiler, ValidationReport};
-use nuphus::workflow::scheduler::{has_frontend_step, ScheduleRunRecord, SchedulerEngine};
+use nuphus::workflow::scheduler::{human_blocker_in_steps, ScheduleRunRecord, SchedulerEngine};
 use nuphus::workflow::types::{InputSpec, ScheduleConfig, Workflow};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -121,8 +121,11 @@ pub async fn wf_schedule_get(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     let (inputs, sensitive_inputs) = sanitized_schedule_inputs(&workflow.inputs, &decoded);
-    let ineligible_reason = has_frontend_step(&workflow.steps)
-        .then(|| "包含桌面或浏览器前台步骤，需要用户在场，不能定时执行".to_string());
+    // 与 scheduler 的保存期门同一个判据：只拦"会停下来等人"的构造。
+    // 桌面/浏览器步骤不再是不合格理由——工作流是人 + Agent 一同编译出来的，
+    // 选择在编译时就已做出；定时只是按时执行这份已决定的人工件。
+    let ineligible_reason = human_blocker_in_steps(&workflow.steps)
+        .map(|reason| format!("{reason}。定时运行必须能在无人介入下跑完。"));
     let config = engine
         .scheduler
         .get_schedule(&id)
@@ -137,7 +140,7 @@ pub async fn wf_schedule_get(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn wf_schedule_preview(config: ScheduleConfig) -> Result<Vec<String>, String> {
     SchedulerEngine::preview(&config, 3)
         .map(|dates| dates.into_iter().map(|date| date.to_rfc3339()).collect())
@@ -372,7 +375,7 @@ pub async fn wf_resume(
 /// 工作流画布工具选择器数据源：全量注册表按 WORKFLOW_TOOL_EXCLUDE 过滤，
 /// 仅保留 workflow tool 步骤可执行的工具（排除 agent 编排/记忆/工作流管理类）。
 /// 仅用于选择器展示；wf_validate/wf_save 的权威校验仍使用全量注册表，不受其影响。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn wf_tools(state: State<'_, AppState>) -> Result<Vec<ToolSchema>, String> {
     let schemas = state.tools.get_schemas();
     Ok(schemas
@@ -508,7 +511,8 @@ pub fn inject_workflow_runtime(state: &AppState, engine: &mut nuphus::workflow::
 
 /// 从画布确定性触发执行（同 id 自动断点续连，execute.rs 语义）。
 /// 与 workflow_run 工具同一条 execute_workflow 链路；前台交互运行，
-/// 不施加 scheduler 的 has_frontend_step 后台限制（desktop_/browser_ 工具本就面向桌面前台）。
+/// 不施加 scheduler 的人类阻塞点限制（那个判据只对无人值守的定时有意义，
+/// 而画布运行的此刻人就在场——等人、点继续、批审批都成立）。
 /// 异步 spawn：立即返回，进度经 workflow-event 事件流推送。
 /// fresh=true：上次运行失败后画布「运行」从头执行（force_fresh，跳过逻辑失效）；
 /// 缺省/续跑（fresh=false）保留断点续连语义。
@@ -684,6 +688,7 @@ mod schedule_editor_tests {
             default: None,
             description: None,
             sensitive,
+            options: None,
         }
     }
 

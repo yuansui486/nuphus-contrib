@@ -559,6 +559,12 @@ impl Runtime {
         Ok(())
     }
 
+    /// 登记一次性模型切换提示（挂起态）：只登记，不写 session。
+    /// 注入由 ReactAgent::build_request 在下次 LLM 请求时以 transient 形态完成一次。
+    pub fn queue_model_notice(&mut self, provider: &str, model: &str) {
+        self.agent.queue_model_notice(provider, model);
+    }
+
     /// Get mutable Session reference
     pub fn session_mut(&mut self) -> &mut Session {
         self.agent.session_mut()

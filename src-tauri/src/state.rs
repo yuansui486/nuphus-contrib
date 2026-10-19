@@ -207,7 +207,12 @@ impl Default for RuntimeContext {
             model_generation: 0,
             model_context_explicit: None,
             metadata_tasks: Default::default(),
-            large_force_refine_threshold: nuphus::agent::distill::LARGE_FORCE_DEFAULT,
+            // 从 config.toml 恢复用户设定的强制线；缺键/不可解析/越界时回落到默认。
+            // 此前恒为 LARGE_FORCE_DEFAULT(=0.50)，意味着用户每次调完强制线，
+            // 重启应用后就被静默重置——表现就是「界面调到 65%，下一轮仍在 50% 强制提炼」。
+            large_force_refine_threshold:
+                crate::commands::config::toml_ops::read_refine_force_threshold_from_config_toml()
+                    .unwrap_or(nuphus::agent::distill::LARGE_FORCE_DEFAULT),
         }
     }
 }
@@ -301,8 +306,12 @@ impl Default for AppState {
         let signals = nuphus::state::new_shared_signals();
         let automation_gate = Arc::new(nuphus::automation_gate::AutomationGate::new());
         let mut tools = nuphus::ToolRegistry::builtin_with_desktop();
+        // 全进程唯一取消标志：先进 registry，再存进 AppState ——
+        // 顺序有含义，工具执行内部读到的必须是这一个实例
+        let cancel_flag = Arc::new(AtomicBool::new(false));
         tools.set_signals(signals.clone());
         tools.set_automation_gate(automation_gate.clone());
+        tools.set_cancel_flag(cancel_flag.clone());
         let mut workflow_engine = nuphus::workflow::WorkflowEngine::new();
         workflow_engine.set_signals(signals.clone());
 
@@ -317,7 +326,7 @@ impl Default for AppState {
             llm_config_path: config_dir.join("providers.toml"),
             tool_permissions_path,
             tool_permissions_ref,
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_flag,
             pause_flag: Arc::new(AtomicBool::new(false)),
             current_mode: Arc::new(std::sync::RwLock::new("leader".to_string())),
             workflow_enhanced_mode: AtomicBool::new(false),

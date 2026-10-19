@@ -23,6 +23,8 @@ export function useModals() {
   const [showCanvas, setShowCanvas] = useState(false)
   // 画布工作台的「目标工作流」：由列表入口带过来；为空时工作台自行挑选最近更新的草稿
   const [canvasWorkflowId, setCanvasWorkflowId] = useState<string | null>(null)
+  // 内置工具页：已从画布移出，作为独立全屏界面（入口在桌面工具条末尾）
+  const [showTools, setShowTools] = useState(false)
 
   /** 打开画布工作台：传 id 直接编辑该工作流，不传则由工作台自选 */
   const openCanvas = useCallback((id?: string | null) => {
@@ -78,5 +80,7 @@ export function useModals() {
     canvasWorkflowId,
     openCanvas,
     closeCanvas,
+    showTools,
+    setShowTools,
   }
 }

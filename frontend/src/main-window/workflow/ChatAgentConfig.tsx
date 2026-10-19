@@ -1,6 +1,8 @@
 // ChatAgentConfig.tsx — Chat Agent 配置页面
 import { useState, useEffect, useCallback } from 'react'
+import { useLanguage } from '../../locales'
 import {
+  backendErrorMessage,
   listChatAgents,
   saveChatAgent,
   deleteChatAgent,
@@ -408,8 +410,10 @@ function InlineStepCard({
   ) => Promise<void>
 }) {
   const { config } = entry
+  const { t } = useLanguage()
   const [editing, setEditing] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   const [persona, setPersona] = useState(config.persona || '')
   const [goal, setGoal] = useState(config.goal || '')
   const [constr, setConstr] = useState((config.constraints || []).join('\n'))
@@ -419,9 +423,15 @@ function InlineStepCard({
 
   const save = async () => {
     setSaving(true)
-    await onSave(persona, goal, constr, reqs, know, aid)
-    setSaving(false)
-    setEditing(false)
+    setSaveError(null)
+    try {
+      await onSave(persona, goal, constr, reqs, know, aid)
+      setEditing(false)
+    } catch (e) {
+      setSaveError(backendErrorMessage(e))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -455,6 +465,11 @@ function InlineStepCard({
       </div>
       {editing ? (
         <div className="cac-card-body">
+          {saveError && (
+            <div role="alert" style={{ color: 'var(--danger)' }}>
+              {t('chatAgent.inlineSaveFailed', saveError)}
+            </div>
+          )}
           <FormRow
             stacked
             label="引用模板（留空 = Active）"
@@ -560,6 +575,7 @@ function InlineStepCard({
 
 // ═══════════════ 页面主体 ═══════════════
 export function ChatAgentConfig({ onClose }: Props) {
+  const { t } = useLanguage()
   const [agents, setAgents] = useState<AgentT[]>([])
   const [loading, setLoading] = useState(true)
   const [activeName, setActiveName] = useState<string | null>(null)
@@ -568,6 +584,7 @@ export function ChatAgentConfig({ onClose }: Props) {
 
   const [entries, setEntries] = useState<InlineChatAgentEntry[]>([])
   const [entriesLoading, setEntriesLoading] = useState(true)
+  const [entriesErrors, setEntriesErrors] = useState<string[]>([])
 
   const [defaultMaxIter, setDefaultMaxIter] = useState<number | null>(null)
   const [dmiSaving, setDmiSaving] = useState(false)
@@ -576,6 +593,7 @@ export function ChatAgentConfig({ onClose }: Props) {
   const loadAll = useCallback(async () => {
     setLoading(true)
     setEntriesLoading(true)
+    setEntriesErrors([])
     try {
       const [list, wfs] = await Promise.all([listChatAgents(), listWorkflows()])
       setAgents(list ?? [])
@@ -584,20 +602,25 @@ export function ChatAgentConfig({ onClose }: Props) {
         if (a) setActiveName(a.name)
       } catch {}
       const all: InlineChatAgentEntry[] = []
+      const errors: string[] = []
       for (const wf of wfs) {
         try {
           const r = await listChatAgentsInline(wf.id)
           if (Array.isArray(r)) all.push(...r)
-        } catch {}
+        } catch (e) {
+          errors.push(`${wf.title || wf.id}: ${backendErrorMessage(e)}`)
+        }
       }
       setEntries(all)
+      setEntriesErrors(errors)
       try {
         const caps: any = await getCapabilities()
         if (caps) setDefaultMaxIter(caps.chat_agent_max_iterations ?? null)
       } catch {}
-    } catch {
+    } catch (e) {
       setAgents([])
       setEntries([])
+      setEntriesErrors([backendErrorMessage(e)])
     } finally {
       setLoading(false)
       setEntriesLoading(false)
@@ -746,14 +769,21 @@ export function ChatAgentConfig({ onClose }: Props) {
         title="工作流步骤"
         description="来自各工作流 Talk 步骤的内联配置，修改直接写入 workflow.json。"
       >
+        {entriesErrors.length > 0 && (
+          <div role="alert" style={{ color: 'var(--danger)' }}>
+            {t('chatAgent.inlineLoadFailed', entriesErrors.join('; '))}
+          </div>
+        )}
         {entriesLoading ? (
           <div className="page-loading">加载中…</div>
         ) : entries.length === 0 ? (
-          <div className="page-empty">
-            <IconBot size={28} />
-            <div>暂无步骤配置</div>
-            <div className="page-empty-hint">工作流含 Talk 步骤后自动显示</div>
-          </div>
+          entriesErrors.length === 0 && (
+            <div className="page-empty">
+              <IconBot size={28} />
+              <div>暂无步骤配置</div>
+              <div className="page-empty-hint">工作流含 Talk 步骤后自动显示</div>
+            </div>
+          )
         ) : (
           entries.map(e => (
             <InlineStepCard

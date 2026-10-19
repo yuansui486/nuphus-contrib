@@ -61,7 +61,10 @@ const STATE_EYE: Record<NuphusAvatarState, keyof typeof EYES> = {
 
 export function NuphusAvatar({ state = 'idle', size = 40, className, gaze }: NuphusAvatarProps) {
   const { theme } = useTheme()
-  const fg = theme !== 'light' ? '#f5f5fa' : '#1a1a2e'
+  // 描边色随主题明暗走：dark 近白 / light 深蓝墨 / fresh 黑。
+  // fresh 不可复用 light 的 #1a1a2e：晨雾青白底上深蓝墨发灰、压不住 logo
+  // （2026-10-13 定：.title-bar-left 的 logo 在清新主题下用黑色）。
+  const fg = theme === 'dark' ? '#f5f5fa' : theme === 'fresh' ? '#000000' : '#1a1a2e'
   const eye = EYES[STATE_EYE[state]]
 
   // 注视偏移（SVG 用户单位，随 viewBox 256 缩放）：x 左右 ±14、y 上下 ±10、俯仰缩短 scaleY

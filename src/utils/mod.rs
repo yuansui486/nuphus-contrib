@@ -1246,8 +1246,134 @@ impl std::io::Write for SafeWriter {
     }
 }
 
+// ── 日志折叠（同源高频错误限流）──
+//
+// 动机（线上事故 2026-10-11）：主 webview 渲染进程死亡后，wry 消息循环对每一次
+// 失败的 JS 注入都 `log::error!` 一条——事件推送速率越高，错误洪水越凶
+// （实测 46 条/秒，64 秒 2977 条），把 nuphus-debug.log 冲成刷屏现场，用户
+// 以为应用崩溃。源头修复（UI 失联检测 + 事件节流，见 src-tauri/emitter.rs）
+// 已消除这一特定洪水，但任何「同一样本点高频重复」的日志都应有兜底：
+// 本模块对每个 callsite 做窗口限流，折叠数周期性汇总，绝不静默吞掉全部。
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+
+/// 同源日志放行间隔：同一 callsite 的日志在该窗口内最多输出一条。
+pub(crate) const LOG_COLLAPSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 每一样本点的折叠状态。
+#[derive(Debug, Default)]
+pub(crate) struct CollapseCounter {
+    /// callsite 地址 → (上次放行时刻, 累计折叠数)。
+    sites: Mutex<HashMap<usize, (Instant, u64)>>,
+}
+
+impl CollapseCounter {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// 是否放行该 callsite 的日志：窗口内首条放行，其余折叠计数。
+    pub(crate) fn admit(&self, site: usize, now: Instant) -> bool {
+        let mut sites = match self.sites.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match sites.get_mut(&site) {
+            Some((last_pass, folded)) => {
+                if now.duration_since(*last_pass) >= LOG_COLLAPSE_WINDOW {
+                    *last_pass = now;
+                    true
+                } else {
+                    *folded += 1;
+                    false
+                }
+            }
+            None => {
+                sites.insert(site, (now, 0));
+                true
+            }
+        }
+    }
+
+    /// 取出并清零所有站点的折叠计数（供周期性摘要上报）。
+    pub(crate) fn take_folded(&self) -> Vec<(usize, u64)> {
+        let mut sites = match self.sites.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut out = Vec::new();
+        for (site, (_last, folded)) in sites.iter_mut() {
+            if *folded > 0 {
+                out.push((*site, *folded));
+                *folded = 0;
+            }
+        }
+        out
+    }
+}
+
+/// tracing 层过滤器：按 callsite 做窗口限流（见 [`CollapseCounter`]）。
+///
+/// `enabled` 只拿得到 `Metadata`（无事件内容），因此按**输出点**限流而非按
+/// 消息内容——对本模块的目标形态（同一点位高频重复，如第三方库的逐条错误）
+/// 恰好精确；不同内容走同一 callsite 的场景会共享窗口（最多 10s 少一条），
+/// 折叠计数在周期性摘要里可见，诊断信息不丢失。
+#[derive(Clone)]
+pub(crate) struct CollapseFilter {
+    counter: std::sync::Arc<CollapseCounter>,
+}
+
+impl CollapseFilter {
+    pub(crate) fn new(counter: std::sync::Arc<CollapseCounter>) -> Self {
+        Self { counter }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for CollapseFilter {
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        // 身份键 = 输出点的 (file, line)：`event!` / `log::error!` 宏的调用位置
+        // 对同一 callsite 恒定，且是稳定公共 API（Identifier 的无名字段是
+        // doc-hidden 不稳定 API，不碰）。同一行只会展开一个宏，碰撞可忽略。
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(file) = meta.file() {
+            file.hash(&mut hasher);
+        }
+        if let Some(line) = meta.line() {
+            line.hash(&mut hasher);
+        }
+        let site = hasher.finish() as usize;
+        self.counter.admit(site, Instant::now())
+    }
+}
+
+/// 周期性上报折叠摘要：把「限流期间被折叠了多少条」汇总输出，避免限流
+/// 本身变成信息黑洞。**只由 init_logging 在 tokio 运行时内调用一次。**
+async fn collapse_summary_loop(counter: std::sync::Arc<CollapseCounter>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let folded = counter.take_folded();
+        if folded.is_empty() {
+            continue;
+        }
+        let total: u64 = folded.iter().map(|(_, n)| n).sum();
+        tracing::warn!(
+            window_s = LOG_COLLAPSE_WINDOW.as_secs(),
+            sources = folded.len(),
+            folded = total,
+            "[log-collapse] 高频重复日志已折叠（窗口内同源仅首条输出，详见上方首条）"
+        );
+    }
+}
+
 pub fn init_logging() {
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::{EnvFilter, Registry};
 
@@ -1261,15 +1387,25 @@ pub fn init_logging() {
         .with_target(false)
         .with_ansi(false);
 
+    // 同源高频错误限流（webview 假死时的 eval 错误洪水即此形态）。
+    let collapse_counter = std::sync::Arc::new(CollapseCounter::new());
+    let collapse_filter = CollapseFilter::new(collapse_counter.clone());
+
     Registry::default()
         .with(
             EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into())
                 .add_directive("chromiumoxide=WARN".parse().unwrap()),
         )
-        .with(file_layer)
-        .with(stderr_layer)
+        .with(file_layer.with_filter(collapse_filter.clone()))
+        .with(stderr_layer.with_filter(collapse_filter))
         .init();
+
+    // 折叠摘要：有 tokio 运行时才起（init_logging 在 setup 内调用，正常具备；
+    // 无运行时的测试环境跳过，不影响日志限流本身）。
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(collapse_summary_loop(collapse_counter));
+    }
 }
 // ── 项目标签记忆日志（memory/{tag}.md）──
 //
@@ -1673,6 +1809,53 @@ pub fn trim_memory_journal_to_cap(content: &str, cap_bytes: usize) -> String {
     }
     kept.reverse();
     kept.join("\n\n")
+}
+
+/// 同源高频日志折叠（webview 假死时 eval 错误洪水的兜底限流）。
+#[cfg(test)]
+mod log_collapse_tests {
+    use super::{CollapseCounter, LOG_COLLAPSE_WINDOW};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_admits_then_collapses_within_window() {
+        let c = CollapseCounter::new();
+        let t0 = Instant::now();
+        assert!(c.admit(1, t0), "窗口内首条必须放行");
+        for _ in 0..5 {
+            assert!(
+                !c.admit(1, t0 + Duration::from_secs(1)),
+                "窗口内重复必须折叠"
+            );
+        }
+        // 窗口边界：刚好到期即放行。
+        assert!(
+            c.admit(1, t0 + LOG_COLLAPSE_WINDOW),
+            "窗口到期后的首条必须放行"
+        );
+    }
+
+    #[test]
+    fn distinct_sites_are_independent() {
+        let c = CollapseCounter::new();
+        let t0 = Instant::now();
+        assert!(c.admit(1, t0));
+        assert!(c.admit(2, t0), "不同 callsite 互不影响");
+        assert!(!c.admit(1, t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn take_folded_drains_and_resets() {
+        let c = CollapseCounter::new();
+        let t0 = Instant::now();
+        assert!(c.admit(7, t0));
+        c.admit(7, t0 + Duration::from_secs(1));
+        c.admit(7, t0 + Duration::from_secs(2));
+
+        let folded = c.take_folded();
+        assert_eq!(folded, vec![(7, 2)], "折叠计数应可取出");
+        assert!(c.take_folded().is_empty(), "取出后必须清零，不得重复汇报");
+    }
 }
 
 /// 日志轮转（`SafeWriter`）：只测纯函数 `rotate_log_if_oversized` —— 不触碰
@@ -2320,7 +2503,9 @@ mod tests {
             "只读资产表不应为空（build.rs 没收到资产？）"
         );
 
-        // 绝不能出现在表里的前缀：这些是用户/运行时生成的状态，git 也是忽略的
+        // 绝不能出现在表里的前缀：这些是用户/运行时生成的状态，git 也是忽略的。
+        // 注：knowledge/nuphus-self/ 是随包政策文档（git 跟踪），已从本清单移除——
+        // 它是允许内嵌的只读资产，Agent 提示词在发布版按锚点路径读它。
         const FORBIDDEN: &[&str] = &[
             "workflows/",
             "skills/community/",
@@ -2330,7 +2515,6 @@ mod tests {
             "ui-maps/im/",
             "ui-maps/media/",
             "ui-maps/terminal/",
-            "knowledge/nuphus-self/",
         ];
         for (rel, bytes) in assets {
             for bad in FORBIDDEN {

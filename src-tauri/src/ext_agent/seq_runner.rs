@@ -293,7 +293,7 @@ async fn execute_desktop_step(
                 "move" => {
                     let x = i32_at(with, "x").unwrap_or(0);
                     let y = i32_at(with, "y").unwrap_or(0);
-                    unwrap(client.mouse_move(x, y, 0.0).await)
+                    unwrap(client.mouse_move(x, y).await)
                 }
                 "position" => unwrap(client.mouse_position().await),
                 other => Err(format!(
@@ -359,8 +359,35 @@ async fn execute_desktop_step(
             unwrap(client.clipboard_write(text).await)
         }
         "desktop_clipboard_clean" => unwrap(client.clipboard_clean().await),
+        "desktop_wait_for" => {
+            let condition = with
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .unwrap_or("change");
+            let region = with.get("region").cloned();
+            let color = with.get("color").and_then(|v| v.as_str());
+            let timeout_ms = with
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10_000);
+            let interval_ms = with
+                .get("interval_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(200);
+            let stable_ms = with
+                .get("stable_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(500);
+            unwrap(
+                client
+                    .wait_for(
+                        condition, region, color, timeout_ms, interval_ms, stable_ms,
+                    )
+                    .await,
+            )
+        }
         other => Err(format!(
-            "未知桌面工具「{other}」（不在 agent_dispatch 白名单；可用 desktop_window_*/desktop_input/desktop_clipboard_*/desktop_mouse*/desktop_screenshot/__sleep）"
+            "未知桌面工具「{other}」（不在 agent_dispatch 白名单；可用 desktop_window_*/desktop_input/desktop_clipboard_*/desktop_mouse*/desktop_screenshot/desktop_wait_for/__sleep）"
         )),
     }
 }

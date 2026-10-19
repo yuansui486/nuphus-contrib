@@ -151,12 +151,12 @@ fn settle(request_id: String, result: RenderResult) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_render_done(request_id: String, pages: Vec<String>) -> Result<(), String> {
     settle(request_id, Ok(pages))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pdf_render_error(request_id: String, error: String) -> Result<(), String> {
     settle(request_id, Err(error))
 }

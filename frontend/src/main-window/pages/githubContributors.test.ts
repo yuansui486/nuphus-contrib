@@ -105,7 +105,6 @@ describe('githubContributors 数据契约', () => {
     expect(users).toEqual([
       'Steooenwolf-666',
       'fouyzjl',
-      'jiangdingwei123-afk',
       'mrpulor-gh',
       'yuansui486',
       'zhoupeiyu515-ui',

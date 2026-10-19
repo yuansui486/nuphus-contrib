@@ -15,12 +15,21 @@ use std::time::Duration;
 /// 连接池大小（可配置）
 const POOL_SIZE: usize = 4;
 
+/// 取连接等待超过该毫秒数即记 warn（把「争用」从猜测变证据）
+const ACQUIRE_WARN_MS: u64 = 200;
+
+/// 取连接的总等待上限（超过即返错，不无限等）
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 全局数据库路径（一次初始化）
 static DB_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// 连接池：Mutex 保护 Vec<Connection>，acquire() 弹出，PoolGuard drop 时归还
 struct ConnectionPool {
     free: Mutex<Vec<Connection>>,
+    /// 归还时唤醒等待者（替代早先的 1ms 自旋：自旋烧 CPU，且池被长事务占满时
+    /// 表现为「卡住」——2026-10-15 用户报告「回复完成界面无响应」的放大因素之一）
+    available: std::sync::Condvar,
 }
 
 /// 全局连接池
@@ -64,6 +73,8 @@ impl Drop for PoolGuard {
                 if let Ok(mut free) = pool.free.lock() {
                     free.push(conn);
                 }
+                // 唤醒一个等待者（拿到锁后立即查池，拿不到会继续等）
+                pool.available.notify_one();
             }
         }
     }
@@ -125,33 +136,50 @@ fn build_pool() -> crate::Result<ConnectionPool> {
     }
     Ok(ConnectionPool {
         free: Mutex::new(connections),
+        available: std::sync::Condvar::new(),
     })
 }
 
-/// 从连接池获取一个连接（阻塞直到有可用连接，30s 超时兜底）
+/// 从连接池获取一个连接。
+///
+/// 池满时**等待唤醒**（Condvar）而不是自旋烧 CPU；等待超过 [`ACQUIRE_WARN_MS`]
+/// 记一条 warn（含等待时长与池内剩余），把「连接争用」从猜测变成日志证据；
+/// 超过 [`ACQUIRE_TIMEOUT`] 返回错误而非无限等（曾经的 30s 静默自旋会让调用方
+/// 无声卡住——用户侧表现为窗口「无响应」）。
 ///
 /// 返回的 `PoolGuard` 实现了 `Deref<Target = Connection>`，
-/// 可直接调用 `Connection` 的方法。
-/// drop 时自动归还连接到池中。
+/// 可直接调用 `Connection` 的方法。drop 时自动归还并唤醒等待者。
 pub fn acquire() -> crate::Result<PoolGuard> {
     let pool = get_or_init_pool()?;
-    // 自旋等待可用连接（业务代码持有时间短，自旋即可）；超时防止连接泄漏导致永久挂起
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    // 锁中毒时恢复数据继续使用（池中 Vec<Connection> 无一致性风险）
+    let mut free = pool.free.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        {
-            // 锁中毒时恢复数据继续使用（池中 Vec<Connection> 无一致性风险）
-            let mut free = pool.free.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(conn) = free.pop() {
-                return Ok(PoolGuard { conn: Some(conn) });
+        if let Some(conn) = free.pop() {
+            let waited = start.elapsed();
+            if waited.as_millis() as u64 >= ACQUIRE_WARN_MS {
+                tracing::warn!(
+                    "[Store] 连接池等待 {}ms 才取到连接（剩余可用 {}）：有长持有者占着连接，\
+                     排查是否在长事务/批量写入里持锁。",
+                    waited.as_millis(),
+                    free.len()
+                );
             }
+            return Ok(PoolGuard { conn: Some(conn) });
         }
-        if std::time::Instant::now() >= deadline {
+        let remaining = ACQUIRE_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
             return Err(crate::StoreError::ConnectionFailed(
                 "连接池获取超时（30s）：连接可能泄漏".to_string(),
             )
             .into());
         }
-        std::thread::sleep(Duration::from_millis(1));
+        // 有界等待：spurious wakeup 与真正超时都会回到循环重查
+        let (guard, _) = pool
+            .available
+            .wait_timeout(free, remaining.min(Duration::from_millis(500)))
+            .unwrap_or_else(|e| e.into_inner());
+        free = guard;
     }
 }
 

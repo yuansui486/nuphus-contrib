@@ -1,8 +1,13 @@
 //! 配置模块 — 模型配置加载与管理
 
+pub mod auth_state;
+pub mod chatgpt;
+pub mod credentials;
 pub mod last_model;
 pub mod model;
 pub mod oauth;
+pub(crate) mod oauth_accounts;
+pub mod oauth_flow;
 pub mod preferences;
 pub mod provider;
 pub mod providers;
@@ -15,6 +20,11 @@ pub use preferences::{
 };
 
 use std::path::PathBuf;
+
+/** 旧配置格式只在适配器边界迁移，通用路由无需认识私有字段。 */
+pub fn normalize_provider_document(doc: &mut toml::Value) {
+    chatgpt::migrate_legacy(doc);
+}
 
 /// Serializes in-process providers.toml read/modify/write transactions across
 /// desktop commands, OAuth refresh and background capability discovery.
@@ -444,6 +454,95 @@ pub fn resolve_image_generation_provider() -> Option<String> {
 /// 显式绑定的视频生成 provider（同上）。
 pub fn resolve_video_generation_provider() -> Option<String> {
     resolve_generation_provider(GenerationKind::Video)
+}
+
+// ── 网页搜索源解析（capabilities.web_search_source）──
+
+/// 已启用的搜索源：绑定段名 + 该段的凭证与端点。
+///
+/// 与生成能力的差别：这里绑定的不是模型，而是**服务商段**（DeepSeek Search 是
+/// 服务商级 HTTP API，不经过任何模型）。字段语义见
+/// [`crate::config::Capabilities::web_search_source`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSourceBinding {
+    /// 绑定的 provider 段名（`capabilities.web_search_source` 的值）
+    pub provider: String,
+    pub api_key: String,
+    /// 已归一化（去掉尾部 `/`）的 base_url
+    pub base_url: String,
+}
+
+/// 从已加载的 registry 解析搜索源绑定。
+///
+/// 三态语义（与 [`resolve_vision_strategy`] 同构，绝不静默发现）：
+/// - `Ok(None)` —— 用户未启用（`web_search_source` 为空）。这是**默认状态**，
+///   调用方应完全按旧行为工作，schema 里也不暴露该选项。
+/// - `Ok(Some(binding))` —— 已启用且段可用。
+/// - `Err(msg)` —— 已启用但**绑定是坏的**（段被删 / 段类型不是 deepseek /
+///   没配 key）。必须报错而不是静默回落到免费源：用户明确勾了开关却拿到别的
+///   结果，比报错更坏 —— 他会以为 DeepSeek 搜索返回了这些内容。
+///
+/// 不读主模型：搜索能力独立绑定，主模型是不是 DeepSeek 与此无关。
+pub fn resolve_search_source_binding(
+    registry: &ModelRegistry,
+) -> Result<Option<SearchSourceBinding>, String> {
+    let configured = registry.capabilities.web_search_source.trim();
+    if configured.is_empty() {
+        return Ok(None);
+    }
+
+    let provider = registry
+        .providers
+        .iter()
+        .find(|p| p.name == configured)
+        .ok_or_else(|| {
+            format!(
+                "网页搜索源绑定已失效：providers.toml 中不存在段 '{configured}'。\
+                 请去模型界面重新选择或关闭网页搜索源。"
+            )
+        })?;
+
+    if provider.provider_type != crate::api::ProviderKind::DeepSeek {
+        return Err(format!(
+            "网页搜索源绑定无效：段 '{configured}' 的类型是 {}，\
+             只有 deepseek 段支持官方搜索 API。",
+            provider.provider_type.as_str()
+        ));
+    }
+
+    let api_key = provider.api_key.trim();
+    if api_key.is_empty() {
+        return Err(format!(
+            "网页搜索源绑定无效：段 '{configured}' 未配置 api_key。"
+        ));
+    }
+
+    let base_url = {
+        let configured_base = provider.base_url.trim().trim_end_matches('/');
+        if configured_base.is_empty() {
+            "https://api.deepseek.com".to_string()
+        } else {
+            configured_base.to_string()
+        }
+    };
+
+    Ok(Some(SearchSourceBinding {
+        provider: configured.to_string(),
+        api_key: api_key.to_string(),
+        base_url,
+    }))
+}
+
+/// 便捷版：自己读盘再解析（给只需要布尔判断的调用方，如 tool schema 构建）。
+pub fn resolve_search_source_binding_from_disk() -> Result<Option<SearchSourceBinding>, String> {
+    match load_registry() {
+        Ok(registry) => resolve_search_source_binding(&registry),
+        Err(e) => {
+            tracing::warn!("resolve_search_source_binding: load_registry failed: {e}");
+            // 读不到配置时不声称「已启用」—— 那会让 schema 暴露一个不可用的选项
+            Ok(None)
+        }
+    }
 }
 
 /// 从已加载的 registry 读某一生成能力的绑定，供工具层凭证解析使用。

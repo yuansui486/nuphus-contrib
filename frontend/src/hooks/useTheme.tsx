@@ -11,7 +11,7 @@ import {
 import { newCustomThemeId, parseCustomThemeJSON, type CustomTheme } from './customTheme'
 import { applySkinBg } from '../ui/skinBg'
 
-export type ThemeId = 'dark' | 'light' | 'tech'
+export type ThemeId = 'dark' | 'light' | 'fresh'
 
 /**
  * 皮肤背景的两层归属（2026-09-28 per-card skin 定稿，改前先读）：
@@ -108,7 +108,7 @@ function readCustomThemes(): { themes: CustomTheme[]; activeId: string | null } 
 export function readBaseTheme(defaultTheme: ThemeId = 'dark'): ThemeId {
   try {
     const saved = localStorage.getItem(LS_THEME) as ThemeId
-    if (saved === 'dark' || saved === 'light' || saved === 'tech') return saved
+    if (saved === 'dark' || saved === 'light' || saved === 'fresh') return saved
   } catch {}
   return defaultTheme
 }
@@ -225,7 +225,7 @@ export function ThemeProvider({
 
   const toggleTheme = useCallback(() => {
     setThemeState(prev => {
-      const next = prev === 'dark' ? 'light' : prev === 'light' ? 'tech' : 'dark'
+      const next = prev === 'dark' ? 'light' : prev === 'light' ? 'fresh' : 'dark'
       try {
         localStorage.setItem(LS_THEME, next)
       } catch {}

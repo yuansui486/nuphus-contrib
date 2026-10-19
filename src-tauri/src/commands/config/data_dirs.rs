@@ -83,7 +83,7 @@ fn entry_from(key: &str, dir: Option<std::path::PathBuf>) -> DataDirEntry {
 }
 
 /// 列举全部数据目录（只读：仅路径解析 + `Path::exists`，无目录扫描/无副作用）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_data_dirs() -> Result<Vec<DataDirEntry>, String> {
     Ok(DATA_DIR_KEYS
         .iter()

@@ -18,6 +18,16 @@ pub enum InputKind {
     Boolean,
     Path,
     Json,
+    /// 档位选择（如模拟方式/输出格式）：JSON 形态 `{"type":"enum","options":["a","b"]}`。
+    /// 校验语义 = String + 白名单；启动表单渲染为下拉框。旧数据无此类型，serde 缺省不影响兼容。
+    Enum,
+}
+
+impl InputKind {
+    /// enum 档位的白名单选项（仅 Enum 类型有意义；随 InputSpec.options 字段承载）。
+    pub fn is_enum(self) -> bool {
+        matches!(self, Self::Enum)
+    }
 }
 
 /// 工作流外部输入声明（workflow.inputs[]）
@@ -37,6 +47,10 @@ pub struct InputSpec {
     pub description: Option<String>,
     #[serde(default)]
     pub sensitive: bool,
+    /// enum 档位白名单（仅 type=enum 时有效且必填非空）；其它类型忽略。
+    /// 值为字符串档位名，运行时校验输入值 ∈ options。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
 }
 
 // ── Workflow definition ──

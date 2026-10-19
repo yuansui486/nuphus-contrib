@@ -8,8 +8,7 @@
  *
  * 用户名可信度（均经 GitHub API `/users/<login>` 200 校验）：
  *   - yuansui486：README 致谢 #23 / #26 / #28 的链接用户名，且这些合并提交的作者名相同；
- *   - zhoupeiyu515-ui：README 致谢 #31 的链接用户名；#32 分支提交作者邮箱与 #31 完全一致（同一人）；
- *   - jiangdingwei123-afk：#21 分支提交作者名即 GitHub 用户名（README 未收录该轮次）。
+ *   - zhoupeiyu515-ui：README 致谢 #31 的链接用户名；#32 分支提交作者邮箱与 #31 完全一致（同一人）。
  *   - Steooenwolf-666：2026-09-28 经 `/contributors` API 确认该账号真实存在且已有 21 次提交，
  *     本轮 PR #67 / #70~#75 的作者均为该账号，头像 u/156271754——新增提交者，按发版铁律
  *     补入头像墙与轮次表。
@@ -41,7 +40,27 @@
  * 补入（`pr: null` + `commit: 短 sha`，`/commit/<sha>` 可公开核对），措辞对齐提交标题；
  * 纯格式 / lint 提交不收录。
  *
- * ⛔ 新增记录前必须先在上面的三处找到出处；不得凭印象补充贡献者或贡献内容。
+ * `0.2.27` 轮次（零 PR）取证：2026-10-10 经 `/pulls?state=closed` API 核对，v0.2.26（2026-10-05）
+ * 之后无任何合并 PR（最后合并仍是 #91，2026-09-29，已收录，非新提交者）；`/contributors`
+ * API 六账号与 REPO_COMMITTERS 一致，头像墙无新增。`git log v0.2.26..HEAD` 区间 38 个提交
+ * 全为仓库所有者直推，按既定口径以 **commit 出处**收录重要功能（`pr: null` + `commit: 短 sha`）；
+ * 纯格式 / lint / 发版杂务提交不收录。
+ *
+ * `0.2.28` 轮次取证：2026-10-12 经 `/pulls?state=closed` API 核对，v0.2.27（2026-10-10）之后
+ * 唯一合并 PR 为 #104（zhoupeiyu515-ui，热门模型快捷 chip + 筛选框多关键词，2026-10-11 合并，
+ * merge commit 3dc1dd4b）。`git log v0.2.27..HEAD` 区间
+ * 其余提交全为仓库所有者直推，按既定口径以 **commit 出处**收录重要功能；纯格式 / lint /
+ * 发版杂务提交不收录。历史轮次中的 #21 条目经所有者复核不属于本仓库贡献记录，已移除，
+ * 不得回填。
+ *
+ * `0.2.29` 轮次取证：2026-10-15 经 `/pulls?state=closed` 与 `/compare/v0.2.28...main` API 核对，
+ * v0.2.28（2026-10-12）之后唯一合并 PR 为 #105（zhoupeiyu515-ui，会话行 hover 重叠修复 +
+ * ModelsPage 测试基线恢复，2026-10-14 合并，merge commit 4110640b；含 Zpy 署名的两个
+ * squash 内 commit，同一账号）。zhoupeiyu515-ui 已在头像墙（v0.2.24 起收录），无新提交者。
+ * 区间其余 42 个提交全为仓库所有者直推，按既定口径以 **commit 出处**收录重要功能；
+ * 纯格式 / lint / 发版杂务提交不收录。
+ *
+ * ⛔ 新增记录前必须先在上面的三处找到出处并经所有者确认；不得凭印象补充贡献者或贡献内容。
  */
 
 /** 本仓库主页（与 Ctrl+K 命令、旧筹备页使用同一地址） */
@@ -101,6 +120,139 @@ export interface GithubRound {
 
 /** 轮次倒序（最新在前），轮内按贡献时间先后 */
 export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
+  {
+    version: '0.2.29',
+    date: '2026-10-15',
+    contributors: [
+      {
+        user: 'zhoupeiyu515-ui',
+        contributions: [
+          {
+            pr: 105,
+            summary:
+              '修复会话行 hover 动画标签重叠、按钮误触，并恢复 ModelsPage 测试基线（补 mock 缺失的 getVisionResolution）',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    version: '0.2.28',
+    date: '2026-10-12',
+    contributors: [
+      {
+        user: 'zhoupeiyu515-ui',
+        contributions: [
+          {
+            pr: 104,
+            summary: '热门模型快捷 chip + 筛选框多关键词（空格 OR）',
+          },
+        ],
+      },
+      {
+        user: 'mrpulor-gh',
+        contributions: [
+          {
+            pr: null,
+            commit: 'e7c14c26',
+            summary: '流式错误体截断改字符边界安全，修复中文错误响应打死 IPC 的 panic',
+          },
+          {
+            pr: null,
+            commit: '68c7f424',
+            summary: 'webview 假死可检测、可降级、可恢复——界面失联不再静默刷屏',
+          },
+          {
+            pr: null,
+            commit: 'bc4d7a32',
+            summary: '死循环守卫分级：3 次重复预警不拦截，5 次失败终止并说明原因',
+          },
+          {
+            pr: null,
+            commit: '2e3bc511',
+            summary:
+              '后台任务生命周期闭环：超时按 background 显式声明分流，看门狗强杀超期，退出必清算',
+          },
+        ],
+      },
+    ],
+  },
+  {
+    version: '0.2.27',
+    date: '2026-10-10',
+    contributors: [
+      {
+        user: 'mrpulor-gh',
+        contributions: [
+          {
+            pr: null,
+            commit: '592fdef3',
+            summary: '简白主题按浅色手法重构，清除深色语义残留',
+          },
+          {
+            pr: null,
+            commit: '93656dbc',
+            summary: 'HTML 预览标注闭环：框选批注回流为结构化引用，按引用定向修改页面',
+          },
+          {
+            pr: null,
+            commit: '8bf6d758',
+            summary: '应用图标反色为白底黑体，修正 ICO 帧行序',
+          },
+          {
+            pr: null,
+            commit: '0241e52b',
+            summary: '修 CDP 浏览器入口唤不起：runtime 死锁 + 连接死亡后不自愈',
+          },
+          {
+            pr: null,
+            commit: '919dc5c1',
+            summary: '执行追踪默认只渲染最近 40 条，上百步不再掉帧',
+          },
+          {
+            pr: null,
+            commit: 'ea3c23a8',
+            summary: 'web_extract 补齐 SSRF 守卫，收紧为公网抓取策略',
+          },
+          {
+            pr: null,
+            commit: '2ba36240',
+            summary: '后台任务账本与中断汇报闭环：跨调用子进程可查可结束，中断如实结算汇报',
+          },
+          {
+            pr: null,
+            commit: '78854529',
+            summary: '外链统一进 Agent 浏览器，冷启动预检提速（6s → 0.9s）',
+          },
+          {
+            pr: null,
+            commit: '28e7d28d',
+            summary: '桌面工具条改右侧常驻按钮列，撤 Ctrl+U 与扳手菜单',
+          },
+          {
+            pr: null,
+            commit: '390ae68f',
+            summary: '输入法组词态守卫，Enter 选词不再误发',
+          },
+          {
+            pr: null,
+            commit: '53ef4098',
+            summary: '执行追踪按步折叠与滚动锚点补偿，折叠 / 下拉 / 贴底不再打架',
+          },
+          {
+            pr: null,
+            commit: 'cd416661',
+            summary: '增强模式改只读状态行，迁入推理强度弹窗',
+          },
+          {
+            pr: null,
+            commit: 'e0d3f368',
+            summary: '贴底跟随改手势判定，内容增长永不抢控制',
+          },
+        ],
+      },
+    ],
+  },
   {
     version: '0.2.26',
     date: '2026-10-05',
@@ -443,12 +595,6 @@ export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
           },
         ],
       },
-      {
-        user: 'jiangdingwei123-afk',
-        contributions: [
-          { pr: 21, summary: 'npm 安装后 macOS / Linux 无法启动：启动器幂等补齐可执行位' },
-        ],
-      },
     ],
   },
 ]
@@ -472,7 +618,6 @@ export const REPO_COMMITTERS: string[] = [
   'fouyzjl', // 13 commits
   'mrpulor-gh', // 3 commits（仓库所有者；2026-10-05 发版后重跑 API 仍报 3——/contributors
   // 统计有缓存滞后，0.2.26 的 8 个直推提交已 push 双远端，计数待 GitHub 后台刷新）
-  'jiangdingwei123-afk', // 1 commit
   'zhoupeiyu515-ui', // 1 commit
 ]
 

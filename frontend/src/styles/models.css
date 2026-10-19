@@ -12,7 +12,7 @@
   margin-bottom: var(--space-2);
 }
 
-/* 鈹€鈹€ 骞界伒鍥炬爣鎸夐挳锛堟樉绀哄瘑鐮?/ 鍒犻櫎绛夎鍐呭皬鎿嶄綔锛夆攢鈹€ */
+/* ── 幽灵图标按钮（显示密度 / 删除等行内小操作）── */
 .icon-btn-ghost {
   display: inline-flex;
   align-items: center;
@@ -39,7 +39,7 @@
   box-shadow: var(--shadow-focus);
 }
 
-/* 鈹€鈹€ 娓呴櫎瀵嗛挜鎸夐挳锛氶粯璁や綆璋冿紙fg-4/鍗婇€忔槑锛夛紝绾㈣壊浠?hover/focus 鏃跺嚭鐜?鈹€鈹€ */
+/* ── 清除密钥按钮：默认低调（fg-4/半透明），红色仅 hover/focus 时出现 ── */
 .icon-btn-clear:hover:not(:disabled) {
   color: var(--error);
   opacity: 1;
@@ -53,13 +53,31 @@
   cursor: default;
 }
 
-/* 鈹€鈹€ 绛夊鏁板瓧杈撳叆锛堜笂涓嬫枃绐楀彛绛夛級鈹€鈹€ */
+/* ── 等宽数字输入（上下文窗口等）── */
 .input-num {
   font-family: var(--font-mono);
   font-size: var(--fz-md);
 }
 
-/* 鈹€鈹€ 娴姩鍙嶉 Toast 鈹€鈹€ */
+/* ── 网页搜索源选择行（capabilities.web_search_source）──
+   与上方「模型选择」区的差别：这里选的是 provider 段而不是模型，
+   故用原生 select 直接呈现段名，不套 VisionModelSelect 的模型菜单。 */
+.web-search-source-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.web-search-source-row .input {
+  min-width: 240px;
+  cursor: pointer;
+}
+.web-search-source-row .input:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ── 浮动反馈 Toast ── */
 .feedback-toast {
   /* 只负责**定位与层叠**：胶囊形态/语义来自共享层 app-pill.css 的 .app-pill（与 island
      同一套视觉，见 ui/AppPill.tsx）。原先的整块半透明绿/红底（rgba(--success-rgb, .92)）
@@ -78,24 +96,22 @@
   pointer-events: none;
 }
 
-/* 鈹€鈹€ 涓嬫媺閫夐」鍐呰仈鍏冪礌 鈹€鈹€ */
+/* ── 下拉选项内联元素 ── */
 .select-option-provider {
   color: var(--fg-4);
   font-size: var(--fz-xs);
   margin-left: 6px;
 }
 
-/* 鈹€鈹€ 妫€娴嬮敊璇彁绀?鈹€鈹€ */
+/* ── 检测错误提示 ── */
 .model-operation-status {
   margin-top: var(--space-2);
   color: var(--accent);
   font-size: var(--fz-xs);
   line-height: 1.4;
 }
-.model-list-item[aria-disabled='true'] {
-  cursor: progress;
-}
-.model-list-item[aria-busy='true'] {
+/* 模型卡片：切换中（启用按钮 busy）——整卡一圈细描边，替代旧行内 aria-busy 样式 */
+.model-card[aria-busy='true'] {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
@@ -107,112 +123,78 @@
   line-height: 1.4;
 }
 
-/* 鈹€鈹€ 鍙樹綋涓庡伐鍏风被 鈹€鈹€ */
+/* ── 变体与工具类 ── */
 .select-menu--up {
   top: auto;
   bottom: calc(100% + 4px);
 }
-/* 鎻愰珮鐗瑰紓鎬ц鐩?components.css 鐨?top 瀹氫綅锛岄伩鍏?!important */
+/* 提高特异性覆盖 components.css 的 top 定位，避免 !important */
 .compact-select-menu.select-menu--up {
   top: auto;
   bottom: calc(100% + 4px);
 }
-.model-list {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+/* 模型卡片网格：2~3 列自适应（minmax 320px），窄屏降为 1 列。
+   **不设固定高度/内滚动**：页面宿主自己滚，列表再滚一次就是双滚动条，
+   操作（拖选、点星、点 chip）要在两条滚动轴之间来回对齐，体验很差。 */
+.model-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 8px;
 }
-.model-list--spaced {
+.model-card-grid--spaced {
   margin-top: var(--space-2);
 }
 .hint-text {
   margin-top: 6px;
 }
-/* 鈹€鈹€ Model list锛堣嚜 components.css 鎷嗗嚭骞跺叆锛夆攢鈹€ */
-/* 鈹€鈹€ Model list 鈹€鈹€ */
-.model-list-item {
+/* ═══════════ 模型卡片（三行）═══════════
+   首行：名称 + 徽章 + 收藏；中行：能力 chips；底行：ctx + 启用。 */
+.model-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--glass-0);
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+.model-card:hover {
+  border-color: rgba(var(--accent-rgb), 0.3);
+}
+.model-card.is-active {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  background: rgba(var(--accent-rgb), 0.06);
+}
+
+/* 首行 */
+.model-card-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  border: 1px solid transparent;
-  background: var(--glass-0);
-  transition: all 0.15s ease;
-  user-select: none;
-  -webkit-user-select: none;
+  gap: 6px;
+  min-width: 0;
 }
-.model-list-item:hover {
-  background: var(--void-hover);
-}
-.model-list-item.active {
-  background: rgba(var(--accent-rgb), 0.08);
-  border-color: rgba(var(--accent-rgb), 0.25);
-}
-
-.model-radio {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 1.5px solid var(--glass-2);
-  background: transparent;
-  flex-shrink: 0;
-  transition: all 0.15s ease;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.model-radio::after {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: transparent;
-  transition: background 0.15s ease;
-}
-.model-radio.selected {
-  border-color: var(--spark-secondary);
-}
-.model-radio.selected::after {
-  background: var(--spark-secondary);
-}
-
-.model-list-name {
+.model-card-name {
   flex: 1;
   min-width: 0;
   font-size: 12.5px;
-  font-weight: 400;
+  font-weight: 600;
   font-family: var(--font-mono);
-  color: var(--spark-secondary);
+  color: var(--fg-1);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.model-list-item.active .model-list-name {
-  font-weight: 500;
-  color: var(--spark-primary);
-}
-
-/* 鈹€鈹€ 妯″瀷鑳藉姏寰芥爣锛堣瑙?闊抽/鍥惧儚鐢熸垚/涓婁笅鏂囩獥鍙ｏ級鈹€鈹€ */
-.model-list-badges {
+.model-card-head-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  margin-left: auto;
+  gap: 2px;
   flex-shrink: 0;
 }
-.model-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--fg-4);
-  opacity: 0.9;
-  line-height: 1;
-}
-/* 视觉能力开关：关闭态低调（未开启），开启态用主题强调色表达「该模型会进入
-   图像理解候选列表」。与 .model-badge--ctx 同一行内区域，尺寸对齐。 */
-.model-vision-toggle {
+/* 收藏星形：常驻但低调，开态才点亮——不与任何能力 chip 抢视觉权重 */
+.model-fav-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -224,34 +206,151 @@
   background: transparent;
   color: var(--fg-4);
   cursor: pointer;
-  opacity: 0.55;
+  opacity: 0.45;
   transition:
     opacity var(--dur-fast) var(--ease-out),
     color var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out),
     background var(--dur-fast) var(--ease-out);
 }
-.model-vision-toggle:hover:not(:disabled) {
+.model-fav-btn:hover {
   opacity: 1;
   color: var(--fg-1);
   border-color: var(--border);
   background: var(--surface-hover);
 }
-.model-vision-toggle:focus-visible {
-  outline: none;
-  opacity: 1;
-  border-color: var(--accent);
-  box-shadow: var(--shadow-focus);
-}
-.model-vision-toggle.is-on {
+.model-fav-btn.is-on {
   opacity: 1;
   color: var(--accent);
   border-color: rgba(var(--accent-rgb), 0.34);
   background: var(--accent-dim);
 }
-.model-vision-toggle:disabled {
+.model-fav-btn:focus-visible {
+  outline: none;
+  opacity: 1;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus);
+}
+.model-card-del {
+  opacity: 0;
+}
+.model-card:hover .model-card-del,
+.model-card-del:focus-visible {
+  opacity: 0.7;
+}
+
+/* 中行：能力 chips——支持在前（重色），不支持在后（浅色线框）；
+   可切换项是按钮（hover 提示可点击），只读项是 span（affordance 不撒谎）。 */
+.model-card-caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.cap-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--fg-4);
+  font-size: 10.5px;
+  line-height: 1;
+  cursor: default;
+  user-select: none;
+}
+.cap-chip.is-on {
+  border-color: rgba(var(--accent-rgb), 0.28);
+  color: var(--fg-1);
+}
+.cap-chip.is-on svg {
+  color: var(--accent);
+}
+.cap-chip-detail {
+  font-family: var(--font-mono);
+  color: var(--fg-3);
+}
+button.cap-chip {
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+button.cap-chip:hover:not(:disabled) {
+  color: var(--fg-1);
+  border-color: var(--border);
+  background: var(--surface-hover);
+}
+button.cap-chip:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus);
+}
+button.cap-chip:disabled {
   cursor: progress;
-  opacity: 0.4;
+  opacity: 0.5;
+}
+
+/* 底行：ctx（左）+ 启用（右） */
+.model-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.model-card-ctx {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.model-use-btn {
+  flex-shrink: 0;
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--fg-2);
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.model-use-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.model-use-btn:disabled {
+  cursor: default;
+  opacity: 0.75;
+}
+.model-card.is-active .model-use-btn {
+  /* 使用中是全局唯一态，视觉权重必须最高：实心前景色（= 主题反色）做底，
+     主题基色做字——暗色主题下「亮底 + 近黑字」，亮色主题下「深底 + 白字」。
+     注意不能用 --accent 做字：亮色主题的 accent 本身接近黑（#111），
+     叠在近黑的反色底上直接看不见。 */
+  border-color: transparent;
+  background: var(--fg-1);
+  color: var(--surface-0);
+}
+
+/* 模型能力徽章（只读呈现的通用底座：ctx 等徽章复用同一形状） */
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-4);
+  opacity: 0.9;
+  line-height: 1;
 }
 .model-badge--ctx {
   font-family: var(--font-mono);
@@ -271,7 +370,7 @@
   padding: 2px 4px;
 }
 
-/* 鈹€鈹€ 妯″瀷琛屽唴 Context Window 缂栬緫锛圡odelsPage 鎵嬪姩鏍″噯鍏ュ彛锛夆攢鈹€ */
+/* ── 模型行内 Context Window 编辑（ModelsPage 手动校准入口）── */
 .model-ctx-edit-btn {
   padding: 2px;
   margin-left: 2px;
@@ -295,7 +394,7 @@
   border-color: var(--accent);
   box-shadow: var(--shadow-focus);
 }
-/* 闅愯棌 number input 鐨勪笂涓嬬澶达紝琛屽唴淇濇寔绱у噾 */
+/* 隐藏 number input 的上下箭头，行内保持紧凑 */
 .ctx-inline-input::-webkit-outer-spin-button,
 .ctx-inline-input::-webkit-inner-spin-button {
   -webkit-appearance: none;
@@ -305,7 +404,7 @@
   -moz-appearance: textfield;
   appearance: textfield;
 }
-/* 琛屽唴缂栬緫鍗曚綅锛圞锛夊鍣細input + 鍗曚綅鍚庣紑 */
+/* 行内编辑单位（K）容器：input + 单位后缀 */
 .ctx-inline-wrap {
   display: inline-flex;
   align-items: center;
@@ -318,7 +417,7 @@
   flex-shrink: 0;
 }
 
-/* 鈹€鈹€ 妯″瀷鍒楄〃鍒锋柊鎸夐挳锛圫ection 鍙充笂瑙?actions锛夛細灏忚兌鍥?+ 鍥炬爣锛屽姞杞戒腑鏃嬭浆 鈹€鈹€ */
+/* ── 模型列表刷新按钮（Section 右上角 actions）：小胶囊 + 图标，加载中旋转 ── */
 .models-refresh-btn {
   display: inline-flex;
   align-items: center;
@@ -437,6 +536,19 @@
   flex-direction: column;
   background: var(--surface-0);
   color: var(--fg-1);
+}
+
+/* 窗口最外圈：主题化 1px 内描边（同 .app-shell 的窗口描边契约；契约说明见
+   components.css 的 .app-shell 注释，绘制方式说明见 preview-overlay.css 的
+   .pv-page::after）。本宿主顶栏 .models-page-bar 是实色（--surface-1），照抄
+   box-shadow 会被盖断，故用同款覆盖层伪元素画全圈，pointer-events: none 不挡交互。 */
+.models-page-host::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  pointer-events: none;
 }
 .models-page-bar {
   /* 供 island 落点锚点（.island-slot，绝对定位于本栏）作为定位基准 */
@@ -769,23 +881,6 @@
 .models-list-wrap {
   margin-top: var(--space-4);
 }
-.model-list {
-  display: flex;
-  max-height: min(440px, 52vh);
-  flex-direction: column;
-  gap: 3px;
-  overflow-y: auto;
-  padding-right: 3px;
-}
-.model-list-item:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: var(--shadow-focus);
-}
-.model-list-item:disabled {
-  cursor: wait;
-  opacity: 0.6;
-}
 @media (max-width: 720px) {
   .models-page-layout {
     grid-template-columns: 1fr;
@@ -810,7 +905,10 @@
    分区已改为宿主分流），故降级判据只认上面的视口断点，不再需要容器宽度标记。 */
 @media (prefers-reduced-motion: reduce) {
   .models-rail-item,
-  .model-list-item {
+  .model-card,
+  .cap-chip,
+  .model-use-btn,
+  .model-fav-btn {
     transition: none;
   }
 }
@@ -972,11 +1070,10 @@
   color: var(--accent-hover);
 }
 
-/* GO 网关模型徽标（opencode-go 页模型行）：低调描边小字，不与选中色/能力徽标冲突 */
-.model-go-badge {
+/* GO 网关模型徽标（模型卡片首行）：低调描边小字，不与选中色/能力 chip 冲突 */
+.model-card-go {
   display: inline-flex;
   align-items: center;
-  margin-left: 5px;
   padding: 0 4px;
   border: 1px solid var(--line-2);
   border-radius: 4px;
@@ -986,7 +1083,6 @@
   font-weight: 500;
   line-height: 1.5;
   letter-spacing: 0.02em;
-  vertical-align: middle;
   user-select: none;
 }
 
@@ -1016,10 +1112,9 @@
 }
 
 /* 手动添加徽标（官方 /v1/models 清单外）：与 GO 徽标同一视觉语言 */
-.model-manual-badge {
+.model-card-manual {
   display: inline-flex;
   align-items: center;
-  margin-left: 5px;
   padding: 0 4px;
   border: 1px solid var(--line-2);
   border-radius: 4px;
@@ -1028,7 +1123,6 @@
   font-weight: 500;
   line-height: 1.5;
   letter-spacing: 0.02em;
-  vertical-align: middle;
   user-select: none;
 }
 /* ══════════════════════════════════════════════════════════════
@@ -1139,6 +1233,56 @@
 .models-empty-title {
   line-height: 1.5;
 }
+
+/* ── 热门模型快捷区（筛选框下方一排 chip）──
+   点击 = 把该 chip 的关键词片段填进筛选框，复用列表既有的分词 OR 筛选；
+   只改筛选框内容，不引入第二套过滤状态。 */
+.models-hot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: var(--space-2);
+}
+.models-hot-label {
+  margin-right: 2px;
+  font-size: var(--fz-xs);
+  color: var(--fg-4);
+}
+.models-hot-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 11px;
+  background: var(--surface-2);
+  color: var(--fg-3);
+  font-size: var(--fz-xs);
+  font-family: inherit;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.models-hot-chip:hover {
+  border-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--fg-1);
+}
+.models-hot-chip:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--shadow-focus);
+}
+/* 选中态：筛选框内容恰等于该 chip 的片段串（点击 chip 后即点亮） */
+.models-hot-chip.is-active {
+  border-color: var(--accent);
+  color: var(--fg-1);
+}
+
 /* 订阅账号（OAuth）：可折叠区块 —— 折叠态只有一行摘要（未配置时对用户零干扰），
    展开后是 OAuth 配置五项 + 登录区。与「自定义标头」同为可选块，故用同一套排版语言。 */
 .custom-oauth {
@@ -1316,4 +1460,19 @@
 .models-confirm-btn:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+/* 模型协议下拉：默认值=服务商默认协议，显式值按模型覆盖。
+   颜色必须用 tokens.css 里已定义的 --text-secondary；
+   --text-2 在本项目从未定义，写了会静默回落到继承色。 */
+.model-protocol-select {
+  width: 100%;
+  min-width: 0;
+  color: var(--text-secondary);
+  background: var(--glass-0);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 11px;
 }

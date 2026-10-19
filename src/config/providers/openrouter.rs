@@ -47,7 +47,12 @@ impl Provider for OpenRouterProvider {
     fn quirks(&self) -> ProviderQuirks {
         ProviderQuirks {
             requires_reasoning_echo: false,
-            supports_reasoning_effort: false,
+            // 官方（openrouter.ai · API Parameters）：Chat Completions 接受
+            // OpenAI 风格顶层 `reasoning_effort`（xhigh/high/medium/low/minimal/none，
+            // SDK 另含 max）。每模型实际档位由 /api/v1/models 的
+            // `reasoning.supported_efforts` 声明 —— 内置表故留空，运行时经
+            // 聚合库（list_models / 激活发现）逐模型补全。
+            supports_reasoning_effort: true,
             effort_excludes_tools: false,
             sanitize_tools: None,
             extra_headers: vec![],
@@ -62,6 +67,10 @@ impl Provider for OpenRouterProvider {
     fn transport(&self, cfg: &ProviderConfig, model_id: &str) -> Arc<dyn Transport> {
         Arc::new(ChatCompletionsTransport::new(ChatCompletionsConfig {
             name: "openrouter".to_string(),
+            // 协议/类型 id —— Transport::provider_name 的语义（每个 custom 实例都折叠成 "custom"）
+            // providers.toml 段名 —— 模型级配置（max_tokens 等）必须按段精确查找，
+            // 用类型 id 查会静默查不到（段名是 custom-xxx 而非 custom）。
+            provider_segment: cfg.name.clone(),
             api_key: cfg.api_key.clone(),
             base_url: if cfg.base_url.is_empty() {
                 self.default_base_url().to_string()

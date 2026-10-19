@@ -26,6 +26,7 @@
 
 // P4 factory match 接线：ResponsesConfig/ResponsesTransport 由 factory 分派构造。
 // （parser 保持模块内私有——仅 transport.rs 内部使用。）
+pub use crate::config::provider::ResponseOptions;
 pub(crate) use config::ResponsesConfig;
 pub(crate) use transport::ResponsesTransport;
 

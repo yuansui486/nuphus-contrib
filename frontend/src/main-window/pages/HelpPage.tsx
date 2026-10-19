@@ -56,16 +56,20 @@ const tipKeys = [
 
 export function HelpPage() {
   const { t } = useLanguage()
-  // 快捷键：与 App.tsx useKeyboard 绑定一一对应（输入框内行为见 ChatPanel.handleKeyDown）
+  // 快捷键：与 App.tsx useKeyboard 绑定一一对应（输入框内行为见 ChatPanel.handleKeyDown；
+  // IME 组词态例外 = 选词时 Enter 让位给输入法，见表下 help.shortcut.imeHint）
   const shortcuts = [
     { keys: 'Enter', key: 'help.shortcut.send' },
     { keys: `Shift+Enter / ${formatPrimaryShortcut('Enter')}`, key: 'help.shortcut.newline' },
     { keys: formatPrimaryShortcut('K'), key: 'help.shortcut.palette' },
     { keys: formatPrimaryShortcut('L'), key: 'help.shortcut.focusInput' },
     { keys: formatPrimaryShortcut('N'), key: 'help.shortcut.newChat' },
-    { keys: formatPrimaryShortcut('U'), key: 'help.shortcut.desktopToolbar' },
     { keys: `${isMacPlatform() ? 'Cmd' : 'Ctrl'}+Shift+W`, key: 'help.shortcut.workflowPanel' },
     { keys: 'Esc', key: 'help.shortcut.esc' },
+    // 桌面工具全局热键（在主窗内与其它应用前台时均可用）
+    { keys: `${isMacPlatform() ? 'Cmd' : 'Ctrl'}+1`, key: 'help.shortcut.toolScreenshot' },
+    { keys: `${isMacPlatform() ? 'Cmd' : 'Ctrl'}+2`, key: 'help.shortcut.toolPicker' },
+    { keys: `${isMacPlatform() ? 'Cmd' : 'Ctrl'}+3`, key: 'help.shortcut.toolColorPicker' },
   ] as const
 
   const modes = [
@@ -117,6 +121,9 @@ export function HelpPage() {
             ))}
           </tbody>
         </table>
+        {/* IME 组词态说明：Enter 发送有例外 —— 组词选字时让位给输入法。
+            行为出处同 ChatPanel.handleKeyDown 的 isComposing / keyCode 229 守卫。 */}
+        <p className="help-text">{t('help.shortcut.imeHint')}</p>
       </Section>
 
       {/* ── 界面入口（聊天区常驻的三个入口 + Ctrl+K）── */}

@@ -259,9 +259,13 @@ export function subscribeRunStatus(
         if (!running) return
         running = false
         lastTerminal = terminalText(payload.status)
+        // 终态日志分色：Error 红 / Cancelled·Stopped 警示色 / Success 绿
+        const statusRaw = payload.status
+        const isCancelled =
+          typeof statusRaw === 'string' && ['Cancelled', 'Stopped', 'Paused'].includes(statusRaw)
         appendLog(
           type,
-          lastTerminal.startsWith('Error') ? 'error' : 'success',
+          lastTerminal.startsWith('Error') ? 'error' : isCancelled ? 'warning' : 'success',
           t('workflowEditor.run.finished', lastTerminal),
           payload,
         )

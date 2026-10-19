@@ -1,13 +1,14 @@
 //! MCP 管理命令（只读视图）。
 //!
 //! 仅提供查看能力：已配置 server 列表 + 按需查询工具列表。
-//! 增删改仍通过手编 `plugin/mcp/servers.yaml` 完成，本模块不提供编辑入口。
+//! 增删改仍通过手编配置文件完成（通用层 `plugin/mcp/servers.yaml`、
+//! 本机层 `<数据目录>/mcp/servers.local.yaml`），本模块不提供编辑入口。
 
 use serde_json::json;
 
 /// 列出所有已配置的 MCP server。
 /// 注意：**不返回 env 字段** —— env 可能含 API token，禁止暴露给前端。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_mcp_servers() -> Result<serde_json::Value, String> {
     let cfg = nuphus::mcp::config::load_config()?;
     let servers: Vec<serde_json::Value> = cfg

@@ -8,7 +8,7 @@
 
 **English** | [中文](README.md)
 
-> **Version**: 0.2.26 · **Status**: Alpha (under active development) · **Platforms**: Windows / macOS / Linux
+> **Version**: 0.2.30 · **Status**: Alpha (under active development) · **Platforms**: Windows / macOS / Linux
 > **Tech Stack**: Tauri v2 · Rust · React 18 · TypeScript
 
 <p align="center">
@@ -148,8 +148,8 @@ For users unfamiliar with the command line — **no CLI, no Node.js / Rust requi
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| [Rust](https://rustup.rs/) | ≥ 1.95 | Core engine compilation |
-| [Node.js](https://nodejs.org/) | ≥ 18 | Tauri frontend build |
+| [Rust](https://rustup.rs/) | 1.95.0 (pinned by `rust-toolchain.toml`) | Core engine compilation |
+| [Node.js](https://nodejs.org/) | ≥ 20 (vitest 4 does not support 18) | Tauri frontend build and frontend tests |
 | Tauri CLI | `cargo install tauri-cli --version "^2"` | Desktop app development |
 
 ```bash
@@ -275,6 +275,26 @@ All plugins are plain-text files (.md / .json); drop them into the matching `plu
 ---
 
 ## Acknowledgements
+
+### v0.2.30 Contributors
+
+No external pull requests were merged in this release; all changes were made by the maintainer.
+
+### v0.2.29 Contributors
+
+Thanks to the community contributors who submitted pull requests in this release:
+
+| Contributor | PR | Summary |
+|-------------|-----|---------|
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#105](https://github.com/mrpulor-gh/nuphus/pull/105) | Fixes session-row hover overlap and stray button hits, restores the ModelsPage test baseline (adds the missing getVisionResolution mock) |
+
+### v0.2.28 Contributors
+
+Thanks to the community contributors who submitted pull requests in this release:
+
+| Contributor | PR | Summary |
+|-------------|-----|---------|
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#104](https://github.com/mrpulor-gh/nuphus/pull/104) | Adds quick-filter chips for popular models and multi-keyword (space-OR) filtering |
 
 ### v0.2.24 Contributors
 

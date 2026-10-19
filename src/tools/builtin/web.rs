@@ -16,6 +16,7 @@ use crate::permissions::ToolCategory;
 use crate::tools::registry::{ToolDef, ToolRegistry};
 use crate::ToolResult;
 use scraper::{CaseSensitivity, Html, Selector};
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -24,6 +25,20 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// Agent 缓存 TTL（秒）—— 过期后重建，感知代理变化
 /// pub(super)：http.rs 的 client 缓存复用同一 TTL 模式
 pub(super) const AGENT_TTL: i64 = 60;
+
+/// web 抓取单响应字节上限（5 MiB）。
+///
+/// 动机：`max_chars` 是字符闸且由模型控制，挡不住「一个 100MB 的 HTML 直接进内存」
+/// —— 字符闸在 decode 之后才生效，全量 `bytes()` 会先把整个 body 读进内存。
+/// 带 Content-Length 且超限的响应直接拒绝（不读 body）；无 Content-Length
+/// （chunked）时读满上限即截断，保留可用部分，不报错。
+const MAX_WEB_BYTES: usize = 5 * 1024 * 1024;
+
+/// DOM 渲染最大递归深度。
+///
+/// 真实页面嵌套几十层就到头，超深只有「恶意构造」一种来源。超限只是不再继续
+/// 下钻，已产出的 parts 照常返回（不整页丢弃）。
+const MAX_DOM_DEPTH: usize = 256;
 
 /// reqwest 出口的 cookie 域白名单（视频/风控域，命中才从 vault 取 cookie
 /// 拼 Cookie header；未命中域名的请求行为完全不变）。
@@ -178,9 +193,17 @@ fn search_bing(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let bytes = response
-            .bytes()
-            .map_err(|e| format!("read bing response failed: {}", e))?;
+        let (bytes, truncated) =
+            read_body_capped(response).map_err(|e| format!("read bing response failed: {}", e))?;
+        // 搜索结果页被字节闸截断 = DOM 不完整，解析出来的条目不可信。
+        // 与其把半页结果混进聚合池（污染排序），不如让本源整体退出，
+        // 由 aggregate_web_search 的跨源降级接手。
+        if truncated {
+            return Err(format!(
+                "bing result page exceeds {} MiB byte cap; source dropped",
+                MAX_WEB_BYTES / (1024 * 1024)
+            ));
+        }
         decode_web_body(&bytes, content_type.as_deref())
     };
 
@@ -274,9 +297,15 @@ fn search_ddg_lite(query: &str, count: usize) -> Result<Vec<SearchResult>, Strin
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let bytes = response
-            .bytes()
+        let (bytes, truncated) = read_body_capped(response)
             .map_err(|e| format!("read ddg lite response failed: {}", e))?;
+        // 同 search_bing：结果页被截断则 DOM 不完整，本源退出而非产出半页结果。
+        if truncated {
+            return Err(format!(
+                "ddg lite result page exceeds {} MiB byte cap; source dropped",
+                MAX_WEB_BYTES / (1024 * 1024)
+            ));
+        }
         decode_web_body(&bytes, content_type.as_deref())
     };
 
@@ -323,7 +352,64 @@ fn search_ddg_lite(query: &str, count: usize) -> Result<Vec<SearchResult>, Strin
     Ok(results)
 }
 
+/// 把各源失败原因汇总成一句**可行动**的失败文案。
+///
+/// 这是跨源降级的最后一环：真正决定「重试还是换词」的判断交给模型，
+/// 文案必须把两件事说清楚 —— 哪些源挂了、各自因为什么挂。
+///
+/// 旧实现是一句写死的 `All search sources failed (...)`，五个源名全列上但
+/// 一个原因都没有，模型只能反复重试同一个查询。
+fn describe_aggregate_failure(failures: &[(&'static str, String, SourceFailure)]) -> String {
+    if failures.is_empty() {
+        // 所有源都「成功返回但零结果」——这不是故障，是查询没匹配上任何源。
+        return "No search source returned results for this query. The query likely matched \
+                nothing; try different or broader terms (drop brand/version qualifiers), or \
+                narrow with source=wiki/github/docs."
+            .to_string();
+    }
+
+    let detail = failures
+        .iter()
+        .map(|(name, reason, _)| format!("{}: {}", name, reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let retryable = failures
+        .iter()
+        .filter(|(_, _, kind)| *kind == SourceFailure::Retryable)
+        .count();
+
+    if retryable > 0 {
+        // 可重试失败占多数 → 大概率是限流而非查询问题，该等而不是换词。
+        format!(
+            "All {} search sources failed ({} of {} look rate-limited or timed out): {}. \
+             This looks like rate limiting rather than a bad query — retry after a short wait \
+             instead of rewriting the query.",
+            failures.len(),
+            retryable,
+            failures.len(),
+            detail
+        )
+    } else {
+        // 全是永久性失败 → 换个查询词比重试有用。
+        format!(
+            "All {} search sources failed for reasons that retrying will not fix ({}). \
+             Try different search terms, or target one source directly with source=wiki/github/docs.",
+            failures.len(),
+            detail
+        )
+    }
+}
+
 fn build_tool_result(query: &str, results: Vec<SearchResult>) -> Result<ToolResult, String> {
+    Ok(ToolResult::success(build_tool_result_body(query, &results)))
+}
+
+/// 结果体的纯渲染（不含 ToolResult 包装）。
+///
+/// 单独抽出供「降级提示 + 结果」这种需要在正文前加一段说明的调用方复用，
+/// 避免两处各写一份 JSON 序列化逻辑而漂移。
+fn build_tool_result_body(query: &str, results: &[SearchResult]) -> String {
     let json_results: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
@@ -341,9 +427,7 @@ fn build_tool_result(query: &str, results: Vec<SearchResult>) -> Result<ToolResu
         "results": json_results,
     });
 
-    Ok(ToolResult::success(
-        serde_json::to_string_pretty(&payload).unwrap_or_default(),
-    ))
+    serde_json::to_string_pretty(&payload).unwrap_or_default()
 }
 
 // ── 默认 web 源：五源聚合 ──
@@ -667,7 +751,62 @@ fn canonical_url(url: &str) -> String {
 ///
 /// 单源失败只记日志不中断 —— 这正是聚合相对串行降级的核心价值：
 /// 任一源翻车（限流 / 反爬 / 结构变更）不影响其余四源的产出。
-fn aggregate_web_search(query: &str, count: usize) -> Vec<SearchResult> {
+/// 源失败后可重试与否 —— 只用于**诊断**：告诉模型/用户该重试还是该改查询。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceFailure {
+    /// 限流 / 暂不可用 / 超时：过一会儿重试可能成功
+    Retryable,
+    /// 不可解析 / 无匹配 / 被拒：重试无意义
+    Permanent,
+}
+
+/// 从源返回的错误文本里判可重试性。
+///
+/// 各 `search_*` 返回 `Result<_, String>`，错误串形如 `HTTP 429` / `HTTP 503` /
+/// `… request failed: …timed out…`，**没有结构化状态码可读**，只能按文本判定。
+/// 真正决定「要不要重试」的仍是各源内部的 `fetch_direct`（429/503 才重试）；
+/// 此处只是把结论汇总给调用方，避免失败时只丢一句
+/// 「All search sources failed」让模型无从判断该等还是该换词。
+fn classify_source_failure(reason: &str) -> SourceFailure {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("429")
+        || lower.contains("503")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        SourceFailure::Retryable
+    } else {
+        SourceFailure::Permanent
+    }
+}
+
+/// 五源聚合的产出：最终结果 + 各源的失败原因。
+///
+/// 失败原因必须一路带回调用方 —— 全部源挂掉时，模型需要知道是「限流，等一下
+/// 再试」还是「查询没匹配，换个词」，这两者的下一步动作完全相反。
+struct AggregateOutcome {
+    results: Vec<SearchResult>,
+    failures: Vec<(&'static str, String, SourceFailure)>,
+}
+
+/// 默认 web 聚合的**免费**源表。
+///
+/// 抽成具名常量是为了让「计费源不得混入默认聚合」这条约束可被测试直接断言
+/// （见 `test_deepseek_source_is_not_in_free_aggregate`）——散落在函数体里的
+/// 字面量数组无法被外部检验，那等于没有约束。
+///
+/// `search_deepseek` 刻意**不在**此表内：官方 Search 按请求次数计费，默认聚合
+/// 会在用户无感知的情况下产生账单。它只在用户于模型界面启用「网页搜索源」后
+/// 才参与（且是优先源，失败才降级到本表）。
+const FREE_SEARCH_SOURCES: [(&str, fn(&str, usize) -> Result<Vec<SearchResult>, String>); 5] = [
+    ("github", search_github),
+    ("docs", search_docs),
+    ("wikipedia", search_wikipedia),
+    ("bing", search_bing),
+    ("ddg-lite", search_ddg_lite),
+];
+
+fn aggregate_web_search(query: &str, count: usize) -> AggregateOutcome {
     let count = count.clamp(1, 20);
     // 候选池深度：每源多取一倍。去重 + 阈值淘汰会消耗候选，池子太浅时
     // 只能用噪声填空。
@@ -676,38 +815,43 @@ fn aggregate_web_search(query: &str, count: usize) -> Vec<SearchResult> {
     let sources: [(
         &'static str,
         fn(&str, usize) -> Result<Vec<SearchResult>, String>,
-    ); 5] = [
-        ("github", search_github),
-        ("docs", search_docs),
-        ("wikipedia", search_wikipedia),
-        ("bing", search_bing),
-        ("ddg-lite", search_ddg_lite),
-    ];
+    ); 5] = FREE_SEARCH_SOURCES;
 
     // 源函数是同步阻塞 IO，且本函数已在 spawn_blocking 线程内；
     // 用 std::thread 并发跑而不是 tokio，避免把阻塞调用塞进 async 上下文。
     let mut handles = Vec::with_capacity(sources.len());
     for (name, f) in sources {
         let q = query.to_string();
-        handles.push((
-            name,
-            std::thread::spawn(move || f(&q, per_source).ok().unwrap_or_default()),
-        ));
+        // 保留 Result —— 旧实现 `.ok().unwrap_or_default()` 把失败原因整个丢掉，
+        // 五个源全挂时只留一句「All search sources failed」，模型分不清是限流
+        // （该等）还是查询本身没匹配（该换词）。
+        handles.push((name, std::thread::spawn(move || f(&q, per_source))));
     }
 
     let mut candidates: Vec<(SearchResult, SearchSource)> = Vec::new();
+    let mut failures: Vec<(&'static str, String, SourceFailure)> = Vec::new();
     for (name, handle) in handles {
-        let results = match handle.join() {
+        let outcome = match handle.join() {
             Ok(r) => r,
             Err(_) => {
                 tracing::warn!("[web_search] source {} panicked, skipped", name);
+                failures.push((name, "panicked".to_string(), SourceFailure::Permanent));
                 continue;
             }
         };
-        if results.is_empty() {
-            tracing::debug!("[web_search] source {} returned nothing", name);
-            continue;
-        }
+        let results = match outcome {
+            Ok(r) if r.is_empty() => {
+                tracing::debug!("[web_search] source {} returned nothing", name);
+                continue;
+            }
+            Ok(r) => r,
+            Err(e) => {
+                let kind = classify_source_failure(&e);
+                tracing::warn!("[web_search] source {} failed ({:?}): {}", name, kind, e);
+                failures.push((name, e, kind));
+                continue;
+            }
+        };
         tracing::debug!(
             "[web_search] source {} contributed {} candidates",
             name,
@@ -831,7 +975,10 @@ fn aggregate_web_search(query: &str, count: usize) -> Vec<SearchResult> {
         }
     }
 
-    out
+    AggregateOutcome {
+        results: out,
+        failures,
+    }
 }
 
 // ── Task 2: 领域搜索源 (Wikipedia / GitHub / Docs) ──
@@ -1028,6 +1175,223 @@ fn search_docs(query: &str, count: usize) -> Result<Vec<SearchResult>, String> {
     tracing::info!("[web_search] MDN Docs returned {} results", out.len());
     if out.is_empty() {
         return Err("mdn docs returned no results".to_string());
+    }
+    Ok(out)
+}
+
+// ── 源6: DeepSeek 官方搜索 API（经 capabilities.web_search_source 显式启用）──
+
+/// DeepSeek 官方 Fetch API：抓取单页并以 Markdown 返回正文。
+///
+/// 与 [`search_deepseek`] 共用同一个开关（`capabilities.web_search_source`）——
+/// 官方 Search/Fetch 属同一服务商的同一套能力，用户开一次即两处生效。
+/// 计费口径相同：每 1000 次成功请求 5 元，未取到正文不计费。
+///
+/// 语义与搜索侧一致：**优先**，失败才降级到现有三层（直连 → CDP → Jina）。
+fn fetch_deepseek(
+    binding: &crate::config::SearchSourceBinding,
+    url: &str,
+) -> Result<FetchOutcome, String> {
+    let endpoint = format!("{}/v1/tools/fetch", binding.base_url);
+    tracing::info!("[web_extract] trying DeepSeek fetch: {}", endpoint);
+
+    let response = get_agent()
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", binding.api_key))
+        .timeout(Duration::from_secs(30))
+        .json(&serde_json::json!({ "url": url }))
+        .send()
+        .map_err(|e| format!("deepseek fetch request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        let hint = match code {
+            400 => "请求参数不合法（URL 为空 / 非 http(s) / 携带用户密码）",
+            401 => "鉴权失败，检查该 deepseek 段的 api_key",
+            402 => "账户余额不足，请充值后重试",
+            403 => "抓取被安全策略拒绝",
+            404 => "未能获取可用网页内容（URL 不可用 / 被站点拦截 / 无可提取正文）",
+            408 => "读取请求体超时",
+            413 => "请求体超过大小限制",
+            429 => "超过账号级 QPS 限制（Fetch 5 QPS）",
+            504 => "下游请求超时",
+            _ => "服务端错误",
+        };
+        return Err(format!("deepseek fetch HTTP {}: {}", code, hint));
+    }
+
+    let text = response
+        .text()
+        .map_err(|e| format!("read deepseek fetch response failed: {}", e))?;
+    parse_deepseek_fetch_response(&text)
+}
+
+/// DeepSeek Fetch 响应 → 正文。抽成纯函数便于单测。
+///
+/// 官方响应：`{"title": "...", "content": "<markdown>"}`。`content` 已是被官方
+/// 提取并转成 Markdown 的正文，**不得**再喂 `extract_readable`（那是 HTML 解析器，
+/// 会把 Markdown 的标题/列表/代码块结构抹平，同 Jina 镜像那条分支的教训）。
+fn parse_deepseek_fetch_response(text: &str) -> Result<FetchOutcome, String> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("parse deepseek fetch json failed: {}", e))?;
+    let content = json["content"].as_str().unwrap_or("").trim();
+    if content.is_empty() {
+        // 官方规则：未取到正文不计费，属「无内容」而非故障
+        return Err("deepseek fetch returned empty content".to_string());
+    }
+    let title = json["title"].as_str().unwrap_or("").trim().to_string();
+    Ok(FetchOutcome {
+        title,
+        content: content.to_string(),
+    })
+}
+
+/// 官方 Fetch 的产出（Markdown 正文 + 页面标题）。
+#[derive(Debug)]
+struct FetchOutcome {
+    title: String,
+    content: String,
+}
+
+/// 源6: DeepSeek 自研搜索引擎（官方 Search API）。
+///
+/// **只在用户在模型界面启用「网页搜索源」后参与**，且语义是**优先**：
+/// `web_search` 先走这里，只有这里失败（429 QPS / 402 欠费 / 401 鉴权 / 网络 /
+/// 5xx）才降级到免费五源聚合。
+///
+/// 官方依据（api-docs.deepseek.com/zh-cn/guides/search，2026-10-17 核对）：
+/// - `POST {base_url}/v1/tools/search`，`Authorization: Bearer <key>`；
+/// - `query` 1～128 Unicode 字符（超范围 400）、`count` 1～50（默认 10）；
+/// - 响应 `results[]` 每项含 `title` / `url` / `snippet`(100~200 字符) /
+///   `summary`(600~800 字符) / `content`(需 need_content=true) /
+///   `rerank_score` / `authority` / `date`。
+///
+/// 字段取舍：本工具的消费者是模型，故 `snippet` 位填 `summary` —— 官方明确
+/// summary「适用于给模型阅读」，信息量远高于面向前端展示的 snippet；summary
+/// 缺失时回退 snippet。`content` 需显式 `need_content=true` 才返回正文，本次
+/// 不取（会把单次响应体积放大一个数量级）；需要正文的调用方走 `web_extract`。
+fn search_deepseek(
+    binding: &crate::config::SearchSourceBinding,
+    query: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, String> {
+    // 官方硬约束：1～128 Unicode 字符。按 char 边界截断，不切断多字节。
+    let q: String = query.trim().chars().take(128).collect();
+    if q.is_empty() {
+        return Err("deepseek search: query cannot be empty".to_string());
+    }
+    let url = format!("{}/v1/tools/search", binding.base_url);
+    let body = serde_json::json!({
+        "query": q,
+        "count": count.clamp(1, 50),
+        // 不取正文：正文交给 web_extract，避免搜索结果响应急剧膨胀
+        "need_content": false,
+    });
+    tracing::info!(
+        "[web_search] trying DeepSeek search: {} (count={})",
+        url,
+        count
+    );
+
+    let response = get_agent()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", binding.api_key))
+        .timeout(Duration::from_secs(20))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("deepseek search request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // 状态码必须进错误串：降级决策与 classify_source_failure 都靠它判定
+        // 可重试性；丢掉码就只能一律当永久失败。
+        let code = status.as_u16();
+        let hint = match code {
+            400 => "请求参数不合法",
+            401 => "鉴权失败，检查该 deepseek 段的 api_key",
+            402 => "账户余额不足，请充值后重试",
+            403 => "请求被安全策略拒绝",
+            404 => "接口不存在（检查 base_url 是否为官方端点）",
+            408 => "读取请求体超时",
+            413 => "请求体超过大小限制",
+            429 => "超过账号级 QPS 限制（Search 5 QPS）",
+            _ => "服务端错误",
+        };
+        let detail = response
+            .text()
+            .unwrap_or_default()
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(format!(
+            "deepseek search HTTP {}: {} ({})",
+            code,
+            hint,
+            detail.trim()
+        ));
+    }
+
+    let text = response
+        .text()
+        .map_err(|e| format!("read deepseek search response failed: {}", e))?;
+    let out = parse_deepseek_search_response(&text, count)?;
+
+    tracing::info!(
+        "[web_search] DeepSeek search returned {} results",
+        out.len()
+    );
+    Ok(out)
+}
+
+/// 解析 DeepSeek Search 响应体 → `SearchResult` 列表。
+///
+/// 抽成纯函数（不发请求、不读配置）以便单测锁死两条契约：
+/// ① `summary` 优先、缺失回退 `snippet`；② 空结果报错而非返回空表。
+///
+/// 空结果必须走 `Err`：官方计费规则是「HTTP 200 且 results 非空才计费」，
+/// 空数组意味着这次没花钱、也确实是查询没匹配上 —— 报成故障会让模型以为
+/// 源挂了而去重试，报成成功则会让它以为「网上查无此事」。
+fn parse_deepseek_search_response(text: &str, count: usize) -> Result<Vec<SearchResult>, String> {
+    let json: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("parse deepseek search json failed: {}", e))?;
+
+    let items = json["results"]
+        .as_array()
+        .ok_or_else(|| "deepseek search: no results array in response".to_string())?;
+
+    let mut out = Vec::new();
+    for item in items {
+        let title = item["title"].as_str().unwrap_or("").trim().to_string();
+        let link = item["url"].as_str().unwrap_or("").trim().to_string();
+        // 缺标题或链接的条目无法被消费（模型点不开、也无法据此引用来源）
+        if title.is_empty() || link.is_empty() {
+            continue;
+        }
+        // summary 优先（官方定位「适用于给模型阅读」），缺失回退 snippet（前端展示用）
+        let summary = item["summary"].as_str().unwrap_or("").trim();
+        let snippet_raw = item["snippet"].as_str().unwrap_or("").trim();
+        let snippet = if !summary.is_empty() {
+            summary.to_string()
+        } else {
+            snippet_raw.to_string()
+        };
+        out.push(SearchResult {
+            title,
+            url: link,
+            snippet,
+        });
+        if out.len() >= count {
+            break;
+        }
+    }
+
+    if out.is_empty() {
+        return Err("deepseek search returned no results".to_string());
     }
     Ok(out)
 }
@@ -1571,7 +1935,12 @@ fn is_nav_link(el: &scraper::ElementRef) -> bool {
 }
 
 /// 递归渲染 DOM 元素为结构化文本
-fn render_element(el: &scraper::ElementRef, parts: &mut Vec<String>, _depth: usize) {
+fn render_element(el: &scraper::ElementRef, parts: &mut Vec<String>, depth: usize) {
+    // 深度闸：真实页面嵌套几十层就到头，超深只有恶意构造一种来源。
+    // 超限只是不再下钻 —— 已产出的 parts 照常返回，不整页丢弃。
+    if depth > MAX_DOM_DEPTH {
+        return;
+    }
     let tag = el.value().name();
 
     if matches!(
@@ -1621,7 +1990,7 @@ fn render_element(el: &scraper::ElementRef, parts: &mut Vec<String>, _depth: usi
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
                     match child_el.value().name() {
                         "thead" | "tbody" | "tfoot" | "tr" | "caption" | "colgroup" | "col" => {
-                            render_element(&child_el, parts, _depth + 1);
+                            render_element(&child_el, parts, depth + 1);
                         }
                         _ => {}
                     }
@@ -1704,14 +2073,14 @@ fn render_element(el: &scraper::ElementRef, parts: &mut Vec<String>, _depth: usi
         "div" | "section" | "article" | "main" | "header" | "details" | "summary" => {
             for child in el.children() {
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
-                    render_element(&child_el, parts, _depth + 1);
+                    render_element(&child_el, parts, depth + 1);
                 }
             }
         }
         _ => {
             for child in el.children() {
                 if let Some(child_el) = scraper::ElementRef::wrap(child) {
-                    render_element(&child_el, parts, _depth + 1);
+                    render_element(&child_el, parts, depth + 1);
                 }
             }
         }
@@ -1844,7 +2213,7 @@ impl ToolRegistry {
     pub(crate) fn register_web_search(&mut self) {
         self.register(ToolDef {
             name: "web_search".to_string(),
-            description: "Web search across 5 sources (github/docs/wikipedia/bing/ddg-lite) aggregated and filtered by relevance — returns title+url+snippet only, NOT page content. Default source=web merges all 5; pass source= to restrict. To read a result's content use web_extract.".to_string(),
+            description: "Web search across 5 free sources (github/docs/wikipedia/bing/ddg-lite) aggregated and filtered by relevance. Returns title+url+snippet only, NOT page content. Default source=web merges the free sources; if the user has enabled a web search source in Settings → Models, that source is tried FIRST and the free sources are used only as a fallback (the result header states when a fallback happened). Pass source= to restrict. To read a result's content use web_extract.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1891,20 +2260,81 @@ impl ToolRegistry {
                             ))
                         }
                         _ => {
-                            // 默认 web 源：五源聚合，不串行降级。
+                            // 默认 web 源。分两种情形：
                             //
-                            // 原实现是 Bing → DDG Lite 两个 HTML 源串行，实测
-                            // 在中文/技术查询下两者都可能返回与查询完全无关的
-                            // 结果（Bing 硬编码 setmkt=en-US 时最严重）。改为
-                            // 五个源并发取候选，按「查询-结果相关性 + 源可靠性」
-                            // 统一排序后取前 count —— 单个源翻车不再决定全局。
-                            let aggregated = aggregate_web_search(&query, count);
-                            if aggregated.is_empty() {
-                                return Ok(ToolResult::failure(
-                                    "All search sources failed (bing/ddg-lite/wiki/github/docs unreachable or returned nothing)".to_string(),
-                                ));
+                            // ① 用户已在模型界面启用「网页搜索源」（capabilities.
+                            //    web_search_source）→ **优先**走官方 DeepSeek 搜索，
+                            //    仅在其失败（429 QPS / 402 欠费 / 401 鉴权 / 网络 /
+                            //    5xx）时才降级到免费五源聚合。
+                            // ② 未启用 → 完全等价旧行为，只走免费五源。
+                            //
+                            // 免费五源的由来：原实现是 Bing → DDG Lite 两个 HTML 源
+                            // 串行，实测在中文/技术查询下两者都可能返回与查询完全
+                            // 无关的结果（Bing 硬编码 setmkt=en-US 时最严重）。改为
+                            // 多源并发取候选，按「查询-结果相关性 + 源可靠性」统一
+                            // 排序后取前 count —— 单个源翻车不再决定全局。
+                            let binding = crate::config::resolve_search_source_binding_from_disk();
+                            let mut deepseek_failure: Option<String> = None;
+
+                            match binding {
+                                Ok(Some(b)) => match search_deepseek(&b, &query, count) {
+                                    Ok(results) if !results.is_empty() => {
+                                        return build_tool_result(&query, results);
+                                    }
+                                    Ok(_) => {
+                                        // 理论不可达（空结果已在 parse 里转 Err），
+                                        // 保守按「失败降级」处理并留痕
+                                        tracing::warn!(
+                                            "[web_search] deepseek returned empty, falling back"
+                                        );
+                                        deepseek_failure =
+                                            Some("deepseek search returned no results".to_string());
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "[web_search] deepseek search failed, falling back to \
+                                             free sources: {}",
+                                            e
+                                        );
+                                        deepseek_failure = Some(e);
+                                    }
+                                },
+                                // 绑定存在但坏了（段被删 / 类型不对 / 没 key）。
+                                // 不静默掩盖：用户明确开了开关，必须知道它没生效。
+                                // 仍然降级取结果 —— 只报错不给结果，对「现在就要
+                                // 搜索结果」的用户是更坏的体验；降级事实写进结果头。
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[web_search] web_search_source binding invalid: {}",
+                                        e
+                                    );
+                                    deepseek_failure = Some(e);
+                                }
+                                Ok(None) => {}
                             }
-                            build_tool_result(&query, aggregated)
+
+                            let outcome = aggregate_web_search(&query, count);
+                            if outcome.results.is_empty() {
+                                let mut msg = describe_aggregate_failure(&outcome.failures);
+                                if let Some(why) = &deepseek_failure {
+                                    msg.push_str(&format!(
+                                        "\n\nDeepSeek search was tried first and failed \
+                                         ({}), then all free sources failed too.",
+                                        why
+                                    ));
+                                }
+                                return Ok(ToolResult::failure(msg));
+                            }
+                            // 降级到免费源时必须让模型看见：否则它会把免费源的
+                            // 结果当成 DeepSeek 的返回，引用来源时误判质量。
+                            if let Some(why) = &deepseek_failure {
+                                return Ok(ToolResult::success(format!(
+                                    "[deepseek search failed, fell back to free sources: {}]\n\n{}",
+                                    why,
+                                    build_tool_result_body(&query, &outcome.results)
+                                )));
+                            }
+                            build_tool_result(&query, outcome.results)
                         }
                     }
                 })
@@ -1916,7 +2346,7 @@ impl ToolRegistry {
     pub(crate) fn register_web_extract(&mut self) {
         self.register(ToolDef {
             name: "web_extract".to_string(),
-            description: "Fetch a known URL and return readable text. Use for reading article/doc/README content found via web_search. NOT for: pages needing login/interaction/anti-bot bypass (use browser_navigate + browser_*), or locating specific elements (use browser_snapshot). Charset is auto-detected (GBK/Shift_JIS/…); falls back to CDP render for SPA/JS-heavy pages.".to_string(),
+            description: "Fetch a known URL and return readable text. Use for reading article/doc/README content found via web_search. NOT for: pages needing login/interaction/anti-bot bypass (use browser_navigate + browser_*), or locating specific elements (use browser_snapshot). Chain: if the user has enabled a web search source in Settings → Models, that provider's official Fetch API is tried FIRST; then direct HTTP; then CDP render for SPA/JS-heavy pages; then a Jina mirror. Charset is auto-detected (GBK/Shift_JIS/…); fallbacks are stated in the result header.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1933,24 +2363,73 @@ impl ToolRegistry {
                 if url.trim().is_empty() {
                     return Ok(ToolResult::failure("url cannot be empty"));
                 }
-                if !(url.starts_with("http://") || url.starts_with("https://")) {
-                    return Ok(ToolResult::failure(
-                        "url must start with http:// or https://"
-                    ));
+                // SSRF 守卫：与 http_request 共用同一实现（check_ssrf 内部已含
+                // http/https scheme 白名单，不再另写前缀判断）。策略传
+                // (allow_private=false, allow_loopback=false)：web_extract 抓的是
+                // 公网网页，私网段与本机地址都不该碰，也不给模型开关。
+                if let Err(e) = super::http::check_ssrf(&url, false, false) {
+                    return Ok(ToolResult::failure(e));
                 }
 
                 super::run_blocking(move || {
                     let agent = get_agent();
 
+                    // ── 第零层: DeepSeek 官方 Fetch（仅用户在设置里启用搜索源时）──
+                    //
+                    // 与搜索侧同一开关、同一「优先 + 降级」语义：成功即返回，
+                    // 失败/未启用才进入原有三层。失败原因必须回传，否则用户看到
+                    // 的是「结果来自别处」却不知道官方 Fetch 已经试过并失败了。
+                    let mut official_failure: Option<String> = None;
+                    match crate::config::resolve_search_source_binding_from_disk() {
+                        Ok(Some(binding)) => match fetch_deepseek(&binding, &url) {
+                            Ok(outcome) => {
+                                let title_part = if outcome.title.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n\n# {}", outcome.title)
+                                };
+                                return Ok(ToolResult::success(format!(
+                                    "Fetched {}\n\n[via DeepSeek Fetch]{}\n\n{}",
+                                    url, title_part, outcome.content
+                                )));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[web_extract] deepseek fetch failed, falling back: {}",
+                                    e
+                                );
+                                official_failure = Some(e);
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "[web_extract] web_search_source binding invalid: {}",
+                                e
+                            );
+                            official_failure = Some(e);
+                        }
+                    }
+
                     // ── 第一层: 直接 HTTP ──
                     let direct_result = fetch_direct(&agent, &url);
                     let _direct_content_ok = match &direct_result {
                         Ok(body) => {
-                            let text = extract_readable(body, max_chars);
+                            let text = extract_readable(&body.text, max_chars);
                             let trimmed = text.trim();
                             // 内容充分（>= 2000 chars）直接返回
                             if trimmed.len() >= 2000 {
-                                return Ok(ToolResult::success(text));
+                                // 字节闸若截断过，必须让模型看见：否则它会把半篇
+                                // 正文当成完整文档来回答，且无从察觉漏了尾巴。
+                                let marker = if body.byte_truncated {
+                                    byte_truncation_marker()
+                                } else {
+                                    String::new()
+                                };
+                                return Ok(ToolResult::success(format!(
+                                    "Fetched {}\n\n{}{}",
+                                    url, text, marker
+                                )));
                             }
                             tracing::info!(
                                 "[web_extract] direct content too short ({} chars), trying CDP browser fallback",
@@ -1968,9 +2447,10 @@ impl ToolRegistry {
                     tracing::info!("[web_extract] launching CDP browser for: {}", url);
                     match fetch_via_browser(&url, max_chars) {
                         Ok(text) if !text.trim().is_empty() => {
-                            return Ok(ToolResult::success(
-                                format!("[via CDP browser render]\n\n{}", text)
-                            ));
+                            return Ok(ToolResult::success(format!(
+                                "Fetched {}\n\n[via CDP browser render]\n\n{}",
+                                url, text
+                            )));
                         }
                         Ok(_) => {
                             tracing::warn!("[web_extract] browser returned empty content");
@@ -1987,7 +2467,8 @@ impl ToolRegistry {
                         url.trim_start_matches("http://").trim_start_matches("https://")
                     );
                     match fetch_direct(&agent, &mirror_url) {
-                        Ok(mirror_body) => {
+                        Ok(mirror) => {
+                            let mirror_body = mirror.text.as_str();
                             // r.jina.ai 返回的是 **Markdown 纯文本**（Jina 的产品
                             // 形态是"URL → clean markdown"），不是 HTML。旧实现直接喂
                             // extract_readable（HTML 解析器）→ find_content_container
@@ -2003,10 +2484,10 @@ impl ToolRegistry {
                                     regex::Regex::new(r"(?is)<(?:p|div|article|section|main|span|h[1-6]|ul|ol|li|table|br|a)\b")
                                         .expect("static html-tag regex")
                                 });
-                                re.is_match(&mirror_body)
+                                re.is_match(mirror_body)
                             };
                             let text = if looks_like_html {
-                                extract_readable(&mirror_body, max_chars)
+                                extract_readable(mirror_body, max_chars)
                             } else if mirror_body.chars().count() > max_chars {
                                 let trunc: String =
                                     mirror_body.chars().take(max_chars).collect();
@@ -2020,26 +2501,52 @@ impl ToolRegistry {
                                 mirror_body.trim().to_string()
                             };
                             if !text.trim().is_empty() {
-                                return Ok(ToolResult::success(
-                                    format!("[via Jina AI mirror]\n\n{}", text)
-                                ));
+                                // 字符闸与字节闸各自打自己的标记：长文常常只触到
+                                // 其中一个，两个都触到时模型能看出被砍了两刀。
+                                let marker = if mirror.byte_truncated {
+                                    byte_truncation_marker()
+                                } else {
+                                    String::new()
+                                };
+                                // 官方 Fetch 失败过就必须写明，否则用户不知道结果
+                                // 来自 Jina 而不是已启用的官方源。
+                                let fallback_note = match &official_failure {
+                                    Some(why) => {
+                                        format!("[deepseek fetch failed: {}]\n\n", why)
+                                    }
+                                    None => String::new(),
+                                };
+                                return Ok(ToolResult::success(format!(
+                                    "Fetched {}\n\n{}[via Jina AI mirror]\n\n{}{}",
+                                    url, fallback_note, text, marker
+                                )));
                             }
                             Ok(ToolResult::failure(format!(
-                                "All methods failed for {} (direct/browser/mirror all returned empty)",
-                                url
+                                "All methods failed for {} (direct/browser/mirror all returned empty){}",
+                                url,
+                                match &official_failure {
+                                    Some(why) => format!("; deepseek fetch: {}", why),
+                                    None => String::new(),
+                                }
                             )))
                         }
                         Err(e) => {
                             let direct_info = match &direct_result {
                                 Ok(body) => {
-                                    let text = extract_readable(body, max_chars);
+                                    let text = extract_readable(&body.text, max_chars);
                                     format!("HTTP content ({} chars)", text.len())
                                 }
                                 Err(e) => format!("HTTP error: {}", e),
                             };
                             Ok(ToolResult::failure(format!(
-                                "Failed to extract content from {}:\n- Direct: {}\n- Browser: failed\n- Jina mirror: {}",
-                                url, direct_info, e
+                                "Failed to extract content from {}:\n- Direct: {}\n- Browser: failed\n- Jina mirror: {}{}",
+                                url,
+                                direct_info,
+                                e,
+                                match &official_failure {
+                                    Some(why) => format!("\n- DeepSeek Fetch: {}", why),
+                                    None => String::new(),
+                                }
                             )))
                         }
                     }
@@ -2050,8 +2557,70 @@ impl ToolRegistry {
     }
 }
 
-/// 直接 HTTP GET 请求，返回 body 字符串（已按 charset 三级嗅探解码）
-fn fetch_direct(agent: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
+/// 按字节上限读取响应 body（防超大响应打爆内存），返回 body 与「是否触发截断」。
+///
+/// - 带 Content-Length 且超限 → 直接 Err（不读 body，避免先分配再丢弃）
+/// - 否则 `take(MAX_WEB_BYTES + 1)` 读入；读出超过上限则截断保留可用部分
+///
+/// `+1` 是为了让「恰好填满上限」与「超出上限」可区分 —— 否则一个正好等于
+/// 上限的响应会被误标成已截断（下游据此判断要不要给模型打标记）。
+fn read_body_capped(response: reqwest::blocking::Response) -> Result<(Vec<u8>, bool), String> {
+    if let Some(len) = response.content_length() {
+        if len > MAX_WEB_BYTES as u64 {
+            return Err(format!(
+                "response too large: Content-Length {} exceeds cap {} bytes",
+                len, MAX_WEB_BYTES
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    let mut limited = response.take(MAX_WEB_BYTES as u64 + 1);
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("body read error: {}", e))?;
+    if buf.len() > MAX_WEB_BYTES {
+        // 真正读到超限才截断；只读满不超限时 truncated 保持 false。
+        buf.truncate(MAX_WEB_BYTES);
+        return Ok((buf, true));
+    }
+    Ok((buf, false))
+}
+
+/// 字节闸截断标记 —— 由调用方拼到**最终文本**末尾。
+///
+/// 不能塞进原始 bytes：中间还隔着 charset 解码与 HTML 正文提取，落在正文
+/// 容器之外的标记会被解析器整段丢掉，模型就不知道自己拿到的是残缺页面。
+/// 格式对齐 `extract_readable` 既有的 `[Truncated: …]` 标记，让模型只需认一种。
+pub(super) fn byte_truncation_marker() -> String {
+    format!(
+        "\n\n[Truncated: response exceeds {} MiB byte cap; tail omitted]",
+        MAX_WEB_BYTES / (1024 * 1024)
+    )
+}
+
+/// `fetch_direct` 的产出：已解码的 body 文本 + 字节闸是否触发过截断。
+pub(super) struct FetchedBody {
+    pub text: String,
+    pub byte_truncated: bool,
+}
+
+/// 解析 `Retry-After` 头（仅秒数形式）。
+///
+/// 只支持 `Retry-After: 2` 这类 delta-seconds；HTTP-date 形式（绝对时间）不解析
+/// —— 抓取工具不该为服务端时区解析引入不确定性。秒数封顶 30s：服务端可能回
+/// `Retry-After: 3600`，抓取工具不能因此挂住一小时。
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let secs = raw.parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs.min(30)))
+}
+
+/// 直接 HTTP GET 请求，返回已按 charset 三级嗅探解码的 body + 字节闸截断标志
+fn fetch_direct(agent: &reqwest::blocking::Client, url: &str) -> Result<FetchedBody, String> {
     // 按域白名单附 cookie（命中才走 vault；未命中域名行为完全不变）
     let cookie_header = cookie_header_for(url);
     let mut attempt = 0;
@@ -2073,24 +2642,32 @@ fn fetch_direct(agent: &reqwest::blocking::Client, url: &str) -> Result<String, 
                 if !code.is_success() {
                     // reqwest blocking: HTTP error status comes as Ok(Response), not Err
                     let msg = format!("HTTP {}", code.as_u16());
-                    if attempt == 0 {
-                        std::thread::sleep(Duration::from_millis(500));
+                    // 只重试 429（限流）/ 503（服务暂不可用）—— 404/403 等重试无意义。
+                    let retryable = matches!(code.as_u16(), 429 | 503);
+                    if retryable && attempt == 0 {
+                        let delay =
+                            retry_after_delay(r.headers()).unwrap_or(Duration::from_millis(500));
+                        std::thread::sleep(delay);
                         attempt += 1;
                         continue;
                     }
                     return Err(msg);
                 }
-                // charset 必须在 bytes() 之前取——bytes() 会消费 Response
+                // charset 必须在消费 Response 之前取——read_body_capped 会消费 Response
                 let content_type = r
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
-                let bytes = r.bytes().map_err(|e| format!("read body failed: {}", e))?;
+                let (bytes, byte_truncated) =
+                    read_body_capped(r).map_err(|e| format!("read body failed: {}", e))?;
                 if bytes.trim_ascii().is_empty() {
                     return Err(format!("HTTP {} (empty body)", code.as_u16()));
                 }
-                return Ok(decode_web_body(&bytes, content_type.as_deref()));
+                return Ok(FetchedBody {
+                    text: decode_web_body(&bytes, content_type.as_deref()),
+                    byte_truncated,
+                });
             }
             Err(e) => {
                 let msg = format!("{}", e);
@@ -2111,6 +2688,9 @@ fn fetch_direct(agent: &reqwest::blocking::Client, url: &str) -> Result<String, 
 /// launch。浏览器操作必须在常驻 browser runtime 上执行（临时 runtime drop
 /// 会杀死 CDP handler）；实例用毕保持存活供后续复用，不在此 close。
 fn fetch_via_browser(url: &str, max_chars: usize) -> Result<String, String> {
+    // SSRF 守卫：本层危害最大 —— CDP profile 带登录态，入口一旦被绕过
+    // 就是「以用户身份访问内网」。策略与 web_extract 入口一致 (false, false)。
+    super::http::check_ssrf(url, false, false)?;
     crate::browser::runtime().block_on(async {
         let mut guard = crate::browser::get_or_launch(true) // headless mode
             .await
@@ -2588,5 +3168,440 @@ mod tests {
         // CJK 标点与全角
         assert!(in_cjk('\u{3001}'), "CJK 标点应命中");
         assert!(in_cjk('\u{ff03}'), "全角字符应命中");
+    }
+
+    // ── 加固：字节闸 / 深度闸 / 重试策略 / SSRF 复用 ──
+
+    #[test]
+    fn test_retry_after_delay_parses_seconds_and_caps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        // 无头 → None
+        let mut h = HeaderMap::new();
+        assert_eq!(retry_after_delay(&h), None);
+
+        // 秒数形式正常解析
+        h.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_after_delay(&h), Some(Duration::from_secs(2)));
+
+        // 封顶 30s（服务端说 1 小时也不能挂住抓取工具）
+        h.insert(RETRY_AFTER, HeaderValue::from_static("3600"));
+        assert_eq!(
+            retry_after_delay(&h),
+            Some(Duration::from_secs(30)),
+            "Retry-After 必须封顶 30s"
+        );
+
+        // HTTP-date 形式不解析
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_delay(&h), None, "HTTP-date 不应被解析");
+
+        // 非数字 → None
+        h.insert(RETRY_AFTER, HeaderValue::from_static("soon"));
+        assert_eq!(retry_after_delay(&h), None);
+    }
+
+    #[test]
+    fn test_render_element_depth_gate_stops_deep_nesting() {
+        // 5000 层嵌套：无深度闸时 render_element 递归会爆栈。
+        // 真实页面几十层就到头，超深只有恶意构造一种来源。
+        let html = format!(
+            "<html><body>{}<p>deep</p>{}</body></html>",
+            "<div>".repeat(5000),
+            "</div>".repeat(5000)
+        );
+        let doc = Html::parse_document(&html);
+        let body_sel = Selector::parse("body").unwrap();
+        let body = doc.select(&body_sel).next().expect("body element");
+
+        let mut parts: Vec<String> = Vec::new();
+        let start = std::time::Instant::now();
+        render_element(&body, &mut parts, 0); // 不得 panic / 爆栈
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "深层渲染耗时应可接受，实得 {:?}",
+            start.elapsed()
+        );
+        // 超限后不再下钻：5000 层深处的文本不应被产出（已产出的 parts 照常返回）
+        assert!(
+            !parts.iter().any(|p| p.contains("deep")),
+            "超过 MAX_DOM_DEPTH 的内容应被闸断"
+        );
+
+        // 直接以超限深度调用：应立即返回、不产出任何内容
+        let mut parts2: Vec<String> = Vec::new();
+        render_element(&body, &mut parts2, MAX_DOM_DEPTH + 1);
+        assert!(parts2.is_empty(), "初始深度即超限时应直接返回");
+    }
+
+    /// web_extract 复用 http_request 的 SSRF 守卫（不再只查 http:// 前缀）。
+    /// 必须在任何网络请求前拦下，故此用例不触网。
+    #[test]
+    fn test_web_extract_applies_ssrf_guard_before_fetch() {
+        let mut registry = ToolRegistry::new();
+        registry.register_web_extract();
+        let def = registry.get("web_extract").expect("web_extract registered");
+        let result = (def.executor)(
+            &serde_json::json!({"url": "http://169.254.169.254/latest/meta-data/"}),
+            &crate::tools::registry::ToolCtx::default(),
+        )
+        .expect("executor ok");
+        assert!(
+            !result.success,
+            "内网/云元数据地址必须在抓取前被 SSRF 守卫拦下"
+        );
+
+        // 非 http/https scheme 同样被守卫拦下（原前缀检查已移除）
+        let result = (def.executor)(
+            &serde_json::json!({"url": "file:///etc/passwd"}),
+            &crate::tools::registry::ToolCtx::default(),
+        )
+        .expect("executor ok");
+        assert!(!result.success, "file 协议应被拦下");
+    }
+
+    /// 字节闸截断必须对模型可见。
+    ///
+    /// 回归目标：曾经 `read_body_capped` 静默 `buf.truncate()`，模型拿到半篇
+    /// 正文却无从察觉，会当成完整文档回答。本用例锁死「标记存在且带上限值」。
+    #[test]
+    fn test_byte_truncation_marker_is_visible_and_names_the_cap() {
+        let marker = byte_truncation_marker();
+        assert!(
+            marker.contains("[Truncated:"),
+            "标记必须沿用 extract_readable 的既有格式，模型只需认一种：{}",
+            marker
+        );
+        assert!(
+            marker.contains(&format!("{}", MAX_WEB_BYTES / (1024 * 1024))),
+            "标记必须报出实际 MiB 上限，否则模型不知道丢了多少：{}",
+            marker
+        );
+        // 标记挂在末尾，供调用方直接 format 到最终文本尾部
+        assert!(marker.starts_with("\n\n"), "应作为独立段落追加");
+    }
+
+    // ── 跨源降级：失败分类与可行动文案 ──
+
+    /// 可重试性判定：限流/超时归 Retryable，其余归 Permanent。
+    ///
+    /// 这条分类直接决定失败文案给模型的下一步建议（等 vs 换词），
+    /// 判错会让模型在限流时反复改写查询、越改越跑偏。
+    #[test]
+    fn test_classify_source_failure_splits_retryable_from_permanent() {
+        for r in [
+            "HTTP 429",
+            "HTTP 503",
+            "bing request failed: operation timed out",
+            "github request failed: timeout",
+            "HTTP 429 Too Many Requests",
+        ] {
+            assert_eq!(
+                classify_source_failure(r),
+                SourceFailure::Retryable,
+                "限流/超时必须归可重试：{}",
+                r
+            );
+        }
+        for r in [
+            "bing returned no parseable results",
+            "HTTP 404",
+            "wikipedia request failed: invalid URL",
+            "ddg lite result page exceeds 5 MiB byte cap; source dropped",
+            "panicked",
+        ] {
+            assert_eq!(
+                classify_source_failure(r),
+                SourceFailure::Permanent,
+                "重试无意义的失败不得归可重试：{}",
+                r
+            );
+        }
+    }
+
+    /// 失败文案必须给出下一步动作，而不是只列源名。
+    ///
+    /// 回归目标：旧文案是一句写死的「All search sources failed (bing/ddg-lite/
+    /// wiki/github/docs unreachable or returned nothing)」，五个源名全列但一个
+    /// 原因都没有 —— 模型只能对同一个查询反复重试。
+    #[test]
+    fn test_describe_aggregate_failure_is_actionable() {
+        // 零失败 = 源都正常但没匹配上 → 应引导换词，而不是让模型等
+        let none: Vec<(&'static str, String, SourceFailure)> = vec![];
+        let msg = describe_aggregate_failure(&none);
+        assert!(
+            msg.contains("No search source returned results"),
+            "零失败应与「全挂」区分开：{}",
+            msg
+        );
+        assert!(
+            msg.contains("different or broader terms"),
+            "零失败要给换词建议：{}",
+            msg
+        );
+
+        // 限流占多数 → 明确劝「等」而不是「改查询」
+        let rate_limited = vec![
+            ("bing", "HTTP 429".to_string(), SourceFailure::Retryable),
+            (
+                "ddg-lite",
+                "request failed: timed out".to_string(),
+                SourceFailure::Retryable,
+            ),
+            (
+                "wikipedia",
+                "returned no parseable results".to_string(),
+                SourceFailure::Permanent,
+            ),
+        ];
+        let msg = describe_aggregate_failure(&rate_limited);
+        assert!(msg.contains("2 of 3"), "应报出可重试占比：{}", msg);
+        assert!(
+            msg.contains("retry after a short wait instead of rewriting"),
+            "限流场景必须劝等待而非改查询：{}",
+            msg
+        );
+        assert!(msg.contains("bing: HTTP 429"), "要带上具体原因：{}", msg);
+
+        // 全是永久性失败 → 劝换词
+        let all_permanent = vec![
+            ("bing", "HTTP 404".to_string(), SourceFailure::Permanent),
+            (
+                "github",
+                "search failed".to_string(),
+                SourceFailure::Permanent,
+            ),
+        ];
+        let msg = describe_aggregate_failure(&all_permanent);
+        assert!(
+            msg.contains("retrying will not fix"),
+            "永久失败要劝换词：{}",
+            msg
+        );
+        assert!(
+            msg.contains("source=wiki/github/docs"),
+            "永久失败要给定向源的出口：{}",
+            msg
+        );
+    }
+
+    // ── DeepSeek 官方搜索源 ──
+
+    /// 官方响应 → SearchResult 的字段映射。
+    ///
+    /// 锁两条契约：
+    /// ① `snippet` 位必须填官方 `summary`（600~800 字符、「适用于给模型阅读」），
+    ///    而不是面向前端展示的 `snippet`（100~200 字符）——填错等于把信息量砍掉
+    ///    四分之三，模型拿到的是残缺摘要；
+    /// ② summary 缺失时才回退 snippet，不得产出空串。
+    #[test]
+    fn test_parse_deepseek_search_prefers_summary_over_snippet() {
+        let body = serde_json::json!({
+            "results": [
+                {
+                    "rerank_score": 2.4,
+                    "title": "有 summary 的条目",
+                    "url": "https://example.com/a",
+                    "snippet": "短摘要-前端展示用",
+                    "summary": "长摘要-官方定位给模型阅读",
+                    "site_name": "Example",
+                    "authority": 3
+                },
+                {
+                    "rerank_score": 1.8,
+                    "title": "无 summary 的条目",
+                    "url": "https://example.com/b",
+                    "snippet": "只有短摘要",
+                    "summary": "",
+                    "authority": -1
+                }
+            ]
+        })
+        .to_string();
+
+        let out = parse_deepseek_search_response(&body, 5).expect("应解析成功");
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].snippet, "长摘要-官方定位给模型阅读",
+            "summary 存在时必须优先于 snippet"
+        );
+        assert_eq!(
+            out[1].snippet, "只有短摘要",
+            "summary 为空时必须回退 snippet，而不是留空"
+        );
+        assert_eq!(out[0].url, "https://example.com/a");
+    }
+
+    /// 空结果必须 Err —— 不能返回空表。
+    ///
+    /// 官方计费规则：只有「HTTP 200 且 results 非空」才计费。空数组 = 没花钱的
+    /// 正常无匹配，报成故障会诱导模型无谓重试；报成 Ok(空) 又会让它误判成
+    /// 「网上确实查无此事」。
+    #[test]
+    fn test_parse_deepseek_search_empty_results_is_error() {
+        let body = serde_json::json!({ "results": [] }).to_string();
+        let err = parse_deepseek_search_response(&body, 5).expect_err("空结果必须报错");
+        assert!(
+            err.contains("returned no results"),
+            "错误文案应说明是查询无匹配：{}",
+            err
+        );
+
+        // 响应体缺 results 字段 = 协议不符，与「无匹配」区分开
+        let err = parse_deepseek_search_response("{}", 5).expect_err("缺 results 必须报错");
+        assert!(
+            err.contains("no results array"),
+            "协议不符应与无匹配区分：{}",
+            err
+        );
+    }
+
+    /// 缺 title 或 url 的条目必须被丢弃。
+    /// 消费方是模型：没有链接就无法引用来源，没有标题就无法判断相关性。
+    #[test]
+    fn test_parse_deepseek_search_drops_incomplete_entries() {
+        let body = serde_json::json!({
+            "results": [
+                { "title": "", "url": "https://example.com/x", "summary": "无标题" },
+                { "title": "无链接", "url": "", "summary": "无 url" },
+                { "title": "完整条目", "url": "https://example.com/ok", "summary": "ok" }
+            ]
+        })
+        .to_string();
+
+        let out = parse_deepseek_search_response(&body, 5).expect("应解析成功");
+        assert_eq!(out.len(), 1, "不完整条目应被丢弃");
+        assert_eq!(out[0].title, "完整条目");
+    }
+
+    /// count 上限必须生效（官方上限 50，工具侧 count 最大 20）。
+    #[test]
+    fn test_parse_deepseek_search_respects_count() {
+        let results: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "title": format!("条目{}", i),
+                    "url": format!("https://example.com/{}", i),
+                    "summary": "s"
+                })
+            })
+            .collect();
+        let body = serde_json::json!({ "results": results }).to_string();
+
+        let out = parse_deepseek_search_response(&body, 3).expect("应解析成功");
+        assert_eq!(out.len(), 3, "应按 count 截断");
+    }
+
+    /// 计费源不得混入默认免费聚合表 —— 它只经「优先 + 降级」链路参与。
+    ///
+    /// 断言对象是**真实源表** `FREE_SEARCH_SOURCES`，不是测试里另写的字面量
+    /// 数组 —— 后者只能证明测试自己写了什么，证明不了产品代码的行为。
+    #[test]
+    fn test_deepseek_source_is_not_in_free_aggregate() {
+        let names: Vec<&str> = FREE_SEARCH_SOURCES.iter().map(|(n, _)| *n).collect();
+        assert!(
+            !names.contains(&"deepseek"),
+            "免费聚合源表不得包含 deepseek（它是「优先+降级」链路，不是聚合成员）：{:?}",
+            names
+        );
+        assert_eq!(names.len(), 5, "免费源表应为 5 个，实际：{:?}", names);
+    }
+
+    /// schema 契约：deepseek 不作为 source 选项暴露。
+    ///
+    /// 设计依据：DeepSeek 搜索由「设置 → 模型 → 网页搜索源」开关驱动，
+    /// 语义是**始终优先**。若同时暴露 `source=deepseek`，模型就会有两种方式
+    /// 触发同一件事（而且其一能绕过用户开关），行为不可预测。
+    #[test]
+    fn test_schema_does_not_expose_deepseek_as_source_option() {
+        let mut registry = ToolRegistry::new();
+        registry.register_web_search();
+        let def = registry.get("web_search").expect("web_search registered");
+        let source_enum = def.parameters["properties"]["source"]["enum"]
+            .as_array()
+            .expect("source enum");
+        assert!(
+            !source_enum.iter().any(|v| v == "deepseek"),
+            "deepseek 不应作为 source 选项（由开关驱动，不由模型选择）：{:?}",
+            source_enum
+        );
+        assert_eq!(
+            def.parameters["properties"]["source"]["default"], "web",
+            "默认值必须是 web"
+        );
+        // 描述必须告知「已启用时会优先」这一事实，否则模型不知道降级头部的含义
+        assert!(
+            def.description.contains("tried FIRST"),
+            "工具描述必须说明已启用源会被优先尝试：{}",
+            def.description
+        );
+        assert!(
+            def.description.contains("fallback"),
+            "工具描述必须说明存在降级：{}",
+            def.description
+        );
+    }
+
+    // ── DeepSeek 官方 Fetch ──
+
+    /// Fetch 响应映射：`content` 必须原样保留 Markdown。
+    ///
+    /// 关键契约：官方返回的 content 已是提炼并转好的 Markdown **正文**，
+    /// 绝不能再喂 `extract_readable`（HTML 解析器）——那会把标题层级、列表、
+    /// 代码块结构抹平。这是 Jina 镜像分支已经踩过一次的坑。
+    #[test]
+    fn test_parse_deepseek_fetch_preserves_markdown() {
+        let body = serde_json::json!({
+            "title": "Example article",
+            "content": "# Example article\n\nSome **markdown** body.\n\n- item 1\n- item 2"
+        })
+        .to_string();
+
+        let out = parse_deepseek_fetch_response(&body).expect("应解析成功");
+        assert_eq!(out.title, "Example article");
+        assert!(
+            out.content.contains("# Example article"),
+            "Markdown 标题必须原样保留：{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("- item 1"),
+            "列表结构必须原样保留：{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("**markdown**"),
+            "行内强调必须原样保留：{}",
+            out.content
+        );
+    }
+
+    /// 空正文必须 Err：官方规则是未取到正文不计费，属「无内容」而非故障。
+    /// 报成 Ok("") 会让上层把空字符串当成成功抓取结果返回给模型。
+    #[test]
+    fn test_parse_deepseek_fetch_empty_content_is_error() {
+        let body = serde_json::json!({ "title": "t", "content": "" }).to_string();
+        let err = parse_deepseek_fetch_response(&body).expect_err("空正文必须报错");
+        assert!(
+            err.contains("empty content"),
+            "错误文案应说明是无正文：{}",
+            err
+        );
+
+        // 缺 content 字段同理
+        let err = parse_deepseek_fetch_response("{}").expect_err("缺 content 必须报错");
+        assert!(err.contains("empty content"), "缺字段也是无正文：{}", err);
+    }
+
+    /// 标题可为空——正文才是必需项，不得因缺标题丢弃整篇。
+    #[test]
+    fn test_parse_deepseek_fetch_title_optional() {
+        let body = serde_json::json!({ "content": "正文内容" }).to_string();
+        let out = parse_deepseek_fetch_response(&body).expect("应解析成功");
+        assert_eq!(out.title, "", "缺 title 应为空串而非报错");
+        assert_eq!(out.content, "正文内容");
     }
 }

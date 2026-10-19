@@ -246,7 +246,7 @@ pub async fn image_resize(
 }
 
 /// 获取图片信息（尺寸 / 文件大小 / 格式）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn image_info(path: String) -> Result<serde_json::Value, String> {
     let input = ensure_input_image(&path)?;
     let img = image::open(&input).map_err(|e| format!("打开图片失败：{}", e))?;

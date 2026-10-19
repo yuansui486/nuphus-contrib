@@ -1,0 +1,13 @@
+{
+  "name": "workflow-recovery",
+  "displayName": "工作流故障恢复",
+  "description": "workflow_run 失败后的恢复协议：阻塞类型识别、就地解决优先级（语义候选/增强判断/视觉回退）、同 id 断点续连、设计缺陷与运行时阻塞的判界、重试上限与汇报。失败处置前必读。",
+  "version": "1.0.0",
+  "author": "Nuphus",
+  "keywords": ["workflow", "恢复", "失败", "断点续连", "阻塞", "重试"],
+  "triggers": {
+    "auto_suggest": true,
+    "context_hints": ["failed", "失败", "error", "阻塞", "重跑", "recovery"]
+  },
+  "data_sources": []
+}

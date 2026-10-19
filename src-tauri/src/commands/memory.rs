@@ -5,7 +5,7 @@ use nuphus::store::session;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_memory_stats(_state: State<'_, AppState>) -> Result<MemoryStats, String> {
     let stats = nuphus::store::memory::entry_stats().unwrap_or_default();
     let entries_count = stats.total_entries as usize;
@@ -33,7 +33,7 @@ pub fn get_memory_stats(_state: State<'_, AppState>) -> Result<MemoryStats, Stri
 }
 
 /// Get entry statistics (replaces legacy TimelineIndex)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_timeline_index_stats(_state: State<'_, AppState>) -> Result<TimelineIndexStats, String> {
     use nuphus::store::memory::entry_stats;
     let stats = entry_stats().map_err(|e| e.to_string())?;
@@ -144,7 +144,7 @@ fn aggregate_entry_summaries(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_session_history() -> Result<Vec<nuphus::store::memory::SessionSummary>, String> {
     // 1) Read ALL rows from sessions table
     let rows =
@@ -256,7 +256,7 @@ pub fn get_session_history() -> Result<Vec<nuphus::store::memory::SessionSummary
     Ok(sessions)
 }
 /// ensuring clean dialogue results are displayed to user.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_session_detail(session_id: String) -> Result<Vec<SessionDetailEntry>, String> {
     let entries = nuphus::store::memory::get_entries_by_session(&session_id)
         .map_err(|e| format!("Failed to load entries for session: {}", e))?;
@@ -350,7 +350,7 @@ pub fn get_session_detail(session_id: String) -> Result<Vec<SessionDetailEntry>,
     Ok(session_entries)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_knowledge_items(category: String) -> Result<serde_json::Value, String> {
     let _ = category;
     Ok(serde_json::json!([]))
@@ -375,7 +375,7 @@ pub struct MemoryOverview {
 }
 
 /// 记忆概览：统计 + 时间跨度 + 经验沉淀 + 向量覆盖（概览 tab 数据源）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_memory_overview(_state: State<'_, AppState>) -> Result<MemoryOverview, String> {
     let stats = nuphus::store::memory::entry_stats().map_err(|e| e.to_string())?;
     let success_rate = if stats.total_entries > 0 {
@@ -407,7 +407,7 @@ pub fn get_memory_overview(_state: State<'_, AppState>) -> Result<MemoryOverview
 }
 
 /// Delete knowledge entry (soft delete by setting active=false)
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_knowledge_item(category: String, id: String) -> Result<bool, String> {
     let _ = (category, id);
     Err("不支持的分类".to_string())
@@ -419,7 +419,7 @@ pub fn delete_knowledge_item(category: String, id: String) -> Result<bool, Strin
 /// - 4-5⭐ → "Save as strategy": tag strategy/high_quality, extract patterns from steps
 /// - 3⭐   → "Save review": neutral archive, enter memory normally
 /// - 1-2⭐ → Low quality: tag error_record, keep as error record but don't trigger evolution
-#[tauri::command]
+#[tauri::command(async)]
 pub fn submit_execution_rating(
     goal: String,
     rating: u8,

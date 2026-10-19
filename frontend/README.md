@@ -10,7 +10,7 @@
 - **Vite** v6 — 构建工具
 - **TypeScript** — 类型安全
 
-> 注：项目含 TailwindCSS 依赖但实际未启用（src/styles 无 @tailwind 引用），样式系统为纯 CSS 文件（`src/styles/` + 各模块 CSS，共 48 个文件），基于 CSS 变量设计令牌。
+> 注：样式系统为纯 CSS 文件（`src/styles/` + 各模块 CSS，共 48 个文件），基于 CSS 变量设计令牌。项目不使用 TailwindCSS。
 
 ## 源码结构
 
@@ -57,7 +57,7 @@ src/
 │       ├── api.ts        # Tauri 命令封装
 │       └── api-memory.ts # 记忆相关 API
 ├── ui/                   # 通用 UI 组件
-│   ├── CommandPalette.tsx   # 命令面板（Ctrl+U 唤出/滚轮/斜杠命令弹窗交互）
+│   ├── CommandPalette.tsx   # 命令面板（Ctrl+K 唤出/滚轮/斜杠命令弹窗交互）
 │   ├── Button.tsx           # 按钮组件
 │   ├── Icons.tsx            # 图标组件
 │   ├── ErrorBoundary.tsx    # 错误边界
@@ -96,7 +96,6 @@ src/
 | 快捷键 | 功能 |
 |--------|------|
 | `Ctrl+K` | 唤出命令面板（CommandPalette） |
-| `Ctrl+U` | 桌面工具栏 |
 | `Ctrl+L` | 聚焦输入框 |
 | `Ctrl+N` | 新建对话 |
 | `Enter` | 发送消息 |

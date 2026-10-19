@@ -979,7 +979,7 @@ pub struct RelayClientStatus {
     pub device_id: String,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn relay_client_status() -> RelayClientStatus {
     let mut cfg = load_config();
     // 二维码必须带 device_id（公共中继归属依据）。缺失/被外部编辑器清空时幂等补齐——
@@ -1222,8 +1222,13 @@ where
                         }
                     }
                     None => {
-                        // 未知消息：静默忽略，避免 warn 刷屏
-                        tracing::debug!("[Relay] 收到未知消息: {}", &text[..text.len().min(200)]);
+                        // 未知消息：静默忽略，避免 warn 刷屏。
+                        // 按字符边界截断——消息体含中文（设备 JSON），裸字节切片
+                        // 会在多字节字符中间 panic（同 transport 错误体事故）。
+                        tracing::debug!(
+                            "[Relay] 收到未知消息: {}",
+                            &text[..nuphus::utils::floor_char_boundary(&text, 200)]
+                        );
                     }
                 }
             }

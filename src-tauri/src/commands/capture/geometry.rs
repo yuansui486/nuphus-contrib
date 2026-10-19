@@ -1,12 +1,11 @@
 //! 截图遮罩的几何与选区计算（**平台无关**）。
 //!
-//! 移植自 shot 项目（`shot/src/main.rs`）的 `Sel` / `Point` / `Rect` /
-//! `normalize` / `apply_node` / 节点布局逻辑。
+//! 定义 `Sel` / `Point` / `Rect` 及 `normalize` / `apply_node` / 节点布局逻辑。
 //!
-//! 与 shot 的差异：**不依赖全局屏幕尺寸**，改由调用方传入 —— 便于单测、
+//! 设计约束：**不依赖全局屏幕尺寸**，改由调用方传入 —— 便于单测、
 //! 便于将来扩展多显示器。
 //!
-//! 硬约束（沿用 shot 的设计原则）：
+//! 硬约束：
 //!   · 负值/越界是**合法输入**，不是错误（normalize 只做左右/上下对调，
 //!     绝不把选区按回屏幕；越界部分由渲染与裁剪沿屏幕边缘自然切掉）。
 //!   · 夹紧放在**输出侧**（渲染/裁剪），不放在输入侧。
@@ -100,7 +99,7 @@ pub const NODE_KINDS: [Kind; NODE_COUNT] = [
     Kind::S,
 ];
 
-// ── 交互参数（与 shot 对齐）──
+// ── 交互参数 ──
 pub const MIN_SEL_W: i32 = 8;
 pub const MIN_SEL_H: i32 = 8;
 pub const DRAG_START_PX: i32 = 4; // 超过才算拖拽

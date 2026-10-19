@@ -1,6 +1,7 @@
 //! 步骤调度与分发
 //!
 //! Recursive step executor — 主入口分发到各步骤处理器。
+use super::control_flow;
 use super::*;
 
 // ── Recursive step executor ──
@@ -243,8 +244,15 @@ impl Executor {
                 Action::Assert { assert } => self.execute_assert_step(assert, variables).await,
                 Action::Mcp { mcp } => self.execute_mcp_step(step, mcp, variables).await,
                 Action::Sleep { sleep } => self.execute_sleep_step(*sleep).await,
-                Action::Break { .. } => Ok("break".to_string()),
-                Action::Continue { .. } => Ok("continue".to_string()),
+                // B2：break/continue 是控制流信号，不是普通输出字符串——
+                // 走错误通道向上传播，最近一层 loop 捕获消费（见 control_flow.rs）。
+                // dispatch 末尾（run_record/事件层）会把该错误还原为正常完成。
+                Action::Break { .. } => Err(control_flow::control_flow_error(
+                    control_flow::ControlFlow::Break,
+                )),
+                Action::Continue { .. } => Err(control_flow::control_flow_error(
+                    control_flow::ControlFlow::Continue,
+                )),
                 Action::Custom(_) => Err(crate::NuphusError::agent(
                     "custom step kind not yet supported".to_string(),
                 )),
@@ -284,10 +292,16 @@ impl Executor {
         };
 
         // ── 记录步骤执行结果到 RunRecord（断点续连 / has_skipped / completed_steps 数据源）──
+        // B2：控制流信号（break/continue）借错误通道传播，但它是正常语义而非失败——
+        // run_record/事件层还原为 Success，用户不看到红叉横幅。
+        let control_flow_signal = result
+            .as_ref()
+            .err()
+            .and_then(control_flow::is_control_flow_error);
         {
             let finished_at = chrono::Utc::now();
-            let record = match &result {
-                Ok(_) => StepRunRecord {
+            let record = match (&result, control_flow_signal) {
+                (Ok(_), _) | (Err(_), Some(_)) => StepRunRecord {
                     step_id: step_id.clone(),
                     started_at,
                     finished_at: Some(finished_at),
@@ -296,7 +310,7 @@ impl Executor {
                         .as_deref()
                         .map(|message| message.chars().take(200).collect()),
                 },
-                Err(_) => StepRunRecord {
+                (Err(_), None) => StepRunRecord {
                     step_id: step_id.clone(),
                     started_at,
                     finished_at: Some(finished_at),
@@ -311,8 +325,8 @@ impl Executor {
         // 成功 → StepRunCompleted{Success}；失败 → Error（message 横幅）+ StepRunCompleted{Error}
         // （补发后者：前端据此把该步骤标记为 failed 红叉；旧实现只发 Error 无 step_id，
         // 前端无法定位失败步骤，导致 run_completed 时失败步骤被误收敛为绿色 completed）。
-        match &result {
-            Ok(_) => {
+        match (&result, control_flow_signal) {
+            (Ok(_), _) | (Err(_), Some(_)) => {
                 if let Some(message) = safe_output.filter(|message| !message.is_empty()) {
                     events.emit(WorkflowEvent::StepRunOutput {
                         step_id: step.id(),
@@ -326,7 +340,7 @@ impl Executor {
                     depth,
                 });
             }
-            Err(_) => {
+            (Err(_), None) => {
                 let message = safe_error.unwrap_or_else(|| "执行失败".to_string());
                 events.emit(WorkflowEvent::Error {
                     message: format!("Step '{}' failed: {}", step.name(), message),
@@ -340,7 +354,7 @@ impl Executor {
             }
         }
 
-        if result.is_ok() {
+        if result.is_ok() || control_flow_signal.is_some() {
             if let Some(session) = crate::workflow::debug::current() {
                 if session.should_break(workflow_id, &step.id) {
                     self.pause(&session.workflow_id).await;
@@ -364,6 +378,7 @@ impl Executor {
                 }
             }
         }
+        // 控制流信号原样向上传播（loop 层捕获消费）；正常结果原样返回
         result
     }
 }

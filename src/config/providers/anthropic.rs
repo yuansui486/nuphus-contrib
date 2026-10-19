@@ -40,8 +40,13 @@ impl Provider for AnthropicProvider {
                 cost_per_million_in: 3.0,
                 cost_per_million_out: 15.0,
                 reasoning_field: "",
-                reasoning_efforts: &["none", "low", "high", "max"],
-                default_effort: None,
+                // 官方依据（platform.claude.com · Effort，2026-10 核对）：effort 五档
+                // low / medium / high / xhigh / max（high 为多数模型默认；Opus 5.5 /
+                // Haiku 5.5 默认 medium）。旧列表 none/low/high/max 来自 DeepSeek 对
+                // Anthropic 兼容格式的转述，非 Anthropic 官方枚举；none 也不是官方档位
+                // （关思考走 thinking.type=disabled，不走 effort）。
+                reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+                default_effort: Some("high"),
             },
             ModelDef {
                 id: "claude-opus-4-8",
@@ -56,8 +61,10 @@ impl Provider for AnthropicProvider {
                 cost_per_million_in: 15.0,
                 cost_per_million_out: 75.0,
                 reasoning_field: "",
-                reasoning_efforts: &["none", "low", "high", "max"],
-                default_effort: None,
+                // 同上：官方五档 low/medium/high/xhigh/max（availability 页：
+                // max 覆盖 Claude Opus 4.8）。
+                reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+                default_effort: Some("high"),
             },
             ModelDef {
                 id: "claude-haiku-4-5-20251001",
@@ -81,7 +88,10 @@ impl Provider for AnthropicProvider {
     fn quirks(&self) -> ProviderQuirks {
         ProviderQuirks {
             requires_reasoning_echo: false,
-            supports_reasoning_effort: false,
+            // 官方 Messages API 接受 effort（output_config.effort，见 transport）。
+            // 该 quirk 闸门只作用于 chat_completions / responses 引擎；Anthropic
+            // 原生 transport 不读它，置 true 仅为元数据与其它 provider 一致。
+            supports_reasoning_effort: true,
             effort_excludes_tools: false,
             sanitize_tools: None,
             extra_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],

@@ -16,7 +16,7 @@ temp/
 frontend/dist/
 frontend/dist-workbench/
 *.bmp
-# 根目录临时 Python 脚本（AI 会话产物，不入库）；scripts/ 正式脚本（generate_icons.py 等）不受影响
+# 根目录临时 Python 脚本（AI 会话产物，不入库）；scripts/ 正式脚本不受影响
 /*.py
 src-tauri/desktop/models/*.onnx
 src-tauri/desktop/models/*.txt
@@ -179,3 +179,7 @@ target-test/
 # 本机专用的构建/启动脚本（内含本机绝对路径，不入库）
 rebuild-and-run.bat
 src-tauri/binaries/nuphus-workbench-mcp-*
+
+# 官网双版本产物（本地待裁决，不入库）
+/website/
+/website-skill/

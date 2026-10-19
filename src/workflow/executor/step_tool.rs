@@ -44,6 +44,11 @@ impl Executor {
         for attempt in 0..=max_retries {
             // 重试间隔
             if attempt > 0 {
+                // I-11：补发射重试事件（此前只有 Error 横幅，前端 step_run_retry 徽章是死代码）
+                events.emit(WorkflowEvent::StepRunRetry {
+                    step_id: step.id.clone(),
+                    attempt,
+                });
                 events.emit(WorkflowEvent::Error {
                     message: format!(
                         "Tool '{}' ({}): attempt {}/{} after error: {}",
@@ -152,11 +157,18 @@ impl Executor {
 }
 
 /// Parse exit code from tool error message (common patterns: "exit code: 1", "exit_code=1")
-fn parse_exit_code_from_tool_error(err: &str) -> Option<i32> {
+///
+/// B6：匹配与切片必须同在 lowercase 串上进行。此前 pos 来自 lowercase 串、
+/// 切片却作用于原始 err——非 ASCII 前缀（如 'İ' U+0130）lowercase 后字节长度变化，
+/// pos 相对原串错位，`&err[pos + pattern.len()..]` 可能落在 UTF-8 字符中间 → panic
+/// （async 任务内 panic 会毒化整个 run）。数字/负号/空白不受 lowercase 影响，
+/// 在 lowercase 串上解析退出码语义等价。
+pub(super) fn parse_exit_code_from_tool_error(err: &str) -> Option<i32> {
+    let lower = err.to_lowercase();
     // Try "exit code: N" or "exit_code: N"
     for pattern in &["exit code:", "exit_code:", "exitcode:"] {
-        if let Some(pos) = err.to_lowercase().find(pattern) {
-            let after = &err[pos + pattern.len()..];
+        if let Some(pos) = lower.find(pattern) {
+            let after = &lower[pos + pattern.len()..];
             if let Some(num) = after
                 .trim()
                 .split(|c: char| !c.is_ascii_digit() && c != '-')

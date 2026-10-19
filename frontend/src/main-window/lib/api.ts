@@ -24,6 +24,7 @@ import type {
   ChatAgentConfig,
   InlineChatAgentEntry,
   TurnMeta,
+  BackgroundTaskView,
 } from '../../core/types'
 
 // ── Tools ──
@@ -311,7 +312,7 @@ export async function processInput(
     mode,
     images,
     references,
-    new_session: newSession ?? false,
+    newSession: newSession ?? false,
   })
 
   // invoke 返回 null 说明 IPC 调用失败（ERR_CONNECTION_REFUSED 等）
@@ -325,6 +326,31 @@ export async function processInput(
 
 export function interrupt() {
   return invoke<string>('interrupt')
+}
+
+// ── 后台任务账本（跨工具调用存活的子进程）──
+//
+// 「强制终止」只杀 retain=false 的前台进程；被显式保留（background=true）或
+// 超时转后台的进程会继续跑。账本是用户唯一能看见/结束它们的地方（产品原则：
+// 不杀可以，但不能看不见）。三个命令的语义见
+// src-tauri/src/commands/process/background.rs。
+
+/** 列出仍存活的后台任务（死条目由后端在读取时顺带清理） */
+export function listBackgroundTasks() {
+  return invoke<BackgroundTaskView[]>('list_background_tasks')
+}
+
+/** 仍存活的**保留项**数量——轻量查询，专供「保留 M 个」这个数字用 */
+export function countRetainedBackgroundTasks() {
+  return invoke<number>('count_retained_background_tasks')
+}
+
+/**
+ * 按 id 结束某个后台任务（**含保留项**——这是显式意图）。
+ * 返回后端的中文结果句（事实来源，原样展示给用户）；失败时后端 reject。
+ */
+export function killBackgroundTask(id: string) {
+  return invoke<string>('kill_background_task', { id })
 }
 
 export function pauseExecution() {
@@ -800,6 +826,7 @@ export function detectCdpBrowsers() {
 
 export interface ModelInfo {
   id: string
+  transport?: TransportKind | null
   provider: string
   alias: string[]
   supports_streaming: boolean
@@ -822,6 +849,17 @@ export interface ModelInfo {
 
 export function listModels() {
   return invoke<ModelInfo[]>('list_models')
+}
+
+export type TransportKind = 'chat-completions' | 'anthropic' | 'responses'
+
+/** 保存模型级协议覆盖；null 恢复服务商默认路由。 */
+export function setModelTransport(
+  provider: string,
+  model: string,
+  transport: TransportKind | null,
+) {
+  return invoke<void>('set_model_transport', { provider, model, transport })
 }
 
 // ── Model Switch (provider-driven: reads key from config.toml, no key param) ──
@@ -1139,6 +1177,8 @@ export interface Capabilities {
   image_generation_provider?: string
   video_generation?: string
   video_generation_provider?: string
+  /** 网页搜索源：值是 provider 段名（不是模型 id）；空 = 未启用 */
+  web_search_source?: string
   chat_agent_max_iterations: number | null
 }
 
@@ -1153,9 +1193,39 @@ export function setCapability(key: string, value: string) {
 /** 原子设置能力模型绑定：model 与 provider 必须在同一次写入内落盘，
  *  否则会留下「新 model + 旧 provider」的半绑定（能力请求按 provider+model
  *  精确解析时找不到该组合，保存看似成功但实际用不了）。
- *  kind ∈ 'vision' | 'stt' | 'tts' | 'voice' | 'image_generation' | 'video_generation'。 */
+ *  kind ∈ 'vision' | 'stt' | 'tts' | 'voice' | 'image_generation' | 'video_generation'
+ *        | 'web_search_source'（后者 model 位填段名、provider 留空）。 */
 export function setCapabilityBinding(kind: string, model: string, provider: string) {
   return invoke<void>('set_capability_binding', { kind, model, provider })
+}
+
+/** 图像理解生效路径解析（后端权威，跟随链展示用）。
+ *  strategy: capability=显式绑定 / main=跟随 Leader 主模型 / none=不可用。 */
+export interface VisionResolution {
+  strategy: 'capability' | 'main' | 'none'
+  /** capability=绑定模型 id；main=Leader 模型 id；none='' */
+  model: string
+  /** 模型所在 provider 段名（解析不到为空串） */
+  provider: string
+  /** 当前 Leader 模型 id */
+  leader_model: string
+}
+
+export function getVisionResolution() {
+  return invoke<VisionResolution>('get_vision_resolution')
+}
+
+/** 「发送测试图片」探测结果（1x1 PNG 直调视觉链路）。
+ *  失败时 kind 为后端分类：auth / billing / rate_limit / image_too_large / other。 */
+export interface VisionTestOutcome {
+  ok: boolean
+  latency_ms: number
+  kind: string
+  message: string
+}
+
+export function testVisionModel() {
+  return invoke<VisionTestOutcome>('test_vision_model')
 }
 
 /** 手动设定某 provider 下某模型的视觉（多模态）能力（模型行内开关）。
@@ -1352,9 +1422,9 @@ export function submitExecutionRating(
     goal,
     rating,
     comment,
-    tools_summary: steps.map(s => s.tool).join(', '),
-    steps_json: JSON.stringify(steps),
-    session_id: sessionId,
+    toolsSummary: steps.map(s => s.tool).join(', '),
+    stepsJson: JSON.stringify(steps),
+    sessionId,
   })
 }
 
@@ -1673,7 +1743,7 @@ export function deleteChatAgent(name: string) {
 
 /** 查询某 workflow 中内联 ChatAgent 步骤配置 */
 export function listChatAgentsInline(workflowId: string) {
-  return invoke<InlineChatAgentEntry[]>('chat_agent_list_inline', { workflow_id: workflowId })
+  return invoke<InlineChatAgentEntry[]>('chat_agent_list_inline', { workflowId })
 }
 
 /** 更新工作流中内联 ChatAgent 配置 */
@@ -1683,8 +1753,8 @@ export function updateChatAgentInline(
   config: Record<string, unknown>,
 ) {
   return invoke<void>('chat_agent_update_inline', {
-    workflow_id: workflowId,
-    step_id: stepId,
+    workflowId,
+    stepId,
     config,
   })
 }
@@ -1922,6 +1992,8 @@ export function openPath(path: string) {
 export function revealPath(path: string) {
   return invoke<void>('reveal_path', { path })
 }
+
+// ── 应用内浏览器（后端 src-tauri/src/commands/browser.rs） ──
 
 // ── 数据目录（只读列举） ──
 
@@ -2286,11 +2358,54 @@ export async function getChangelog() {
 // ── 外链 ──
 
 /**
- * 用系统默认浏览器打开外链（桌面端 WebView 不处理 `target="_blank"`）。
+ * 用系统默认浏览器打开外链。
+ *
+ * ⚠️ **用户可见的外链不再走这里**（2026-10-09 起统一进 Agent 浏览器，见
+ * {@link browserOpenUrl}）：登录态必须落在工作流/Agent 用的那个 profile 里。
+ * 现存调用点只剩模型厂商 OAuth 授权——那条链路依赖外部浏览器的回调与既有登录态，
+ * 刻意保持系统浏览器。
+ *
  * 后端只放行 http/https；失败时返回可读原因，调用方通常只记录不打断。
  */
 export function openExternal(url: string) {
   return invoke<void>('open_external', { url })
+}
+
+/**
+ * 唤起 Agent 浏览器窗口（Nuphus 自己的 CDP 浏览器，不是系统浏览器）。
+ *
+ * 已有窗口则提到前台，没有则启动一个。返回窗口当前页URL，供调用方回显落点。
+ * 只置前、**不导航**；要打开某个网址用 {@link browserOpenUrl}（新开标签）。
+ */
+export function browserShowWindow() {
+  return invoke<string>('browser_show_window')
+}
+
+/** {@link browserOpenUrl} 的返回（字段名与后端 serde 逐字对应，见 cdp_window.rs 的测试） */
+export interface AgentBrowserOpened {
+  /** 本次调用是否**新启动**了浏览器（false = 窗口本来就在） */
+  launched: boolean
+  /** 实际落点 URL */
+  url: string
+}
+
+/**
+ * 在 Agent 浏览器（CDP 那个 Chrome）里**新开一个标签页**打开外链，并把窗口置前。
+ *
+ * ## 为什么外链不再走系统浏览器（2026-10-09 大王定调）
+ *
+ * 用户点外链的常见动机是「Agent 让我登录某个网站」。登录态必须落在**工作流/Agent 用的
+ * 那个 profile** 里——在系统浏览器登录，工作流照样过不去。统一到 CDP 浏览器后，用户在
+ * 这个窗口里登录/授权/填表，Agent 随后复用同一份状态。
+ *
+ * ## 为什么不导航当前页
+ *
+ * 点链接的时机常常正好是 Agent 在自动化某页时；导航会把它正在操作的页顶掉。
+ *
+ * 窗口已经开着时不会重复提示——`launched=false` 即代表"它本来就在"。
+ */
+export function browserOpenUrl(url: string) {
+  return invoke<AgentBrowserOpened>('browser_open_url', { url })
 }
 
 // Local workflow execution evidence. Summaries stay separate from full invocation values.

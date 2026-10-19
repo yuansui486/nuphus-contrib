@@ -121,7 +121,7 @@ fn mode_to_type(mode: &str) -> &'static str {
 }
 
 /// 列出全部外部 Agent（每个段 → 扁平字段，含默认值补全）。按 key 排序，稳定输出。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_external_agents() -> Result<Vec<serde_json::Value>, String> {
     list_external_agents_at(&nuphus::utils::plugin_root())
 }
@@ -662,7 +662,7 @@ fn upsert_external_agent_at(plugin_dir: &Path, agent: &serde_json::Value) -> Res
 /// 不删除 .nuphus/handoff/{key}/ 目录——但**联动清掉运行时态 status.json**：
 /// 状态栏唯一边据即 status.json（L0 配置与 L1 运行时态联动注销），删之即从列表
 /// 消失且重启不复活；briefs/projects/memory.md/read.md 全留，追溯链不断。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_external_agent(
     key: String,
     state: tauri::State<'_, crate::state::AppState>,
@@ -708,7 +708,7 @@ fn delete_external_agent_at(plugin_dir: &Path, key: &str) -> Result<bool, String
 ///
 /// 配置中心显式保存 = 用户主动纳入 → 同时撤销该 agent 的「从列表移出」显示态
 /// （移除遵循用户选择：只有新的用户显式动作能覆盖它）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn upsert_external_agent(
     agent: serde_json::Value,
     state: tauri::State<'_, crate::state::AppState>,
@@ -757,7 +757,7 @@ fn handoff_root() -> PathBuf {
 /// - lucide 预设名（bot/terminal/...）→ 前端 SVG 渲染，不走此命令；
 /// - "auto" → 前端取 open/process 路径调用此命令；
 /// - 显式文件路径（.png/.ico/.exe...）→ 前端直接调用此命令。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn extract_agent_icon(path: String) -> Result<String, String> {
     let p = Path::new(&path);
     if !p.exists() {

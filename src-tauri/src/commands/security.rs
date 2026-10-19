@@ -77,7 +77,7 @@ pub async fn reject_security(
     Ok("rejected".to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_tool_permissions(
     state: State<'_, AppState>,
     file_access: bool,

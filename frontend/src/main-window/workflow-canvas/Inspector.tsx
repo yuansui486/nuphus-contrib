@@ -111,6 +111,7 @@ function TextField({
   error,
   validate,
   references,
+  hideLabel,
 }: {
   label: string
   value: string
@@ -126,6 +127,11 @@ function TextField({
   error?: string | null
   validate?: (value: string) => string | null
   references?: boolean
+  /** 行内复合布局（如 wfc-cond-operand）用：隐藏可见 label，
+      使各分支渲染高度一致——否则 lit 分支 label+input、var 分支裸 input，
+      切换类型时输入框垂直跳动（2026-10-14 错位事故）。label 元素保留，
+      htmlFor 关联与 data-draft-field 定位不受影响 */
+  hideLabel?: boolean
 }) {
   const { t } = useLanguage()
   const variables = useContext(VariableContext)
@@ -152,7 +158,7 @@ function TextField({
       data-draft-field={editorFieldId(label)}
       htmlFor={fieldId}
     >
-      <span className="wfc-field-label">
+      <span className="wfc-field-label" {...(hideLabel ? { hidden: true } : undefined)}>
         {editorFieldLabel(label, t)}
         {required && <em className="wfc-required-mark">{t('workflowEditor.field.required')}</em>}
         {multiline && (
@@ -688,6 +694,7 @@ function ConditionEditor({
                 readOnly={readOnly}
                 label={i === 0 ? '左侧变量' : '右侧变量'}
                 onCommit={v => setOperand(i, { var: v })}
+                hideLabel
               />
             ) : (
               <TextField
@@ -696,6 +703,7 @@ function ConditionEditor({
                 readOnly={readOnly}
                 placeholder={editorText('字面量值', t)}
                 onCommit={v => setOperand(i, v)}
+                hideLabel
               />
             )}
           </div>
@@ -1403,11 +1411,14 @@ function ReferenceField({
   readOnly,
   label,
   onCommit,
+  hideLabel,
 }: {
   value: string
   readOnly?: boolean
   label: string
   onCommit: (value: string) => unknown
+  /** 行内复合布局用：隐藏 VariablePicker 的可见标签（对齐 TextField.hideLabel） */
+  hideLabel?: boolean
 }) {
   const { t } = useLanguage()
   const variables = useContext(VariableContext)
@@ -1421,7 +1432,7 @@ function ReferenceField({
       }}
     >
       <VariablePicker
-        label={editorFieldLabel(label, t)}
+        label={hideLabel ? undefined : editorFieldLabel(label, t)}
         value={draft.text}
         readOnly={readOnly}
         onChange={draft.setText}

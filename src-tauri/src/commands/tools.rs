@@ -13,7 +13,7 @@ pub mod voice;
 use crate::state::{AppState, DesktopStatus, HookScriptInfo, HooksConfigStatus, ToolSchema};
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_tools(state: State<'_, AppState>) -> Result<Vec<ToolSchema>, String> {
     let schemas = state.tools.get_schemas();
     Ok(schemas
@@ -88,7 +88,7 @@ pub async fn execute_tool(
     }))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_desktop_status(state: State<'_, AppState>) -> Result<DesktopStatus, String> {
     let has_desktop = state
         .tools
@@ -102,7 +102,7 @@ pub fn get_desktop_status(state: State<'_, AppState>) -> Result<DesktopStatus, S
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_hooks_status() -> Result<HooksConfigStatus, String> {
     let exe_dir = std::env::current_exe()
         .map(|p| {

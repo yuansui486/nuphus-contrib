@@ -6,6 +6,16 @@ import type { WorkflowItem, WorkflowStep, Action } from '../../core/types'
 import { NO_INPUT_SPECS, WorkflowInputsForm, useWorkflowInputs } from './WorkflowInputsForm'
 import '../../styles/workflow-modal.css'
 
+/** 上次运行可续跑（Paused / Error）→ inputs 表单顶部提示「新填值对快照已有变量不生效」 */
+function resumableStatus(workflow: WorkflowItem | null): 'Paused' | 'Error' | null {
+  const last = workflow?.run_history?.[0]
+  if (!last) return null
+  if (last.status === 'Paused') return 'Paused'
+  if (typeof last.status === 'object' && last.status !== null && 'Error' in last.status)
+    return 'Error'
+  return null
+}
+
 interface WorkflowRunModalProps {
   open: boolean
   workflow: WorkflowItem | null
@@ -68,6 +78,8 @@ export function WorkflowRunModal({
   // 外部输入表单（hooks 必须先于早退调用）：声明为空时表单区整体不渲染
   const inputSpecs = workflow?.inputs ?? NO_INPUT_SPECS
   const hasInputs = inputSpecs.length > 0
+  /** 上次运行可续跑（Paused/Error）→ 表单下方提示 inputs 与快照的合并语义（hooks 顺序：先于早退） */
+  const resumable = resumableStatus(workflow)
   const inputState = useWorkflowInputs(
     workflow?.inputs,
     `${workflow?.id ?? ''}|${open ? 'open' : 'closed'}`,
@@ -107,6 +119,13 @@ export function WorkflowRunModal({
       {/* ── 外部输入表单（仅在声明了 inputs 时出现；未声明 → 与既有弹窗完全一致）── */}
       {hasInputs && (
         <WorkflowInputsForm specs={inputSpecs} state={inputState} workflowId={workflow.id} />
+      )}
+      {hasInputs && resumable && (
+        <div className="wcf-resume-hint" role="note">
+          {resumable === 'Paused'
+            ? '上次运行已暂停：本次将断点续跑，已完成步骤自动跳过；新填的输入仅对快照中不存在的变量生效（需要换值请从头执行）。'
+            : '上次运行失败：本次将跳过已完成步骤继续执行；新填的输入仅对快照中不存在的变量生效。'}
+        </div>
       )}
 
       {/* 步骤列表 — 保留原有的 step card 结构 */}

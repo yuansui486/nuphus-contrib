@@ -18,6 +18,19 @@ use std::time::Duration;
 const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 内容级静默告警阈值：连接活着（chunk 持续到达——心跳/保活字节也算），
+/// 但**没有任何真实内容**（文本 / 推理 / 工具调用 / 图片）超过该时长时，
+/// 向前端推送「上游模型 N 秒无内容输出」提示。到点只告警、不杀流。
+/// 首次告警后每过一个阈值时长重复一次——持续等待时用户需要周期性确认
+/// 「系统还在等」而不是「又死了」。
+///
+/// 为什么不能只靠 `CHUNK_TIMEOUT`：它按**字节**计时，而中转网关普遍每秒
+/// 发 keep-alive 空行保活——每个字节都重置 idle 计时器。线上实测（2026-10-11）：
+/// 上游 19 分钟不发一个内容块，60s idle 超时一次都没触发，用户侧只见
+/// 「执行中」、无任何反馈。本阈值按**内容**计时，心跳 reset 不了它；
+/// 真正的断流判定仍归 `CHUNK_TIMEOUT`（字节无流动 60s 才杀）。
+const CONTENT_STALL_WARN: Duration = Duration::from_secs(60);
+
 /// finish_reason 之后等待 usage 尾帧的容差。
 ///
 /// 协议依据（OpenAI 兼容 / 阿里云百炼文档，2026-09-18 版）：
@@ -95,6 +108,29 @@ fn silence_retry_notice(timeout: Duration, attempt: usize) -> String {
     )
 }
 
+/// 按**字符边界**截断展示文本（至多 `max` 字节）。
+///
+/// 为什么存在：`&s[..s.len().min(N)]` 的字节切片在 N 落在多字节字符中间时直接
+/// panic。线上事故（2026-10-11）：上游 429 错误响应体含中文，`[..500]` 正好切在
+/// 「或」字中间（bytes 499..502）→ task panic → `send_message_cmd` 整条 IPC 失败，
+/// 前端只看到 "Task panicked: end byte index 500 is not a char boundary"。
+/// 错误体 / 日志摘要 / 展示位的一切截断必须走这里，不得再裸切字节。
+fn truncate_display(s: &str, max: usize) -> &str {
+    &s[..crate::utils::floor_char_boundary(s, max)]
+}
+
+/// 内容级静默（连接活着、字节在走，但没有真实内容）的前端提示文案。
+///
+/// 措辞面向普通用户：说「上游模型」而非 provider / 网关 / host，
+/// 并 explicitly 说明「连接保持中，仍在等待」——这是等待提示不是故障警报，
+/// 不能让人以为应用死了而手动终止。
+fn content_stall_notice(idle: Duration) -> String {
+    format!(
+        "上游模型 {} 秒无内容输出（连接保持中，仍在等待）…",
+        idle.as_secs()
+    )
+}
+
 /// Read cache hit tokens from usage JSON, using provider-specific field name.
 /// Falls back to OpenAI standard `prompt_tokens_details.cached_tokens` when field is empty.
 fn read_cache_hit(usage: &serde_json::Value, field: &str) -> u32 {
@@ -166,11 +202,17 @@ impl SseByteBuffer {
 #[derive(Debug, Clone)]
 pub struct ChatCompletionsTransport {
     config: ChatCompletionsConfig,
+    /// 内容静默告警阈值覆写——仅测试注入小值用；生产恒为 `None`
+    /// （取常量 `CONTENT_STALL_WARN`）。
+    content_stall_warn_override: Option<Duration>,
 }
 
 impl ChatCompletionsTransport {
     pub fn new(config: ChatCompletionsConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            content_stall_warn_override: None,
+        }
     }
 
     pub fn with_model(mut self, model: &str) -> Self {
@@ -197,6 +239,20 @@ impl ChatCompletionsTransport {
     /// idle 阈值（已开流 → 下一个 chunk）
     fn idle_chunk_timeout(&self) -> Duration {
         CHUNK_TIMEOUT
+    }
+
+    /// 内容级静默告警阈值（见 `CONTENT_STALL_WARN` 文档）。
+    /// 测试可经 `with_content_stall_warn` 覆写为小值。
+    fn content_stall_warn(&self) -> Duration {
+        self.content_stall_warn_override
+            .unwrap_or(CONTENT_STALL_WARN)
+    }
+
+    /// 测试专用：覆写内容静默阈值（生产路径不调用）。
+    #[cfg(test)]
+    pub(crate) fn with_content_stall_warn(mut self, warn: Duration) -> Self {
+        self.content_stall_warn_override = Some(warn);
+        self
     }
 
     /// 判断错误是否为网络连接层错误（TCP/DNS/TLS），而非 HTTP 服务端错误
@@ -661,6 +717,8 @@ impl ChatCompletionsTransport {
                     );
                     tracing::error!(
                         timeout_s = self.first_chunk_timeout().as_secs(),
+                        provider = %self.config.name,
+                        url = %self.config.endpoint(),
                         "LLM API first response timeout"
                     );
                     if will_retry {
@@ -680,13 +738,13 @@ impl ChatCompletionsTransport {
                     last_error = format!(
                         "API error {}: {}",
                         status,
-                        &body_text[..body_text.len().min(200)]
+                        truncate_display(&body_text, 200)
                     );
                     continue;
                 }
                 return Err(crate::NuphusError::LLM(crate::LLMError::ApiError {
                     status,
-                    body: body_text[..body_text.len().min(500)].to_string(),
+                    body: truncate_display(&body_text, 500).to_string(),
                 }));
             }
 
@@ -711,6 +769,12 @@ impl ChatCompletionsTransport {
             // 后续只按这个值分流：Clean → 正常收尾；Interrupted → salvage 决策。
             // 取代原先「last_error 是否为空」+「stream_was_silent」两套隐式判断。
             let mut stream_end = StreamEnd::Clean;
+            // 内容时钟：最后一次收到**真实内容**（文本/推理/工具/图片）的时刻。
+            // 与字节时钟分开——心跳保活只推进字节，内容时钟到点即向前端告警
+            // （content_stall_notice）。流打开即起算：首内容前的等待由
+            // FIRST_CHUNK_TIMEOUT 负责兜底，这里覆盖的是「开了流却不出内容」。
+            let mut last_content_at = std::time::Instant::now();
+            let mut stall_last_notice: Option<std::time::Instant> = None;
 
             {
                 use futures_util::StreamExt;
@@ -721,6 +785,28 @@ impl ChatCompletionsTransport {
                         if flag.load(Ordering::SeqCst) {
                             return Err(crate::NuphusError::LLM(crate::LLMError::Cancelled));
                         }
+                    }
+
+                    // 内容级静默巡检（每圈一次，成本 = 两次 Instant 比较）：
+                    // 连接活着但不出内容超过阈值 → 推送等待提示；此后每过一个
+                    // 阈值时长重复一次（生产 60s/次）。只告警、不杀流——
+                    // 断流判定仍归下面的 idle_chunk_timeout（字节 60s 无流动）。
+                    let content_idle = last_content_at.elapsed();
+                    let stall_warn = self.content_stall_warn();
+                    if content_idle >= stall_warn
+                        && !saw_finish
+                        && stall_last_notice.is_none_or(|t| t.elapsed() >= stall_warn)
+                    {
+                        stall_last_notice = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            content_idle_s = content_idle.as_secs(),
+                            model = %self.config.model,
+                            url = %self.config.endpoint(),
+                            "[STREAM] content stall: connection alive, no content — notifying frontend"
+                        );
+                        emitter(AssistantEvent::ConnectionStatus(content_stall_notice(
+                            content_idle,
+                        )));
                     }
 
                     // saw_finish 之后只需等协议指定的最后一个 usage 块，
@@ -755,15 +841,21 @@ impl ChatCompletionsTransport {
                                 break;
                             }
                             // 无 finish_reason 的空闲才是真断流。
+                            // error 串带 provider/url：归因「哪家抽风」不能只靠
+                            // 请求日志的时间线对齐（线上事故的教训）。
                             stream_end = StreamEnd::Interrupted {
                                 error: format!(
-                                    "Chunk read timeout after {}s",
-                                    self.idle_chunk_timeout().as_secs()
+                                    "Chunk read timeout after {}s (provider={}, url={})",
+                                    self.idle_chunk_timeout().as_secs(),
+                                    self.config.name,
+                                    self.config.endpoint()
                                 ),
                                 silent: true,
                             };
                             tracing::error!(
                                 timeout_s = self.idle_chunk_timeout().as_secs(),
+                                provider = %self.config.name,
+                                url = %self.config.endpoint(),
                                 "LLM stream chunk timeout"
                             );
                             break;
@@ -821,6 +913,7 @@ impl ChatCompletionsTransport {
                             {
                                 if !r.is_empty() {
                                     current_reasoning.push_str(r);
+                                    last_content_at = std::time::Instant::now();
                                     emitter(AssistantEvent::Reasoning(r.to_string()));
                                 }
                             }
@@ -830,6 +923,7 @@ impl ChatCompletionsTransport {
                             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                                 if !text.is_empty() {
                                     current_text.push_str(text);
+                                    last_content_at = std::time::Instant::now();
                                     emitter(AssistantEvent::TextDelta(text.to_string()));
                                 }
                             } else if let Some(parts) =
@@ -845,6 +939,7 @@ impl ChatCompletionsTransport {
                                                 {
                                                     if !txt.is_empty() {
                                                         current_text.push_str(txt);
+                                                        last_content_at = std::time::Instant::now();
                                                         emitter(AssistantEvent::TextDelta(
                                                             txt.to_string(),
                                                         ));
@@ -861,6 +956,7 @@ impl ChatCompletionsTransport {
                                                             "[IMAGE] model generated image: {}",
                                                             url
                                                         );
+                                                        last_content_at = std::time::Instant::now();
                                                         emitter(AssistantEvent::ImageAttachment {
                                                             url: url.to_string(),
                                                         });
@@ -874,6 +970,7 @@ impl ChatCompletionsTransport {
                             } else if let Some(text) = delta.get("text").and_then(|c| c.as_str()) {
                                 if !text.is_empty() {
                                     current_text.push_str(text);
+                                    last_content_at = std::time::Instant::now();
                                     emitter(AssistantEvent::TextDelta(text.to_string()));
                                 }
                             }
@@ -905,13 +1002,21 @@ impl ChatCompletionsTransport {
                                         tool_id_order.push(index);
                                         (String::new(), String::new(), String::new())
                                     });
+                                    // 工具调用的 id / name / args 增量都是真实内容
+                                    // （参数流常被网关拆成几十个小帧）——推进内容时钟，
+                                    // 别把"正在吐参数"误报成无内容。
                                     if !id.is_empty() {
                                         entry.0 = id.to_string();
+                                        last_content_at = std::time::Instant::now();
                                     }
                                     if !name.is_empty() {
                                         entry.1 = name.to_string();
+                                        last_content_at = std::time::Instant::now();
                                     }
-                                    entry.2.push_str(args);
+                                    if !args.is_empty() {
+                                        entry.2.push_str(args);
+                                        last_content_at = std::time::Instant::now();
+                                    }
                                 }
                             }
                         }
@@ -921,6 +1026,7 @@ impl ChatCompletionsTransport {
                         if let Some(msg) = json.pointer("/choices/0/message") {
                             if let Some(r) = msg.get("reasoning_content").and_then(|c| c.as_str()) {
                                 if current_reasoning.is_empty() {
+                                    last_content_at = std::time::Instant::now();
                                     emitter(AssistantEvent::Reasoning(r.to_string()));
                                 }
                                 current_reasoning.push_str(r);
@@ -928,7 +1034,13 @@ impl ChatCompletionsTransport {
                         }
 
                         // usage
-                        if let Some(usage) = json.get("usage") {
+                        // 必须过滤 null：vLLM/SGLang 系网关（opencode zen、CodeBuddy 等）
+                        // 会在中间 chunk 里序列化成 `"usage": null`。若不挡掉，
+                        // `json.get("usage")` 对 null 也返回 Some(Value::Null)，
+                        // 下面取值全落 unwrap_or(0)，final_usage 被提前锁成 Some(0,0,0)，
+                        // 紧接着的收尾判据就会在 finish_reason 帧后立刻 break，
+                        // 真正携带 token 的 usage 尾帧永远读不到（ctx 显示 -- / 0 tok）。
+                        if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
                             let prompt_tokens = usage
                                 .get("prompt_tokens")
                                 .and_then(|v| v.as_u64())
@@ -949,10 +1061,21 @@ impl ChatCompletionsTransport {
                         }
                     }
                     // 本 chunk 已带 finish_reason 且内容已全部处理。
-                    // 收尾判据：**usage 尾帧已到手**（协议规定的最后一块）⇒ 收；
+                    // 收尾判据：**非空 usage 尾帧已到手**（协议规定的最后一块）⇒ 收；
                     // 若尚未到手，继续读——它按协议是紧随其后的毫秒级帧，
                     // 由 USAGE_GRACE 短容差兜底，不会退化成 60s 空等。
-                    if saw_finish && final_usage.is_some() {
+                    //
+                    // 判据要求 usage 非零而非 `is_some()`：上游若真给了全 0
+                    // （部分网关在未统计时如此），也应继续等真正的尾帧。
+                    let usage_ready = matches!(
+                        final_usage,
+                        Some(StreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            ..
+                        }) if input_tokens > 0 || output_tokens > 0
+                    );
+                    if saw_finish && usage_ready {
                         break 'sse;
                     }
                 }
@@ -1180,9 +1303,15 @@ impl ChatCompletionsTransport {
         });
         if let Some(max_tokens) = request.max_tokens {
             body["max_tokens"] = serde_json::json!(max_tokens);
-        } else if let Some(cfg_max) =
-            crate::config::resolve_max_output_tokens(&model, Some(&self.config.name))
-        {
+        } else if let Some(cfg_max) = crate::config::resolve_max_output_tokens(
+            &model,
+            // Segment-exact binding: `config.name` is the provider *type* id, under
+            // which every custom-xxx instance collapses to "custom" and misses its
+            // own segment (silently dropping model-level max_tokens). Empty when
+            // unbound → None, which resolves to nothing instead of a sibling.
+            (!self.config.provider_segment.is_empty())
+                .then_some(self.config.provider_segment.as_str()),
+        ) {
             // 用户显式在 providers.toml 配置了模型级 max_tokens → 遵循
             body["max_tokens"] = serde_json::json!(cfg_max);
         }
@@ -1230,9 +1359,11 @@ impl ChatCompletionsTransport {
         // Reasoning depth — effort control for providers that accept it.
         // Gated by quirks.supports_reasoning_effort so the other Providers never
         // receive an unknown field; the value comes from `config.toml
-        // [[providers]] reasoning_effort`. Providers with effort_excludes_tools
-        // (DeepSeek) additionally suppress the field on tool-carrying requests;
-        // others (Kimi k3 — verified live) receive it with or without tools.
+        // [[providers]] reasoning_effort`. effort_excludes_tools (no builtin
+        // provider sets it now — DeepSeek officially accepts tools +
+        // reasoning_effort together, Thinking Mode · Tool Calls sample) would
+        // additionally suppress the field on tool-carrying requests; Kimi k3
+        // verified live with tools.
         if self.config.quirks.supports_reasoning_effort
             && (request.tools.is_none() || !self.config.quirks.effort_excludes_tools)
         {
@@ -1241,6 +1372,21 @@ impl ChatCompletionsTransport {
             }
         }
 
+        if matches!(
+            self.config.quirks.max_tokens_field,
+            crate::config::provider::MaxTokensField::MaxCompletionTokens
+        ) {
+            if let Some(value) = body
+                .as_object_mut()
+                .expect("request object")
+                .remove("max_tokens")
+            {
+                body["max_completion_tokens"] = value;
+            }
+        }
+        for field in self.config.quirks.forbidden_request_fields {
+            body.as_object_mut().expect("request object").remove(*field);
+        }
         body
     }
 }
@@ -1299,9 +1445,11 @@ impl super::super::Transport for ChatCompletionsTransport {
     ) -> Result<()> {
         let body = self.build_request_body(&request);
         tracing::info!(
-            "[REQ-STREAMING] model={}, {} messages",
+            "[REQ-STREAMING] provider={}, model={}, {} messages, url={}",
+            self.config.name,
             self.config.model,
-            body["messages"].as_array().map(|a| a.len()).unwrap_or(0)
+            body["messages"].as_array().map(|a| a.len()).unwrap_or(0),
+            self.config.endpoint()
         );
         self.send_chat_request_streaming(body, Some(cancel_flag), emitter)
             .await
@@ -1428,7 +1576,9 @@ impl ChatCompletionsTransport {
                     current_reasoning.push_str(r);
                 }
             }
-            if let Some(usage) = json.get("usage") {
+            // 过滤 null：`"usage": null` 不是有效统计，推 0 值只会污染下游
+            // 取"最后一个 Usage 事件"的逻辑（common.rs 按 last-wins 归一）。
+            if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
                 let prompt_tokens = usage
                     .get("prompt_tokens")
                     .and_then(|v| v.as_u64())
@@ -1614,7 +1764,8 @@ impl ChatCompletionsTransport {
                     current_reasoning.push_str(r);
                 }
             }
-            if let Some(usage) = json.get("usage") {
+            // 过滤 null：同 parse_sse，`"usage": null` 不产生统计事件
+            if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
                 let prompt_tokens = usage
                     .get("prompt_tokens")
                     .and_then(|v| v.as_u64())
@@ -1785,7 +1936,8 @@ impl ChatCompletionsTransport {
         }
 
         // usage
-        if let Some(usage) = json.get("usage") {
+        // 过滤 null：非流式响应同样可能带 `"usage": null`（网关转发重序列化）
+        if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
             let prompt_tokens = usage
                 .get("prompt_tokens")
                 .and_then(|v| v.as_u64())
@@ -1822,6 +1974,7 @@ mod salvage_tests {
     fn test_config(port: u16) -> ChatCompletionsConfig {
         ChatCompletionsConfig {
             name: "test".into(),
+            provider_segment: String::new(), // 测试/直构：无段绑定
             api_key: "sk-test".into(),
             base_url: format!("http://127.0.0.1:{}", port),
             model: "test-model".into(),
@@ -2153,6 +2306,214 @@ mod salvage_tests {
         );
     }
 
+    /// 内容级静默的提示文案：普通用户措辞（「上游模型」而非 provider/网关），
+    /// 且必须显式说明「连接保持中，仍在等待」——这是等待提示，不是故障警报。
+    #[test]
+    fn content_stall_notice_uses_plain_language() {
+        let notice = content_stall_notice(Duration::from_secs(60));
+        assert!(
+            notice.contains("上游模型"),
+            "必须用普通用户能看懂的「上游模型」措辞: {notice}"
+        );
+        assert!(
+            notice.contains("60 秒无内容输出"),
+            "必须报告无内容时长: {notice}"
+        );
+        assert!(
+            notice.contains("连接保持中") && notice.contains("仍在等待"),
+            "必须说明连接未断、仍在等待，避免被误判为卡死: {notice}"
+        );
+    }
+
+    /// 展示截断不得切坏 UTF-8：`&s[..n]` 落在多字节字符中间会 panic。
+    /// 线上事故（2026-10-11）：上游 429 中文错误体，`[..500]` 切在「或」字
+    /// 中间（bytes 499..502）→ task panic → send_message_cmd IPC 失败。
+    #[test]
+    fn truncate_display_never_splits_utf8() {
+        // 构造字节边界必定落点在汉字中间的中文串：>500 字节、且第 500 字节不是边界。
+        let mut zh =
+            String::from("{\"code\":14003,\"msg\":\"too many requests\",\"displayMsg\":{\"zh\":\"");
+        while zh.len() < 600 {
+            zh.push('或'); // 3 字节字符，把 500 钉进字符内部
+        }
+        zh.push_str("\"}");
+        assert!(zh.len() > 500);
+        assert!(!zh.is_char_boundary(500), "用例前提：500 必须落在字符中间");
+
+        let cut = truncate_display(&zh, 500);
+        assert!(
+            cut.len() < 500 + 3,
+            "截断结果不得越过字符边界: len={}",
+            cut.len()
+        );
+        assert!(zh.starts_with(cut), "截断必须是原串前缀");
+        assert!(zh.is_char_boundary(cut.len()), "切口必须是字符边界");
+        // 短串 / 边界正好：原样返回
+        assert_eq!(truncate_display("短错误", 500), "短错误");
+    }
+
+    /// 事故本体重放：流式请求收到 **429 + 长中文错误体**，必须正常收敛为
+    /// ApiError（含前缀 body），而不是在截断处 panic 把 IPC 打挂。
+    #[tokio::test]
+    async fn http_error_with_chinese_body_does_not_panic() {
+        // 形态对齐线上负载：智谱风格 displayMsg 多语言错误 JSON，>500 字节。
+        let body = "{\"code\":14003,\"msg\":\"too many requests\",\"requestId\":\"df46c7db\",\
+\"retry_policy\":{\"retry\":true},\"displayMsg\":{\"en\":\"Too many requests. Please retry later.\",\
+\"zh\":\"请求过于频繁，请稍后重试。请求过于频繁，请稍后重试。请求过于频繁，请稍后重试。\
+请求过于频繁，请稍后重试。请求过于频繁，请稍后重试。请求过于频繁，请稍后重试。\",\
+\"zh-hant\":\"請求過於頻繁，請稍後重試。\"}}";
+        let (port, _hits) = spawn_status_body_server("HTTP/1.1 429 Too Many Requests", body).await;
+
+        let transport = ChatCompletionsTransport::new(test_config(port));
+        let (events, emitter) = collect_events();
+        let result = transport
+            .send_chat_request_streaming(request_body(), None, emitter)
+            .await;
+
+        match result {
+            Err(crate::NuphusError::LLM(crate::LLMError::ApiError { status, body })) => {
+                assert_eq!(status, 429, "应透出上游状态码");
+                assert!(!body.is_empty(), "错误体应保留可诊断内容");
+                assert!(
+                    body.starts_with("{\"code\":14003"),
+                    "body 应保留原始 JSON 前缀: {body}"
+                );
+                assert!(
+                    body.len() < 500 + 4,
+                    "body 截断必须落在字符边界上: len={}",
+                    body.len()
+                );
+            }
+            other => panic!("429 应收敛为 ApiError，实际: {other:?}"),
+        }
+        // 不得产生任何流式内容事件（错误路径）
+        let events = events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AssistantEvent::TextDelta(_))),
+            "429 错误不得产出内容"
+        );
+    }
+
+    /// 一次性假服务器：直接返回指定状态行 + body（Content-Length 精确，无 chunked）。
+    async fn spawn_status_body_server(status_line: &str, body: &str) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                hits2.fetch_add(1, AtomicOrdering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        sock.read(&mut buf),
+                    )
+                    .await;
+                    let head = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// 心跳保活下的内容级静默：上游只发 SSE 注释帧（`: keep-alive`，解析层
+    /// 静默丢弃）拖延时间，**一个内容块都不发**——字节在走，60s idle 被
+    /// 反复重置（线上事故：19 分钟无内容也不触发）。期望：
+    /// 内容时钟独立计时，到点向前端推送「上游模型 N 秒无内容输出」，
+    /// 并按重复间隔持续提醒；不误发 TextDelta、不中断流。
+    #[tokio::test]
+    async fn heartbeat_only_stream_warns_content_stall() {
+        // 每 300ms 一个心跳帧，共发 10 个（约 3s）后关闭连接。
+        let (port, _hits) = spawn_heartbeat_server(10, 300).await;
+        let transport = ChatCompletionsTransport::new(test_config(port))
+            .with_content_stall_warn(Duration::from_millis(700));
+        let (events, emitter) = collect_events();
+
+        // 整体 10s 上限：即便断言写错也必须是「失败」而不是「挂住」。
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            transport.send_chat_request_streaming(request_body(), None, emitter),
+        )
+        .await
+        .expect("heartbeat stream must terminate (server closes) — test would hang");
+
+        // 对端最终关闭连接 = 协议允许的正常结束点。
+        assert!(result.is_ok(), "clean close 应 Ok: {:?}", result.err());
+        let events = events.lock().unwrap();
+
+        let stall_notices: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AssistantEvent::ConnectionStatus(m) if m.contains("上游模型") => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stall_notices.len() >= 2,
+            "内容静默须至少告警两次（首次 + 一次重复），实际 {} 次: {:?}",
+            stall_notices.len(),
+            stall_notices
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AssistantEvent::TextDelta(_))),
+            "纯心跳流不得产生任何内容事件"
+        );
+    }
+
+    /// 启动一次性假服务器：只发 SSE **注释帧**（`: keep-alive`）保活——
+    /// 对 SSE 解析层是空行（`data:` 前缀都没有），一个内容帧都不发。
+    /// `rounds × interval_ms` 后以 chunked 终止块**干净关闭**（正常结束点），
+    /// 避免非干净断连把测试拖进重试路径。
+    async fn spawn_heartbeat_server(rounds: usize, interval_ms: u64) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                hits2.fetch_add(1, AtomicOrdering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        sock.read(&mut buf),
+                    )
+                    .await;
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    for _ in 0..rounds {
+                        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                        // SSE 注释帧：以 ':' 开头，协议规定忽略；且不带 data: 前缀，
+                        // 解析层 continue——客户端收到字节（重置 idle 计时器）但零内容。
+                        let frame = ": keep-alive\n\n";
+                        let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                        let _ = sock.write_all(chunk.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    }
+                    // chunked 合法终止块 → 客户端 Ok(None) = Clean 结束点
+                    // （非干净断连会走读错误 → 零内容重试路径，把测试拖超时）
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                    let _ = sock.flush().await;
+                    drop(sock);
+                });
+            }
+        });
+        (port, hits)
+    }
+
     /// 启动一次性假服务器：写完整 SSE 流后**真正挂起**——body 用 chunked 编码
     /// 但**不写终止块**，也不关闭连接。
     ///
@@ -2436,9 +2797,25 @@ mod salvage_tests {
 mod wire_shape_tests {
     use super::*;
 
+    #[test]
+    fn declared_budget_field_and_forbidden_fields_are_applied() {
+        let mut cfg = config();
+        cfg.quirks.max_tokens_field = crate::config::provider::MaxTokensField::MaxCompletionTokens;
+        cfg.quirks.forbidden_request_fields = &["temperature"];
+        let transport = ChatCompletionsTransport::new(cfg);
+        let mut request = crate::api::MessageRequest::new("model", vec![]);
+        request.max_tokens = Some(123);
+        request.temperature = Some(0.3);
+        let body = transport.build_request_body(&request);
+        assert_eq!(body["max_completion_tokens"], 123);
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
     fn config() -> ChatCompletionsConfig {
         ChatCompletionsConfig {
             name: "wire-shape".into(),
+            provider_segment: String::new(), // 测试/直构：无段绑定
             api_key: "sk-test".into(),
             base_url: "http://127.0.0.1:1".into(),
             model: "test-model".into(),

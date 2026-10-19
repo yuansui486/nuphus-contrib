@@ -359,6 +359,51 @@
   color: var(--error);
 }
 
+/* path 字段：文本框 + 浏览按钮同行 */
+.wcf-input-pathrow {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.wcf-input-pathrow .wcf-input-control {
+  flex: 1;
+  min-width: 0;
+}
+
+.wcf-input-browse {
+  padding: 0 12px;
+  border: 1px solid var(--glass-2);
+  border-radius: 6px;
+  font-size: var(--fz-sm);
+  font-family: inherit;
+  color: var(--spark-primary);
+  background: var(--void-input);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.2s ease;
+}
+
+.wcf-input-browse:hover {
+  border-color: rgba(var(--accent-rgb), 0.45);
+}
+
+.wcf-input-browse:focus-visible {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  outline: none;
+}
+
+/* 断点续跑提示：inputs 表单下方的语义说明条（Paused/Error 可续跑时出现） */
+.wcf-resume-hint {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(var(--warning-rgb), 0.35);
+  border-radius: 6px;
+  font-size: var(--fz-xs);
+  color: var(--spark-muted);
+  background: rgba(var(--warning-rgb), 0.08);
+}
+
 .wcf-presets {
   display: flex;
   flex-direction: column;

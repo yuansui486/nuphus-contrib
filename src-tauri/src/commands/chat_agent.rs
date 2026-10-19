@@ -140,27 +140,27 @@ fn visit_chat_steps_mut(steps: &mut [Step], visit: &mut impl FnMut(&str, &mut Ch
 
 // ── 全局 ChatAgent CRUD ──
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn chat_agent_list() -> Result<Vec<ChatAgentConfig>, String> {
     Ok(ChatAgentStore::list())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn chat_agent_save(config: ChatAgentConfig) -> Result<ChatAgentConfig, String> {
     ChatAgentStore::save(&config)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn chat_agent_delete(name: String) -> Result<(), String> {
     ChatAgentStore::delete(&name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn chat_agent_set_active(name: String) -> Result<ChatAgentConfig, String> {
     ChatAgentStore::set_active(&name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn chat_agent_get_active() -> Result<Option<ChatAgentConfig>, String> {
     Ok(ChatAgentStore::get_active())
 }

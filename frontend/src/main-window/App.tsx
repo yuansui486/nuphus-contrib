@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { listen } from '../core/bridge'
 import type { WorkflowItem } from '../core/types'
-import { wfStop, wfPause, wfResume, wfRun, getToolPermissions, openExternal } from './lib/api'
+import { wfStop, wfPause, wfResume, wfRun, getToolPermissions, browserOpenUrl } from './lib/api'
 import { handleExternalAnchorClick } from './lib/externalLink'
 import { scheduleIdle } from './lib/idle'
 import { applySkinBg, readSkinBg } from '../ui/skinBg'
@@ -53,6 +53,7 @@ import { SplashScreen } from '../ui/SplashScreen'
 import { ErrorScreen } from '../ui/ErrorScreen'
 import { TaskBubble } from './chat/TaskBubble'
 import { WorkflowTaskPanel } from './layout/WorkflowTaskPanel'
+import { BackgroundTasksPanel } from './layout/BackgroundTasksPanel'
 import { UserInputPrompt } from './layout/UserInputPrompt'
 import { RegionPicker } from './tools/RegionPicker'
 import { ScreenCaptureTool } from './tools/ScreenCaptureTool'
@@ -105,6 +106,8 @@ const WorkflowPage = lazy(() =>
 const CanvasWorkbenchPage = lazy(() =>
   import('./workflow/CanvasWorkbenchPage').then(m => ({ default: m.CanvasWorkbenchPage })),
 )
+// 内置工具页：独立全屏界面（从画布移出；入口在桌面工具条末尾）
+const ToolsPage = lazy(() => import('./tools/ToolsPage').then(m => ({ default: m.ToolsPage })))
 // ── 插件市场体系不开源阶段：入口改为 GitHub 贡献者页（GithubPage，原筹备页已下线）。
 //    市场 ready 后恢复下面两个 lazy 声明与挂载块即可（可逆）。
 // const PluginAppsPage = lazy(() =>
@@ -170,13 +173,15 @@ export default function App() {
     return () => window.removeEventListener('nuphus-nav-models', handler)
   }, [s.setShowModels])
 
-  // ── 外链接管：WebView 不处理 target="_blank"（点了没反应）→ 交系统浏览器 ──
+  // ── 外链接管：WebView 不处理 target="_blank"（点了没反应）→ 交 Agent 浏览器 ──
   // 捕获阶段统一拦截，覆盖聊天消息、设置中心各页、插件页等所有外链。
+  // 2026-10-09 起不再走系统浏览器：登录态必须落在工作流/Agent 用的那个 profile 里，
+  // 用户在 Agent 浏览器里登录，工作流才过得去。后端在新标签打开，不打断正在自动化的页面。
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
       const handled = handleExternalAnchorClick(e.target, url => {
-        void openExternal(url).catch(err => {
-          console.warn('[external] open failed:', err)
+        void browserOpenUrl(url).catch(err => {
+          console.warn('[external] open in agent browser failed:', err)
         })
       })
       if (handled) e.preventDefault()
@@ -229,21 +234,11 @@ export default function App() {
     // layout effect 先于本 passive effect 执行），故无需列入依赖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  // ── 输入栏 workflow 扳手菜单「工作流画布」直达（2026-09-03 大王定稿）：
-  //    有未完成（draft）工作流 → 续编最近草稿；否则新建空白工作流并进入画布。
-  //    闸门铁律同 WorkflowPage：任意执行态禁止进入画布（点击级 gate 复核）。──
-  const handleWorkflowCanvasDirect = async () => {
-    s.setShowCanvas(true)
-  }
-  /** 输入栏 workflow 扳手菜单「工作流列表」：等同 Ctrl+K → 工作流（WorkflowPage 弹窗） */
-  const handleOpenWorkflowList = () => s.setShowWorkflow(true)
   // ── 应用插件全屏宿主（App Plugin 体系；打开即关闭列表弹窗，仿画布模式）──
   const [runningPluginId, setRunningPluginId] = useState<string | null>(null)
   // ── 宿主最小化态：true 时 AppShellPage 保持挂载但 visibility 隐藏（iframe 保活），
   //    主窗口输入框 dock 左侧悬浮 PluginRestoreFab 点击恢复 ──
   const [pluginMinimized, setPluginMinimized] = useState(false)
-  // ── Desktop toolbar (Ctrl+U) ──
-  const [showDesktopToolbar, setShowDesktopToolbar] = useState(false)
   // ── 设置中心全屏覆盖层（输入栏最左端齿轮按钮 → 左导航 + 右内容）──
   const [showSettingsCenter, setShowSettingsCenter] = useState(false)
   // island 落点锚点：模型页这类全屏宿主（fixed inset:0 + z 2500）会盖住聊天区，
@@ -275,7 +270,7 @@ export default function App() {
   }
   /**
    * 聊天界面快捷键的可用性闸门：设置中心面板打开时不响应。
-   * 这些快捷键作用于面板「背后」的聊天界面（Ctrl+N 新建会话 / Ctrl+U 桌面工具栏 /
+   * 这些快捷键作用于面板「背后」的聊天界面（Ctrl+N 新建会话 /
    * Ctrl+L 聚焦输入框 / Ctrl+Shift+W 工作流面板），焦点此时已被焦点陷阱收进面板，
    * 继续生效会让用户在弹窗里的操作意外改动背后会话。Ctrl+K 例外 —— 它的语义是
    * 「先退出面板，再执行原分支」，见下。
@@ -313,12 +308,6 @@ export default function App() {
       handler: () => {
         /* TODO: 插件搜索 */
       },
-    },
-    {
-      key: 'u',
-      ctrl: true,
-      enabled: chatShortcutEnabled,
-      handler: () => setShowDesktopToolbar((p: boolean) => !p),
     },
     {
       // 工作流步骤面板：收起 / 展开。
@@ -374,13 +363,23 @@ export default function App() {
     }
   }
   useEffect(() => {
+    let disposed = false
     let unlisten: (() => void) | undefined
     void listen<{ seq: number; event: { type: string } }>('nuphus-event', ({ event }) => {
+      if (disposed) return
       if (event.type === 'new_chat_broadcast') void reloadFromBackendRef.current()
     }).then(u => {
-      unlisten = u
+      // 卸载竞态：listen 的 promise 还没回来就清理时，unlisten 仍是 undefined，
+      // 只写 unlisten?.() 会空转 → 监听器在 JS/Rust 两侧都留着（dev 双挂载、
+      // HMR 必现），此后每个 nuphus-event 帧被**重复处理 N 次**。
+      // 与 useEvents.ts 的事件订阅写法对齐。
+      if (disposed) u()
+      else unlisten = u
     })
-    return () => unlisten?.()
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
   }, [])
 
   // ── 实际启动工作流（权限与模式均已确认后调用） ──
@@ -471,7 +470,11 @@ export default function App() {
       {/* ── Main UI: ready state ── */}
       {s.appState === 'ready' && (
         <ErrorBoundary>
-          <TitleBar onNewChat={s.handleNewChat} agentState={s.isProcessing ? 'working' : 'idle'} />
+          <TitleBar
+            onNewChat={s.handleNewChat}
+            agentState={s.isProcessing ? 'working' : 'idle'}
+            onOpenUpdate={() => s.setShowUpdate(true)}
+          />
           <MacosPermissionNotice mode={s.mode} onOpenSettings={() => s.setShowSecurity(true)} />
           <div className="chat-area">
             {/*
@@ -547,10 +550,6 @@ export default function App() {
                 s.showToast(t('refine.dismissHint'), 'info')
               }}
               isWorkflowRunning={s.workflowRunSteps.length > 0}
-              showDesktopToolbar={showDesktopToolbar}
-              onToggleDesktopToolbar={() => setShowDesktopToolbar(o => !o)}
-              onOpenWorkflowCanvas={() => void handleWorkflowCanvasDirect()}
-              onOpenWorkflowList={handleOpenWorkflowList}
               onOpenSettings={() => setShowSettingsCenter(true)}
               /* 外观浮窗的全局打开请求（Ctrl+K → 外观）：开关 state 在
                  ChatPanel 内，这里只喂请求 + 在收起时收回 */
@@ -706,6 +705,13 @@ export default function App() {
               {s.isWorkflowPaused && <span className="wfst-restore-paused">已暂停</span>}
             </button>
           )}
+
+          {/* ── 后台任务账本（跨工具调用存活的子进程）──
+              与工作流面板同层挂载：入口/面板都是**只在有保留任务时**才出现的
+              fixed 浮层，两者纵向错开（bottom 204 / 244 vs 160），互不遮挡。
+              executionStage 供它在「一轮执行转空闲」时刷新保留项数量——
+              长任务超时那一刻没有任何事件推给前端，这是唯一可靠的触发点。 */}
+          <BackgroundTasksPanel executionStage={s.executionStage} />
 
           {/* ── Command Palette（Ctrl+K） ── */}
           <CommandPalette
@@ -1083,6 +1089,16 @@ export default function App() {
               </div>
             </Suspense>
           )}
+          {/* ── 内置工具页：独立全屏宿主（从画布移出；入口在桌面工具条末尾）──
+              与模型页同一宿主模式：fixed inset:0 + 自带顶栏关闭按钮；
+              层级取 2500 与 .models-page-host 同档，压过画布（100）与设置中心。 */}
+          {s.showTools && (
+            <Suspense fallback={null}>
+              <div className="tools-page-host">
+                <ToolsPage onClose={() => s.setShowTools(false)} />
+              </div>
+            </Suspense>
+          )}
           {/* ── 设置中心：居中弹窗（左导航 + 右内容；子页一律复用 pages/* 现有实现）── */}
           {showSettingsCenter && (
             <Suspense fallback={null}>
@@ -1186,8 +1202,8 @@ export default function App() {
         <AnnotationsDialog onClose={() => setMemoryDialog(null)} />
       )}
 
-      {/* ── Desktop toolbar (Ctrl+U) ── */}
-      <DesktopToolbar visible={showDesktopToolbar} onClose={() => setShowDesktopToolbar(false)} />
+      {/* ── Desktop toolbar：右侧固定竖条，hover 显隐（无快捷键 / 无关闭） ── */}
+      <DesktopToolbar onOpenTools={() => s.setShowTools(true)} />
     </div>
   )
 }

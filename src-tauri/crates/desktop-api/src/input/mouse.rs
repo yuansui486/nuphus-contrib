@@ -247,13 +247,9 @@ pub async fn drag(start: Point, end: Point) -> Result<()> {
         unsafe {
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
         }
-        let steps = 20;
-        for i in 1..=steps {
-            let t = i as f32 / steps as f32;
-            let x = (start.x as f32 + (end.x as f32 - start.x as f32) * t) as i32;
-            let y = (start.y as f32 + (end.y as f32 - start.y as f32) * t) as i32;
-            move_to(x, y).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        for point in drag_path(start, end, DRAG_STEPS) {
+            move_to(point.x, point.y).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(DRAG_STEP_MS)).await;
         }
         held.release_last();
         Ok(())
@@ -287,12 +283,9 @@ pub async fn drag(start: Point, end: Point) -> Result<()> {
                     .map_err(|e| DesktopError::InputFailed(e.to_string()))
             })?;
         }
-        for i in 1..=20 {
-            let t = i as f32 / 20.0;
-            let x = (start.x as f32 + (end.x as f32 - start.x as f32) * t) as i32;
-            let y = (start.y as f32 + (end.y as f32 - start.y as f32) * t) as i32;
-            move_to(x, y).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        for point in drag_path(start, end, DRAG_STEPS) {
+            move_to(point.x, point.y).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(DRAG_STEP_MS)).await;
         }
         held.release_last();
         drop(held);
@@ -305,6 +298,59 @@ pub async fn drag(start: Point, end: Point) -> Result<()> {
     {
         Err(DesktopError::PlatformNotSupported)
     }
+}
+
+// ── 拖拽轨迹 ─────────────────────────────────────────────────────────
+
+/// 拖拽的中间步数（起点与终点之间发射的 Move 事件数）
+const DRAG_STEPS: usize = 20;
+
+/// 每步之间的间隔
+const DRAG_STEP_MS: u64 = 10;
+
+/// 生成拖拽中间轨迹点（不含起点、含终点）。
+///
+/// 速度分布取 ease-in-out（三次缓动）：起步与收尾慢、中段快——更接近人工拖拽的
+/// 节奏，也让依赖移动事件的接收端（滑块/画布/拖选）拿到连续的中间态，而不是一次
+/// 瞬间跳变。轨迹法线方向叠加低幅正弦微抖（两端为 0、中点最大），避免全程严格
+/// 共线；抖幅随轨迹长度增长但封顶，长距离拖拽不会更抖。
+///
+/// 终点为精确值：物理落点必须与调用参数一致。
+fn drag_path(start: Point, end: Point, steps: usize) -> Vec<Point> {
+    let mut points = Vec::with_capacity(steps);
+    if steps == 0 {
+        return points;
+    }
+    let dx = f64::from(end.x - start.x);
+    let dy = f64::from(end.y - start.y);
+    let len = (dx * dx + dy * dy).sqrt();
+    let (nx, ny) = if len > f64::EPSILON {
+        (-dy / len, dx / len)
+    } else {
+        (0.0, 0.0)
+    };
+    let amp = (len * 0.01).clamp(0.0, 1.5);
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        // ease-in-out cubic
+        let e = if t < 0.5 {
+            4.0 * t * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+        };
+        // sin²(πt) 包络：两端为 0，中途最大
+        let envelope = (std::f64::consts::PI * t).sin();
+        let wobble = amp * envelope * envelope * (12.0 * std::f64::consts::PI * t).sin();
+        points.push(Point {
+            x: (f64::from(start.x) + dx * e + nx * wobble).round() as i32,
+            y: (f64::from(start.y) + dy * e + ny * wobble).round() as i32,
+        });
+    }
+    // 终点取精确值，避免浮点舍入带来的最后 1px 偏差
+    if let Some(last) = points.last_mut() {
+        *last = end;
+    }
+    points
 }
 
 // Enigo defines positive vertical lengths as down and negative lengths as up.
@@ -348,6 +394,54 @@ mod tests {
             Point { x: i32::MIN, y: 0 },
             Point { x: i32::MAX, y: 0 }
         ));
+    }
+
+    #[test]
+    fn drag_path_keeps_endpoint_and_never_stalls() {
+        let start = Point { x: 100, y: 100 };
+        let end = Point { x: 500, y: 300 };
+        let path = drag_path(start, end, 20);
+        assert_eq!(path.len(), 20);
+        // 终点必须精确（物理落点不能有浮点舍入偏差）
+        assert_eq!(*path.last().unwrap(), end);
+        // 单调推进：相邻点不应后退
+        for pair in path.windows(2) {
+            assert!(pair[1].x >= pair[0].x || pair[1].y >= pair[0].y);
+        }
+        // 缓动两端速度趋零，末端允许重复点；但有效位移步应占绝大多数
+        let moving = path.windows(2).filter(|pair| pair[0] != pair[1]).count()
+            + usize::from(path[0] != start);
+        assert!(moving >= 15, "moving steps too few: {moving}/20");
+    }
+
+    #[test]
+    fn drag_path_handles_zero_length_and_single_step() {
+        let p = Point { x: 42, y: 24 };
+        let path = drag_path(p, p, 20);
+        assert_eq!(path.len(), 20);
+        // 零长度位移：所有点都落在原地（抖幅为 0，法线未定义时不应产生偏移）
+        assert!(path.iter().all(|q| *q == p));
+
+        let one = drag_path(Point { x: 0, y: 0 }, Point { x: 10, y: 0 }, 1);
+        assert_eq!(one, vec![Point { x: 10, y: 0 }]);
+
+        assert!(drag_path(Point { x: 0, y: 0 }, Point { x: 10, y: 0 }, 0).is_empty());
+    }
+
+    #[test]
+    fn drag_path_wobble_stays_bounded() {
+        let start = Point { x: 0, y: 0 };
+        let end = Point { x: 2000, y: 0 };
+        let path = drag_path(start, end, 20);
+        // 微抖幅度封顶 1.5px：任意中间点偏离直线（y 方向）不得超过 2px
+        for point in &path {
+            assert!(point.y.abs() <= 2, "wobble out of bounds: {point:?}");
+        }
+        // 两端无抖动（端点精确闭合）
+        assert_eq!(path.last().unwrap().y, 0);
+        if let Some(first) = path.first() {
+            assert!(first.y.abs() <= 1);
+        }
     }
 }
 
@@ -521,17 +615,11 @@ mod macos {
             armed: true,
         };
         post(start, 1, 0, 1)?;
-        for step in 1..=20 {
+        for point in drag_path(start, end, DRAG_STEPS) {
             check_permission()?;
-            let point = Point {
-                x: (i64::from(start.x) + (i64::from(end.x) - i64::from(start.x)) * step / 20)
-                    as i32,
-                y: (i64::from(start.y) + (i64::from(end.y) - i64::from(start.y)) * step / 20)
-                    as i32,
-            };
             release.point = point;
             post(point, 6, 0, 1)?;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(DRAG_STEP_MS)).await;
         }
         post(end, 2, 0, 1)?;
         release.armed = false;

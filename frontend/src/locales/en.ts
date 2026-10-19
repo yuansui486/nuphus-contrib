@@ -1,7 +1,8 @@
-import { editorEn } from './workflowEditor'
+import { editorEn, toolbarEn } from './workflowEditor'
 
 const en: Record<string, string> = {
   ...editorEn,
+  ...toolbarEn,
   'workflowCanvas.variable.outputSection': 'Output variable',
   'workflowCanvas.variable.consumers': 'Steps referencing this output:',
   'workflowCanvas.variable.renameHint':
@@ -107,6 +108,30 @@ const en: Record<string, string> = {
   'app.name': 'Nuphus',
   'app.subtitle': 'Smart Partner → Always Ready',
 
+  // ── Background task ledger + interrupt reporting ──
+  // {0} in the interrupt.* keys is the backend's factual sentence, verbatim
+  // (it is the source of truth — i18n only frames it, never rewrites it and
+  // never swallows the "could not terminate" part inside).
+  'interrupt.report': 'Interrupted · {0}',
+  'interrupt.reportFailed': 'Interrupt did not fully take effect · {0}',
+  'interrupt.retained':
+    '{0} background task(s) still running (open the bottom-right capsule to view or end them)',
+
+  'backgroundTasks.entryTitle': 'Background tasks',
+  'backgroundTasks.entryLabel': 'Background tasks ({0} still running)',
+  'backgroundTasks.title': 'Background tasks',
+  'backgroundTasks.close': 'Close',
+  'backgroundTasks.loading': 'Loading…',
+  'backgroundTasks.empty': 'No background tasks are still running',
+  'backgroundTasks.badgeRetained': 'Retained',
+  'backgroundTasks.startedAt': 'since {0}',
+  'backgroundTasks.kill': 'End',
+  'backgroundTasks.killFailed': 'Failed to end background task',
+  'backgroundTasks.killRequested': 'End request sent for the background task',
+  'backgroundTasks.confirmTitle': 'End background task',
+  'backgroundTasks.confirmBody':
+    'This ends "{0}" and all of its child processes. Any build or download in progress will stop immediately. Continue?',
+
   'common.save': 'Save',
   'common.cancel': 'Cancel',
   'common.close': 'Close',
@@ -122,6 +147,61 @@ const en: Record<string, string> = {
   'common.copy': 'Copy',
   'common.copied': 'Copied',
   'common.askNuphus': 'Ask Nuphus',
+
+  // ── HTML preview annotation (P4: iframe hosts zero UI; parent window owns entry + list) ──
+  'preview.annotate': 'Annotate',
+  'preview.annotating': 'Annotating',
+  'preview.annotateMode': 'Enter annotation mode (click elements, drag for regions)',
+  'preview.exitAnnotateMode': 'Exit annotation mode',
+
+  // ── In-app browser (own window: 44px shell controller + remote content page) ──
+  'browser.toggle': 'In-app browser',
+  'browser.toggleTitle': 'Open / raise a browser window',
+  'browser.starting': 'Starting browser…',
+  'browser.addressPlaceholder': 'Enter a URL and press Enter, e.g. https://example.com',
+  'browser.go': 'Go',
+  'browser.goTitle': 'Navigate to this URL',
+  'browser.back': 'Back',
+  'browser.backTitle': 'Go back one page',
+  'browser.forward': 'Forward',
+  'browser.forwardTitle': 'Go forward one page',
+  'browser.reload': 'Reload',
+  'browser.reloadTitle': 'Reload the current page',
+  'browser.untitled': 'Untitled page',
+  'browser.loadFailed': 'Failed to load the page',
+  'browser.emptyUrl': 'Enter a URL first',
+  'browser.tabs': 'Browser tabs',
+  'browser.closeTab': 'Close this tab',
+  'browser.record': 'Record',
+  'browser.recordTitle': 'Start recording page actions',
+  'browser.recordStop': 'Stop recording',
+  'browser.recording': 'Recording',
+  'browser.recordFailed': 'Failed to toggle recording',
+  'browser.recorded': '{0} recorded',
+  'browser.annotate': 'Annotate',
+  'browser.annotateTitle': 'Annotate the page (overlay script lands next iteration)',
+  'browser.focusPending': 'Raising this window lands next iteration',
+  'preview.annotatorMissing': 'Annotator not ready',
+  'preview.diagToggle': 'Diagnostics',
+  'preview.diagCollapse': 'Collapse',
+  'preview.annotateEntered': 'Annotation mode: click elements, drag for regions',
+  'preview.annotationList': 'Changes',
+  'preview.annotationCount': '{0} annotations',
+  'preview.annotationEmpty': 'Click any element to annotate, or drag to select a region',
+  'preview.annotationNoComment': '(no note)',
+  'preview.annotationPlaceholder': 'Write a note (optional)',
+  'preview.sendToAgent': 'Send to Agent',
+  'preview.sendToAgentTitle': 'Attach to the input, then send with your message',
+  'preview.sendUnsupported': 'This view cannot send to chat (open preview from chat)',
+  'preview.discard': 'Discard',
+  'preview.discardTitle': 'Discard these annotations',
+  'preview.discarded': 'Discarded {0} annotations',
+  'preview.sentToInput': 'Attached {0} annotations — press Enter to send',
+  'preview.restored': 'Restored {0} saved annotations',
+  'preview.restoredSuffix': '({0} restored)',
+  'preview.outerHtmlSummary': 'outerHTML summary (≤300 chars)',
+  'preview.locateTitle': 'Locate this annotation on the page',
+  'preview.removeTitle': 'Remove this annotation',
   'common.retry': 'Retry',
   'common.confirm': 'Confirm',
   'common.back': 'Back',
@@ -224,7 +304,7 @@ const en: Record<string, string> = {
   'turn.ctxDelta': 'ctx',
   'turn.steps': 'steps',
 
-  // 鈹€鈹€ External Agents status bar (handoff) 鈹€鈹€
+  // ── External Agents status bar (handoff) ──
   'extAgents.title': 'Agents',
   'extAgents.titleHint': 'External agent runtime status (synced from handoff doorbell events)',
   'extAgents.empty': 'No external agents yet',
@@ -234,6 +314,7 @@ const en: Record<string, string> = {
   'extAgents.state.ready': 'Ready',
   'extAgents.state.done': 'Standby',
   'extAgents.state.blocked': 'Blocked',
+  'extAgents.state.cancelled': 'Cancelled',
   'extAgents.state.error': 'Error',
   'extAgents.state.uninitialized': 'Uninitialized',
   'extAgents.state.unknown': 'Unknown',
@@ -337,10 +418,10 @@ const en: Record<string, string> = {
   'settings.sessionGroups.loadFail': 'Failed to load the setting',
   'settings.sessionGroups.saveFail': 'Save failed',
 
-  // 鈹€鈹€ Welcome 鈹€鈹€
+  // ── Welcome ──
   'welcome.resume': 'Resume',
 
-  // 鈹€鈹€ External Agents config center (team.toml CRUD) 鈹€鈹€
+  // ── External Agents config center (team.toml CRUD) ──
   'extAgents.cfg.title': 'External Agents',
   'extAgents.cfg.add': 'Configure external agents',
   'extAgents.cfg.new': 'New config',
@@ -383,7 +464,7 @@ const en: Record<string, string> = {
   'extAgents.cfg.loadFail': 'Failed to load',
   'extAgents.cfg.deleteConfirm':
     'Delete this external agent config? (handoff workspace will not be deleted)',
-  // 鈹€鈹€ v8 advanced group: interaction hardening 鈹€鈹€
+  // ── v8 advanced group: interaction hardening ──
   'extAgents.cfg.launch': 'Launch command (launch)',
   'extAgents.cfg.launchHint':
     'The command Leader uses to start this agent manually (skill section 2 startup SOP). agent_dispatch performs no implicit cold start - if the window cannot be captured it fails outright',
@@ -524,23 +605,15 @@ const en: Record<string, string> = {
   'cmd.toolsDesc': 'PDF / Image / Video processing tools',
   'cmd.canvas': 'Canvas',
   'cmd.canvasDesc': 'Workflow editor, UI prototyping, and conversion tools',
-  'workflow.workTypeLabel': 'Work type',
-  'workflow.workType.workflow': 'Workflow Editor',
-  'workflow.workType.workflowEditor': 'Workflow Editor',
-  'workflow.workType.prototype': 'UI Prototype',
-  'workflow.workType.tools': 'Tools',
   'cmd.category.canvas': 'Canvas',
 
   'canvas.title': 'Canvas Hub',
   'canvas.workflow': 'Workflow Canvas',
   'canvas.workflowDesc':
     'Visually compose agent tasks: intent forms, tool steps, branches, retries',
-  'canvas.uiPrototype': 'UI Prototype',
-  'canvas.uiPrototypeDesc':
-    'Drag-and-drop UI screens, export as a concise prompt for AI coding agents',
   'canvas.comingSoon': 'Porting',
   'canvas.footNote':
-    'Canvas capabilities keep growing: UI prototyping, motion recording, screen casting and device debugging land here',
+    'Canvas capabilities keep growing: motion recording, screen casting and device debugging land here',
 
   'tools.tabImage': 'Image',
   'tools.tabVideo': 'Video',
@@ -730,11 +803,13 @@ const en: Record<string, string> = {
   'app.tools': 'Tools',
 
   'mcp.serversTitle': 'MCP Servers',
-  'mcp.serversDesc': 'Configured MCP servers (read-only; edit plugin/mcp/servers.yaml to change)',
+  'mcp.serversDesc':
+    'Configured MCP servers (read-only; general config in plugin/mcp/servers.yaml, machine-local in <data dir>/mcp/servers.local.yaml)',
   'mcp.loading': 'Loading...',
   'mcp.loadError': 'Failed to load MCP servers',
   'mcp.empty.title': 'No MCP server configured',
-  'mcp.empty.desc': 'Edit plugin/mcp/servers.yaml to add servers, then reopen',
+  'mcp.empty.desc':
+    'Edit plugin/mcp/servers.yaml (general) or <data dir>/mcp/servers.local.yaml (machine-local), then reopen',
   'mcp.autoStart': 'Auto start',
   'mcp.onDemand': 'On demand',
   'mcp.timeout': 'Timeout',
@@ -985,6 +1060,12 @@ const en: Record<string, string> = {
   'models.needUrl': 'Please enter the Model API URL',
   'models.oauthExpiresAt': 'Expires at {0}',
   'models.visionNone': 'Follow Leader model (must support vision) (recommended)',
+  'models.visionTestBtn': 'Send test image',
+  'models.visionTesting': 'Probing…',
+  'models.visionTestHint': 'Sends a ~1 KB test request (one real call)',
+  'models.visionTestOk': '✓ Test passed',
+  'models.visionTestFail': '✗ Test failed',
+  'models.visionTestFailDefault': 'Failed to send the test request',
   'models.railGroupProviders': 'Providers',
   'models.railGroupCustom': 'Custom Models',
   'models.railGroupLocal': 'Local Models',
@@ -1050,6 +1131,7 @@ const en: Record<string, string> = {
   'models.voiceSaved': 'Voice cloning model saved',
   // ── Custom headers / OAuth account ──
   'models.filterPlaceholder': 'Filter models…',
+  'models.hotModelsTitle': 'Popular models',
   'models.baseUrlLabel': 'Endpoint URL',
   'models.baseUrlHelp': 'Endpoint URL of the relay or gateway, usually ending with /v1',
   'models.headerSectionLabel': 'Custom Headers',
@@ -1153,6 +1235,7 @@ const en: Record<string, string> = {
   // ── Model list section ──
   'models.modelListTitle': 'Available Models',
   'models.currentModelOf': '(Currently using: {0})',
+  'models.currentModelElsewhere': '(Active model {0} belongs to another provider: {1})',
   'models.refreshBtn': 'Refresh',
   'models.refreshing': 'Refreshing…',
   'models.refreshTitle': 'Re-fetch the latest model list using the saved key',
@@ -1283,6 +1366,71 @@ const en: Record<string, string> = {
   'jev.testFail': 'Connection test failed: {0}',
   'jev.clearOk': 'Enhanced judge model API Key cleared',
   'jev.clearFail': 'Clear failed: {0}',
+  'jev.sectionTitle': 'Enhanced Judge Model',
+  'jev.sectionDesc':
+    'Performs structured judgments over a limited candidate action set during workflow development; it does not replace the chat model and cannot click coordinates or generate arbitrary scripts.',
+  'jev.tabsAria': 'Decision backend',
+  // ── Laya decision backend panel (LayaBackendPanel) ──
+  'laya.enabledState': 'Enabled',
+  'laya.disabledState': 'Not enabled',
+  'laya.offState': 'Off',
+  'laya.notTestedNote':
+    'This feature has not been end-to-end tested in a real environment (no machine available to run Laya); the protocol integration was implemented from the Laya source and has not been verified against a live model. Verify against your actual deployment before putting it into production and adjust as needed.',
+  'laya.exclusiveNote':
+    'Note: Jev and Laya are configured independently and only one takes effect at a time; Jev takes priority when its API Key is configured.',
+  'laya.enableLabel': 'Enable Laya decision backend',
+  'laya.enableHint':
+    'When off, no Laya service is contacted; enhanced mode still follows the existing Jev or primary model logic.',
+  'laya.enableAria': 'Enable Laya decision backend',
+  'laya.baseUrlLabel': 'Service URL',
+  'laya.baseUrlHint':
+    'Self-hosted Laya service URL, defaults to localhost port 8000; non-local addresses must use HTTPS.',
+  'laya.baseUrlAria': 'Laya service URL',
+  'laya.modelLabel': 'Model',
+  'laya.modelHint':
+    'Use english, multilingual or typed-decisions; leave empty to let the Laya router pick by language.',
+  'laya.modelPlaceholder': 'Empty for automatic routing',
+  'laya.modelAria': 'Laya model',
+  'laya.configured': 'Configured',
+  'laya.apiKeyHint':
+    'Self-hosted Laya usually needs no key; only required when the server sets LAYA_API_KEY.',
+  'laya.apiKeyPlaceholderSet': 'Configured; enter a new key to overwrite',
+  'laya.apiKeyPlaceholderEmpty': 'Usually empty',
+  'laya.apiKeyAria': 'Laya API Key',
+  'laya.showKey': 'Show',
+  'laya.hideKey': 'Hide',
+  'laya.showKeyAria': 'Show Laya API Key',
+  'laya.hideKeyAria': 'Hide Laya API Key',
+  'laya.clearKeyTitle': 'Clear the saved Laya API Key',
+  'laya.clearKeyAria': 'Clear the saved Laya API Key',
+  'laya.timeoutLabel': 'Request timeout (ms)',
+  'laya.timeoutHint':
+    'Maximum wait time for a single request, range 100–120000. Allow more for CPU inference.',
+  'laya.timeoutAria': 'Laya request timeout',
+  'laya.retriesLabel': 'Max retries',
+  'laya.retriesHint': 'Applies only to retryable transient errors, range 0–10.',
+  'laya.retriesAria': 'Laya max retries',
+  'laya.fallbackLabel': 'Fall back to the primary model when Laya is unavailable',
+  'laya.fallbackHint':
+    'When a service request fails, the primary model continues selecting from the same limited candidate action space.',
+  'laya.fallbackAria': 'Fall back to primary model',
+  'laya.saveBtn': 'Save configuration',
+  'laya.testBtn': 'Test connection',
+  'laya.clearModalTitle': 'Clear API Key',
+  'laya.cancel': 'Cancel',
+  'laya.confirmClear': 'Confirm clear',
+  'laya.clearModalBody':
+    'Clear the saved Laya API Key? The service URL and model configuration will be kept.',
+  'laya.connOk': 'Service reachable',
+  'laya.connRouted': 'Service reachable (routed to {0})',
+  'laya.connStatus': 'Connection status: {0}',
+  'laya.errNeedBaseUrl': 'Please enter the Laya service URL',
+  'laya.errTimeoutRange': 'Request timeout must be between 100 and 120000 ms',
+  'laya.errRetriesRange': 'Max retries must be an integer between 0 and 10',
+  'laya.errNoConfig': 'Backend did not return the Laya config',
+  'laya.saveOk': 'Laya config saved',
+  'laya.errNoTestResult': 'Backend did not return a connection test result',
+  'laya.clearOk': 'Laya API Key cleared',
   // ── Scheduled run history (ScheduleHistoryPage) ──
   'schedule.heading': 'Scheduled Run History',
   'schedule.refresh': 'Refresh',
@@ -1366,6 +1514,20 @@ const en: Record<string, string> = {
     'Model and credentials used when the AI calls the video generation tool: the registry has a single generation declaration field, so video generation reuses the same "Image generation" filter. Unbound fails loudly with a candidate list instead of silently picking a provider. Output is saved to ~/.nuphus/generated/.',
   'models.videoGenNone': 'Unbound (generation tools fail when unbound)',
   'models.videoGenSaved': 'Video generation model saved',
+  // Web search source (capabilities.web_search_source): binds a provider
+  // segment, not a model.
+  'models.webSearchSection': 'Web Search Source',
+  'models.webSearchSectionDesc':
+    "Search and fetch service used first by the web tools. When off, only the built-in free sources run (GitHub / MDN / Wikipedia / Bing / DDG). When on, the provider's official Search / Fetch APIs are called first and free alternatives are used only if they error, are rate-limited, or run out of credit — the fallback is stated in the result header.",
+  'models.webSearchOff': 'Off (built-in free sources only)',
+  'models.webSearchEnabled': 'Enabled: web search will prefer this service',
+  'models.webSearchDisabled': 'Disabled: web search uses built-in free sources only',
+  'models.webSearchActiveHint':
+    "Current behavior: both web search and web fetch call this provider's official APIs first; only when they error, are rate-limited, or run out of credit does the app fall back to the built-in free options — the fallback is stated at the top of the result.",
+  'models.webSearchBilling':
+    'Official Search / Fetch are billed per successful request (5 CNY per 1000 each). Empty results and failed requests are not billed.',
+  'models.webSearchNoProvider':
+    'No DeepSeek provider configured yet. Add a DeepSeek segment with an API key on the left, then enable it here.',
   'models.genCapabilityEmpty':
     'No model declares "Image generation" yet: open the provider model list on the left and enable the "Image generation" declaration for that model.',
   'models.genBoundMissing':
@@ -1381,6 +1543,23 @@ const en: Record<string, string> = {
     'Click to declare image generation (only declared models appear in the image generation binding candidates)',
   'models.imageGenMarkedOn': '{0} marked as supporting image generation',
   'models.imageGenMarkedOff': '{0} marked as not supporting image generation',
+  // ── Model cards: capability chips / favorite / switch ──
+  'models.chipVision': 'Image understanding',
+  'models.chipImageVideo': 'Image/video generation',
+  'models.chipReasoning': 'Text reasoning',
+  'models.chipAudio': 'Audio input',
+  'models.capReasoningHint':
+    'Reasoning tiers come from upstream capability data; manual editing is not supported yet',
+  'models.capAudioHint':
+    'Audio input capability comes from auto-probing; manual editing is not supported yet',
+  'models.favAria': 'Favorite',
+  'models.favHintOn': 'Favorited (pinned to the top of the switcher popup)',
+  'models.favHintOff': 'Click to favorite (pinned to the top of the switcher popup)',
+  'models.switchBtn': 'Switch',
+  'models.using': 'In use',
+  'models.usingHint':
+    'Active model; click again after editing connection params to re-apply (triggers one probe)',
+  'models.switchingBtn': 'Switching…',
   'models.capContext': 'Context window',
   'models.capContextUnknown': 'Context window unknown',
   'models.editContext': 'Edit context window',
@@ -1445,8 +1624,8 @@ const en: Record<string, string> = {
   'theme.darkDesc': 'Dark theme',
   'theme.light': 'White',
   'theme.lightDesc': 'Light theme',
-  'theme.tech': 'Void Light',
-  'theme.techDesc': 'Deep black → high contrast',
+  'theme.fresh': 'Morning Mist',
+  'theme.freshDesc': 'Mist base · a touch of spring green',
   'lang.zh': '中文',
   'lang.en': 'English',
 
@@ -1537,6 +1716,8 @@ const en: Record<string, string> = {
   'titleBar.close': 'Close',
   'titleBar.menu': 'Menu',
   'titleBar.newChat': 'New Chat',
+  'titleBar.feedback': 'Feedback',
+  'titleBar.checkUpdate': 'Version (Check for updates)',
 
   'toast.configureApiKey': 'Please configure API Key first',
   'toast.connectionLost': 'Connection lost, retrying...',
@@ -1567,6 +1748,9 @@ const en: Record<string, string> = {
   'init.app': 'App',
 
   'chat.systemLabel': 'System',
+  'chat.turnRail.label': 'Conversation turns',
+  'chat.turnRail.jump': 'Jump to turn {0}',
+  'chat.turnRail.turn': 'Turn {0}',
   'chat.errorPrefix': 'Error',
   'chat.llmErrorPrefix': 'LLM Error',
   'chat.retry': 'Retry',
@@ -1818,6 +2002,7 @@ const en: Record<string, string> = {
   'modelManager.noConfigsHint': 'Configure API keys in Settings to enable models.',
   'modelManager.switchTip': 'Tip: Use /models to quickly switch models anytime',
   'modelManager.unknownContext': 'Context unknown',
+  'modelManager.favorited': 'Favorited (pinned to top of this provider popup)',
   'modelManager.contextUnit': 'Context {0}',
   'modelManager.reasoning': 'Reasoning {0}',
 
@@ -2054,11 +2239,6 @@ const en: Record<string, string> = {
   'workflow.runCount': 'Run {0} times',
   'workflow.run': 'Run',
   'workflow.canvas': 'Canvas',
-  // Input box: workflow mode wrench menu (workflow canvas / workflow list / toolbox)
-  'wfMenu.title': 'Workflow tools',
-  'wfMenu.canvas': 'Workflow canvas',
-  'wfMenu.list': 'Workflow list',
-  'wfMenu.toolbox': 'Toolbox',
 
   'workflowCreate.title': 'Create Workflow',
   'workflowCreate.errorName': 'Please enter a workflow name',
@@ -2098,10 +2278,14 @@ const en: Record<string, string> = {
   'help.shortcut.palette': 'Open command palette; in Workflow mode, open workflows',
   'help.shortcut.focusInput': 'Focus the input box',
   'help.shortcut.newChat': 'New session (archives the current chat)',
-  'help.shortcut.desktopToolbar': 'Desktop toolbar (color picker, screen capture, etc.)',
   'help.shortcut.workflowPanel':
     'Workflow steps panel: collapse / expand (available while a run has steps)',
   'help.shortcut.esc': 'Close modal / Cancel',
+  'help.shortcut.toolScreenshot': 'Global screenshot (works while any app is focused)',
+  'help.shortcut.toolPicker': 'Global region picker (works while any app is focused)',
+  'help.shortcut.toolColorPicker': 'Global color picker (works while any app is focused)',
+  'help.shortcut.imeHint':
+    'While an IME (Chinese, Japanese, etc.) is composing, Enter only confirms the highlighted candidate — it will not send. Press Enter again once the text is committed.',
   'help.entries': 'Where to Find Things',
   'help.entries.settings':
     'Gear icon (top-right of chat) = Settings: five groups — Shortcuts, AI, Connect, Workspace, System — hold every setting.',
@@ -2141,7 +2325,7 @@ const en: Record<string, string> = {
   'help.tips.settings':
     'Open Settings from the gear icon (top-right of chat): everything lives in five groups — Shortcuts, AI, Connect, Workspace, System.',
 
-  // 鈹€鈹€ Mobile PWA (src/mobile) 鈹€鈹€ shares this dictionary; language follows nuphus_language
+  // ── Mobile PWA (src/mobile) ── shares this dictionary; language follows nuphus_language
   'mobile.connecting': 'Connecting',
   'mobile.connected': 'Connected',
   'mobile.disconnected': 'Disconnected',
@@ -2311,6 +2495,8 @@ const en: Record<string, string> = {
   'mobile.msgNotDelivered': 'Message not delivered (network interruption), please resend',
   'mobile.switchModelFailed': 'Switch model failed',
   'mobile.switchModeFailed': 'Switch mode failed',
+  'chatAgent.inlineLoadFailed': 'Failed to load workflow step configurations: {0}',
+  'chatAgent.inlineSaveFailed': 'Failed to save step configuration: {0}',
   'workflow.presets.label': 'Input presets',
   'workflow.presets.choose': 'Choose a saved preset',
   'workflow.presets.name': 'Preset name',

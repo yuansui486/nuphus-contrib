@@ -537,7 +537,7 @@ pub async fn dict_ocr_list_dicts() -> Result<Value, String> {
     Ok(json!(list))
 }
 
-/// 自动识别（类似大漠 FindStr 模式）：先 Ocr 全区域识字，再输出匹配结果
+/// 自动识别：先 Ocr 全区域识字，再输出匹配结果
 #[tauri::command]
 pub async fn dict_ocr_auto_match(
     image_path: String,

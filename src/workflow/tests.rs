@@ -233,6 +233,7 @@ mod compiler_tests {
             default,
             description: None,
             sensitive: false,
+            options: None,
         }
     }
 
@@ -322,6 +323,7 @@ mod compiler_tests {
             default: None,
             description: None,
             sensitive: false,
+            options: None,
         }];
         store.save(&child).await.unwrap();
 
@@ -472,6 +474,69 @@ mod compiler_tests {
         }];
         let report = Compiler::validate_workflow(&wf);
         assert!(report.passed);
+    }
+
+    // ── B15：repeat 编译期上限钳制 ──
+
+    /// B15 回归：repeat 超过上限（此前 u32 全域可过 schema 与反序列化，无 tick
+    /// 预算即静默空转）必须在编译期拒绝，错误信息含上限值与实际值。
+    #[test]
+    fn validate_loop_repeat_over_limit_fails() {
+        let mut wf = Workflow::new("repeat 超限");
+        wf.steps = vec![Step {
+            id: "loop1".into(),
+            name: "巨额循环".into(),
+            action: Action::Loop {
+                def: LoopDef {
+                    repeat: Some(4_000_000_000), // 40 亿：报告论断的原始场景
+                    for_each: None,
+                    until: None,
+                    max: 100,
+                    steps: vec![make_tool("l1", "体", "Read", serde_json::json!({}))],
+                },
+            },
+            ..Default::default()
+        }];
+        let report = Compiler::validate_workflow(&wf);
+        assert!(
+            !report.passed,
+            "repeat 超限必须编译期拒绝: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("repeat") && e.contains("上限")),
+            "错误信息应说明 repeat 超限: {:?}",
+            report.errors
+        );
+    }
+
+    /// B15 回归：上限内的合法 repeat 不受影响（钳制不得误伤正常批量场景）。
+    #[test]
+    fn validate_loop_repeat_within_limit_passes() {
+        let mut wf = Workflow::new("repeat 合法");
+        wf.steps = vec![Step {
+            id: "loop1".into(),
+            name: "批量循环".into(),
+            action: Action::Loop {
+                def: LoopDef {
+                    repeat: Some(100_000), // 恰好等于上限：合法
+                    for_each: None,
+                    until: None,
+                    max: 100,
+                    steps: vec![make_tool("l1", "体", "Read", serde_json::json!({}))],
+                },
+            },
+            ..Default::default()
+        }];
+        let report = Compiler::validate_workflow(&wf);
+        assert!(
+            report.passed,
+            "上限内的 repeat 必须放行: {:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -1329,6 +1394,7 @@ mod serialization_tests {
             default: Some(serde_json::json!("D:/tmp")),
             description: Some("输入目录".into()),
             sensitive: true,
+            options: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""type":"path""#), "type 别名未生效: {json}");
@@ -1342,6 +1408,36 @@ mod serialization_tests {
         assert!(round.sensitive);
     }
 
+    /// enum 类型序列化与 options 携带：旧数据（无 options）反序列化不受影响
+    #[test]
+    fn input_spec_enum_round_trip() {
+        let spec = InputSpec {
+            name: "mode".into(),
+            kind: InputKind::Enum,
+            required: false,
+            default: Some(serde_json::json!("普通")),
+            description: None,
+            sensitive: false,
+            options: Some(vec!["普通".into(), "后台".into()]),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""type":"enum""#), "enum 别名未生效: {json}");
+        assert!(json.contains(r#""options""#), "options 未序列化: {json}");
+
+        let round: InputSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.kind, InputKind::Enum);
+        assert_eq!(
+            round.options.as_deref(),
+            Some(&["普通".to_string(), "后台".to_string()][..])
+        );
+
+        // 旧数据：无 options 字段 → None，非 enum 类型零影响
+        let legacy: InputSpec =
+            serde_json::from_str(r#"{"name":"topic","type":"string"}"#).unwrap();
+        assert_eq!(legacy.kind, InputKind::String);
+        assert!(legacy.options.is_none());
+    }
+
     /// 声明项省略可选字段时取默认：type=string / required=false / sensitive=false
     #[test]
     fn input_spec_defaults() {
@@ -1351,5 +1447,498 @@ mod serialization_tests {
         assert!(spec.default.is_none());
         assert!(spec.description.is_none());
         assert!(!spec.sensitive);
+    }
+}
+
+// ── 调度域回归（批次四：B16/B17/B18/B10）──
+
+#[cfg(test)]
+mod scheduler_domain_tests {
+    use crate::workflow::scheduler::{
+        human_blocker_in_step, human_blocker_in_steps, SchedulerEngine,
+    };
+    use crate::workflow::store::WorkflowStore;
+    use crate::workflow::types::{Action, ChatOpts, Condition, IfDef, Step, Workflow};
+
+    fn config(cron: &str) -> crate::workflow::types::ScheduleConfig {
+        crate::workflow::types::ScheduleConfig {
+            cron: cron.into(),
+            timezone: "UTC".into(),
+            enabled: true,
+            label: None,
+            interval_minutes: None,
+        }
+    }
+
+    fn chat_step(name: &str) -> Step {
+        Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            action: Action::Chat {
+                chat: "做点什么".into(),
+                with: ChatOpts::default(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn call_step(name: &str, target: &str) -> Step {
+        Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            action: Action::Call {
+                call: target.into(),
+                with: serde_json::json!({}),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn tool_step(tool: &str) -> Step {
+        Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: tool.into(),
+            action: Action::Tool {
+                tool: tool.into(),
+                with: serde_json::json!({}),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// `prompt` 即 wait 步骤的 `wait` 字段：空 = 不暂停，非空 = 暂停等人点继续。
+    /// auto 里放一个界面步骤：非空 prompt 时报告必须是 wait 自身（说明先判自身再下钻），
+    /// 空 prompt 时因为 auto 不含阻塞点而放行。
+    fn wait_step(prompt: &str) -> Step {
+        Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: prompt.into(),
+            action: Action::Wait {
+                wait: prompt.into(),
+                auto: vec![tool_step("browser_navigate")],
+            },
+            ..Default::default()
+        }
+    }
+
+    /// B16：chat 步骤的 Agent 白名单含 request_user_input 等会等人的工具，一律按需人在场——
+    /// 直接步骤与 Seq/Loop/If/Wait 容器内嵌套均要被判为阻塞点。
+    #[test]
+    fn chat_step_blocks_everywhere() {
+        // 直接 chat
+        let wf = Workflow {
+            steps: vec![chat_step("chat1")],
+            ..Workflow::new("b16_chat_direct")
+        };
+        assert!(
+            human_blocker_in_steps(&wf.steps).is_some(),
+            "顶层 chat 应判为阻塞点"
+        );
+
+        // Seq 内嵌套
+        let wf = Workflow {
+            steps: vec![Step {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "seq".into(),
+                action: Action::Seq {
+                    seq: vec![chat_step("chat_nested")],
+                },
+                ..Default::default()
+            }],
+            ..Workflow::new("b16_chat_in_seq")
+        };
+        assert!(
+            human_blocker_in_steps(&wf.steps).is_some(),
+            "Seq 内 chat 应判为阻塞点"
+        );
+
+        // If 分支内
+        let wf = Workflow {
+            steps: vec![Step {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "if".into(),
+                action: Action::If {
+                    def: IfDef {
+                        condition: Condition::Always { always: true },
+                        then: vec![chat_step("chat_in_then")],
+                        else_branch: vec![],
+                    },
+                },
+                ..Default::default()
+            }],
+            ..Workflow::new("b16_chat_in_if")
+        };
+        assert!(
+            human_blocker_in_steps(&wf.steps).is_some(),
+            "If 内 chat 应判为阻塞点"
+        );
+    }
+
+    /// 判据换核：界面自动化步骤（browser_/desktop_）**不再**是不合格理由。
+    ///
+    /// 回归的是 issue #106：读取邮件 → 企业微信文档填表 → 提交这种全流程无人值守的
+    /// 自动化，此前只因出现 `browser_navigate` 就无法建定时。选择权在"人 + Agent 一同
+    /// 编译工作流"时已经行使，定时只是执行那份已决定的人工件。
+    #[test]
+    fn gui_automation_steps_do_not_block_scheduling() {
+        for tool in [
+            "browser_navigate",
+            "browser_exec",
+            "browser_click",
+            "browser_type",
+            "desktop_mouse",
+            "desktop_find_color",
+            "desktop_window_activate",
+            "Read",
+            "web_extract",
+            "system_shell",
+        ] {
+            let wf = Workflow {
+                steps: vec![tool_step(tool)],
+                ..Workflow::new("gui_not_blocking")
+            };
+            assert_eq!(
+                human_blocker_in_steps(&wf.steps),
+                None,
+                "{tool} 只是界面自动化，不该拦住定时"
+            );
+        }
+    }
+
+    /// 真正会让人无人值守跑不下去的三种构造：request_user_input、非空 wait、审批门。
+    #[test]
+    fn human_blocking_constructs_are_rejected_with_reasons() {
+        let user_input = human_blocker_in_step(&tool_step("request_user_input"))
+            .expect("request_user_input 必须判为阻塞点");
+        assert!(user_input.contains("request_user_input"), "{user_input}");
+
+        let approval = human_blocker_in_step(&tool_step("desktop_semantic_execute"))
+            .expect("desktop_semantic_execute 的审批门必须判为阻塞点");
+        assert!(approval.contains("desktop_semantic_execute"), "{approval}");
+
+        let wait =
+            human_blocker_in_step(&wait_step("等用户确认")).expect("非空 wait 必须判为阻塞点");
+        assert!(wait.contains("wait"), "{wait}");
+        assert!(
+            !wait.contains("browser_navigate"),
+            "报告必须指向 wait 自身: {wait}"
+        );
+
+        // 空 wait = 不暂停（step_wait 的既有语义）：不是阻塞点
+        assert_eq!(
+            human_blocker_in_step(&wait_step("")),
+            None,
+            "空 prompt 的 wait 步骤不会暂停，不该拦住定时"
+        );
+        // 纯空白的 prompt 同样不暂停
+        assert_eq!(human_blocker_in_step(&wait_step("   \n ")), None);
+    }
+
+    /// B16：Call 指向含 chat 步骤的子工作流必须被拦（异步递归解析）；
+    /// 纯工具子工作流不误伤——包括只含 browser_/desktop_ 的那种。
+    #[tokio::test]
+    async fn call_into_blocking_subworkflow_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("nuphus_b16_call_{}", uuid::Uuid::new_v4().simple()));
+        let store = WorkflowStore::with_root(root.join("workflows"));
+        let scheduler = SchedulerEngine::with_persist_path(root.join("schedules.json"));
+
+        // 子工作流 A：含 chat → Call 它必须被拒
+        let mut frontend_sub = Workflow::new("sub_frontend");
+        frontend_sub.steps = vec![chat_step("sub_chat")];
+        store.save(&frontend_sub).await.unwrap();
+
+        // 子工作流 B：纯工具 → Call 它放行
+        let mut pure_sub = Workflow::new("sub_pure");
+        pure_sub.steps = vec![Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "t".into(),
+            action: Action::Tool {
+                tool: "mock_echo".into(),
+                with: serde_json::json!({}),
+            },
+            ..Default::default()
+        }];
+        store.save(&pure_sub).await.unwrap();
+
+        // 调用方 C：Call A
+        let mut caller = Workflow::new("caller");
+        caller.steps = vec![call_step("c1", &frontend_sub.id)];
+        store.save(&caller).await.unwrap();
+        let schedule_result = scheduler
+            .set_schedule(
+                &caller.id,
+                config("* * * * *"),
+                std::collections::HashMap::new(),
+                &store,
+                |_| async {},
+            )
+            .await;
+        let err = match schedule_result {
+            Ok(()) => panic!("Call 指向 chat 子工作流的调度必须被拒"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string().contains("无法定时执行"),
+            "应报人类阻塞点错误: {err}"
+        );
+
+        // 调用方 D：Call B（纯工具）→ 放行
+        let mut caller_pure = Workflow::new("caller_pure");
+        caller_pure.steps = vec![call_step("d1", &pure_sub.id)];
+        store.save(&caller_pure).await.unwrap();
+        scheduler
+            .set_schedule(
+                &caller_pure.id,
+                config("* * * * *"),
+                std::collections::HashMap::new(),
+                &store,
+                |_| async {},
+            )
+            .await
+            .expect("Call 纯工具子工作流不应被拦");
+
+        scheduler.remove_schedule(&caller_pure.id).await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// issue #106 的正面场景：全流程都是界面自动化的工作流必须能建定时。
+    /// 读邮件 → 企业微信文档填表 → 提交 → 校验，没有任何需要人判断的节点。
+    #[tokio::test]
+    async fn gui_only_workflow_can_be_scheduled() {
+        let root =
+            std::env::temp_dir().join(format!("nuphus_106_gui_{}", uuid::Uuid::new_v4().simple()));
+        let store = WorkflowStore::with_root(root.join("workflows"));
+        let scheduler = SchedulerEngine::with_persist_path(root.join("schedules.json"));
+
+        let mut gui = Workflow::new("daily_report");
+        gui.steps = vec![
+            tool_step("Read"),
+            tool_step("browser_navigate"),
+            tool_step("browser_exec"),
+            tool_step("browser_click"),
+            tool_step("browser_type"),
+            tool_step("browser_extract"),
+        ];
+        store.save(&gui).await.unwrap();
+
+        scheduler
+            .set_schedule(
+                &gui.id,
+                config("0 9 * * 1-5"),
+                std::collections::HashMap::new(),
+                &store,
+                |_| async {},
+            )
+            .await
+            .expect("纯界面自动化工作流必须允许定时（issue #106）");
+
+        scheduler.remove_schedule(&gui.id).await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// 保存期判过不等于触发时成立：Call 的目标当时缺失（放行）之后被补成含 chat 的
+    /// 子工作流，运行期复检必须拦住——否则无人时白等到各自的超时。
+    #[tokio::test]
+    async fn schedule_survives_save_but_run_time_recheck_rejects() {
+        let root =
+            std::env::temp_dir().join(format!("nuphus_106_late_{}", uuid::Uuid::new_v4().simple()));
+        let store = WorkflowStore::with_root(root.join("workflows"));
+        let scheduler = SchedulerEngine::with_persist_path(root.join("schedules.json"));
+
+        // 目标先不落盘：此刻对 store 不可见
+        let mut late = Workflow::new("sub_added_later");
+        let late_id = late.id.clone();
+        late.steps = vec![chat_step("late_chat")];
+
+        let mut caller = Workflow::new("caller_late");
+        caller.steps = vec![call_step("c1", &late_id)];
+        store.save(&caller).await.unwrap();
+
+        // 目标此刻不存在 → 保存期放行
+        scheduler
+            .set_schedule(
+                &caller.id,
+                config("* * * * *"),
+                std::collections::HashMap::new(),
+                &store,
+                |_| async {},
+            )
+            .await
+            .expect("Call 目标缺失时保存期放行");
+
+        // 之后目标被补齐，且是会等人的那种
+        store.save(&late).await.unwrap();
+
+        let reason = crate::workflow::scheduler::human_blocker_with_calls(&caller.steps, &store, 0)
+            .await
+            .expect("补齐目标后运行期复检必须判出阻塞点");
+        assert!(reason.contains("Chat"), "{reason}");
+
+        scheduler.remove_schedule(&caller.id).await;
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// B18：工作流文件损坏 → 调度条目必须保留（persist 落盘不删）；
+    /// 工作流目录不存在 → 孤儿调度照旧删除（既有行为保持）。
+    #[tokio::test]
+    async fn restore_keeps_schedule_when_workflow_file_corrupted() {
+        let root = std::env::temp_dir().join(format!(
+            "nuphus_b18_restore_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = WorkflowStore::with_root(root.join("workflows"));
+        let scheduler = SchedulerEngine::with_persist_path(root.join("schedules.json"));
+
+        // wf_broken：先正常保存再写坏 workflow.json（目录仍在）
+        let mut broken = Workflow::new("broken");
+        broken.steps = vec![];
+        store.save(&broken).await.unwrap();
+        let broken_dir = root.join("workflows").join(&broken.id);
+        std::fs::write(broken_dir.join("workflow.json"), "{ not valid json").unwrap();
+
+        // wf_missing：注册过调度但目录被整删（孤儿）
+        let missing = Workflow::new("missing");
+        store.save(&missing).await.unwrap();
+        let missing_id = missing.id.clone();
+        tokio::fs::remove_dir_all(root.join("workflows").join(&missing_id))
+            .await
+            .unwrap();
+
+        // 直接写 schedules.json 模拟「上次运行的持久化状态」
+        let persisted = format!(
+            r#"{{"schedules":{{"{}":{{"cron":"* * * * *","timezone":"UTC","enabled":true}},"{}":{{"cron":"* * * * *","timezone":"UTC","enabled":true}}}}}}"#,
+            broken.id, missing_id
+        );
+        std::fs::write(root.join("schedules.json"), persisted).unwrap();
+
+        // 模拟 restore 主循环的核心判定（用干净 store 实例绕过 save 写入的缓存，
+        // 强制读盘——与启动时 restore_schedules 的运行态一致）：
+        // broken → get None + validation_load_error Some → 保留
+        let cold_store = WorkflowStore::with_root(root.join("workflows"));
+        assert!(
+            cold_store.get(&broken.id).await.is_none(),
+            "损坏的工作流必须读不出来（get → None）"
+        );
+        assert!(
+            cold_store.validation_load_error(&broken.id).await.is_some(),
+            "损坏文件必须被 validation_load_error 探测到（区分于不存在）"
+        );
+        // missing → get None + validation_load_error None → 删除
+        assert!(cold_store.get(&missing_id).await.is_none());
+        assert!(
+            cold_store
+                .validation_load_error(&missing_id)
+                .await
+                .is_none(),
+            "目录不存在时 validation_load_error 必须返回 None（真孤儿）"
+        );
+
+        // persist_current_with_retained：restore 主循环只把 broken 放 retained，
+        // 孤儿 missing 不放 → 落盘后 broken 在、missing 消失。
+        let persisted_before = scheduler.load_current();
+        assert_eq!(persisted_before.schedules.len(), 2);
+        let mut retained = std::collections::HashMap::new();
+        retained.insert(
+            broken.id.clone(),
+            persisted_before.schedules[&broken.id].clone(),
+        );
+        scheduler
+            .persist_current_with_retained(&retained)
+            .await
+            .unwrap();
+        let after = scheduler.load_current();
+        assert!(
+            after.schedules.contains_key(&broken.id),
+            "损坏工作流的调度条目必须保留"
+        );
+        assert!(
+            !after.schedules.contains_key(&missing_id),
+            "孤儿调度（目录不存在）必须被物理删除（既有行为保持）"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// B10：并发 save 同一工作流不产生交错损坏——每次 save 的 tmp 名唯一，
+    /// 最终 workflow.json 恰为某一次完整序列化。
+    #[tokio::test]
+    async fn concurrent_saves_produce_valid_workflow_json() {
+        let root =
+            std::env::temp_dir().join(format!("nuphus_b10_tmp_{}", uuid::Uuid::new_v4().simple()));
+        let store = WorkflowStore::with_root(root.join("workflows"));
+
+        let wf = Workflow::new("b10_concurrent");
+        store.save(&wf).await.unwrap();
+
+        // 20 个并发 save（节流保存 vs 暂停快照并发的放大模拟）
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let store = WorkflowStore::with_root(root.join("workflows"));
+            let mut wf = wf.clone();
+            wf.name = format!("b10_concurrent_v{i}");
+            handles.push(tokio::spawn(async move { store.save(&wf).await }));
+        }
+        for handle in handles {
+            handle.await.unwrap().expect("并发 save 不应失败");
+        }
+
+        // 最终文件必须是合法 JSON（旧实现下并发交错可能写出半成品）
+        let final_text =
+            tokio::fs::read_to_string(root.join("workflows").join(&wf.id).join("workflow.json"))
+                .await
+                .unwrap();
+        let parsed: Workflow = serde_json::from_str(&final_text)
+            .expect("并发 save 后 workflow.json 必须是完整合法 JSON");
+        assert!(parsed.name.starts_with("b10_concurrent"));
+
+        // 目录中不应残留 tmp 文件
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("workflows").join(&wf.id))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rename 成功后不得残留 tmp 文件: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    /// B17：tool_schemas=None 时 registry 兜底必须生效（定时源 chat 步骤拿工具），
+    /// Some(vec![]) 会挡掉兜底（修复前的错误形态，测试固化其区别）。
+    /// execute_workflow 的闸门/编译器全链路太重，这里直测 mod.rs:347 的
+    /// 兜底表达式语义：None + registry 注入 → Some(非空)。
+    #[tokio::test]
+    async fn registry_fallback_applies_when_tool_schemas_none() {
+        use crate::workflow::WorkflowEngine;
+
+        let engine = WorkflowEngine::new();
+        // 未注入 tools 时：None → None（无兜底，chat 步骤无工具——headless 预期）
+        let schemas: Option<Vec<crate::api::ToolDefinition>> = None;
+        let resolved = schemas
+            .clone()
+            .or_else(|| engine.tools().map(|t| t.get_schemas()));
+        assert!(resolved.is_none(), "未注入 registry 时不得凭空产生 schemas");
+
+        // 注入 registry 后：None → Some(非空)（B17 修复依赖的兜底路径）
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+        let mut engine = engine;
+        engine.set_tools(registry);
+        let resolved = schemas.or_else(|| engine.tools().map(|t| t.get_schemas()));
+        let schemas = resolved.expect("注入 registry 后 None 必须兜底为 Some");
+        assert!(
+            !schemas.is_empty(),
+            "registry.get_schemas() 必须返回非空全量工具表"
+        );
+        // 对照：Some(vec![]) 挡掉兜底（B17 修复前的错误形态）
+        let blocking: Option<Vec<crate::api::ToolDefinition>> = Some(vec![]);
+        let resolved_blocked = blocking.or_else(|| engine.tools().map(|t| t.get_schemas()));
+        assert!(
+            resolved_blocked.map(|s| s.is_empty()).unwrap_or(false),
+            "Some(vec![]) 必须挡掉 registry 兜底（这就是 B17 的 bug 形态）"
+        );
     }
 }

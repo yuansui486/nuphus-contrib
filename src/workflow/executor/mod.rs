@@ -9,6 +9,8 @@
 //!
 //! 核心原则：执行是确定性的，不自动调用 LLM，除非步骤失败。
 
+pub mod control_flow;
+
 use crate::agent::events::{EventEmitter, NuphusEvent};
 use crate::api::ApiClient;
 use crate::api::ToolDefinition;
@@ -92,6 +94,7 @@ pub(crate) const CHAT_AGENT_ALLOWED_TOOLS: &[&str] = &[
     "desktop_find_image",
     "desktop_find_multi_color",
     "desktop_find_text",
+    "desktop_wait_for",
     // 浏览器全量（23）
     "browser_navigate",
     "browser_screenshot",
@@ -167,6 +170,37 @@ pub struct Executor {
     signals: crate::state::SharedSignals,
     /// 模型客户端工厂（chat 步骤 with.model 按 registry 模型 ID 路由专属 client）
     client_factory: Option<crate::llm::ClientFactory>,
+}
+
+/// RAII：execute_v2 运行期 per-workflow 状态的 Drop 守卫（B1）。
+///
+/// 背景：cancel_flags/pause_notifies/sensitive_values 三张 per-run map 此前只在
+/// execute_v2 正常返回路径手工 remove；future 被外部 drop（plugin_apps 300s 超时
+/// 是受支持路径、task abort、panic unwind）时清理不跑——若取消标志已置 true，
+/// 下次同 id 运行会复用残留 true 的 flag，每步立即「已被取消」。
+///
+/// 语义：Drop 只 remove map 条目，**不 reset Arc 内部值**——debug 会话场景插入的
+/// 是 `session.cancelled`（Arc 归 session 所有），remove 不销毁 Arc，session 自身
+/// 的取消状态不受影响。tokio RwLock 无法在 Drop 中 await，故用 try_write：拿不到
+/// 锁说明有并发运行正在持有（全局闸门保证同 id 至多一个 run，理论不可达），
+/// 该极端下留下清理任务给下一次运行——残留比误删安全。
+struct RunStateGuard<'a> {
+    executor: &'a Executor,
+    workflow_id: String,
+}
+
+impl Drop for RunStateGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut flags) = self.executor.cancel_flags.try_write() {
+            flags.remove(&self.workflow_id);
+        }
+        if let Ok(mut notifies) = self.executor.pause_notifies.try_write() {
+            notifies.remove(&self.workflow_id);
+        }
+        if let Ok(mut values) = self.executor.sensitive_values.try_write() {
+            values.remove(&self.workflow_id);
+        }
+    }
 }
 
 impl Executor {

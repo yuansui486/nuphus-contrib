@@ -38,6 +38,7 @@ const STATE_CLASS: Record<string, string> = {
   ready: 'is-ready',
   done: 'is-done',
   blocked: 'is-blocked',
+  cancelled: 'is-blocked',
   error: 'is-error',
 }
 
@@ -49,6 +50,7 @@ const STATE_I18N: Record<string, string> = {
   ready: 'extAgents.state.ready',
   done: 'extAgents.state.done',
   blocked: 'extAgents.state.blocked',
+  cancelled: 'extAgents.state.cancelled',
   error: 'extAgents.state.error',
   uninitialized: 'extAgents.state.uninitialized',
 }

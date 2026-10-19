@@ -975,7 +975,7 @@ pub(crate) fn create_draft_session(
 /// 归属路径取 `utils::active_project()`（与真实会话诞生点同源）——未配置项目目录时
 /// 返回稳定错误码 `no_project_dir`，**不猜测路径**。失败码：busy / append_pending /
 /// no_project_dir。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_project_chat(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1090,7 +1090,7 @@ pub(crate) fn archive_active(state: &AppState, ctx: &mut crate::state::RuntimeCo
 
 /// 列出展示台：按 created_at 降序稳定排序（最新创建在上，切换/激活不改变位置，
 /// 只通过 is_active 变化颜色/效果）。附 stage（执行态权威）与 can_switch（切换守卫）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_shelf_sessions(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     list_shelf_sessions_inner(&state)
 }
@@ -1165,14 +1165,28 @@ pub(crate) fn list_shelf_sessions_inner(state: &AppState) -> Result<serde_json::
     } else if let Some(sess) = read_backup_session(state) {
         // chat_history 在当前 mode 的 runtime 槽为空时也使用 session_backup；
         // 列表必须复用同一回退源，否则 Workflow 会话切换成功后看不到“当前”。
-        push_active_candidate(
-            state,
-            kind,
-            &sess,
-            &mut candidates,
-            &mut active_id,
-            &mut created_fallback,
-        );
+        // ── backup 归属校验（与 chat_history 同一把尺子，2026-10-13 事故修复）──
+        // backup 会话镜像归属 ≠ 当前 kind → 跳过（它是残留/错位快照，不能当 active 展示）；
+        // 无镜像（新会话未落库）→ 放行，宁缺勿错。
+        let backup_allowed = match nuphus::store::session::get_snapshot(&sess.id) {
+            Ok(Some((mode, _))) => normalize_mode(&mode) == kind,
+            _ => true,
+        };
+        if backup_allowed {
+            push_active_candidate(
+                state,
+                kind,
+                &sess,
+                &mut candidates,
+                &mut active_id,
+                &mut created_fallback,
+            );
+        } else {
+            tracing::warn!(
+                "[Shelf] backup 归属错位（id={}），跳过 active 回退防跨 mode 串会话",
+                &sess.id[..8.min(sess.id.len())]
+            );
+        }
     }
 
     if let Ok(shelf) = state.shelf.lock() {
@@ -1294,7 +1308,7 @@ pub(crate) fn list_shelf_sessions_inner(state: &AppState) -> Result<serde_json::
 /// 两次 IPC——此前 split 调用存在竞态：set_mode 触发的 mode_changed 事件
 /// 会抢先 reloadChatFromBackend，若 switch_session 随后失败，聊天区与
 /// mode chip 已错乱（回归 2026-08-30）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn switch_session(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1494,7 +1508,7 @@ pub(crate) fn switch_session_inner_mode(
 ///
 /// 广播：CompoundEmitter 双推（桌面 Tauri IPC + 手机 WS）——手机「新建对话」遥控桌面
 /// 走同一入口，变更经 SessionChanged 事件回传，双端跟随显示（单一路径，手机跟随）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn new_chat_session_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1571,7 +1585,7 @@ pub(crate) fn new_chat_session_with_event<R: tauri::Runtime>(
 }
 
 /// 重命名：覆盖表 + 元数据行；对 active 会话立即生效（归档时沿用）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_session_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1618,7 +1632,7 @@ pub fn rename_session_cmd(
 /// 与 LRU 淘汰语义一致，由用户主动触发（前端非 active 条目显示归档按钮 + 确认弹窗）。
 /// active 会话在 runtime 不在 shelf，无法经此归档（前端不显示按钮）。错误码：
 /// busy / append_pending / not_found。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn archive_session(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -1647,7 +1661,7 @@ pub fn archive_session(
 /// 是否存在可恢复的最近会话镜像（leader/workflow/custom 全 mode 支持）——
 /// 欢迎页「继续对话」按钮显示条件：只看重启前最后对话镜像是否非空，
 /// 不按 mode 排除（2026-08-30 起全 mode 统一支持继续对话）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn has_resume_candidate() -> bool {
     matches!(
         load_latest_mirror(),
@@ -1662,7 +1676,7 @@ pub fn has_resume_candidate() -> bool {
 ///    （retry.rs 同一先例），新指令即续聊
 /// 3) current_mode 跟随镜像 mode（leader/workflow/custom 均支持）——重启后
 ///    mode 先落镜像，随后用户选择（继续对话/会话台/手动 chip）覆盖
-#[tauri::command]
+#[tauri::command(async)]
 pub fn resume_latest_session(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::state::HistoryMessage>, String> {
@@ -3009,6 +3023,32 @@ mod tests {
         assert_eq!(active.len(), 1, "backup 当前会话必须是唯一 active");
         assert_eq!(active[0]["id"].as_str(), Some(target_id.as_str()));
         assert_eq!(active[0]["mode"].as_str(), Some("workflow"));
+    }
+
+    /// 2026-10-13 事故回归（rail 侧）：current_mode=leader + 无 agent 槽 +
+    /// session_backup 残留 **workflow** 会话（镜像归属 workflow）→ 该 backup
+    /// 不得作为 active 展示（与 chat_history 同一把尺子，防跨 mode 串会话）。
+    #[test]
+    fn list_shelf_rejects_backup_from_other_mode() {
+        let state = AppState::default();
+        {
+            let mut cm = state.current_mode.write().unwrap();
+            *cm = "leader".to_string();
+        }
+        let wf_sess = session_with_user(&["工作流会话"]);
+        let json = serde_json::to_string(&wf_sess).unwrap();
+        nuphus::store::session::upsert_snapshot(&wf_sess.id, "workflow", &json).unwrap();
+        {
+            let mut session = state.session.lock().unwrap();
+            session.session_backup = Some(json);
+        }
+        let payload = list_shelf_sessions_inner(&state).unwrap();
+        let items = payload["items"].as_array().unwrap();
+        assert!(
+            items.iter().all(|i| i["is_active"] == false),
+            "错位 backup 不得作为 active 展示"
+        );
+        let _ = nuphus::store::session::delete_session(&wf_sess.id);
     }
 
     /// runtime agent 已恢复时优先使用 runtime 会话，不能被旧 backup 覆盖。

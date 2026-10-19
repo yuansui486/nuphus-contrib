@@ -5,9 +5,15 @@
 
 use crate::ToolCall;
 
+/// 死循环预警阈值（连续重复次数）：达到即提醒但不拦截；`dead_loop_threshold`（5）
+/// 达到才终止。预警给模型一次在终止前自行纠偏的机会。
+const DEAD_LOOP_WARN_AT: u32 = 3;
+
 /// Protection detection alert
 #[derive(Debug, Clone)]
 pub enum ProtectionAlert {
+    /// Dead loop early warning: same tool + same params repeated 3 times (execution continues, reminder only)
+    DeadLoopWarning { tool: String, count: u32 },
     /// Dead loop: same tool + same params repeated execution
     DeadLoop { tool: String, count: u32 },
     /// Consecutive error: same tool consecutive failures
@@ -164,6 +170,24 @@ impl ProtectionGuard {
         self.last_call_tool = call.tool.clone();
         self.last_call_params = params_str;
 
+        // 预警级：连续重复达到 DEAD_LOOP_WARN_AT（且尚未到终止阈值）→ 提醒不拦截。
+        // 触发一次即静默升级，不逐次重发（重复同文案只会淹没上下文）；到终止阈值
+        // 时 last_call_count 仍会继续增长并命中下方 DeadLoop 分支。
+        if self.last_call_count == DEAD_LOOP_WARN_AT
+            && self.last_call_count < self.dead_loop_threshold
+        {
+            tracing::warn!(
+                guard = "dead_loop_warn",
+                tool = %call.tool,
+                count = self.last_call_count,
+                "protection: dead loop early warning"
+            );
+            return Some(ProtectionAlert::DeadLoopWarning {
+                tool: call.tool.clone(),
+                count: DEAD_LOOP_WARN_AT,
+            });
+        }
+
         if self.last_call_count >= self.dead_loop_threshold {
             let count = self.last_call_count;
             self.last_call_count = 0;
@@ -225,10 +249,16 @@ impl ProtectionAlert {
     /// Generate prompt text for Session injection (executor.rs style)
     pub fn to_session_warning(&self) -> String {
         match self {
-            ProtectionAlert::DeadLoop { tool, .. } => {
+            ProtectionAlert::DeadLoopWarning { tool, count } => {
                 format!(
-                    "检测到死循环：工具 `{}` 重复调用且参数相同。请更换方法或直接给出最终结果。",
-                    tool
+                    "防死循环机制已介入：工具 `{}` 已连续 {} 次执行重复操作，连续 {} 次将终止执行！请立即更换方法、调整参数或直接给出最终结果。",
+                    tool, count, crate::runtime::protection::DEAD_LOOP_TERMINATE_AT_DISPLAY
+                )
+            }
+            ProtectionAlert::DeadLoop { tool, count } => {
+                format!(
+                    "任务已被防死循环机制终止：工具 `{}` 已连续 {} 次执行完全相同的重复操作（同工具同参数），没有任何进展迹象。继续重复只会产生相同结果，因此执行被强制结束。请基于已获得的结果更换思路，或直接向用户说明当前进展与卡点。",
+                    tool, count
                 )
             }
             ProtectionAlert::ConsecutiveError { tool, .. } => {
@@ -250,6 +280,9 @@ impl ProtectionAlert {
     /// Generate forced output reminder
     pub fn to_force_output_reminder(&self) -> Option<&'static str> {
         match self {
+            ProtectionAlert::DeadLoopWarning { .. } => Some(
+                "防死循环机制已介入：你正在以完全相同的参数重复调用同一工具。请立即更换方法、调整参数，或基于已有结果直接给出最终答复——继续重复将在第 5 次后被强制终止。",
+            ),
             ProtectionAlert::DeadLoop { .. } => {
                 Some("检测到重复操作循环。请立即停止工具调用，直接回复用户当前进展和结论。")
             }
@@ -259,12 +292,17 @@ impl ProtectionAlert {
 
     pub fn label(&self) -> &'static str {
         match self {
+            ProtectionAlert::DeadLoopWarning { .. } => "dead-loop-warn",
             ProtectionAlert::DeadLoop { .. } => "dead-loop",
             ProtectionAlert::ConsecutiveError { .. } => "consecutive-error",
             ProtectionAlert::SameFileReadOveruse { .. } => "file-read-overuse",
         }
     }
 }
+
+/// 终止阈值展示值（与 ProtectionGuard::new 的 dead_loop_threshold=5 保持一致；
+/// 单独常量是因为文案模块无法访问 guard 实例字段）。
+pub const DEAD_LOOP_TERMINATE_AT_DISPLAY: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -286,8 +324,24 @@ mod tests {
 
         for i in 1..=6 {
             let alert = guard.check_pre_call(&call);
+            // 预警级：第 4 次调用（连续重复计数=3）返回 DeadLoopWarning，执行不拦截
+            if i == 4 {
+                match alert {
+                    Some(ProtectionAlert::DeadLoopWarning { tool, count }) => {
+                        assert_eq!(tool, "system_shell");
+                        assert_eq!(count, 3);
+                    }
+                    other => panic!("expected DeadLoopWarning at call 4, got {:?}", other),
+                }
+                continue;
+            }
             if i < 6 {
-                assert!(alert.is_none(), "alert fired at iteration {}", i);
+                assert!(
+                    alert.is_none(),
+                    "unexpected alert at iteration {}: {:?}",
+                    i,
+                    alert
+                );
             } else {
                 assert!(alert.is_some());
                 match alert.unwrap() {
@@ -301,19 +355,68 @@ mod tests {
         }
     }
 
+    /// Dead-loop warning fires exactly once: repeated calls between warn-at and
+    /// terminate-at must not re-emit the warning (same text would flood context).
+    #[test]
+    fn test_dead_loop_warning_fires_once() {
+        let mut guard = ProtectionGuard::new();
+        let call = shell_cmd("echo test");
+        let mut warnings = 0;
+        for _ in 1..=6 {
+            if let Some(
+                ProtectionAlert::DeadLoopWarning { .. } | ProtectionAlert::DeadLoop { .. },
+            ) = guard.check_pre_call(&call)
+            {
+                warnings += 1;
+            }
+        }
+        // 1 warning (at repeat count 3) + 1 terminate (at count 5)
+        assert_eq!(warnings, 2, "warning must fire once, not per-call");
+    }
+
+    /// Termination copy must be honest failure text (not the old fake "任务完成").
+    #[test]
+    fn test_dead_loop_copy_is_honest_failure() {
+        let alert = ProtectionAlert::DeadLoop {
+            tool: "system_sleep".to_string(),
+            count: 5,
+        };
+        let msg = alert.to_session_warning();
+        assert!(msg.contains("已连续 5 次"), "copy must state count: {msg}");
+        assert!(
+            msg.contains("防死循环机制终止"),
+            "copy must name the terminator: {msg}"
+        );
+        assert!(!msg.contains("任务完成"), "must not fake success: {msg}");
+        let warn = ProtectionAlert::DeadLoopWarning {
+            tool: "system_sleep".to_string(),
+            count: 3,
+        };
+        let wmsg = warn.to_session_warning();
+        assert!(
+            wmsg.contains("防死循环机制已介入") && wmsg.contains("将终止执行"),
+            "warning copy must state the escalation: {wmsg}"
+        );
+    }
+
     #[test]
     fn test_dead_loop_resets_on_param_change() {
         let mut guard = ProtectionGuard::new();
         let call1 = shell_cmd("cmd_a");
         let call2 = shell_cmd("cmd_b");
 
-        // 5x call1 — 6th time triggers
+        // 5x call1：第 4 次（重复计数=3）返 Warning，其余无 alert（到第 6 次才终止）
         for i in 1..=5 {
-            assert!(
-                guard.check_pre_call(&call1).is_none(),
-                "premature alert at {}",
-                i
-            );
+            let alert = guard.check_pre_call(&call1);
+            if i == 4 {
+                assert!(
+                    matches!(alert, Some(ProtectionAlert::DeadLoopWarning { .. })),
+                    "expected warning at 4th call, got {:?}",
+                    alert
+                );
+            } else {
+                assert!(alert.is_none(), "premature alert at {}", i);
+            }
         }
         // Param change resets counter
         assert!(guard.check_pre_call(&call2).is_none());

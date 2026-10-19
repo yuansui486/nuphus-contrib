@@ -1,4 +1,5 @@
 //! 顺序执行子步骤
+use super::control_flow;
 use super::*;
 
 impl Executor {
@@ -51,7 +52,7 @@ impl Executor {
                 }
 
                 // ── 执行子步骤 ──
-                match self
+                let sub_result = self
                     .execute_step(
                         sub,
                         depth + 1,
@@ -66,36 +67,42 @@ impl Executor {
                         completed_ids,
                         run_record,
                     )
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        // 根据 on_error 策略处理
-                        let err_msg = e.to_string();
-                        if sub.on_error_strategy().is_skip() {
-                            events.emit(WorkflowEvent::Error {
-                                message: format!(
-                                    "步骤 '{}' ({}) 失败，跳过继续: {}",
-                                    sub.name(),
-                                    sub.kind_str(),
-                                    err_msg
-                                ),
-                            });
-                            // dispatch 已记录 Error，这里纠正为 Skipped（has_skipped 语义）
-                            if let Some(rec) = run_record
-                                .steps
-                                .iter_mut()
-                                .rev()
-                                .find(|s| s.step_id == sub.id())
-                            {
-                                rec.status = StepRunStatus::Skipped;
-                                rec.finished_at = Some(chrono::Utc::now());
-                            }
-                            continue;
+                    .await;
+                if let Err(error) = sub_result {
+                    // B2：控制流信号穿透 seq 容器——优先于 on_error 策略
+                    //（Skip 不得吞掉 break/continue），提升 seq 内已产生的变量后
+                    // 原样向上传播，由最近一层 loop 消费。
+                    if control_flow::is_control_flow_error(&error).is_some() {
+                        for (k, v) in &scope {
+                            variables.insert(k.clone(), v.clone());
                         }
-                        // Abort or other: 立即传播
-                        return Err(e);
+                        return Err(error);
                     }
+                    // 根据 on_error 策略处理
+                    let err_msg = error.to_string();
+                    if sub.on_error_strategy().is_skip() {
+                        events.emit(WorkflowEvent::Error {
+                            message: format!(
+                                "步骤 '{}' ({}) 失败，跳过继续: {}",
+                                sub.name(),
+                                sub.kind_str(),
+                                err_msg
+                            ),
+                        });
+                        // dispatch 已记录 Error，这里纠正为 Skipped（has_skipped 语义）
+                        if let Some(rec) = run_record
+                            .steps
+                            .iter_mut()
+                            .rev()
+                            .find(|s| s.step_id == sub.id())
+                        {
+                            rec.status = StepRunStatus::Skipped;
+                            rec.finished_at = Some(chrono::Utc::now());
+                        }
+                        continue;
+                    }
+                    // Abort or other: 立即传播
+                    return Err(error);
                 }
 
                 // 提升子步骤变量

@@ -551,12 +551,12 @@ export interface ScheduleConfig {
 // ── WorkflowInputSpec（后端 InputSpec 镜像：workflow.inputs[]）──
 
 /** 输入类型（后端 InputKind，JSON 字段名 type） */
-export type WorkflowInputKind = 'string' | 'number' | 'boolean' | 'path' | 'json'
+export type WorkflowInputKind = 'string' | 'number' | 'boolean' | 'path' | 'json' | 'enum'
 
 /** 工作流外部输入声明（运行前由 UI 收集，注入变量池 inputs.x / 顶层 x） */
 export interface WorkflowInputSpec {
   name: string
-  /** 控件类型，缺省 string */
+  /** 控件类型，缺省 string；enum = 档位下拉（须配 options） */
   type?: WorkflowInputKind
   /** 必填：无 default 且未填 → 运行前阻断 */
   required?: boolean
@@ -565,6 +565,8 @@ export interface WorkflowInputSpec {
   description?: string
   /** 敏感值：密码控件且不写日志/事件；本机运行快照仍会保留值 */
   sensitive?: boolean
+  /** enum 档位白名单（仅 type=enum 有效且必填非空）；其它类型忽略 */
+  options?: string[]
 }
 
 // ── WorkflowItem (V2) ──
@@ -664,15 +666,6 @@ export type NuphusEvent =
       /** 本轮起点（Unix 毫秒，**后端权威**）——前端据此实时推算耗时，
        *  刷新 / 重连后依然准确（根治「刷新后计时归零」）。旧后端缺省 = 无起点。 */
       started_at_ms?: number
-    }
-  | {
-      type: 'assistant_progress'
-      session_id: string
-      turn_id: string
-      message_id: string
-      text: string
-      timestamp: number
-      replaces_draft: boolean
     }
   | {
       type: 'tool_call_start'
@@ -851,6 +844,9 @@ export type NuphusEvent =
   /** 新建对话纯意图广播（手机 /new-chat 触发）：后端不创建任何 session，
    *  桌面端收到执行本地 handleNewChat（清聊天区回欢迎页）；手机端本机已先行清视图 */
   | { type: 'new_chat_broadcast' }
+  /** 后台任务账本结构变化（登记/保留翻转/注销）：重拉清单与保留项数字。
+   *  载荷为空——账本是后端唯一真相，收到后走既有 IPC 重拉，不冗余快照 */
+  | { type: 'background_tasks_changed' }
   | {
       type: 'workflow_event'
       /** WorkflowEvent 子类型（run_started / step_run_started / step_run_completed /
@@ -924,4 +920,29 @@ export interface WorkflowRunStep {
   status: 'pending' | 'running' | 'completed' | 'failed' | 'paused'
   depth?: number
   kind?: string
+}
+
+/**
+ * 后台任务账本条目（后端 `nuphus::tools::background_tasks::BackgroundTaskView`）。
+ *
+ * 字段名与 Rust 侧 serde 默认的 snake_case **逐字一致**，此处刻意不做驼峰归一：
+ * 归一层只是多一处可能与后端漂移的映射，而 IPC 的字段名就是契约本身。
+ *
+ * 后端只返回**存活**条目（死条目在读取时顺带从账本清出）。
+ */
+export interface BackgroundTaskView {
+  /** 账本 id（`bg-<seq>`），结束任务时按它寻址 */
+  id: string
+  /** 启动它的工具名（如 `system_shell`） */
+  tool: string
+  /** 命令文本（后端已截断，仅供展示） */
+  command: string
+  pid: number
+  started_at_ms: number
+  /** 已运行时长（毫秒）——前端本地格式化，避免自算起点与后端漂移 */
+  elapsed_ms: number
+  /** 显式保留意图：true = 用户/Agent 要求留在后台，取消不会杀它 */
+  retain: boolean
+  /** 输出日志路径（可读取），没有则为 null */
+  output_path: string | null
 }

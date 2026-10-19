@@ -21,7 +21,7 @@ import type { MutableRefObject } from 'react'
 import type { ExecutionStage } from './useExecutionState'
 import type { MoodState } from '../ui/MoodFace'
 import { playUiSound } from '../ui/sound'
-import { showAppFeedbackByHudPhase } from '../ui/islandChannel'
+import { showAppFeedback, showAppFeedbackByHudPhase } from '../ui/islandChannel'
 import type { ApiHealthState, ApiHealthEventKind, ApiHealthIncident } from '../core/types'
 import { requestWorkflowEnhancedModeRefresh } from '../main-window/workflow-canvas/enhancedModeEvents'
 
@@ -192,9 +192,6 @@ export function useEvents(h: EventHandlers) {
   const refineOutputRef = useRef('')
   const refineStartTimeRef = useRef(0)
   const refineMsgIdRef = useRef<string | null>(null)
-  const progressTurnRef = useRef<{ session_id: string; turn_id: string } | null>(null)
-  const progressIdsRef = useRef(new Set<string>())
-
   // ── 提炼状态统一复位（四个出口共用，勿在各处复制）──
   // 出口：refine_failed 事件 / forced invoke 失败兜底 / 超时 guard / 手动关闭弹窗。
   // 复位提炼 refs（refineActiveRef 卡 true 会让后续 refine_prompt 被忽略、
@@ -433,8 +430,6 @@ export function useEvents(h: EventHandlers) {
       switch (event.type) {
         case 'session_changed':
         case 'new_chat_broadcast':
-          progressTurnRef.current = null
-          progressIdsRef.current.clear()
           // 会话增强偏好由后端按 Workflow session 保存。会话切换或新建后让所有
           // 已挂载的入口重新读取权威状态，避免按钮仍展示上一会话的开关与配置徽标。
           requestWorkflowEnhancedModeRefresh()
@@ -476,7 +471,12 @@ export function useEvents(h: EventHandlers) {
             h.setRefineState(null)
             h.setPendingRefine(null)
             h.setForceDraftForRefine?.(null)
-            addSystemMsg('模型已切换，上下文提示已按新的上下文窗口重新计算。')
+            // 只提示、不落进对话流：这不是执行结果，而是一次即时说明，常驻气泡会把
+            // 会话切碎；轻反馈通道自会分流（应用在前台 → island，后台 → HUD）。
+            // 注意别和模型侧的通知混为一谈：后端已把「当前模型已切换至 …」改为
+            // 一次性消费账本（config/llm.rs 只登记挂起，下次 LLM 请求 transient
+            // 注入一次、不驻留会话），那条必须留着。
+            showAppFeedback('模型已切换，上下文提示已按新的上下文窗口重新计算。')
           }
           h.setModelName(event.model)
           // ⚠️ SessionInfo.session_id 是**每轮随机生成的事件关联 id**（后端
@@ -510,6 +510,13 @@ export function useEvents(h: EventHandlers) {
           // 后端重试间隔带指数退避（2s/4s/8s...），不会连续轰炸。
           if (event.code === 'llm_retry' || event.code === 'llm_network_retry') {
             playUiSound('retry')
+          }
+          // 界面失联后恢复：失联期间后端丢弃了非关键事件（防死 webview 错误洪水），
+          // 本地执行态可能已过期——reload 从 DB 重建完整状态是唯一自愈路径。
+          if (event.code === 'ui_reconnected') {
+            console.warn('[UI-LINK] reconnected after disconnect — reloading to resync')
+            playUiSound('retry')
+            setTimeout(() => window.location.reload(), 1200)
           }
           break
         }
@@ -548,16 +555,11 @@ export function useEvents(h: EventHandlers) {
           if (h.refs.executionActiveRef.current) {
             break
           }
-          progressTurnRef.current =
-            event.session_id && event.turn_id
-              ? { session_id: event.session_id, turn_id: event.turn_id }
-              : null
           // 真实会话 id 的唯一权威来源：execution_started.session_id（后端
           // rt.session().id）——点评提交（useAgentControl submitExecutionRating）
           // 等消费方据此关联后端会话记录。SessionInfo.session_id 是每轮随机
           // 事件关联 id、**不是会话 id**（曾误消费，点评关联到假会话，2026-10 纠）。
           if (event.session_id) h.setSessionId(event.session_id)
-          progressIdsRef.current.clear()
           // Refine mode: set execution state but don't create a message bubble
           // Keep refineState intact — the modal should stay open until SessionRefined
           if (refineActiveRef.current) {
@@ -787,51 +789,6 @@ export function useEvents(h: EventHandlers) {
           }
           break
         }
-        case 'assistant_progress': {
-          const turn = progressTurnRef.current
-          if (
-            refineActiveRef.current ||
-            !h.refs.executionActiveRef.current ||
-            h.refs.interruptedRef.current ||
-            !turn ||
-            turn.session_id !== event.session_id ||
-            turn.turn_id !== event.turn_id ||
-            progressIdsRef.current.has(event.message_id) ||
-            !event.text.trim()
-          )
-            break
-          progressIdsRef.current.add(event.message_id)
-          const draftId = h.refs.streamingMsgId.current
-          if (!draftId) break
-          h.setMessages(prev => {
-            if (prev.some(m => m.message_id === event.message_id)) return prev
-            prev = continueReplyAfterUser(prev, draftId)
-            const index = prev.findIndex(m => m.id === draftId)
-            if (index < 0) return prev
-            const draft = prev[index]
-            const progress: ChatMessage = {
-              id: event.message_id,
-              reply_id: draft.reply_id ?? draft.id,
-              message_id: event.message_id,
-              kind: 'progress',
-              role: 'assistant',
-              content: event.text,
-              timestamp: event.timestamp,
-              runtime: 'done',
-            }
-            return [
-              ...prev.slice(0, index),
-              progress,
-              event.replaces_draft
-                ? { ...draft, content: '', timestamp: event.timestamp }
-                : draft.content
-                  ? draft
-                  : { ...draft, timestamp: event.timestamp },
-              ...prev.slice(index + 1),
-            ]
-          })
-          break
-        }
         case 'llm_text_delta':
           // 暂停菜单打开期间收到 LLM 流式文本 = agent 已越过暂停检查点恢复执行
           // （如手机端追加后先思考再调工具），自动关闭桌面暂停菜单
@@ -930,6 +887,7 @@ export function useEvents(h: EventHandlers) {
             // （process_text_delta 跨 chunk 折叠不完美）。execution_completed 的
             // result_message 是后端 extract_think_blocks 处理过的权威干净文本——
             // finalMsg 非空时无条件覆盖，避免"中间的空格都是 thinking 的 chars"。
+            // 与 leader 完全同构：最终回复覆盖流式过程文本，气泡只留权威定稿。
             const content = finalMsg.trim() ? finalMsg : '（已执行完成，未产出回复）'
             h.setMessages((prev: ChatMessage[]) =>
               continueReplyAfterUser(prev, s).map(m =>
@@ -1243,6 +1201,15 @@ export function useEvents(h: EventHandlers) {
             const nextPending = {
               ...pending,
               usagePercent: pct,
+              // 必须用本次事件下发的 force_threshold（= 后端此刻真正生效的强制线），
+              // 不能沿用 pending 里的旧快照。旧快照是「跳过那一刻」的值，而滑块拖动
+              // 只写后端 + 组件本地 forceDraft，从不回写 refineState/pendingRefine，
+              // 于是快照会长期偏低甚至偏高。autoRaiseForceThreshold 以
+              // `forceThreshold >= minPct` 作为「后端已够高、无需抬升」的判据，
+              // 喂旧快照会误判：用户明明调到 80%，快照还停在 0.5，下一轮 usage 把
+              // 下限顶到 70% → 误判为「需要抬升」→ 把后端从 0.80 改写成 0.70，
+              // 用户的设置被静默降级。此处对齐权威值即可消除该降级。
+              forceThreshold,
               skippedTurns: pending.skippedTurns + 1,
             }
             h.setPendingRefine(cur => (cur ? nextPending : null))
@@ -1469,11 +1436,47 @@ export function useEvents(h: EventHandlers) {
     return () => clearInterval(interval)
   }, [])
 
+  // ── UI 心跳：向后端证明「主界面还活着」──
+  //
+  // 为什么需要：Tauri 的 emit 在 webview 渲染进程死亡后仍然返回 Ok（失败发生在
+  // wry 消息循环里，表现为 HRESULT 0x8007139F 错误洪水），Rust 侧拿不到任何
+  // 信号。心跳停摆超 90s 即被后端判定「界面失联」→ 进入降级模式（丢弃非关键
+  // 事件 + 主窗口标题切换 + HUD 提示）。心跳停 = 界面真的没了，不存在误报
+  // （隐藏页签定时器节流最差 ~1 分钟一次，仍小于 90s 阈值）。
+  //
+  // 恢复路径：后端收到复活心跳会推 `ui_reconnected` 警告（见下方 case 'warning'），
+  // 前端 reload 从 DB 重建完整状态——失联期间被丢弃的事件不做补偿。
+  useEffect(() => {
+    const ping = () => {
+      // 不直接链 invoke 的返回值：测试 mock / 非标准桥可能返回 undefined，
+      // `.catch` 链在非 Promise 上会 TypeError。Promise.resolve 包裹后，
+      // 同步返回与 Promise 拒绝两条路径都安全忽略。
+      void Promise.resolve()
+        .then(() => invoke('ui_heartbeat'))
+        .catch(() => {
+          // 后端不可达时静默：心跳只是活性证明，失败不该产生新噪音
+        })
+    }
+    ping()
+    const interval = setInterval(ping, 3000)
+    // 从后台/最小化恢复时立即补一次，缩短后端感知延迟
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') ping()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [])
+
   // ── toolbar:action listener ──
   useEffect(() => {
+    let disposed = false
     let unlisten: (() => void) | null = null
 
     listen<{ action: string }>('toolbar:action', async payload => {
+      if (disposed) return
       console.log('[Toolbar] action received:', payload)
       switch (payload.action) {
         case 'screenshot':
@@ -1492,10 +1495,13 @@ export function useEvents(h: EventHandlers) {
           console.warn('[Toolbar] unknown action:', payload.action)
       }
     }).then(fn => {
-      unlisten = fn
+      // 同 App.tsx：promise 未回来即卸载时，unlisten 为 null → 清理空转 → 泄漏。
+      if (disposed) fn()
+      else unlisten = fn
     })
 
     return () => {
+      disposed = true
       unlisten?.()
     }
   }, [h.setRegionPickerMode])

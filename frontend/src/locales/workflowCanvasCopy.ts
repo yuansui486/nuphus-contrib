@@ -11,6 +11,9 @@ export const workflowCanvasCopy: Record<string, string> = {
   '当前有任务执行中，暂不可保存（编辑仍在画布上，任务结束后按 Ctrl+S 保存）':
     'A task is running. Your edits remain on the canvas; save after it ends.',
   '保存失败：后端无响应': 'Save failed: no response.',
+  '保存失败：工作流不存在或已被删除': 'Save failed: this workflow no longer exists.',
+  '该工作流在画布外被修改过（如定时设置、重命名或运行记录）。继续保存将覆盖这些修改，仍要继续？':
+    'This workflow was changed outside the canvas (schedule, rename, or run records). Saving will overwrite those changes. Continue?',
   '已保存提交时的版本；后续编辑尚未保存':
     'The submitted version was saved. Newer edits are still unsaved.',
   已保存: 'Saved',
@@ -28,6 +31,8 @@ export const workflowCanvasCopy: Record<string, string> = {
   '无法定位该连线终点节点，未插入': 'The target node is unavailable. No node was inserted.',
   '跨层连线暂不支持插入，请进入对应子层操作': 'Enter the corresponding layer to insert a node.',
   '加载画布中…': 'Loading workflow…',
+  加载画布失败: 'Failed to load the workflow',
+  重试: 'Retry',
   双击重命名工作流: 'Double-click to rename the workflow',
   历史回放中不可切换工作流: 'Exit history replay before switching workflows',
   '运行中 · 画布只读': 'Running · read-only canvas',

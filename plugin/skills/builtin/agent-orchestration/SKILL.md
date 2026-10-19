@@ -9,6 +9,8 @@ tags: [agent, 外部Agent, 并行, 编排]
 
 > 外部 Agent（独立终端 TUI / 桌面 App / Web 等平台）协作指南。系统提示词已覆盖的（工具描述/annotation/Constitution）不重复，本技能只写外部 Agent 特有流程。
 
+**铁律：非显式指定不派发外部 Agent。**
+
 ---
 
 ## 1. 登记（team.toml）
@@ -276,9 +278,9 @@ GET /handoff/health → 免令牌自检
 | 200 | 已受理 | —（同 id 终态重复 POST 幂等忽略，仍回 200） |
 | 403 | 缺/错 X-Handoff-Token 头（响应体无任何提示） | 核对 token 来源：prompt 环境信息 / contract 原文；重启后旧 token 一律失效 |
 | 422 | JSON 缺必填字段（id/status/summary） | 补全四个字段：id/status/summary/report_path(可 null) |
-| 400 | status 非法值 或 id/summary 为空 | status 只允许 done/progress/blocked |
+| 400 | status 非法值 或 id/summary 为空 | status 只允许 done/progress/blocked/cancelled |
 
-语义细节：progress 同 id 折叠（只注入最新一条）；done/blocked 终态幂等且到达后清除同 id 陈旧 progress；summary 换行压平、500 字截断。上报形态两种等价：裸 POST（如上）或契约内置的 `<桌面壳 exe> task ...` CLI（终端类 agent 实测在用）——以契约原文为准，不要求 agent 改换形态。
+语义细节：progress 同 id 折叠（只注入最新一条）；done/blocked/cancelled 终态幂等且到达后清除同 id 陈旧 progress；summary 换行压平、500 字截断。上报形态两种等价：裸 POST（如上）或契约内置的 `<桌面壳 exe> task ...` CLI（终端类 agent 实测在用）——以契约原文为准，不要求 agent 改换形态。
 
 **task_id 一致性闸**：状态栏的 task_id 是「板上当前轮」、上板时写入。迟到的旧轮事件（事件 id 的 task_id 与板上不一致）只追加 last_event + 后台 warn——不动 state/task_id、不跑完工审计，但事件绝不丢弃（done/blocked 唤醒只认事件 status，与状态栏无关）。因此 agent 侧「上报返回 200 但状态栏没动」的正当成因之一是 task_id 不匹配：先核对事件 id 是否 `{agent}::{task_id}` 且 task_id 为本轮 brief 的值，再怀疑链路故障。
 
@@ -307,11 +309,12 @@ Nuphus 重启（有在途任务）→ 令牌已轮换（旧令牌 403，契约�
 | `in_progress` | Agent 正在跑 | 搁置，等门铃/下个验收点 |
 | `done` | 完工（门铃 done 已落 status） | 走验收（§7.4） |
 | `blocked` | 阻塞（agent 报 blocked） | 介入：查 report ⚠️/终端 OCR，解决后续派 |
+| `cancelled` | 已取消（任务作废终态） | 无在途任务，可直接派新任务 |
 | `blocked`（确认类） | 卡在需要人工批准的界面（权限/许可/执行确认） | **不代批**——向用户转呈「需在目标应用中手动授权什么」，用户授予后让 agent 重试或重派 |
 | `error` | 出错 | 介入：查终端报错 |
 | `idle` / `ready` | 空闲/就绪 | 无在途任务 |
 
-注意：状态栏**只读不写**，state 由外部 Agent 门铃 POST 驱动（`progress`/`done`/`blocked`）；Leader 不要试图直接改 status.json。状态栏与门铃同源（status.json），门铃已响则状态栏必同步，二者互证。列表栏的「从列表栏移除」是**后端共享显示态**（应用生命周期内保持、重启即净；被再次调用或配置中心保存时撤销）——Leader 不要据此判断 agent 已注销，注销以配置中心删除为准（删除联动清 status.json，列表立即消失且重启不复活）。例外：`agent_dispatch` 派发失败（上板前未登记 / 上板或投递失败）会由后端写 `error` 并把人类可读原因落在 `error_reason`——此时按原因判断是进程没起来、窗口没捕获还是输入没进去，照 §5 接管 SOP 处置，不要当成 agent 自己出的错。工具返回里的 `submitted=true` 只表示 brief 已上板、不代表指令已送达外部 Agent——是否补投以终端实况为准（§5 第 6 条），勿据该字段直接重投。
+注意：状态栏**只读不写**，state 由外部 Agent 门铃 POST 驱动（`progress`/`done`/`blocked`/`cancelled`）；Leader 不要试图直接改 status.json。取消在途任务用契约内的 CLI：`<桌面壳 exe> task cancel --id {agent}::{task_id} --token <令牌> --reason "..."`（`cancelled` 同为终态，放行在途闸；cancel 是派发方收口动词，不写进 brief 契约，禁止让外部 Agent 自行取消任务）。状态栏与门铃同源（status.json），门铃已响则状态栏必同步，二者互证。列表栏的「从列表栏移除」是**后端共享显示态**（应用生命周期内保持、重启即净；被再次调用或配置中心保存时撤销）——Leader 不要据此判断 agent 已注销，注销以配置中心删除为准（删除联动清 status.json，列表立即消失且重启不复活）。例外：`agent_dispatch` 派发失败（上板前未登记 / 上板或投递失败）会由后端写 `error` 并把人类可读原因落在 `error_reason`——此时按原因判断是进程没起来、窗口没捕获还是输入没进去，照 §5 接管 SOP 处置，不要当成 agent 自己出的错。工具返回里的 `submitted=true` 只表示 brief 已上板、不代表指令已送达外部 Agent——是否补投以终端实况为准（§5 第 6 条），勿据该字段直接重投。
 
 **重启重置（设计意图）**：应用重启会把 status.json 重置为 idle/空 task_id（运行时态不跨重启）。在途任务经重启后，验收依据 = brief/report 文件（`.nuphus/handoff/`），状态栏只反映重启后的新事件；续派需重新 dispatch。
 

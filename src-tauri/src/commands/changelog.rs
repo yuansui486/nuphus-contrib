@@ -12,7 +12,7 @@ const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 ///
 /// 内容在编译期已确定，读取不可能失败，故没有错误分支——保留 `Result` 只为与前端
 /// `invoke` 的错误通道同形，调用方无需分支出错路径。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_changelog() -> Result<String, String> {
     Ok(CHANGELOG.to_string())
 }

@@ -12,7 +12,7 @@ const BINARY_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// 读取文件文本内容（≤2MB），供前端预览覆盖层渲染。
 /// 超过 2MB 或读取失败时返回错误信息，前端提示改用「系统打开」。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_file(path: String) -> Result<String, String> {
     let p = Path::new(&path);
     if !p.exists() {
@@ -33,7 +33,7 @@ pub fn read_file(path: String) -> Result<String, String> {
 
 /// 读取文件为 base64 字符串（≤8MB），供前端内联预览图片等二进制内容。
 /// 超过 8MB 或读取失败时返回错误信息，前端提示改用「系统打开」。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn read_file_base64(path: String) -> Result<String, String> {
     let p = Path::new(&path);
     if !p.exists() {
@@ -57,7 +57,7 @@ pub fn read_file_base64(path: String) -> Result<String, String> {
 /// 用系统默认程序打开文件/文件夹。
 /// 先做存在性检查：路径不存在时直接报错（而非让系统弹框/静默），
 /// 避免「点了打不开」无反馈的体验。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_path(path: String) -> Result<(), String> {
     let p = Path::new(&path);
     if !p.exists() {
@@ -94,7 +94,7 @@ pub fn open_path(path: String) -> Result<(), String> {
 /// 在文件管理器中定位文件。
 /// Windows 用 explorer /select,<path>（合并为单参数以正确处理含空格路径）。
 /// 同样先做存在性检查（explorer 对不存在路径会静默打开默认目录，具误导性）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reveal_path(path: String) -> Result<(), String> {
     let p = Path::new(&path);
     if !p.exists() {

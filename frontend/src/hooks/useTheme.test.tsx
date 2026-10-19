@@ -27,16 +27,19 @@ it('defaults Lingque to light both before paint and after mounting', () => {
   expect(localStorage.getItem('nuphus_theme')).toBeNull()
 })
 
-it.each<ThemeId>(['dark', 'light', 'tech'])('preserves the saved %s preference', theme => {
-  localStorage.setItem('nuphus_theme', theme)
-  expect(readBaseTheme('light')).toBe(theme)
-  render(
-    <ThemeProvider defaultTheme="light">
-      <CurrentTheme />
-    </ThemeProvider>,
-  )
-  expect(document.documentElement).toHaveAttribute('data-theme', theme)
-})
+it.each(['dark', 'light', 'fresh'] satisfies ThemeId[])(
+  'preserves the saved %s preference',
+  theme => {
+    localStorage.setItem('nuphus_theme', theme)
+    expect(readBaseTheme('light')).toBe(theme)
+    render(
+      <ThemeProvider defaultTheme="light">
+        <CurrentTheme />
+      </ThemeProvider>,
+    )
+    expect(document.documentElement).toHaveAttribute('data-theme', theme)
+  },
+)
 
 it('keeps the original edition default unchanged', () => {
   expect(readBaseTheme()).toBe('dark')
@@ -53,7 +56,7 @@ it.each([undefined, 'C:/theme/skin.png'])(
   skin => {
     localStorage.setItem(
       'nuphus_custom_themes',
-      JSON.stringify([{ id: 'saved', name: 'Saved', base: 'tech', overrides: {}, skin }]),
+      JSON.stringify([{ id: 'saved', name: 'Saved', base: 'fresh', overrides: {}, skin }]),
     )
     localStorage.setItem('nuphus_custom_active', 'saved')
     function RestoredTheme() {
@@ -69,7 +72,7 @@ it.each([undefined, 'C:/theme/skin.png'])(
         <RestoredTheme />
       </ThemeProvider>,
     )
-    expect(screen.getByTestId('restored')).toHaveTextContent('tech')
+    expect(screen.getByTestId('restored')).toHaveTextContent('fresh')
     expect(screen.getByTestId('restored')).toHaveAttribute('data-skin', skin ?? '')
   },
 )

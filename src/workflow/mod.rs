@@ -142,7 +142,10 @@ impl<'a> ActiveRunGuard<'a> {
         workflow_id: &str,
         source: &WorkflowRunSource,
     ) -> crate::Result<ActiveRunGuard<'a>> {
-        let mut slot = engine.active_run.lock().unwrap();
+        let mut slot = engine
+            .active_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = slot.as_ref() {
             if source.is_agent() {
                 return Err(crate::NuphusError::agent(format!(
@@ -156,7 +159,10 @@ impl<'a> ActiveRunGuard<'a> {
         }
         // Agent 自身发起：豁免 busy 检查（发起者即 busy 持有者）；Ui/Schedule/Plugin 双查
         if !source.is_agent() {
-            let busy_guard = engine.busy_provider.lock().unwrap();
+            let busy_guard = engine
+                .busy_provider
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cb) = busy_guard.as_ref() {
                 if cb() {
                     return Err(crate::NuphusError::agent(
@@ -180,7 +186,11 @@ impl<'a> ActiveRunGuard<'a> {
 
 impl Drop for ActiveRunGuard<'_> {
     fn drop(&mut self) {
-        *self.engine.active_run.lock().unwrap() = None;
+        *self
+            .engine
+            .active_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -202,7 +212,10 @@ impl WorkflowEngine {
 
     /// Set the schedule execution callback (called once at Tauri startup)
     pub fn set_schedule_exec_callback(&self, cb: ScheduleExecCallback) {
-        *self.schedule_exec.lock().unwrap() = Some(cb);
+        *self
+            .schedule_exec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cb);
     }
 
     // ── 全局执行闸门（大王铁律：无并行机制、禁止并行、系统操作更禁止并行）──
@@ -210,12 +223,18 @@ impl WorkflowEngine {
     /// 注入 Agent 执行态读取器（Tauri shell setup 注入读 AppState.busy 的闭包；
     /// 无宿主（单元测试 / headless）时为 None，视为空闲）
     pub fn set_busy_provider(&self, cb: BusyProvider) {
-        *self.busy_provider.lock().unwrap() = Some(cb);
+        *self
+            .busy_provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cb);
     }
 
     /// 当前 active workflow run（None = 空闲）
     pub fn active_run_info(&self) -> Option<ActiveRunInfo> {
-        self.active_run.lock().unwrap().clone()
+        self.active_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Set the LLM client
@@ -337,14 +356,15 @@ impl WorkflowEngine {
         // ── Pre-execution validation（与 execute_v2 内部校验同源）──
         // tool_schemas 提前构建，供校验与执行共用
         let tool_schemas = tool_schemas.or_else(|| self.tools.as_ref().map(|t| t.get_schemas()));
-        if let Some(wf) = store.get(workflow_id).await {
+        let workflow_snapshot = store.get(workflow_id).await;
+        if let Some(wf) = workflow_snapshot.as_ref() {
             let report = match tool_schemas.as_deref() {
-                Some(schemas) => Compiler::validate_workflow_with_tools(&wf, schemas),
-                None => Compiler::validate_workflow(&wf),
+                Some(schemas) => Compiler::validate_workflow_with_tools(wf, schemas),
+                None => Compiler::validate_workflow(wf),
             };
             // Call 目标存在性 + 循环调用链静态检测
             let mut errors = report.errors;
-            errors.extend(Compiler::validate_calls(&wf, store).await);
+            errors.extend(Compiler::validate_calls(wf, store).await);
             for w in &report.warnings {
                 tracing::warn!("Workflow validation warning: {}", w);
             }
@@ -353,6 +373,22 @@ impl WorkflowEngine {
                     "Workflow validation failed: {}",
                     errors.join("; ")
                 )));
+            }
+        }
+
+        // ── 定时的运行期复检：人类阻塞点 ──
+        // 保存期判过一次不等于触发时还成立：Call 的目标可能当时缺失（放行）之后被补齐，
+        // 子工作流也可能被改出等人的构造。绑定是快照，判据必须每次触发重算——否则无人时
+        // 跑到的就是一张停下来等人的工作流，白等到各自超时。
+        // 用与保存期同一个函数（scheduler::human_blocker_with_calls），两处不可能漂移。
+        if matches!(source, WorkflowRunSource::Schedule) {
+            if let Some(wf) = workflow_snapshot.as_ref() {
+                if let Some(reason) = scheduler::human_blocker_with_calls(&wf.steps, store, 0).await
+                {
+                    return Err(crate::NuphusError::agent(format!(
+                        "定时运行未执行：{reason}。该环节需要人在场，请改用手动运行或去掉它。"
+                    )));
+                }
             }
         }
 
@@ -446,7 +482,11 @@ impl WorkflowEngine {
             crate::NuphusError::agent(format!("Workflow not found: {workflow_id}"))
         })?;
         let wf_id = workflow_id.to_string();
-        let exec_cb = self.schedule_exec.lock().unwrap().clone();
+        let exec_cb = self
+            .schedule_exec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         self.scheduler
             .set_schedule_with_anchor(
                 &wf_id.clone(),
@@ -503,41 +543,62 @@ impl WorkflowEngine {
             "[Scheduler] Restoring {} persisted schedule(s)",
             persisted.schedules.len()
         );
+        let mut retained: std::collections::HashMap<
+            String,
+            crate::workflow::scheduler::ScheduleBinding,
+        > = std::collections::HashMap::new();
         for (wf_id, binding) in &persisted.schedules {
             let wf_id = wf_id.clone();
-            let Some(workflow) = self.store.get(&wf_id).await else {
-                tracing::warn!("[Scheduler] Removing orphan schedule for '{}'", wf_id);
-                continue;
-            };
-            let inputs = match binding.decode_inputs(&workflow.inputs) {
-                Ok(inputs) => inputs,
-                Err(error) => {
-                    tracing::error!(
-                        "[Scheduler] Removing schedule for '{}' after input decode failed: {}",
+            if let Some(workflow) = self.store.get(&wf_id).await {
+                let inputs = match binding.decode_inputs(&workflow.inputs) {
+                    Ok(inputs) => inputs,
+                    Err(error) => {
+                        tracing::error!(
+                            "[Scheduler] Removing schedule for '{}' after input decode failed: {}",
+                            wf_id,
+                            error
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = self
+                    .set_schedule_with_inputs_and_anchor(
+                        &wf_id,
+                        binding.config.clone(),
+                        inputs,
+                        binding.anchor_at,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "[Scheduler] Failed to restore schedule for '{}': {}",
                         wf_id,
-                        error
+                        e
                     );
-                    continue;
                 }
-            };
-            if let Err(e) = self
-                .set_schedule_with_inputs_and_anchor(
-                    &wf_id,
-                    binding.config.clone(),
-                    inputs,
-                    binding.anchor_at,
-                )
-                .await
-            {
-                tracing::warn!(
-                    "[Scheduler] Failed to restore schedule for '{}': {}",
-                    wf_id,
-                    e
-                );
+                continue;
             }
+            // get() 返回 None 有两种含义：工作流确实不存在，或 workflow.json
+            // 存在但损坏（反序列化失败被吞成 None，见 store.rs get 实现）。
+            // 只有前者才是真正的孤儿；后者调度数据仍然有效，删了就真丢了——
+            // 保留条目并让用户修复文件后重启即可恢复。
+            if self.store.validation_load_error(&wf_id).await.is_some() {
+                tracing::error!(
+                    "[Scheduler] Keeping schedule for '{}': workflow.json exists but is invalid; fix the file and restart to restore",
+                    wf_id
+                );
+                retained.insert(wf_id, binding.clone());
+                continue;
+            }
+            tracing::warn!("[Scheduler] Removing orphan schedule for '{}'", wf_id);
         }
         // set_schedule rewrites active bindings; this also removes orphan/invalid entries.
-        if let Err(error) = self.scheduler.persist_current().await {
+        // 损坏工作流的条目经 retained 合并保住，不会被本次落盘物理删除。
+        if let Err(error) = self
+            .scheduler
+            .persist_current_with_retained(&retained)
+            .await
+        {
             tracing::error!(
                 "[Scheduler] Failed to persist restored schedules: {}",
                 error
@@ -665,8 +726,12 @@ impl WorkflowEngine {
             })
             .collect();
 
-        let json_path = export_dir.join(format!("{}.json", safe_name));
-        let md_path = export_dir.join(format!("{}.md", safe_name));
+        // B8：导出命名隔离——导出件带 .export 中缀，杜绝与同目录固定名冲突。
+        // 名为 "workflow" 的工作流此前导出为 workflow.json，会覆盖自身活定义；
+        // 同目录固定名（workflow.json / params.json / guide.md / canvas.layout.json）
+        // 均无 .export 中缀，该方案与其不可能冲突。
+        let json_path = export_dir.join(format!("{}.export.json", safe_name));
+        let md_path = export_dir.join(format!("{}.export.md", safe_name));
 
         tokio::fs::write(&json_path, &json_content).await?;
         tokio::fs::write(&md_path, &md_content).await?;
@@ -810,6 +875,7 @@ mod gate_tests {
             default: None,
             description: None,
             sensitive: false,
+            options: None,
         }];
         engine.store.save(&workflow).await.unwrap();
 
@@ -868,6 +934,63 @@ mod gate_tests {
         engine.restore_schedules().await;
         let restored = engine.scheduler.load_current();
         assert!(restored.schedules.is_empty());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// B8 回归：名为 "workflow" 的工作流成功运行后自动导出，
+    /// 导出件必须带 .export 中缀，不得覆盖同目录的 workflow.json（活定义）。
+    #[tokio::test]
+    async fn export_never_overwrites_live_definition_for_workflow_named_workflow() {
+        let root = std::env::temp_dir().join(format!(
+            "nuphus_b8_export_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut engine = WorkflowEngine::new();
+        let store_root = root.join("plugin").join("workflows");
+        engine.store = WorkflowStore::with_root(store_root.clone());
+
+        let mut wf = Workflow::new("workflow");
+        wf.steps = vec![crate::workflow::types::Step {
+            id: "only".into(),
+            name: "echo".into(),
+            action: crate::workflow::types::Action::Tool {
+                tool: "mock_echo".into(),
+                with: serde_json::json!({}),
+            },
+            ..Default::default()
+        }];
+        let wf_id = wf.id.clone();
+        engine.store.save(&wf).await.unwrap();
+
+        // 预置活定义落盘内容（含独特标记），运行后必须原样保留
+        let live_path = store_root.join(&wf_id).join("workflow.json");
+        let original = std::fs::read_to_string(&live_path).unwrap();
+        assert!(original.contains(&wf_id), "预置定义应存在");
+
+        // 直接调用导出（execute_workflow 成功路径的自动导出即调用此函数）
+        let (json_path, md_path) = engine.export_workflow(&wf_id).await.unwrap();
+
+        // 活定义未被覆盖：内容与导出前一致
+        let after = std::fs::read_to_string(&live_path).unwrap();
+        assert_eq!(
+            after, original,
+            "名为 workflow 的工作流导出不得覆盖自身 workflow.json"
+        );
+
+        // 导出件落到隔离命名
+        assert!(
+            json_path.ends_with("workflow.export.json"),
+            "导出 JSON 应带 .export 中缀: {json_path}"
+        );
+        assert!(
+            md_path.ends_with("workflow.export.md"),
+            "导出 MD 应带 .export 中缀: {md_path}"
+        );
+        assert!(
+            std::path::Path::new(&json_path).exists(),
+            "导出 JSON 应真实写出"
+        );
+
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

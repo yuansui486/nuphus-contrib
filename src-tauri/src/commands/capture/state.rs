@@ -1,9 +1,8 @@
 //! 截图遮罩的交互状态机（**平台无关**）。
 //!
-//! 移植自 shot 项目 `shot/src/main.rs` 的 `Phase` / `Op` / `App` 及
-//! `app_ldown` / `app_move` / `app_lup` / `app_set_hover_target`。
+//! 定义 `Phase` / `Op` / `App` 及其状态迁移（按下 / 移动 / 松开 / hover 目标设定）。
 //!
-//! 与 shot 的差异：
+//! 设计约束：
 //!   · **无全局状态**：屏幕尺寸由调用方传入；动作通过返回值 `Action` 表达，
 //!     不在状态机里直接调退出/保存（那些属平台/编排层）。
 //!   · 纯计算：不碰 GDI、不碰文件、不做任何 IO。
@@ -211,6 +210,37 @@ impl App {
         }
     }
 
+    /// 键盘微调：确认相位下整框平移（方向键）。`dx`/`dy` 由调用方按步长给出。
+    ///
+    /// 返回 `true` = 本次按键被消费（调用方据此吞掉键盘消息，避免方向键漏到下层应用）。
+    ///
+    /// 允许越界：越界部分由渲染/裁剪沿屏幕边缘切掉 —— 与拖拽平移同一约定，
+    /// 在输入侧钳住会让贴边选区「按了没反应」。
+    pub fn nudge(&mut self, dx: i32, dy: i32) -> bool {
+        // 只有「选区已固定」的相位才有整框可调；Hover/Dragging/Exiting 一律不消费。
+        // 鼠标键仍按着（pending）时也不消费 —— 否则会打断正在进行的拖拽/缩放。
+        if !matches!(
+            self.phase,
+            Phase::Confirm | Phase::Moving | Phase::Adjusting
+        ) || self.pending
+        {
+            return false;
+        }
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+        let next = Sel::new(self.sel.x + dx, self.sel.y + dy, self.sel.w, self.sel.h);
+        if next == self.sel {
+            return false;
+        }
+        self.sel = next;
+        // 微调 = 鼠标拖拽平移的键盘等价物，落点相位回到 Confirm。
+        self.phase = Phase::Confirm;
+        self.op = Op::None;
+        self.dirty = true;
+        true
+    }
+
     /// 鼠标松开（单击与拖拽的分界）。
     pub fn on_lup(&mut self, _px: i32, _py: i32) {
         if self.pending && !self.started {
@@ -327,6 +357,38 @@ mod tests {
         let x = app.btn_x;
         let act = app.on_ldown((x.left + x.right) / 2, (x.top + x.bottom) / 2, 1920, 1080);
         assert_eq!(act, Action::Cancel);
+    }
+
+    #[test]
+    fn nudge_moves_selection_only_in_confirm_phases() {
+        let mut app = App::new(1920, 1080);
+        // Hover 相位（未固定选区）：不消费，选区不动
+        assert!(!app.nudge(1, 0));
+        assert_eq!(app.sel, Sel::new(0, 0, 1920, 1080));
+
+        app.set_hover_target(Some(Sel::new(100, 100, 300, 200)), 1920, 1080);
+        app.on_ldown(200, 200, 1920, 1080);
+        app.on_lup(200, 200);
+        assert_eq!(app.phase, Phase::Confirm);
+
+        // 确认相位：整框平移，尺寸不变
+        assert!(app.nudge(1, 0));
+        assert_eq!(app.sel, Sel::new(101, 100, 300, 200));
+        assert!(app.nudge(0, -1));
+        assert_eq!(app.sel, Sel::new(101, 99, 300, 200));
+        // 零位移不消费（不制造无意义重绘）
+        assert!(!app.nudge(0, 0));
+    }
+
+    #[test]
+    fn nudge_is_ignored_while_exiting() {
+        let mut app = App::new(1920, 1080);
+        app.set_hover_target(Some(Sel::new(100, 100, 300, 200)), 1920, 1080);
+        app.on_ldown(200, 200, 1920, 1080);
+        app.on_lup(200, 200);
+        app.enter_exiting();
+        assert!(!app.nudge(1, 0));
+        assert_eq!(app.sel, Sel::new(100, 100, 300, 200));
     }
 
     #[test]

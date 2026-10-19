@@ -19,6 +19,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 行尾闸门：仓库统一 LF（见 .gitattributes）。历史上曾出现「脚本改 1 行
+      # → 整个文件被转成 CRLF」导致 diff 里 2450 行全是噪音，review 与 blame 双双失效。
+      # 这里在装依赖之前先拦，失败只需几秒。
+      - name: Line endings must be LF
+        run: |
+          bad=$(git grep -Il $'\r' -- . ':!*.png' ':!*.jpg' ':!*.gif' ':!*.ico' \
+                ':!*.woff*' ':!*.dll' ':!*.exe' ':!*.so' ':!*.pdf' ':!*.zip' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::以下文件含 CRLF，请归一化为 LF（git add --renormalize .）："
+            echo "$bad"
+            exit 1
+          fi
+          echo "line endings OK"
+      # 标注 overlay 脚本的防漂移闸门：.rs 里的原始字符串必须与 .js 真源逐字节相同。
+      # 此前 CI 完全不跑它，等于这道防线无人执行——vitest 只做子串提取，不比对内容。
+      # 退出码契约：0=同步 / 1=漂移 / 2=无法判定。
+      - name: Annotation overlay script must be in sync
+        run: node frontend/tools/sync-overlay-script.mjs --check
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -131,7 +149,30 @@ jobs:
           stage_dir=$(mktemp -d)
           ditto target/debug/bundle/macos/Nuphus.app "$stage_dir/Nuphus.app"
           ln -s /Applications "$stage_dir/Applications"
-          hdiutil create -volname Nuphus -srcfolder "$stage_dir" -format UDZO nuphus-macos-arm64-rpa.dmg
+          # 重试 3 次：v0.2.26 release 打包已撞过 `hdiutil: create failed - Resource busy`
+          # （新 .app 刚落盘、Spotlight/文件系统仍在扫，一次性竞态，sleep 5s 重试即过），
+          # 本步骤同一竞态窗口。加 -ov 防残留同名文件。三次全败时输出环境快照，失败可自证。
+          dmg_created=0
+          for attempt in 1 2 3; do
+            if hdiutil create -volname Nuphus -srcfolder "$stage_dir" -ov -format UDZO nuphus-macos-arm64-rpa.dmg; then
+              echo "dmg created on attempt $attempt"
+              dmg_created=1
+              break
+            fi
+            echo "hdiutil create attempt $attempt failed, retrying in 5s"
+            sleep 5
+          done
+          if [ "$dmg_created" -ne 1 ]; then
+            echo "::group::hdiutil create failed — environment snapshot"
+            hdiutil list || true
+            hdiutil info || true
+            df -h || true
+            mount | grep -i -E 'nuphus|dmg' || true
+            mdutil -s / || true
+            ls -la nuphus-macos-arm64-rpa.dmg* 2>/dev/null || true
+            echo "::endgroup::"
+            exit 1
+          fi
           hdiutil verify nuphus-macos-arm64-rpa.dmg
           mount_dir=$(mktemp -d)
           hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" nuphus-macos-arm64-rpa.dmg

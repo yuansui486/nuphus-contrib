@@ -1,4 +1,5 @@
 //! 等待人工/模型介入步骤
+use super::control_flow;
 use super::*;
 
 impl Executor {
@@ -94,7 +95,7 @@ impl Executor {
         // 执行子步骤（如果有）
         let mut scope = variables.clone();
         for sub in auto {
-            if let Err(e) = self
+            if let Err(error) = self
                 .execute_step(
                     sub,
                     depth + 1,
@@ -111,9 +112,17 @@ impl Executor {
                 )
                 .await
             {
+                // B2：控制流信号穿透 wait.auto——提升变量后向上传播，
+                // 由最近一层 loop 消费；其余错误保持「log and continue」。
+                if control_flow::is_control_flow_error(&error).is_some() {
+                    for (k, v) in &scope {
+                        variables.insert(k.clone(), v.clone());
+                    }
+                    return Err(error);
+                }
                 // On error: log and continue (no early abort)
                 events.emit(WorkflowEvent::Error {
-                    message: format!("WaitStep '{}' step failed: {}", step.name, e),
+                    message: format!("WaitStep '{}' step failed: {}", step.name, error),
                 });
             }
         }

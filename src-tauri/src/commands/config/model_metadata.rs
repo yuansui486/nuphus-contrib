@@ -91,6 +91,15 @@ fn context(entry: Option<&toml::Value>) -> Option<usize> {
         .map(|n| n as usize)
 }
 
+/// 模型条目是否已声明 effort 档位（providers.toml 侧）。空数组 / 缺字段 /
+/// 条目不存在一律视为「未声明」——发现任务据此决定要不要探测。
+fn has_efforts(entry: Option<&toml::Value>) -> bool {
+    entry
+        .and_then(|m| m.get("reasoning_efforts"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
 // Ignore model metadata and display labels, but invalidate for endpoint, protocol,
 // headers, credentials and OAuth changes. Decrypt before hashing: DPAPI can encode
 // the same key differently on each save. This fingerprint stays in memory only.
@@ -242,7 +251,7 @@ fn schedule_inner<R: tauri::Runtime>(
                 return;
             }
         }
-        let mut result = discover_context(&cfg, &snapshot, &path, cached).await;
+        let mut result = discover_capabilities(&cfg, &snapshot, &path, cached).await;
         let state = app.state::<AppState>();
         let vision = state
             .runtime
@@ -284,7 +293,11 @@ fn schedule_inner<R: tauri::Runtime>(
     });
 }
 
-async fn discover_context(
+/// 能力发现（激活时后台跑一次）：上下文窗口 + 推理强度档位**各自独立补缺**。
+/// 为什么解耦：旧实现把 effort 发现挂在「context 缺失」条件上——context 一旦
+/// 落盘（绝大多数模型首次激活即补写），effort 就再也不探测，档位旋钮长期空转。
+/// 现在任缺其一即触发 /models 探测；探测与聚合库只**填空**，不覆写已有值。
+async fn discover_capabilities(
     cfg: &LlamaConfig,
     snapshot: &toml::Value,
     path: &Path,
@@ -302,7 +315,10 @@ async fn discover_context(
         .get(protocol)
         .map(|p| (p.auth_header().to_string(), p.auth_prefix().to_string()))
         .unwrap_or(("authorization".into(), "Bearer ".into()));
-    if context(model_entry(snapshot, &cfg.model)).is_none() && result.context.is_none() {
+    let entry = model_entry(snapshot, &cfg.model);
+    let needs_context = context(entry).is_none() && result.context.is_none();
+    let needs_efforts = !has_efforts(entry) && result.efforts.is_empty();
+    if needs_context || needs_efforts {
         let (probe_cfg, header, prefix) = (cfg.clone(), header.clone(), prefix.clone());
         if let Ok(Some(meta)) = tokio::task::spawn_blocking(move || {
             llm::query_model_metadata_from_api(
@@ -315,17 +331,56 @@ async fn discover_context(
         })
         .await
         {
-            result.context = meta.context_length.filter(|n| *n > 0);
-            result.efforts = meta.reasoning_efforts;
-            result.default_effort = meta.default_effort;
+            if result.context.is_none() {
+                result.context = meta.context_length.filter(|n| *n > 0);
+            }
+            if result.efforts.is_empty() {
+                result.efforts = meta.reasoning_efforts;
+                result.default_effort = meta.default_effort;
+            }
         }
-        if result.context.is_none() && aggregator::has_vendor(&cfg.provider) {
+        // ② 内置 ModelDef（编译期官方表，逐模型引用官方文档）。两层作用：
+        //    补「上游裸 /models 探测不到」的官方档位；刷新旧版本写入的存量值
+        //    （providers.toml 里 unchanged-since-dispatch 的 auto 数据可被覆写，
+        //    用户手改值有 merge 的漂移护栏保护）。按 (provider_type, 精确 id)
+        //    匹配——custom/local 的占位模型（custom-model 等）永不命中真实 id。
+        if result.efforts.is_empty() {
+            if let Some(p) = registry.get(protocol) {
+                if let Some(m) = p.models().iter().find(|m| m.id == cfg.model) {
+                    if !m.reasoning_efforts.is_empty() {
+                        result.efforts =
+                            m.reasoning_efforts.iter().map(|s| s.to_string()).collect();
+                        result.default_effort = m.default_effort.map(String::from);
+                    }
+                }
+            }
+        }
+        // ③ OpenRouter 聚合库（权威目录）。
+        //    · context 兜底保持原语义：仅厂商映射段（has_vendor）；
+        //    · efforts 兜底放开到全部段：厂商映射优先，中转 / 自建网关
+        //      （custom-*/opencode-go 等）走 tier-2 全目录唯一基名匹配 ——
+        //      中转站转发的大多是官方同名模型，能力数据可信；零或多命中不采信。
+        let want_vendor_ctx = result.context.is_none() && aggregator::has_vendor(&cfg.provider);
+        if want_vendor_ctx || result.efforts.is_empty() {
             if let Some(dir) = path.parent() {
                 let entries = aggregator::ensure_cache(&aggregator::cache_path(dir)).await;
-                result.context = aggregator::lookup(&entries, &cfg.provider, &cfg.model)
-                    .and_then(|entry| entry.context_length)
-                    .map(|n| n as usize)
-                    .filter(|n| *n > 0);
+                let vendor_lookup = || aggregator::lookup(&entries, &cfg.provider, &cfg.model);
+                if want_vendor_ctx {
+                    result.context = vendor_lookup()
+                        .and_then(|entry| entry.context_length)
+                        .map(|n| n as usize)
+                        .filter(|n| *n > 0);
+                }
+                if result.efforts.is_empty() {
+                    let lookup = vendor_lookup()
+                        .or_else(|| aggregator::lookup_generic(&entries, &cfg.model));
+                    if let Some(entry) = lookup {
+                        result.efforts = entry.supported_efforts.clone();
+                        result.default_effort = result
+                            .default_effort
+                            .or_else(|| entry.default_effort.clone());
+                    }
+                }
             }
         }
     }
@@ -534,6 +589,81 @@ mod tests {
         assert!(is_current(&runtime, &cfg, 2));
         runtime.llm_config.as_mut().unwrap().model = "another".into();
         assert!(!is_current(&runtime, &cfg, 2));
+    }
+
+    #[test]
+    fn has_efforts_gate_drives_discovery() {
+        let seg = |models: &str| {
+            let doc: toml::Value = format!("[[providers]]\nname='p'\n{models}")
+                .parse()
+                .unwrap();
+            segment(&doc, "p").unwrap().clone()
+        };
+        // 条目存在但未声明 / 空数组 → 需要探测
+        assert!(!has_efforts(model_entry(
+            &seg("[[providers.models]]\nid='m'\n"),
+            "m"
+        )));
+        assert!(!has_efforts(model_entry(
+            &seg("[[providers.models]]\nid='m'\nreasoning_efforts=[]\n"),
+            "m"
+        )));
+        // 已声明非空 → 不重复探测
+        assert!(has_efforts(model_entry(
+            &seg("[[providers.models]]\nid='m'\nreasoning_efforts=['low','high']\n"),
+            "m"
+        )));
+        // 条目不存在 → 视为未声明（调用方按 miss 处理）
+        assert!(!has_efforts(model_entry(
+            &seg("[[providers.models]]\nid='m'\n"),
+            "other"
+        )));
+    }
+
+    #[test]
+    fn discovery_persists_efforts_when_entry_lacks_them() {
+        let (cfg, mut doc, snapshot, key) = fixture();
+        let result = Discovery {
+            efforts: vec!["low".into(), "high".into(), "max".into()],
+            default_effort: Some("high".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge(&mut doc, &cfg, &snapshot, &key, &result),
+            Some((true, None))
+        );
+        let entry = &doc["providers"][0]["models"][0];
+        assert_eq!(
+            entry["reasoning_efforts"],
+            toml::Value::Array(vec!["low".into(), "high".into(), "max".into()])
+        );
+        assert_eq!(entry["default_effort"], toml::Value::String("high".into()));
+    }
+
+    #[test]
+    fn discovery_does_not_clobber_user_edited_efforts() {
+        let (cfg, mut doc, snapshot, key) = fixture();
+        // 发现任务派发后用户手改了档位（doc 相对 snapshot 漂移）→ 不得覆写。
+        // 注意：toml::Value 的 IndexMut 对缺失键直接 panic，必须走 as_table_mut 插入。
+        doc["providers"][0]["models"][0]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "reasoning_efforts".into(),
+                toml::Value::Array(vec!["low".into()]),
+            );
+        let result = Discovery {
+            efforts: vec!["low".into(), "high".into(), "max".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            merge(&mut doc, &cfg, &snapshot, &key, &result),
+            Some((false, None))
+        );
+        assert_eq!(
+            doc["providers"][0]["models"][0]["reasoning_efforts"],
+            toml::Value::Array(vec!["low".into()])
+        );
     }
 
     #[test]

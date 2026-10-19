@@ -63,6 +63,8 @@ $ReleaseApi = 'https://api.github.com/repos/mrpulor-gh/nuphus'
 # Release API 的 sha256 digest 对账，对不上即删除换源；取不到 digest 时只允许 GitHub 权威源，
 # 未校验的镜像产物不得进入 npm 包。
 $MirrorUrls = @('https://gh-proxy.com', 'https://cors.isteed.cc')
+# 共享下载内核：curl --resolve 锁快节点直连（IWR 走域名会落慢节点、大文件停滞，见其头注）
+. (Join-Path $PSScriptRoot 'lib\mirror-download.ps1')
 # 访问 GitHub API 需经代理的机器设此环境变量，如 http://127.0.0.1:2081
 $ApiProxy = $(if ($env:NUPHUS_GITHUB_PROXY) { $env:NUPHUS_GITHUB_PROXY } else { '' })
 $Registry   = 'https://registry.npmjs.org'
@@ -216,10 +218,18 @@ function Get-Asset($p, $version) {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Step "Downloading $assetName <- $($s.Uri)"
         try {
-            $req = @{ Uri = $s.Uri; OutFile = $tmp; UseBasicParsing = $true; TimeoutSec = 1200 }
-            # 镜像必须直连（叠本地代理会被限速回 40 KB/s）；只有裸 GitHub 域名才按需走代理
-            if ($s.Label -eq 'github' -and $ApiProxy) { $req['Proxy'] = $ApiProxy }
-            Invoke-WebRequest @req | Out-Null
+            # 镜像走共享内核（curl --resolve 锁快节点直连）；IWR 走域名会落慢节点、
+            # 大资产（>40MB）还会无征兆停滞（2026-10-15 实测，见 lib 头注）
+            if ($s.Label -like 'mirror*') {
+                if (-not (Invoke-MirrorDownload -Url $s.Uri -OutFile $tmp)) {
+                    throw "mirror download failed after retries: $($s.Uri)"
+                }
+            } else {
+                # 裸 GitHub 域名按需走本地代理（镜像绝不叠代理，叠了限速回 40 KB/s）
+                $req = @{ Uri = $s.Uri; OutFile = $tmp; UseBasicParsing = $true; TimeoutSec = 1200 }
+                if ($ApiProxy) { $req['Proxy'] = $ApiProxy }
+                Invoke-WebRequest @req | Out-Null
+            }
             if (-not (Test-Path $tmp)) { throw 'download produced no file' }
             $size = (Get-Item $tmp).Length
             if ($size -le 0) { throw 'zero-byte file' }

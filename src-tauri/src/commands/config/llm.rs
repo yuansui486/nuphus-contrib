@@ -24,6 +24,25 @@ use nuphus::agent::events::{EventEmitter, NuphusEvent};
 use nuphus::config::registry::ProviderRegistry;
 use tauri::{Manager, State};
 
+pub(crate) fn oauth_segment(name: &str) -> bool {
+    get_config_path().is_some_and(|p| nuphus::config::auth_state::provider_auth(&p, name).has_oauth)
+}
+
+fn authentication_ready(provider: &str, has_key: bool) -> bool {
+    let auth = get_config_path()
+        .map(|path| nuphus::config::auth_state::provider_auth(&path, provider))
+        .unwrap_or_default();
+    if auth.oauth_configured {
+        auth.has_oauth
+    } else {
+        has_key
+    }
+}
+
+fn oauth_entry(entry: &toml::Value) -> bool {
+    nuphus::config::auth_state::oauth_entry(entry)
+}
+
 /// OpenRouter aggregate cache path — next to providers.toml (config dir).
 fn openrouter_cache_path() -> std::path::PathBuf {
     let dir = get_config_path()
@@ -81,7 +100,7 @@ pub fn load_llm_config_from_disk(state: &crate::state::AppState) {
                         .any(|m| m.get("id").and_then(|i| i.as_str()) == Some(model))
                 })
                 .unwrap_or(false);
-            if has_model && !k.is_empty() {
+            if has_model && (!k.is_empty() || oauth_entry(entry)) {
                 let hit = (
                     name.to_string(),
                     model.to_string(),
@@ -125,7 +144,7 @@ pub fn load_llm_config_from_disk(state: &crate::state::AppState) {
                 let k_raw = entry.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
                 let k = nuphus::cookies::decrypt_secret(k_raw).unwrap_or_default();
                 let u = entry.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
-                if !k.is_empty() && !name.is_empty() {
+                if (!k.is_empty() || oauth_entry(entry)) && !name.is_empty() {
                     let model = entry
                         .get("models")
                         .and_then(|arr| arr.as_array())
@@ -133,7 +152,12 @@ pub fn load_llm_config_from_disk(state: &crate::state::AppState) {
                         .and_then(|m| m.get("id").and_then(|id| id.as_str()))
                         .unwrap_or("");
                     if !model.is_empty() {
-                        p = name.to_string();
+                        p = if oauth_entry(entry) {
+                            entry["name"].as_str().unwrap_or(name)
+                        } else {
+                            name
+                        }
+                        .to_string();
                         m = model.to_string();
                         bu = u.to_string();
                         key = k.to_string();
@@ -148,7 +172,7 @@ pub fn load_llm_config_from_disk(state: &crate::state::AppState) {
         }
     };
 
-    if api_key.is_empty() || model_id.is_empty() {
+    if (api_key.is_empty() && !oauth_segment(&provider_name)) || model_id.is_empty() {
         return;
     }
 
@@ -556,13 +580,13 @@ fn notify_binding_issues<R: tauri::Runtime>(
 }
 
 /// Get current agent-level model configuration (advanced settings).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_agent_models(state: State<'_, AppState>) -> Result<AgentModels, String> {
     Ok(load_agent_models(&state.llm_config_path))
 }
 
 /// 计算某 mode 的生效模型（前端输入框显示用）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_effective_model(state: State<'_, AppState>, mode: String) -> Result<String, String> {
     let registry = nuphus::config::load_registry().map_err(|e| format!("加载模型配置失败: {e}"))?;
     Ok(effective_model(&state.llm_config_path, &registry, &mode))
@@ -575,7 +599,7 @@ pub fn get_effective_model(state: State<'_, AppState>, mode: String) -> Result<S
 /// （model 与 `get_effective_model` 复用同一 `effective_model` 解析点保证一致，
 /// provider 走 `resolve_model_provider_core`）。同 id 跨 provider（官方
 /// deepseek vs opencode-go）时前端双全等勾选靠本命令落对卡片。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_provider_context(
     state: State<'_, AppState>,
     mode: String,
@@ -591,7 +615,7 @@ pub fn get_provider_context(
 /// 删掉 provider 键写出「有 model 无 provider」的半绑定 → 解析时静默回落 leader。
 /// provider 缺省时由 `resolve_agent_binding_provider` 消歧：唯一候选自动补全，
 /// 多候选/无候选显式报错（不静默写半绑定）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_agent_model(
     state: State<'_, AppState>,
     agent: String,
@@ -638,13 +662,21 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
     mode: Option<String>,
 ) -> Result<String, String> {
     // Read the target provider's stored API key from config.toml.
+    if get_config_path().is_some_and(|path| {
+        let auth = nuphus::config::auth_state::provider_auth(&path, &provider);
+        auth.oauth_configured && !auth.has_oauth
+    }) {
+        return Err("请先完成该账号的 OAuth 授权登录".into());
+    }
     //
     // 自定义中转站允许无 key 切换（Ollama / llama-swap / 无鉴权网关：地址自己填，
     // 本就不需要鉴权）—— 空串表示「不携带鉴权头」。前提是配置段已存在，否则切换会
     // 「成功」但请求无处可发；官方远程服务商保持原强制校验，避免空鉴权头串台。
     let api_key = match read_provider_api_key_from_config_toml(&provider) {
         Some(k) => k,
-        None if is_custom_segment_name(&provider) && provider_segment_exists(&provider) => {
+        None if oauth_segment(&provider)
+            || (is_custom_segment_name(&provider) && provider_segment_exists(&provider)) =>
+        {
             String::new()
         }
         None => {
@@ -748,15 +780,15 @@ pub async fn switch_model_impl<R: tauri::Runtime>(
     // 只在用户主动切换模型这一自然时机做，不引入定时器/轮询。
     notify_binding_issues(&app, &state.llm_config_path);
 
-    // Push notification if model or provider changed
+    // 模型切换提示改一次性消费账本：只登记挂起（双字段比对 + 切回撤销由
+    // agent.queue_model_notice 按「上次实际使用绑定」权威裁决），等用户下次发
+    // 消息后的首次 LLM 请求以 transient 形态注入一次——不再 push_system 永久
+    // 驻留会话（旧行为导致提示每轮重发，同 session 内可积十余条）。
     if let Some((prev_provider, prev_model)) = prev_binding {
         if prev_provider != resolved_provider || prev_model != resolved_model {
             let mut guard = state.runtime.lock().map_err(|e| e.to_string())?;
             if let Some(agent) = guard.leader_agent.as_mut() {
-                agent.session_mut().push_system(format!(
-                    "当前模型已切换至 {}（provider: {}）",
-                    resolved_model, resolved_provider
-                ));
+                agent.queue_model_notice(&resolved_provider, &resolved_model);
             }
         }
     }
@@ -974,12 +1006,15 @@ pub async fn configure_llm(
         ));
     }
 
-    // Check if this is a model switch (re-config vs initial setup)
-    let prev_model = state
-        .runtime
-        .lock()
-        .ok()
-        .and_then(|g| g.llm_config.as_ref().map(|c| c.model.clone()));
+    // Check if this is a model switch (re-config vs initial setup) —
+    // (provider, model) 双字段：同名模型跨 provider 切换也算切换
+    // （旧实现只比 model，且 resolved_provider != cfg.provider 恒为假，
+    // provider 维度的切换被漏判）。
+    let prev_binding = state.runtime.lock().ok().and_then(|g| {
+        g.llm_config
+            .as_ref()
+            .map(|c| (c.provider.clone(), c.model.clone()))
+    });
 
     // 协议类型 = provider_kind_for_segment 的解析结果（自定义实例解析回 custom /
     // anthropic）。落盘（新建段）与内置默认模型都以此为准，只解析一次。
@@ -1063,15 +1098,14 @@ pub async fn configure_llm(
     }
     let generation = super::model_metadata::activate(&state, &cfg, context_window)?;
 
-    // Push system notification if model actually changed (re-config, not initial setup)
-    if let Some(prev) = prev_model {
-        if prev != resolved_model || resolved_provider != cfg.provider {
+    // 模型切换提示改一次性消费账本（同 switch_model_impl）：只登记挂起，
+    // 由 agent.queue_model_notice 按「上次实际使用绑定」双字段裁决（切回即撤销），
+    // 下次 LLM 请求 transient 注入一次。prev 为 None = 首次配置，不登记。
+    if let Some((prev_provider, prev_model)) = prev_binding {
+        if prev_provider != resolved_provider || prev_model != resolved_model {
             let mut guard = state.runtime.lock().map_err(|e| e.to_string())?;
             if let Some(agent) = guard.leader_agent.as_mut() {
-                agent.session_mut().push_system(format!(
-                    "当前模型已切换至 {}（provider: {}）",
-                    resolved_model, resolved_provider
-                ));
+                agent.queue_model_notice(&resolved_provider, &resolved_model);
             }
         }
     }
@@ -1088,7 +1122,7 @@ pub async fn configure_llm(
 ///
 /// Preserves the provider entry (name / base_url / models) — only `api_key`
 /// is emptied. Idempotent: unknown providers return `Ok(())` without changes.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_provider_api_key(state: State<'_, AppState>, provider: String) -> Result<(), String> {
     let toml_config_path = get_config_path().or_else(|| {
         let fallback = state.llm_config_path.with_file_name("providers.toml");
@@ -1118,7 +1152,7 @@ pub fn clear_provider_api_key(state: State<'_, AppState>, provider: String) -> R
 ///   refine 阈值与桌面/手机上下文占用展示立即按新窗口计算
 /// - 找不到对应 provider/model 条目时返回明确错误（写盘原语对缺失静默 Ok，
 ///   此处回读校验把「未生效」暴露给 UI，禁止假装保存成功）
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_model_context_window(
     state: State<'_, AppState>,
     provider: String,
@@ -1179,7 +1213,7 @@ pub fn set_model_context_window(
 /// - 回读校验：写盘原语对「找不到条目」是静默 Ok，这里把「没写进去」暴露给 UI，
 ///   禁止假装保存成功。
 /// - 只改模型元数据，不动当前主模型 / 视觉模型绑定。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_model_supports_vision(
     state: State<'_, AppState>,
     provider: String,
@@ -1237,7 +1271,7 @@ pub fn set_model_supports_vision(
 /// - 回读校验：写盘原语对「找不到条目」是静默 Ok，这里把「没写进去」
 ///   暴露给 UI，禁止假装保存成功。
 /// - 只改模型元数据，不动当前生成能力绑定（capabilities.image_generation）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_model_supports_image_generation(
     state: State<'_, AppState>,
     provider: String,
@@ -1287,7 +1321,7 @@ pub fn set_model_supports_image_generation(
     ))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let configured_providers = list_configured_providers();
 
@@ -1300,7 +1334,7 @@ pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Valu
         if let Some(cfg) = guard.llm_config.as_ref() {
             return Ok(serde_json::json!({
                 "api_key": &cfg.api_key,
-                "has_key": !cfg.api_key.is_empty(),
+                "has_key": !cfg.api_key.is_empty() || oauth_segment(&cfg.provider),
                 "model": cfg.model,
                 "provider": cfg.provider,
                 "base_url": cfg.base_url,
@@ -1321,7 +1355,7 @@ pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Valu
                     if model.id == current_model {
                         return Ok(serde_json::json!({
                             "api_key": &provider.api_key,
-                            "has_key": !provider.api_key.is_empty(),
+                            "has_key": !provider.api_key.is_empty() || provider.oauth.as_ref().is_some_and(|o| o.has_credentials()),
                             "model": current_model,
                             "provider": provider.name,
                             "base_url": provider.base_url,
@@ -1346,7 +1380,7 @@ pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Valu
     match guard.llm_config.as_ref() {
         Some(cfg) => Ok(serde_json::json!({
             "api_key": &cfg.api_key,
-            "has_key": !cfg.api_key.is_empty(),
+            "has_key": !cfg.api_key.is_empty() || oauth_segment(&cfg.provider),
             "model": cfg.model,
             "provider": cfg.provider,
             "base_url": cfg.base_url,
@@ -1356,7 +1390,7 @@ pub fn get_current_config(state: State<'_, AppState>) -> Result<serde_json::Valu
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn is_llm_configured(state: State<'_, AppState>) -> Result<bool, String> {
     let guard = state.runtime.lock().map_err(|e| e.to_string())?;
 
@@ -1380,7 +1414,7 @@ pub fn is_llm_configured(state: State<'_, AppState>) -> Result<bool, String> {
                                     entry.get("api_key").and_then(|k| k.as_str()).unwrap_or("");
                                 let base_url =
                                     entry.get("base_url").and_then(|u| u.as_str()).unwrap_or("");
-                                if !api_key.is_empty() && !name.is_empty() {
+                                if (!api_key.is_empty() || oauth_entry(entry)) && !name.is_empty() {
                                     let model_id = entry
                                         .get("models")
                                         .and_then(|m| m.as_array())
@@ -1394,7 +1428,12 @@ pub fn is_llm_configured(state: State<'_, AppState>) -> Result<bool, String> {
                                         guard.llm_config = Some(LlamaConfig {
                                             api_key: api_key.to_string(),
                                             model: model_id.to_string(),
-                                            provider: provider_type.to_string(),
+                                            provider: if oauth_entry(entry) {
+                                                name
+                                            } else {
+                                                provider_type
+                                            }
+                                            .to_string(),
                                             base_url: base_url.to_string(),
                                             parameters: None,
                                             reasoning_effort: None,
@@ -1426,18 +1465,58 @@ pub fn is_llm_configured(state: State<'_, AppState>) -> Result<bool, String> {
         // Re-acquire lock
         let guard = state.runtime.lock().map_err(|e| e.to_string())?;
         match guard.llm_config.as_ref() {
-            Some(cfg) => Ok(!cfg.api_key.is_empty() && cfg.api_key.len() >= 10),
+            Some(cfg) => Ok(authentication_ready(
+                &cfg.provider,
+                !cfg.api_key.is_empty() && cfg.api_key.len() >= 10,
+            )),
             None => Ok(false),
         }
     } else {
         match guard.llm_config.as_ref() {
-            Some(cfg) => Ok(!cfg.api_key.is_empty() && cfg.api_key.len() >= 10),
+            Some(cfg) => Ok(authentication_ready(
+                &cfg.provider,
+                !cfg.api_key.is_empty() && cfg.api_key.len() >= 10,
+            )),
             None => Ok(false),
         }
     }
 }
 
-#[tauri::command]
+/// 推理档位的三源解析（纯函数，`list_models` 与单测共用）。
+///
+/// 信任链：providers.toml 显式 > builtin ModelDef（provider 限定）> OpenRouter
+/// 聚合库兜底。**诚实显示**是硬规则：任一级为空数组即视为「该级无数据」，
+/// 绝不用空数组、更不用别家数据充数——上游取不到就不显示档位旋钮
+/// （自定义中转段尤其如此：relay 自己的 /v1/models 大多不暴露 effort 元数据，
+/// 能显示的只有聚合目录里的同名模型档位，取不到就不显示）。
+///
+/// default 继承：toml 显式 default 置信最高（发现链落盘过的），各级只在自己的
+/// efforts 非空时才贡献档位值；全空时保留 toml default（无档位时前端本就不
+/// 渲染旋钮，无副作用）。
+pub(crate) fn resolve_effort_tiers(
+    toml_efforts: &[String],
+    toml_default: Option<&str>,
+    builtin: Option<(&[&str], Option<&str>)>,
+    or_entry: Option<(&[String], Option<&str>)>,
+) -> (Vec<String>, Option<String>) {
+    if !toml_efforts.is_empty() {
+        return (toml_efforts.to_vec(), toml_default.map(String::from));
+    }
+    if let Some((efforts, default)) = builtin {
+        if !efforts.is_empty() {
+            let tiers = efforts.iter().map(|s| s.to_string()).collect();
+            return (tiers, toml_default.or(default).map(String::from));
+        }
+    }
+    if let Some((efforts, default)) = or_entry {
+        if !efforts.is_empty() {
+            return (efforts.to_vec(), toml_default.or(default).map(String::from));
+        }
+    }
+    (Vec::new(), toml_default.map(String::from))
+}
+
+#[tauri::command(async)]
 pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::ModelInfo>, String> {
     use nuphus::config::ModelRegistry;
 
@@ -1468,32 +1547,16 @@ pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::Model
             // 那是错贴不是兜底——miss 就 miss，effort 旋钮缺失好过贴错值。
             let builtin_meta =
                 builtin.find_model_for_provider(provider.provider_type.as_str(), &model.id);
-            let (mut reasoning_efforts, mut default_effort) = if !model.reasoning_efforts.is_empty()
-            {
-                (
-                    model.reasoning_efforts.clone(),
-                    model.default_effort.clone(),
-                )
-            } else {
-                match builtin_meta {
-                    Some(m) => (
-                        m.reasoning_efforts.iter().map(|s| s.to_string()).collect(),
-                        m.default_effort.map(|s| s.to_string()),
-                    ),
-                    None => (
-                        model.reasoning_efforts.clone(),
-                        model.default_effort.clone(),
-                    ),
-                }
-            };
-            if reasoning_efforts.is_empty() {
-                if let Some(entry) = &or_entry {
-                    if !entry.supported_efforts.is_empty() {
-                        reasoning_efforts = entry.supported_efforts.clone();
-                        default_effort = default_effort.or_else(|| entry.default_effort.clone());
-                    }
-                }
-            }
+            // 三源解析（纯函数 + 单测见 resolve_effort_tiers）：toml > builtin >
+            // OpenRouter 兜底，任一级空数组即「无数据」，绝不拿空数组充数。
+            let (reasoning_efforts, default_effort) = resolve_effort_tiers(
+                &model.reasoning_efforts,
+                model.default_effort.as_deref(),
+                builtin_meta.map(|m| (m.reasoning_efforts, m.default_effort)),
+                or_entry
+                    .as_ref()
+                    .map(|e| (e.supported_efforts.as_slice(), e.default_effort.as_deref())),
+            );
             // Cost（USD / 百万 tokens）：providers.toml 显式值优先（信任链最高层）；
             // 否则 OpenRouter 聚合库定价 ×1_000_000；均无 → None（未知，前端不展示）。
             let (cost_in, cost_out) = match (model.cost_per_million_in, model.cost_per_million_out)
@@ -1515,6 +1578,7 @@ pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::Model
             };
             models.push(nuphus::api::ModelInfo {
                 id: model.id.clone(),
+                transport: model.transport,
                 provider: provider.name.clone(),
                 alias: model.alias.clone(),
                 supports_streaming: model.supports_streaming,
@@ -1549,7 +1613,7 @@ pub fn list_models(_state: State<'_, AppState>) -> Result<Vec<nuphus::api::Model
 /// —— 「刷新」按官方 /v1/models 同步时会移除清单外的 auto 条目，manual 条目必须
 /// 存活；能力元数据缺失时 ctx 显示未知（?），可经 RowCtxEditor 手动补充或首次
 /// 调用时探测。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_provider_model(provider: String, model_id: String) -> Result<(), String> {
     let model_id = model_id.trim().to_string();
     if model_id.is_empty() {
@@ -1574,20 +1638,31 @@ pub fn add_provider_model(provider: String, model_id: String) -> Result<(), Stri
     add_provider_model_entry(&config_path, &provider, provider_type.as_str(), &model_id).map(|_| ())
 }
 
+/** 协议覆盖写入精确的 provider/model 条目，None 恢复服务商默认值。 */
+#[tauri::command(async)]
+pub fn set_model_transport(
+    provider: String,
+    model: String,
+    transport: Option<nuphus::config::provider::TransportKind>,
+) -> Result<(), String> {
+    let path = get_config_path().ok_or("Provider configuration not found")?;
+    nuphus::config::model::set_model_transport(&path, &provider, &model, transport)
+}
+
 /// 清空某服务商的模型列表（config.toml `[[providers]].models` → []）。
 ///
 /// 场景：接口地址（base_url）变更后，旧模型条目可能在新地址失效——
 /// 模型代号不存在（调用报 model not found）或同名模型能力不同（ctx/视觉
 /// 元数据不匹配）。前端「接口地址已变更」提示条调用；仅清 models，
 /// 保留 name / provider_type / base_url / api_key。返回清除条目数（幂等）。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn clear_provider_models(provider: String) -> Result<usize, String> {
     let config_path =
         get_config_path().ok_or_else(|| "无法定位 config.toml 配置路径".to_string())?;
     clear_provider_models_in_config_toml(&config_path, &provider)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_default_model(_state: State<'_, AppState>) -> Result<String, String> {
     use nuphus::config::ModelRegistry;
 
@@ -1604,7 +1679,7 @@ pub fn get_default_model(_state: State<'_, AppState>) -> Result<String, String> 
 /// Read the reasoning-effort value configured for a provider
 /// (config.toml `[[providers]] reasoning_effort`). `null` = not configured /
 /// provider default (transport sends no `reasoning_effort`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_reasoning_effort(
     _state: State<'_, AppState>,
     provider: String,
@@ -1615,7 +1690,7 @@ pub fn get_reasoning_effort(
 /// Persist a reasoning-effort value for a provider into config.toml and update
 /// the in-memory LlamaConfig so the next client build picks it up.
 /// `effort: null` or empty clears the setting (provider default).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_reasoning_effort(
     state: State<'_, AppState>,
     provider: String,
@@ -2201,7 +2276,7 @@ impl CapabilitySource for ProviderCapabilitySource<'_> {
 /// 读取某服务商已保存的接口地址（界面回填用）：未配置返回 null。
 /// 前端在切换服务商时据此还原「接口地址」输入框——否则切回页面即空，
 /// 用户会误以为配置丢失，检测/刷新也会拿着空值去回落内置默认地址。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_provider_base_url(provider: String) -> Option<String> {
     read_provider_base_url_from_config_toml(&provider)
 }
@@ -2224,7 +2299,7 @@ pub struct ProviderInfo {
     pub oauth: Option<super::oauth::OauthSummaryDto>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_supported_providers() -> Result<Vec<ProviderInfo>, String> {
     let mut providers = ProviderRegistry::builtin()
         .list_info()
@@ -2333,7 +2408,7 @@ fn custom_provider_config_path(state: &AppState) -> std::path::PathBuf {
 ///
 /// 前置校验故意放这里而不是只靠前端：命令是可被任意 invoke 的公开入口，
 /// 「name 非空」这类不变量必须在后端也成立一次。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_custom_provider(state: State<'_, AppState>, name: String) -> Result<bool, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -2356,7 +2431,7 @@ pub fn remove_custom_provider(state: State<'_, AppState>, name: String) -> Resul
 /// 存在旧 `custom` 段时执行升级迁移（见 `create_custom_provider_segment`）。
 /// `oauth`：可选 OAuth 订阅配置（授权端点等五项）；Some → 该实例以 OAuth 令牌
 /// 作为请求凭证（登录后由令牌路径维护），None → 静态 api_key 模式。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_custom_provider(
     state: State<'_, AppState>,
     name: String,
@@ -2418,7 +2493,7 @@ pub fn create_custom_provider(
 /// `api_key` 空串 = 保持原密钥不变（编辑表单留空即「不修改密钥」）；非空才覆盖。
 /// `headers`：自定义标头全量提交，空数组 = 清除已存标头（见 `update_custom_provider_segment`）。
 /// `oauth`：Some → 覆盖写 OAuth 配置五项（既有令牌保留）；None → 不动 OAuth 配置。
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_custom_provider(
     state: State<'_, AppState>,
     name: String,
@@ -2474,7 +2549,7 @@ pub fn update_custom_provider(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_capabilities(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     use nuphus::config::ModelRegistry;
 
@@ -2506,6 +2581,8 @@ pub fn get_capabilities(state: State<'_, AppState>) -> Result<serde_json::Value,
         "image_generation_provider": caps.image_generation_provider,
         "video_generation": caps.video_generation,
         "video_generation_provider": caps.video_generation_provider,
+        // 网页搜索源：值是 provider 段名（不是模型 id）
+        "web_search_source": caps.web_search_source,
         "chat_agent_max_iterations": caps.chat_agent_max_iterations,
     });
 
@@ -2515,32 +2592,55 @@ pub fn get_capabilities(state: State<'_, AppState>) -> Result<serde_json::Value,
 
 /// Model capability metadata discovered from the provider's /models endpoint.
 /// Kimi additionally exposes per-model reasoning-effort capability
-/// (`think_efforts { valid_efforts, default_effort }`); providers that return
-/// bare id lists (DeepSeek/MiniMax) simply yield empty efforts.
+/// (`think_efforts { valid_efforts, default_effort }`); OpenAI-compatible
+/// gateways (OpenRouter 及其同族) 用 `reasoning { supported_efforts,
+/// default_effort }`；只返回裸 id 列表的（DeepSeek/MiniMax…）解析为空。
 pub(super) struct ModelApiMetadata {
     pub context_length: Option<usize>,
     pub reasoning_efforts: Vec<String>,
     pub default_effort: Option<String>,
 }
 
-/// Extract reasoning-effort capability from a /models model entry.
-/// Known shape: Kimi `think_efforts { valid_efforts[], default_effort }`.
-fn extract_reasoning_efforts(m: &serde_json::Value) -> (Vec<String>, Option<String>) {
-    if let Some(te) = m.get("think_efforts") {
-        let efforts = te
-            .get("valid_efforts")
-            .and_then(|v| v.as_array())
+/// 字符串数组提取（容忍单字符串写法）。
+fn efforts_from_array(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| {
+        v.as_array()
             .map(|a| {
                 a.iter()
                     .filter_map(|e| e.as_str().map(String::from))
                     .collect()
             })
-            .unwrap_or_default();
+            .or_else(|| v.as_str().map(|s| vec![s.to_string()]))
+    })
+    .unwrap_or_default()
+}
+
+/// Extract reasoning-effort capability from a /models model entry.
+/// 已知官方形状（按序探测，先命中先返回）：
+/// ① Kimi：`think_efforts { valid_efforts[], default_effort }`
+///    （platform.kimi.ai 官方 /models 扩展字段）；
+/// ② OpenAI 兼容族：`reasoning { supported_efforts[], default_effort }`
+///    （OpenRouter 模型目录每模型的 reasoning 对象，同族网关同形状）。
+fn extract_reasoning_efforts(m: &serde_json::Value) -> (Vec<String>, Option<String>) {
+    if let Some(te) = m.get("think_efforts") {
+        let efforts = efforts_from_array(te.get("valid_efforts"));
         let default = te
             .get("default_effort")
             .and_then(|v| v.as_str())
             .map(String::from);
-        return (efforts, default);
+        if !efforts.is_empty() || default.is_some() {
+            return (efforts, default);
+        }
+    }
+    if let Some(r) = m.get("reasoning") {
+        let efforts = efforts_from_array(r.get("supported_efforts"));
+        let default = r
+            .get("default_effort")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if !efforts.is_empty() || default.is_some() {
+            return (efforts, default);
+        }
     }
     (Vec::new(), None)
 }
@@ -2787,7 +2887,7 @@ fn extract_context(obj: &serde_json::Value, ctx_keys: &[&str]) -> Option<usize> 
     None
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_context_limit(state: State<'_, AppState>) -> Result<usize, String> {
     // 1. Prefer backend cached value (real model window set during configure_llm /
     //    startup calibration). 0 = unknown — kept as-is (never guessed).
@@ -2822,6 +2922,102 @@ pub async fn startup_model_calibration(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 诚实显示：三源全空 → 空档位（custom 中转取不到就不显示旋钮）
+    #[test]
+    fn resolve_effort_tiers_empty_everywhere_is_empty() {
+        assert_eq!(
+            resolve_effort_tiers(&[], None, None, None),
+            (Vec::new(), None)
+        );
+        // 各级「有条目但空数组」同样不算数据
+        assert_eq!(
+            resolve_effort_tiers(&[], None, Some((&[], None)), Some((&[], None))),
+            (Vec::new(), None)
+        );
+        // 仅 OR 有条目但空数组（无推理能力模型）→ 不采纳
+        let or_empty: Vec<String> = Vec::new();
+        assert_eq!(
+            resolve_effort_tiers(&[], None, None, Some((&or_empty, Some("high")))),
+            (Vec::new(), None)
+        );
+    }
+
+    /// 信任链：toml > builtin > OR；各级空数组不阻断下一级
+    #[test]
+    fn resolve_effort_tiers_trust_chain_and_skips_empty_levels() {
+        let or_efforts = vec!["max".to_string(), "high".into(), "low".into()];
+        // toml 优先（含 toml default 胜出）
+        let (t, d) = resolve_effort_tiers(
+            &["high".into(), "max".into()],
+            Some("high"),
+            Some((&["low", "medium"], Some("low"))),
+            Some((&or_efforts, Some("max"))),
+        );
+        assert_eq!(t, vec!["high", "max"]);
+        assert_eq!(d.as_deref(), Some("high"));
+        // toml 空 + builtin 非空 → builtin
+        let (t, d) = resolve_effort_tiers(
+            &[],
+            None,
+            Some((&["low", "medium", "high"], Some("medium"))),
+            Some((&or_efforts, Some("max"))),
+        );
+        assert_eq!(t, vec!["low", "medium", "high"]);
+        assert_eq!(d.as_deref(), Some("medium"));
+        // toml 空 + builtin 空数组 + OR 非空 → OR（空数组级被跳过）
+        let (t, d) = resolve_effort_tiers(
+            &[],
+            Some("medium"),
+            Some((&[], None)),
+            Some((&or_efforts, Some("max"))),
+        );
+        assert_eq!(t, vec!["max", "high", "low"]);
+        assert_eq!(
+            d.as_deref(),
+            Some("medium"),
+            "toml 显式 default 优先于 OR default"
+        );
+    }
+
+    /// /models 条目的 effort 能力提取：两种官方形状 + 裸列表。
+    /// ① Kimi `think_efforts`；② OpenAI 兼容族 `reasoning.supported_efforts`。
+    #[test]
+    fn extract_reasoning_efforts_both_official_shapes() {
+        // Kimi 形状（platform.kimi.ai 官方 /models 扩展）
+        let kimi = serde_json::json!({
+            "id": "kimi-k3",
+            "think_efforts": {"valid_efforts": ["low", "high", "max"], "default_effort": "max"},
+        });
+        assert_eq!(
+            extract_reasoning_efforts(&kimi),
+            (
+                vec!["low".to_string(), "high".into(), "max".into()],
+                Some("max".into())
+            )
+        );
+
+        // OpenAI 兼容族形状（OpenRouter 目录的 reasoning 对象）
+        let or_style = serde_json::json!({
+            "id": "grok-4.6",
+            "reasoning": {"supported_efforts": ["low", "medium", "high", "xhigh"], "default_effort": "high"},
+        });
+        assert_eq!(
+            extract_reasoning_efforts(&or_style),
+            (
+                vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+                Some("high".into())
+            )
+        );
+
+        // 裸 id 列表（DeepSeek/MiniMax…）：解析为空，交由 builtin/聚合库兜底
+        let bare = serde_json::json!({"id": "deepseek-flash"});
+        assert_eq!(extract_reasoning_efforts(&bare), (Vec::new(), None));
+
+        // think_efforts 存在但字段畸形 → 落 ② 形状；两者皆无 → 空
+        let broken = serde_json::json!({"think_efforts": {"default_effort": null}});
+        assert_eq!(extract_reasoning_efforts(&broken), (Vec::new(), None));
+    }
 
     /// 上游 /models 条目的上下文字段解析：只认**输入侧**窗口字段。
     /// 钉子：`max_tokens`（输出上限）绝不可能是上下文窗口。

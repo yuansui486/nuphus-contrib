@@ -4,12 +4,12 @@
 
 use nuphus::annotation::types::Annotation;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_annotations() -> Result<Vec<Annotation>, String> {
     Ok(nuphus::annotation::store::AnnotationStore::list())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_annotation(
     keyword: String,
     description: String,
@@ -31,7 +31,7 @@ pub fn add_annotation(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_annotation(
     keyword: String,
     description: Option<String>,
@@ -50,7 +50,7 @@ pub fn update_annotation(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_annotation(keyword: String) -> Result<(), String> {
     nuphus::annotation::store::AnnotationStore::remove(&keyword)
 }

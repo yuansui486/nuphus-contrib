@@ -1,4 +1,4 @@
-/** Keep atomic progress receipts for history reconciliation, not separate UI bubbles. */
+/** Fold consecutive assistant rounds in persisted history (leader-identical semantics). */
 export function foldAssistantHistory<
   T extends {
     role: string
@@ -14,12 +14,7 @@ export function foldAssistantHistory<
     if (message.message_id && seen.has(message.message_id)) continue
     if (message.message_id) seen.add(message.message_id)
     const prev = out[out.length - 1]
-    if (
-      message.role === 'assistant' &&
-      prev?.role === 'assistant' &&
-      message.kind !== 'progress' &&
-      prev.kind !== 'progress'
-    ) {
+    if (message.role === 'assistant' && prev?.role === 'assistant') {
       out[out.length - 1] = {
         ...prev,
         ...message,
@@ -75,16 +70,11 @@ export function composeAssistantReplies<
 >(messages: T[]): T[] {
   const out: T[] = []
   const seen = new Set<string>()
-  let hasProgress = false
   for (const message of messages) {
     if (message.message_id && seen.has(message.message_id)) continue
     if (message.message_id) seen.add(message.message_id)
     const prev = out[out.length - 1]
-    if (
-      message.role === 'assistant' &&
-      prev?.role === 'assistant' &&
-      (hasProgress || message.kind === 'progress')
-    ) {
+    if (message.role === 'assistant' && prev?.role === 'assistant') {
       out[out.length - 1] = {
         ...prev,
         ...message,
@@ -98,10 +88,8 @@ export function composeAssistantReplies<
         images: [...new Set([...(prev.images ?? []), ...(message.images ?? [])])],
         audio: [...new Set([...(prev.audio ?? []), ...(message.audio ?? [])])],
       }
-      hasProgress = true
     } else {
       out.push(message.reply_id ? { ...message, id: message.reply_id } : message)
-      hasProgress = message.kind === 'progress'
     }
   }
   // Tool-only placeholders have their own activity line, never an empty chat bubble.

@@ -127,6 +127,108 @@
   border-color: var(--glass-3);
   color: var(--spark-primary);
 }
+/* 浏览器按钮：与设置/外观按钮逐字同款磨砂配方（--panel-bg 62% + blur(8px)
+   saturate(1.2) + 30x30 + radius 8 + hover 85% 档），不引新审美。
+   同样分开写而不合并选择器：opacity-system.test.ts 按单选择器取各按钮的
+   声明块，合并会让回归断言静默落空。 */
+.chat-header-browser-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: all var(--transition-fast);
+}
+.chat-header-browser-btn:hover {
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  border-color: var(--glass-3);
+  color: var(--spark-primary);
+}
+/* 启动中（pending）：冷启动要拉起整个 Chrome 进程，期间按钮禁用——后端浏览器是单槽
+   串行的，连点只会把等待排成队。图标自转 + 降不透明度表达「在处理」，文案由岛
+   （island）/ HUD 承担，按钮上不重复。keyframes 自带（不复用 ink.css 里的 spin）：
+   本文件不保证 components.css 已加载。 */
+.chat-header-browser-btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+  /* 压回未 hover 的档位：禁用态不该再被 :hover 提亮 */
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+}
+/* ── header 右侧按钮列的 hover 名称浮层 ──
+   仿桌面工具条 .desktop-toolbar-label 的配方（同一视觉语言）：常态隐藏，hover /
+   focus-visible 时绝对定位向左浮出——按钮列贴窗口右缘，向左是唯一不出屏的方向。
+   原先这三个按钮只有浏览器原生 title（灰底方框、延迟约1s、跟随系统样式），
+   与工具条不一致，故统一为本浮层。
+
+   ⚠️ 两条纪律：
+   ① 只新增本选择器，**不改** .chat-header-settings-btn / -appearance-btn /
+   -browser-btn 三条本体规则的既有声明 —— opacity-system.test.ts:236 按单选择器
+   取 .chat-header-settings-btn 的声明块做断言，合并选择器会让那条回归静默落空。
+   ② position:relative 是**新增**属性而非改写：三个按钮原本没有定位上下文，
+   浮层会以 .chat-header-right（position:relative）为包含块 → 三个浮层会重叠在
+   同一位置。给按钮自身加 relative 才能让各浮层贴各自按钮浮出。 */
+.chat-header-settings-btn,
+.chat-header-appearance-btn,
+.chat-header-browser-btn {
+  position: relative;
+}
+.chat-header-btn-label {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 8px);
+  transform: translateY(-50%);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--fg-1);
+  font-size: var(--fz-xs);
+  line-height: 1;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity var(--transition-fast),
+    visibility var(--transition-fast);
+}
+.chat-header-settings-btn:hover > .chat-header-btn-label,
+.chat-header-appearance-btn:hover > .chat-header-btn-label,
+.chat-header-browser-btn:hover > .chat-header-btn-label,
+.chat-header-settings-btn:focus-visible > .chat-header-btn-label,
+.chat-header-appearance-btn:focus-visible > .chat-header-btn-label,
+.chat-header-browser-btn:focus-visible > .chat-header-btn-label {
+  opacity: 1;
+  visibility: visible;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-header-btn-label {
+    transition: none;
+  }
+}
+
+.chat-header-browser-btn.is-busy svg {
+  animation: chat-header-browser-spin 0.8s linear infinite;
+}
+@keyframes chat-header-browser-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-header-browser-btn.is-busy svg {
+    animation: none;
+  }
+}
 .chat-messages {
   flex: 1;
   /* min-height: 0 —— 滚动链的最后一环。本元素是 .chat-panel（纵向 flex）的 item，
@@ -136,6 +238,10 @@
      .chat-panel(min-height:0) → .chat-messages(本处，overflow-y:auto)。 */
   min-height: 0;
   overflow-y: auto;
+  /* overflow-anchor: none —— 关掉浏览器的滚动锚定。默认锚定会在流式内容增长时反向
+     调整 scrollTop，与 useStickyScroll 的贴底互相打架（「被流式顶起」的根因之一）；
+     关掉后内容增长只改 scrollHeight、不改 scrollTop，跟随态不会因增长被误改。 */
+  overflow-anchor: none;
   padding: 0;
 }
 .chat-messages-inner {
@@ -164,7 +270,7 @@
   to {
     box-shadow:
       0 0 8px rgba(var(--accent-rgb), 0.3),
-      0 2px 6px #0000004d;
+      var(--shadow-surface);
   }
   50% {
     box-shadow:
@@ -462,6 +568,32 @@
   justify-content: center;
   width: 36px;
 }
+/* ── Mood 头像固定默认色（2026-10-07 大王令：SVG 用默认色，不随主题变化）──
+   MoodFace 内部全部 stroke/fill="currentColor"，颜色由 .mood-face.* 的 color 决定。
+   此处限定 .thinking-mood-box 作用域覆写为固定色值（取默认/暗色主题的语义色）：
+   该组中等亮度，亮卡片与暗卡片底上均清晰可读；若取亮色主题套，
+   墨黑 #111 在深色 indicator 卡上不可见，故不取。
+   语义区分保留：idle/thinking/读写/检索/编码=蓝、working/waiting/analyzing=琥珀、
+   success=绿、error=红。全局 .mood-face.*（ChatPanel 等处）仍走主题色，不变。 */
+.thinking-mood-box .mood-face.idle,
+.thinking-mood-box .mood-face.thinking,
+.thinking-mood-box .mood-face.reading,
+.thinking-mood-box .mood-face.writing,
+.thinking-mood-box .mood-face.searching,
+.thinking-mood-box .mood-face.coding {
+  color: #3b82f6;
+}
+.thinking-mood-box .mood-face.working,
+.thinking-mood-box .mood-face.waiting,
+.thinking-mood-box .mood-face.analyzing {
+  color: #f59e0b;
+}
+.thinking-mood-box .mood-face.success {
+  color: #10b981;
+}
+.thinking-mood-box .mood-face.error {
+  color: #ef4444;
+}
 /* ── 中间内容 ── */
 .thinking-body {
   flex: 1;
@@ -568,12 +700,61 @@
   width: 680px;
   max-width: 92vw;
   max-height: 80vh;
+  /* 定位包含块：右下角「收起」按钮（.exec-trace-collapse-fab）的绝对定位依据。
+     必须在**非滚动容器**上 —— 若改给滚动容器 .execution-trace-body 加 relative，
+     Chromium 会把按钮钉在内容坐标上随内容滚出视口（实测，同 .chat-messages-wrap
+     一节的结论），而那正是本按钮要救的场景。 */
+  position: relative;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   box-shadow:
     0 8px 48px var(--overlay-bg),
     0 0 0 1px var(--glass-0) inset;
+}
+/* ── UI 卡片模式：thinking 展开的常驻「收起」出口 ──
+   悬浮在内容区右下角（不随内容滚动）：展开态出现、收起后消失，见 ExecutionTraceFloating
+   的 uiExpandedThinking。bottom 让开 footer（边框 1 + 上下 padding 10+10 + 按钮 34
+   ≈ 55px，再留 ~11px 呼吸），别压住「点评 / 重新生成」。 */
+.exec-trace-collapse-fab {
+  position: absolute;
+  right: 16px;
+  bottom: 66px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 11px;
+  border: 1px solid var(--glass-3);
+  border-radius: 999px;
+  /* 磨砂配方逐字复用 .chat-jump-bottom（--panel-bg 派生兑透明 + blur + saturate 小芯片档）：
+     控制面板不透明度滑块遍历得到，不用不透明硬色。 */
+  background: color-mix(in srgb, var(--panel-bg) 62%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  color: var(--spark-secondary);
+  font-family: inherit;
+  font-size: var(--fz-xs);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+  animation: exec-trace-fab-in 160ms ease both;
+}
+.exec-trace-collapse-fab:hover {
+  /* hover 抬高实度（同一支键的更高混合比），不是换不透明色 */
+  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  color: var(--spark-primary);
+}
+@keyframes exec-trace-fab-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .execution-trace-header {
   display: flex;
@@ -599,7 +780,9 @@
 }
 .exec-topbar-meta {
   font-size: var(--fz-xs);
-  color: var(--spark-muted);
+  /* 头部「N 调用」计数走 --fg-3（弱文本级）：原 --spark-muted = --fg-4，
+     在三个主题下对面板底分别只有 ≈4.0/2.8/2.8:1，数字看不清。 */
+  color: var(--fg-3);
   font-weight: 400;
   font-family: var(--font-mono);
 }
@@ -670,6 +853,8 @@
 .execution-trace-body {
   flex: 1;
   overflow-y: auto;
+  /* 同 .chat-messages：关掉浏览器滚动锚定，避免流式增长反向调整 scrollTop 与贴底打架 */
+  overflow-anchor: none;
   padding: 10px 12px;
 }
 .execution-trace-placeholder {
@@ -677,6 +862,32 @@
   padding: 40px 0;
   color: var(--spark-muted);
   font-size: var(--fz-md);
+}
+/* ── 历史折叠行（执行追踪：只完整渲染最近 N 条，更早的收进这里）──
+   两类容器共用：终端模式挂 .execution-terminal-lines 内、卡片模式挂
+   .execution-trace-body 内，宽度吃满各自的内容盒，无需为容器再加 padding。 */
+.trace-history-fold {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--radius-3);
+  background: transparent;
+  color: var(--fg-3);
+  font-family: var(--font-ui);
+  font-size: var(--fz-xs);
+  text-align: center;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.trace-history-fold:hover {
+  background: var(--surface-hover);
+  border-color: var(--line-3);
+  color: var(--fg-2);
 }
 .tc-option {
   display: flex;
@@ -695,7 +906,9 @@
 }
 .tc-option-indicator {
   font-size: 10px;
-  color: var(--glass-3);
+  /* 每行「步骤序号」：原 --glass-3 是**背景**用键（深色 白 7% / 浅色 黑 4%），
+     当文字色用近乎不可见（≈1.1:1）。改用前景语义键 --fg-3。 */
+  color: var(--fg-3);
   font-family: var(--font-mono);
   min-width: 16px;
   text-align: right;
@@ -1913,61 +2126,6 @@
   from {
     opacity: 0;
     transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* ── 选中文字 → 引用浮条（固定定位，z-index 高于 .chat-jump-bottom 的 30）──
-   位置由 JS 按松手时光标内联给定（left/top 即浮条左上角，不再居中于选区），
-   贴边翻转见 ChatPanel.handleMessagesMouseUp。
-   这里只管外观与指针事件：mousedown 必须 preventDefault，
-   否则焦点转移会清掉 selection，点击时已读不到原文。 */
-.quote-float {
-  position: fixed;
-  z-index: 40;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 1px solid var(--glass-3);
-  border-radius: var(--radius-2);
-  background: color-mix(in srgb, var(--panel-bg) 88%, transparent);
-  backdrop-filter: blur(10px) saturate(1.3);
-  -webkit-backdrop-filter: blur(10px) saturate(1.3);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
-  color: var(--spark-secondary);
-  font-family: var(--font-ui);
-  font-size: 12px;
-  line-height: 1.2;
-  white-space: nowrap;
-  cursor: pointer;
-  animation: quote-float-in 120ms ease both;
-  transition:
-    color 120ms ease,
-    border-color 120ms ease,
-    transform 120ms ease,
-    box-shadow 120ms ease;
-}
-
-.quote-float:hover {
-  color: var(--spark-primary);
-  border-color: var(--accent);
-  transform: translateY(-1px);
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.34);
-}
-
-.quote-float:active {
-  transform: translateY(0);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
-}
-
-@keyframes quote-float-in {
-  from {
-    opacity: 0;
-    transform: translateY(-2px);
   }
   to {
     opacity: 1;
