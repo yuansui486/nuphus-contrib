@@ -758,9 +758,6 @@ pub fn resolve_project_root() -> PathBuf {
 /// 所有运行时**写入**路径应统一走这里；`resolve_project_root` 保留给路径信任
 /// 边界（workspace 内/外判定）等只读场景。
 pub fn nuphus_data_dir() -> PathBuf {
-    if let Some(root) = crate::profile::author_data_dir() {
-        return root;
-    }
     if crate::profile::WORKBENCH {
         return crate::profile::workbench_data_dir();
     }
@@ -1466,7 +1463,13 @@ pub fn memory_md_path(tag: Option<&str>) -> PathBuf {
         .map(sanitize_memory_tag)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
-    nuphus_data_dir().join("memory").join(format!("{t}.md"))
+    memory_data_dir().join("memory").join(format!("{t}.md"))
+}
+
+/// Only author memory is project-owned; MCP configuration, registered desktop
+/// applications and knowledge assets retain their upstream application paths.
+pub fn memory_data_dir() -> PathBuf {
+    crate::profile::author_data_dir().unwrap_or_else(nuphus_data_dir)
 }
 
 /// 当前生效的记忆文件路径——注入与工具写盘统一入口。

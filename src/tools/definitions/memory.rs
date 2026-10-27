@@ -417,7 +417,7 @@ impl ToolRegistry {
                 let ts = chrono::Local::now();
                 let sig = format!("[{} · {}]", ts.format("%m-%d %H:%M"), sid8);
 
-                let nuphus_dir = crate::utils::nuphus_data_dir();
+                let nuphus_dir = crate::utils::memory_data_dir();
                 let path = nuphus_dir.join("workflow-memory.md");
                 if let Err(e) = std::fs::create_dir_all(&nuphus_dir) {
                     return Ok(ToolResult::failure(format!("Failed to create dir: {}", e)));

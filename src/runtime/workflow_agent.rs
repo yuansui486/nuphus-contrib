@@ -484,7 +484,7 @@ impl WorkflowAgent {
     /// Inject workflow memory tail from workflow-memory.md（append 日志，最新条目）
     pub fn inject_memory_snapshot(&mut self) {
         if self.session.is_empty() {
-            let wmem_path = crate::utils::nuphus_data_dir().join("workflow-memory.md");
+            let wmem_path = crate::utils::memory_data_dir().join("workflow-memory.md");
             if wmem_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&wmem_path) {
                     // append 日志：只注入最新条目 tail（≤2000 字符），与 Leader memory journal 注入一致

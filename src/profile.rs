@@ -7,7 +7,7 @@ pub const WORKBENCH: bool = cfg!(feature = "workbench");
 type ProductGuard = Box<dyn Fn() -> std::result::Result<String, String> + Send + Sync>;
 static PRODUCT_GUARD: std::sync::OnceLock<ProductGuard> = std::sync::OnceLock::new();
 tokio::task_local! { pub static PRODUCT_EPOCH: String; }
-// Optional host-owned data root. Does not change process environment or upstream defaults.
+// Optional host-owned memory root. Does not change process environment or tool configuration.
 tokio::task_local! { pub static AUTHOR_DATA_DIR: PathBuf; }
 
 pub fn author_data_dir() -> Option<PathBuf> {

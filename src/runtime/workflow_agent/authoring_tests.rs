@@ -229,6 +229,7 @@ async fn authoring_refreshes_permissions_and_checks_host_session_each_call() {
 async fn authoring_data_stays_in_project_through_blocking_tools() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
+    let app_data = crate::utils::nuphus_data_dir();
     let mut tools = ToolRegistry::new();
     tools.register(crate::tools::registry::ToolDef {
         name: "authoring_test_data".into(),
@@ -248,7 +249,9 @@ async fn authoring_data_stays_in_project_through_blocking_tools() {
                 .query_row("SELECT count(*) FROM author_test", [], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
             Ok(ToolResult::success(
-                json!({"count":count,"root":crate::utils::nuphus_data_dir(),
+                json!({"count":count,"root":crate::utils::memory_data_dir(),
+                    "app_root":crate::utils::nuphus_data_dir(),
+                    "knowledge_index":crate::utils::knowledge_index_dir(),
                     "project":crate::utils::active_project(),
                     "tag":crate::utils::active_project_tag(),
                     "configured":crate::utils::has_configured_project_dir(),
@@ -280,6 +283,11 @@ async fn authoring_data_stays_in_project_through_blocking_tools() {
         let parsed: Value = serde_json::from_str(&result.output.unwrap()).unwrap();
         assert_eq!(parsed["count"], expected);
         assert_eq!(parsed["root"], root.to_string_lossy().as_ref());
+        assert_eq!(parsed["app_root"], app_data.to_string_lossy().as_ref());
+        assert_eq!(
+            parsed["knowledge_index"],
+            app_data.join("index").to_string_lossy().as_ref()
+        );
         assert_eq!(parsed["project"][1], parsed["root"]);
         assert_eq!(parsed["project"][0], parsed["tag"]);
         assert_eq!(parsed["configured"], true);
