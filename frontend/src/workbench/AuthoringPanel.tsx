@@ -14,6 +14,8 @@ import { useLanguage } from '../locales'
 import { IntentFormPanel } from '../main-window/workflow-canvas/IntentFormPanel'
 import { buildIntentTextTemplate } from '../main-window/workflow-canvas/intentText'
 import type { Draft } from './api'
+import { UserInputPrompt } from '../main-window/layout/UserInputPrompt'
+import { SecurityPrompt } from '../main-window/layout/SecurityPrompt'
 import './authoring.css'
 
 interface Props {
@@ -28,6 +30,8 @@ interface Props {
 }
 interface History {
   busy: boolean
+  turn_id?: string
+  pending?: AuthoringPrompt[]
   session?: {
     messages?: Array<{
       role: string
@@ -40,7 +44,26 @@ interface Progress {
   project_id: string
   workflow_id: string
   turn_id: string
-  event: { type: string; text?: string; name?: string; success?: boolean; delta?: boolean }
+  event: AuthoringPrompt & { text?: string; name?: string; success?: boolean; delta?: boolean }
+}
+
+interface AuthoringPrompt {
+  type: string
+  action_id?: string
+  title?: string
+  prompt?: string
+  sensitive?: boolean
+  input_type?: string
+  icon_path?: string
+  default_name?: string
+  default_shortcut?: string
+  rel_x?: number
+  rel_y?: number
+  default_note?: string
+  default_stage?: string
+  tool?: string
+  risk?: 'low' | 'medium' | 'high' | 'critical'
+  reason?: string
 }
 
 export function AuthoringPanel({
@@ -100,8 +123,13 @@ export function AuthoringPanel({
   const callbacks = useRef({ onBusyChange, onChanged })
   callbacks.current = { onBusyChange, onChanged }
   const identity = { projectId: draft.project_id, workflowId: draft.workflow_id }
+  const [prompts, setPrompts] = useState<AuthoringPrompt[]>([])
+  const activeTurn = useRef<string | undefined>(undefined)
+  const completedTurns = useRef(new Set<string>())
+  const eventSequence = useRef(0)
   const refreshHistory = useCallback(async () => {
     const sequence = ++historySequence.current
+    const eventsAtRequest = eventSequence.current
     const result = await invoke<History>('workbench_generate', {
       projectId: draft.project_id,
       workflowId: draft.workflow_id,
@@ -119,7 +147,12 @@ export function AuthoringPanel({
       }))
       .filter(message => message.text)
     setHistory(rows)
+    // A prompt or completion received while history was loading is newer
+    // than that snapshot. Do not resurrect its old busy/prompt state.
+    if (eventsAtRequest !== eventSequence.current) return
     setBusy(result.busy)
+    activeTurn.current = result.turn_id
+    setPrompts(result.pending ?? [])
     callbacks.current.onBusyChange(result.busy)
   }, [draft.project_id, draft.workflow_id])
   useEffect(() => {
@@ -127,6 +160,7 @@ export function AuthoringPanel({
     let initializingNow = false
     let stopListening: (() => void) | undefined
     mounted.current = true
+    activeTurn.current = undefined
     const onProgress = (payload: Progress) => {
       if (
         !alive ||
@@ -135,6 +169,25 @@ export function AuthoringPanel({
       )
         return
       const event = payload.event
+      if (completedTurns.current.has(payload.turn_id)) return
+      if (activeTurn.current && payload.turn_id !== activeTurn.current) return
+      if (!activeTurn.current) activeTurn.current = payload.turn_id
+      ++eventSequence.current
+      if (event.type !== 'completed') {
+        setBusy(true)
+        callbacks.current.onBusyChange(true)
+      }
+      if (event.type === 'user_input_request' || event.type === 'security_check') {
+        setPrompts(previous => [...previous.filter(p => p.action_id !== event.action_id), event])
+      }
+      if (event.type === 'prompt_timeout')
+        setPrompts(previous => previous.filter(p => p.action_id !== event.action_id))
+      if (event.type === 'run') callbacks.current.onChanged()
+      if (event.type === 'tool_result') {
+        setActivity(event.name ?? '')
+        if (['canvas_update', 'workflow_save', 'canvas_create'].includes(event.name ?? ''))
+          callbacks.current.onChanged()
+      }
       if (event.type === 'progress')
         setProgress(previous =>
           event.delta
@@ -151,6 +204,8 @@ export function AuthoringPanel({
       }
       if (event.type === 'error') setError(event.text ?? '')
       if (event.type === 'completed') {
+        completedTurns.current.add(payload.turn_id)
+        setPrompts([])
         setBusy(false)
         setCancelling(false)
         callbacks.current.onBusyChange(false)
@@ -234,6 +289,8 @@ export function AuthoringPanel({
     starting.current = true
     try {
       if (!(await beforeGenerate())) return
+      activeTurn.current = undefined
+      setPrompts([])
       setBusy(true)
       ++historySequence.current
       onBusyChange(true)
@@ -245,7 +302,12 @@ export function AuthoringPanel({
       setAwayFromBottom(false)
       const text = input
       try {
-        await invoke('workbench_generate', { ...identity, action: 'start', input: text })
+        const started = await invoke<{ turn_id: string }>('workbench_generate', {
+          ...identity,
+          action: 'start',
+          input: text,
+        })
+        if (!completedTurns.current.has(started.turn_id)) activeTurn.current = started.turn_id
         setHistory(previous => [...previous, { role: 'user', text }])
         setInput(current => (current === text ? '' : current))
       } catch (reason) {
@@ -259,6 +321,16 @@ export function AuthoringPanel({
       starting.current = false
     }
   }
+  const respond = async (actionId: string, response: Record<string, unknown>) => {
+    await invoke('workbench_generate', {
+      ...identity,
+      action: 'respond',
+      input: JSON.stringify({ ...response, action_id: actionId, turn_id: activeTurn.current }),
+    })
+    setPrompts(previous => previous.filter(p => p.action_id !== actionId))
+    return 'responded'
+  }
+  const pending = prompts[0]
   return (
     <aside
       id="wb-assistant-panel"
@@ -266,6 +338,48 @@ export function AuthoringPanel({
       hidden={collapsed}
       aria-label={ui('工作流助手', 'Workflow assistant')}
     >
+      {!collapsed && pending?.action_id && pending.type === 'user_input_request' && (
+        <UserInputPrompt
+          key={pending.action_id}
+          actionId={pending.action_id}
+          title={pending.title ?? ''}
+          prompt={pending.prompt ?? ''}
+          sensitive={pending.sensitive ?? false}
+          inputType={pending.input_type ?? 'text'}
+          iconPath={pending.icon_path}
+          defaultName={pending.default_name}
+          defaultShortcut={pending.default_shortcut}
+          relX={pending.rel_x}
+          relY={pending.rel_y}
+          defaultNote={pending.default_note}
+          defaultStage={pending.default_stage}
+          submitInput={(id, value) => respond(id, { value })}
+          rejectInput={id => respond(id, { cancelled: true })}
+          onSubmit={() => {}}
+          onReject={() => {}}
+        />
+      )}
+      {!collapsed && pending?.action_id && pending.type === 'security_check' && (
+        <SecurityPrompt
+          key={pending.action_id}
+          actionId={pending.action_id}
+          tool={pending.tool ?? ''}
+          risk={pending.risk ?? 'medium'}
+          reason={pending.reason ?? ''}
+          decide={async choice => {
+            try {
+              await respond(pending.action_id!, {
+                approved: choice !== 'deny',
+                session: choice === 'session',
+              })
+            } catch (reason) {
+              showError(reason)
+            }
+          }}
+          onApprove={() => {}}
+          onReject={() => {}}
+        />
+      )}
       <header className="wb-authoring-header">
         <h2>{ui('工作流助手', 'Workflow assistant')}</h2>
         <button className="wb-authoring-guided" disabled={busy} onClick={() => setGuided(true)}>

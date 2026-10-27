@@ -9,6 +9,7 @@ import { useLanguage } from '../../locales'
 import '../../styles/security.css'
 
 interface SecurityPromptProps {
+  decide?: (choice: string) => Promise<void>
   tool: string
   risk: 'low' | 'medium' | 'high' | 'critical'
   reason: string
@@ -25,6 +26,7 @@ const RISK_CONFIG: Record<string, { color: string; bg: string }> = {
 }
 
 export function SecurityPrompt({
+  decide,
   tool,
   risk,
   reason,
@@ -47,6 +49,16 @@ export function SecurityPrompt({
     async (choice: string) => {
       if (busy) return
       setBusy(true)
+      if (decide) {
+        try {
+          await decide(choice)
+          if (choice === 'deny') onReject(actionId)
+          else onApprove(actionId)
+        } finally {
+          setBusy(false)
+        }
+        return
+      }
       switch (choice) {
         case 'once':
           playUiSound('send')
@@ -65,7 +77,7 @@ export function SecurityPrompt({
           break
       }
     },
-    [actionId, tool, onApprove, onReject, busy],
+    [actionId, tool, onApprove, onReject, busy, decide],
   )
 
   const handleKeyDown = useCallback(

@@ -17,6 +17,8 @@ import { toAssetUrl } from '../../ui/assetUrl'
 import { INTENT_FORM_LIMITS } from '../workflow-canvas/intentTypes'
 
 interface UserInputPromptProps {
+  submitInput?: typeof submitUserInput
+  rejectInput?: typeof rejectUserInput
   title: string
   prompt: string
   sensitive: boolean
@@ -43,6 +45,8 @@ const CAPTURE_LABELS: Record<string, string> = {
 }
 
 export function UserInputPrompt({
+  submitInput = submitUserInput,
+  rejectInput = rejectUserInput,
   title,
   prompt,
   sensitive,
@@ -98,13 +102,13 @@ export function UserInputPrompt({
     if (busy || !value.trim()) return
     setBusy(true)
     try {
-      await submitUserInput(actionId, value)
+      await submitInput(actionId, value)
       onSubmit(actionId)
     } catch (e) {
       console.warn('submission failed:', e)
       setBusy(false)
     }
-  }, [busy, value, actionId, onSubmit])
+  }, [busy, value, actionId, onSubmit, submitInput])
 
   // ══════════════════════════════════════════
   // Capture submit (screenshot/region/...)
@@ -124,13 +128,13 @@ export function UserInputPrompt({
           ? { x: captureResult.region.x, y: captureResult.region.y }
           : undefined
       }
-      await submitUserInput(actionId, JSON.stringify(payload))
+      await submitInput(actionId, JSON.stringify(payload))
       onSubmit(actionId)
     } catch (e) {
       console.warn('submission failed:', e)
       setBusy(false)
     }
-  }, [busy, captureResult, actionId, onSubmit])
+  }, [busy, captureResult, actionId, onSubmit, submitInput])
 
   // ══════════════════════════════════════════
   // icon_confirm submit
@@ -146,13 +150,13 @@ export function UserInputPrompt({
       if (!isNaN(nx)) payload.rel_x = nx
       if (!isNaN(ny)) payload.rel_y = ny
       if (iconNote.trim()) payload.note = iconNote.trim()
-      await submitUserInput(actionId, JSON.stringify(payload))
+      await submitInput(actionId, JSON.stringify(payload))
       onSubmit(actionId)
     } catch (e) {
       console.warn('submission failed:', e)
       setBusy(false)
     }
-  }, [busy, iconName, iconShortcut, iconX, iconY, iconNote, actionId, onSubmit])
+  }, [busy, iconName, iconShortcut, iconX, iconY, iconNote, actionId, onSubmit, submitInput])
 
   // ══════════════════════════════════════════
   // step_form submit（JSON {stage, steps}，与 icon_confirm 同协议：submitUserInput(actionId, JSON.stringify(payload))）
@@ -165,13 +169,13 @@ export function UserInputPrompt({
         stage: stageName.trim(),
         steps: stepLines.map(l => l.trim()).filter(Boolean),
       }
-      await submitUserInput(actionId, JSON.stringify(payload))
+      await submitInput(actionId, JSON.stringify(payload))
       onSubmit(actionId)
     } catch (e) {
       console.warn('step_form submission failed:', e)
       setBusy(false)
     }
-  }, [busy, stepFormValid, stageName, stepLines, actionId, onSubmit])
+  }, [busy, stepFormValid, stageName, stepLines, actionId, onSubmit, submitInput])
 
   // step_form 行操作：受控数组更新 + 至少保底 1 行
   const updateStepLine = useCallback((index: number, text: string) => {
@@ -194,12 +198,14 @@ export function UserInputPrompt({
     if (busy) return
     setBusy(true)
     try {
-      await rejectUserInput(actionId)
-    } catch (_) {
-      /* ignore */
+      await rejectInput(actionId)
+    } catch (error) {
+      console.warn('rejection failed:', error)
+      setBusy(false)
+      return
     }
     onReject(actionId)
-  }, [busy, actionId, onReject])
+  }, [busy, actionId, onReject, rejectInput])
 
   // ══════════════════════════════════════════
   // Capture

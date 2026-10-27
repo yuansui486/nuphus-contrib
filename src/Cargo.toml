@@ -166,6 +166,7 @@ windows = { version = "0.56", features = [
 ] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio-test = "0.4"
 # store 层测试共享真实 DB（~/.nuphus/nuphus.db，无隔离）：latest_snapshot 等全局
 # 查询在并行测试下被污染（CI windows 实测 flaky）→ serial_test 串行化

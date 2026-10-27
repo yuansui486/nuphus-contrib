@@ -11,12 +11,48 @@ const mocks = vi.hoisted(() => ({
   listener: null as null | ((event: { payload: unknown }) => void),
   history: { busy: false, session: { messages: [] } } as {
     busy: boolean
+    turn_id?: string
+    pending?: Array<Record<string, unknown>>
     session: { messages: Array<{ role: string; content: Array<{ type: string; text: string }> }> }
   },
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 vi.mock('@tauri-apps/api/event', () => ({
   listen: mocks.listen,
+}))
+vi.mock('../main-window/layout/UserInputPrompt', () => ({
+  UserInputPrompt: ({
+    actionId,
+    title,
+    inputType,
+    submitInput,
+  }: {
+    actionId: string
+    title: string
+    inputType: string
+    submitInput: (id: string, value: string) => Promise<string>
+  }) => (
+    <div role="dialog" aria-label={title}>
+      <button
+        onClick={() => void submitInput(actionId, '{"stage":"Prepare","steps":["Open app"]}')}
+      >
+        Answer {inputType}
+      </button>
+    </div>
+  ),
+}))
+vi.mock('../main-window/layout/SecurityPrompt', () => ({
+  SecurityPrompt: ({
+    reason,
+    decide,
+  }: {
+    reason: string
+    decide: (choice: string) => Promise<void>
+  }) => (
+    <div role="dialog" aria-label={reason}>
+      <button onClick={() => void decide('session')}>Allow session</button>
+    </div>
+  ),
 }))
 vi.mock('../main-window/workflow-canvas/IntentFormPanel', () => ({
   IntentFormPanel: ({
@@ -119,6 +155,123 @@ beforeEach(() => {
 })
 
 describe('Workbench assistant', () => {
+  it('routes upstream structured input through the bound authoring turn', async () => {
+    setup()
+    await ready()
+    await emit('user_input_request', {
+      action_id: 'input-one',
+      title: 'Workflow details',
+      input_type: 'step_form',
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Answer step_form' }))
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        'workbench_generate',
+        expect.objectContaining({
+          projectId: 'project-one',
+          workflowId: 'flow-one',
+          action: 'respond',
+          input: JSON.stringify({
+            value: '{"stage":"Prepare","steps":["Open app"]}',
+            action_id: 'input-one',
+            turn_id: 'turn-one',
+          }),
+        }),
+      ),
+    )
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('restores pending upstream permission prompts and ignores other turns', async () => {
+    mocks.history = {
+      busy: true,
+      turn_id: 'active-turn',
+      pending: [
+        {
+          type: 'security_check',
+          action_id: 'permission-one',
+          tool: 'Write',
+          reason: 'File permission',
+        },
+      ],
+      session: { messages: [] },
+    }
+    setup()
+    await ready()
+    await emit('completed', { success: true, text: 'Stale completion' })
+    expect(screen.getByRole('dialog', { name: 'File permission' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Allow session' }))
+    await waitFor(() =>
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        'workbench_generate',
+        expect.objectContaining({
+          action: 'respond',
+          input: JSON.stringify({
+            approved: true,
+            session: true,
+            action_id: 'permission-one',
+            turn_id: 'active-turn',
+          }),
+        }),
+      ),
+    )
+  })
+
+  it('keeps a new prompt when an older history snapshot arrives late', async () => {
+    let resolveHistory: (value: typeof mocks.history) => void = () => {}
+    mocks.invoke.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveHistory = resolve
+        }),
+    )
+    setup()
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled())
+    await emit('user_input_request', {
+      action_id: 'new-input',
+      title: 'New question',
+      input_type: 'text',
+    })
+    await act(async () => resolveHistory({ busy: false, session: { messages: [] } }))
+    expect(screen.getByRole('dialog', { name: 'New question' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+  })
+
+  it('does not reopen a prompt from a completed turn', async () => {
+    setup()
+    await ready()
+    await emit('completed', { success: true })
+    await emit('user_input_request', {
+      action_id: 'old-input',
+      title: 'Expired question',
+      input_type: 'text',
+    })
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('keeps a permission prompt retryable when its response fails', async () => {
+    setup()
+    await ready()
+    await emit('security_check', {
+      action_id: 'permission-one',
+      tool: 'Write',
+      reason: 'File permission',
+    })
+    mocks.invoke.mockRejectedValueOnce(new Error('Response unavailable'))
+    fireEvent.click(screen.getByRole('button', { name: 'Allow session' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Response unavailable')
+    expect(screen.getByRole('dialog', { name: 'File permission' })).toBeInTheDocument()
+  })
+
+  it('refreshes canvas and run evidence when native authoring tools finish', async () => {
+    const { props } = setup()
+    await ready()
+    await emit('tool_result', { name: 'canvas_update', success: true })
+    await emit('run', { run_id: 'run-one' })
+    expect(props.onChanged).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
   it('joins streamed chunks without adding paragraph breaks between tokens', async () => {
     mocks.history = { busy: true, session: { messages: [] } }
     setup()

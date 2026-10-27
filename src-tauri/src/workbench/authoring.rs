@@ -9,81 +9,63 @@ struct Authoring {
     project: String,
     workflow: String,
     epoch: String,
+    cancel: Arc<AtomicBool>,
+    runs: Arc<Mutex<Vec<String>>>,
+    turn: String,
 }
 
-#[async_trait]
-impl WorkflowAuthoring for Authoring {
-    fn schemas(&self) -> Vec<ToolDefinition> {
-        let mut tools: Vec<_> = nuphus_workbench::catalog::operations()
-            .into_iter()
-            .filter(|op| {
-                matches!(
-                    op.name,
-                    "canvas.get" | "canvas.update" | "workflow.validate" | "workflow.save"
-                )
-            })
-            .map(|op| {
-                let mut schema = op.input_schema;
-                if let Some(props) = schema["properties"].as_object_mut() {
-                    props.remove("project_id");
-                    props.remove("workflow_id");
-                }
-                if let Some(required) = schema["required"].as_array_mut() {
-                    required.retain(|v| v != "project_id" && v != "workflow_id");
-                }
-                ToolDefinition {
-                    tool_type: "function".into(),
-                    function: FunctionDefinition {
-                        name: op.name.replace('.', "_"),
-                        description: Some(op.description.into()),
-                        parameters: schema,
-                        permission: None,
-                    },
-                }
-            })
-            .collect();
-        tools.push(ToolDefinition {
-            tool_type: "function".into(),
-            function: FunctionDefinition {
-                name: "workbench_schema".into(),
-                description: Some("Read the authoritative native step schema and workflow tool schemas. Filter tools by name fragment to limit context.".into()),
-                parameters: json!({"type":"object","properties":{"tool_filter":{"type":"string"}},"additionalProperties":false}),
-                permission: None,
-            },
-        });
-        tools
-    }
-    fn system_prompt(&self) -> String {
-        "You are Nuphus Workbench's workflow author, using the existing WorkflowAgent conversation runtime. Respond in the user's language. The active canvas is already bound to your tools; do not request project IDs. Use concise public text alongside tool calls to describe progress, then read canvas_get and workbench_schema. Create or modify the native Workflow IR using canvas_update with its exact current revision. Preserve existing user edits, IDs and fields not implicated by the request. On revision_conflict reread and reconcile, never blindly overwrite. Native validation is authoritative: validate, repair actionable errors, and publish with workflow_save when valid. Incomplete drafts can be stored without claiming they are runnable. UI canvas renders changes automatically. Do not write workflow files, invoke a shell, invent tools, or claim a run/test happened: this authoring panel edits but does not execute; the user starts a published version with Run. Deterministic tools, waits, conditions, loops, child workflows, inputs and Agent nodes use the existing step schema. Prefer semantic desktop targets, with mouse/OCR as supported alternatives when needed; don't fabricate live UI IDs or coordinates. If necessary live target information is missing, declare runtime inputs/observation steps or ask the user a concise question. A configured model is needed only for this generation and AI nodes, not deterministic execution. Give concise progress during longer work, finish with what changed and any unresolved validation issue. Never send private unrelated app content to a model.".into()
-    }
-    async fn execute(&self, tool: &str, params: &Value) -> nuphus::ToolResult {
-        let result: Result<Value> = async {
-            if self.service.host.session_epoch()?.unwrap_or_default() != self.epoch { return Err(ApiError::new("product_session_changed","旧生成任务已停止，请重新登录。")); }
-            let draft=self.service.store.draft(&self.project,&self.workflow)?;
-            if draft.authoring_mode != nuphus_workbench::AuthoringMode::Internal {
-                return Err(ApiError::new("authoring_mode_changed","This canvas switched to external authoring; stop this generation"));
-            }
-            if tool=="workbench_schema" {
-                let filter=params.get("tool_filter").and_then(Value::as_str).unwrap_or("");
-                let state=self.service.host.app.state::<crate::state::AppState>();
-                let schemas=state.tools.get_schemas().into_iter().filter(|s|nuphus::tools::registry::is_workflow_step_tool(&s.function.name) && s.function.name.contains(filter)).collect::<Vec<_>>();
-                return Ok(json!({"step_schema":serde_json::from_str::<Value>(include_str!("../../../src/workflow/step_schema.json"))?,"tools":schemas}));
-            }
-            let operation=match tool {
-                "canvas_get"=>"canvas.get", "canvas_update"=>"canvas.update",
-                "workflow_validate"=>"workflow.validate", "workflow_save"=>"workflow.save",
-                _=>return Err(ApiError::new("unknown_operation","Only canvas authoring tools are available here")),
-            };
-            let mut args=params.clone();
-            if !args.is_object() { return Err(ApiError::new("invalid_params","Object required")); }
-            args["project_id"]=json!(self.project);
-            args["workflow_id"]=json!(self.workflow);
-            self.service.dispatch(&Principal::LocalUi,operation,args).await
-        }.await;
-        match result {
-            Ok(value) => nuphus::ToolResult::success(value.to_string()),
-            Err(error) => nuphus::ToolResult::failure(error.to_string()),
+mod host;
+
+pub(super) struct Generation {
+    pub cancel: Arc<AtomicBool>,
+    signals: nuphus::state::SharedSignals,
+    pending: Arc<Mutex<HashMap<String, Value>>>,
+    turn: String,
+}
+
+impl Generation {
+    fn respond(&self, response: &Value) -> Result<Value> {
+        if response["turn_id"] != self.turn || self.cancel.load(Ordering::SeqCst) {
+            return Err(ApiError::new(
+                "stale_prompt",
+                "This prompt belongs to an inactive turn",
+            ));
         }
+        let id = response["action_id"]
+            .as_str()
+            .ok_or_else(|| ApiError::new("invalid_params", "action_id required"))?;
+        let mut pending = self.pending.lock().map_err(native_error)?;
+        let prompt = pending
+            .get(id)
+            .ok_or_else(|| ApiError::new("stale_prompt", "Prompt expired"))?;
+        if prompt["type"] == "security_check" {
+            let approved = response["approved"]
+                .as_bool()
+                .ok_or_else(|| ApiError::new("invalid_params", "approved required"))?;
+            if nuphus::security::approval::get(&self.signals, id)
+                .is_some_and(|p| p.kind == nuphus::tools::desktop_approval::KIND)
+            {
+                nuphus::tools::desktop_approval::resolve(&self.signals, id, approved)
+                    .map_err(native_error)?;
+            } else {
+                if approved && response["session"] == true {
+                    if let Some(tool) = prompt["tool"].as_str() {
+                        nuphus::security::approve_session_tool(&self.signals, tool);
+                    }
+                }
+                nuphus::security::set_security_result(&self.signals, id, approved);
+            }
+        } else if response["cancelled"] == true {
+            nuphus::security::user_input::cancel(&self.signals, id);
+        } else {
+            nuphus::security::user_input::submit(
+                &self.signals,
+                id,
+                response["value"].as_str().unwrap_or("").to_string(),
+            );
+        }
+        pending.remove(id);
+        Ok(json!({"responded":true}))
     }
 }
 
@@ -93,6 +75,7 @@ struct AuthoringEmitter {
     project: String,
     workflow: String,
     turn: String,
+    pending: Arc<Mutex<HashMap<String, Value>>>,
 }
 impl nuphus::agent::events::EventEmitter for AuthoringEmitter {
     fn emit(&self, event: nuphus::agent::events::NuphusEvent) {
@@ -112,6 +95,15 @@ impl nuphus::agent::events::EventEmitter for AuthoringEmitter {
         let Some(visible) = authoring_event(event) else {
             return;
         };
+        if let Some(id) = visible["action_id"].as_str() {
+            if let Ok(mut pending) = self.pending.lock() {
+                if visible["type"] == "prompt_timeout" {
+                    pending.remove(id);
+                } else {
+                    pending.insert(id.into(), visible.clone());
+                }
+            }
+        }
         let _=self.app.emit("workbench-authoring",json!({"project_id":self.project,"workflow_id":self.workflow,"turn_id":self.turn,"event":visible}));
     }
 }
@@ -134,6 +126,17 @@ fn authoring_event(event: nuphus::agent::events::NuphusEvent) -> Option<Value> {
             error,
             ..
         } => Some(json!({"type":"error","text":error})),
+        NuphusEvent::ToolCallEnd {
+            tool_name,
+            success,
+            output_preview,
+            ..
+        } => Some(
+            json!({"type":"tool_result","name":tool_name,"success":success,"text":output_preview}),
+        ),
+        event @ (NuphusEvent::SecurityCheck { .. }
+        | NuphusEvent::UserInputRequest { .. }
+        | NuphusEvent::PromptTimeout { .. }) => serde_json::to_value(event).ok(),
         _ => None,
     }
 }
@@ -153,15 +156,34 @@ pub async fn workbench_generate(
     let epoch = state.service.host.session_epoch()?.unwrap_or_default();
     let key = format!("{project_id}/{workflow_id}");
     if action == "history" {
+        let generations = state.generations.lock().map_err(native_error)?;
+        let active = generations.get(&key);
+        let pending = active
+            .map(|g| {
+                g.pending
+                    .lock()
+                    .map(|p| p.values().cloned().collect::<Vec<_>>())
+                    .map_err(native_error)
+            })
+            .transpose()?
+            .unwrap_or_default();
         return Ok(
-            json!({"session":state.service.store.authoring_session(&project_id,&workflow_id)?,"busy":state.generations.lock().map_err(native_error)?.contains_key(&key)}),
+            json!({"session":state.service.store.authoring_session(&project_id,&workflow_id)?,"busy":active.is_some(),"turn_id":active.map(|g| &g.turn),"pending":pending}),
         );
     }
     if action == "cancel" {
         if let Some(flag) = state.generations.lock().map_err(native_error)?.get(&key) {
-            flag.store(true, Ordering::Relaxed);
+            flag.cancel.store(true, Ordering::Relaxed);
         }
         return Ok(json!({"cancel_requested":true}));
+    }
+    if action == "respond" {
+        let response: Value = serde_json::from_str(input.as_deref().unwrap_or("{}"))?;
+        let generations = state.generations.lock().map_err(native_error)?;
+        let active = generations
+            .get(&key)
+            .ok_or_else(|| ApiError::new("stale_prompt", "This authoring turn has ended"))?;
+        return active.respond(&response);
     }
     if action != "start" {
         return Err(ApiError::new("unknown_operation", action));
@@ -192,15 +214,27 @@ pub async fn workbench_generate(
     let llm = factory
         .create_client_for(&binding.0, &binding.1)
         .map_err(native_error)?;
-    let tools = nuphus::ToolRegistry::work_agent(); // isolated generation signals; no native execution tools are exposed
+    let cancel = Arc::new(AtomicBool::new(false));
+    let signals = nuphus::state::new_shared_signals();
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let mut tools = nuphus::ToolRegistry::work_agent();
+    tools.set_signals(signals.clone());
+    tools.set_cancel_flag(cancel.clone());
+    if let Some(gate) = native.tools.automation_gate() {
+        tools.set_automation_gate(gate);
+    }
+    tools.set_enhanced_mode(native.workflow_enhanced_mode.load(Ordering::Relaxed));
     let emitter = Arc::new(AuthoringEmitter {
         app: app.clone(),
         epoch: epoch.clone(),
         project: project_id.clone(),
         workflow: workflow_id.clone(),
         turn: uuid::Uuid::new_v4().to_string(),
+        pending: pending.clone(),
     });
     let turn = emitter.turn.clone();
+    nuphus::tools::desktop_approval::install_host(&signals, emitter.clone(), cancel.clone());
     let mut agent = nuphus::runtime::WorkflowAgent::new(
         llm,
         tools,
@@ -209,7 +243,7 @@ pub async fn workbench_generate(
         binding.1,
         "用户".into(),
         "Nuphus Workbench".into(),
-        nuphus::permissions::ToolPermissions::default(),
+        *native.tool_permissions_ref.lock().map_err(native_error)?,
         0.5,
     );
     if let Some(session) = state
@@ -219,13 +253,26 @@ pub async fn workbench_generate(
     {
         *agent.session_mut() = serde_json::from_value(session)?;
     }
-    agent.set_authoring(Arc::new(Authoring {
+    let authoring = Arc::new(Authoring {
         service: state.service.clone(),
         project: project_id.clone(),
         workflow: workflow_id.clone(),
         epoch: epoch.clone(),
-    }));
-    let cancel = Arc::new(AtomicBool::new(false));
+        cancel: cancel.clone(),
+        runs: runs.clone(),
+        turn: turn.clone(),
+    });
+    agent.set_authoring(authoring.clone());
+    let store = state.service.store.pinned()?;
+    let project = store.project(&project_id)?;
+    let data_dir = store.project_data_dir(&project_id)?.join("author");
+    let context = Arc::new(RunContext {
+        run_id: turn.clone(),
+        project_dir: PathBuf::from(&project.directory),
+        cancelled: cancel.clone(),
+        store: WorkflowStore::frozen(data_dir.join("workflow-snapshots"), vec![]),
+        event_sink: None,
+    });
     {
         let mut generations = state.generations.lock().map_err(native_error)?;
         if generations.contains_key(&key) {
@@ -234,21 +281,42 @@ pub async fn workbench_generate(
                 "This workflow already has a generation in progress",
             ));
         }
-        generations.insert(key.clone(), cancel.clone());
+        generations.insert(
+            key.clone(),
+            Generation {
+                cancel: cancel.clone(),
+                signals,
+                pending,
+                turn: turn.clone(),
+            },
+        );
     }
-    let store = state.service.store.pinned()?;
     let generations = state.generations.clone();
     let returned = turn.clone();
     tauri::async_runtime::spawn(nuphus::profile::PRODUCT_EPOCH.scope(epoch, async move {
-        let result = tokio::select! {
-            result=agent.run(&input, &None, &cancel)=>result,
+        let result = nuphus::automation_gate::with_execution_owner(format!("authoring:{turn}"), nuphus::profile::AUTHOR_DATA_DIR.scope(data_dir, CURRENT.scope(context, async {
+        let run = agent.run(&input, &None, &cancel);
+        tokio::pin!(run);
+        tokio::select! {
+            result=&mut run=>result,
             _=async {
                 loop {
-                    if cancel.load(Ordering::SeqCst) || nuphus::profile::require_product().is_err() { break; }
+                    if authoring.check_context().is_err() || nuphus::profile::require_product().is_err() { break; }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            }=>Err(nuphus::NuphusError::Tool("登录已失效或生成已取消。".into())),
-        };
+            }=>{ cancel.store(true, Ordering::SeqCst); run.await },
+        }
+        }))).await;
+        if cancel.load(Ordering::SeqCst) {
+            let run_ids = runs.lock().map(|r| r.clone()).unwrap_or_default();
+            for id in run_ids {
+                if let Ok(run) = store.run(&project_id, &id) {
+                    if !run.status.terminal() {
+                        let _ = authoring.service.host.control(&store, &run, "run.cancel", &json!({})).await;
+                    }
+                }
+            }
+        }
         let session_result = serde_json::to_value(agent.session())
             .map_err(ApiError::from)
             .and_then(|session| store.save_authoring_session(&project_id, &workflow_id, &session));
@@ -276,6 +344,89 @@ pub async fn workbench_generate(
 mod tests {
     use super::*;
     use nuphus::agent::events::NuphusEvent;
+
+    #[test]
+    fn authoring_replies_reach_only_the_active_upstream_signals() {
+        let generation = Generation {
+            cancel: Arc::new(AtomicBool::new(false)),
+            signals: nuphus::state::new_shared_signals(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            turn: "active".into(),
+        };
+        let id = nuphus::security::user_input::add(
+            &generation.signals,
+            "Details",
+            "Steps",
+            false,
+            "step_form",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("Prepare"),
+        );
+        generation
+            .pending
+            .lock()
+            .unwrap()
+            .insert(id.clone(), json!({"type":"user_input_request"}));
+        let value = json!({"stage":"Prepare","steps":["Open app"]}).to_string();
+        assert_eq!(
+            generation
+                .respond(&json!({"turn_id":"old","action_id":id,"value":value}))
+                .unwrap_err()
+                .code,
+            "stale_prompt"
+        );
+        assert!(nuphus::security::user_input::poll_response(&generation.signals, &id).is_none());
+        generation
+            .respond(&json!({"turn_id":"active","action_id":id,"value":value}))
+            .unwrap();
+        assert_eq!(
+            nuphus::security::user_input::poll_response(&generation.signals, &id),
+            Some(value)
+        );
+        assert!(generation.pending.lock().unwrap().is_empty());
+
+        generation.pending.lock().unwrap().insert(
+            "permission".into(),
+            json!({"type":"security_check","tool":"system_shell"}),
+        );
+        generation.respond(&json!({"turn_id":"active","action_id":"permission","approved":true,"session":true})).unwrap();
+        assert!(nuphus::security::is_session_approved(
+            &generation.signals,
+            "system_shell"
+        ));
+        assert!(!nuphus::security::is_session_approved(
+            &nuphus::state::new_shared_signals(),
+            "system_shell"
+        ));
+        generation.cancel.store(true, Ordering::SeqCst);
+        assert_eq!(
+            generation
+                .respond(&json!({"turn_id":"active","action_id":"permission","approved":true}))
+                .unwrap_err()
+                .code,
+            "stale_prompt"
+        );
+    }
+
+    #[test]
+    fn authoring_preserves_upstream_prompt_fields_and_timeout() {
+        let prompt = json!({"type":"user_input_request","action_id":"input","title":"Details","prompt":"Steps","sensitive":false,"input_type":"step_form","default_stage":"Prepare"});
+        assert_eq!(
+            authoring_event(serde_json::from_value(prompt.clone()).unwrap()),
+            Some(prompt)
+        );
+        assert_eq!(
+            authoring_event(NuphusEvent::PromptTimeout {
+                action_id: "input".into()
+            }),
+            Some(json!({"type":"prompt_timeout","action_id":"input"}))
+        );
+    }
 
     #[test]
     fn authoring_stream_exposes_public_text_but_not_thinking_or_subtasks() {

@@ -779,6 +779,87 @@ async fn published_run_retries_do_not_start_another_execution() {
     assert!(events.iter().any(|e| e.kind == "run.running"));
 }
 
+#[tokio::test]
+async fn authoring_uses_canvas_revisions_and_versioned_runs() {
+    let (_dir, service, project, _) = fixture();
+    let p = &project.project_id;
+    let draft = service
+        .dispatch_authoring(p, "", "canvas.create", json!({"name":"Author"}))
+        .await
+        .unwrap();
+    let id = draft["workflow_id"].as_str().unwrap();
+    assert_eq!(draft["authoring_mode"], "internal");
+    let edit = json!({"project_id":"ignored-model-project","revision":1,"operations":[{"op":"add_step","parent_id":null,"lane":"main","index":0,"step":{"id":"wait","name":"Wait","do":{"sleep":0.01}}}]});
+    let updated = service
+        .dispatch_authoring(p, id, "canvas.update", edit.clone())
+        .await
+        .unwrap();
+    assert_eq!(updated["draft"]["revision"], 2);
+    assert_eq!(
+        service
+            .dispatch_authoring(p, id, "canvas.update", edit)
+            .await
+            .unwrap_err()
+            .code,
+        "revision_conflict"
+    );
+    let report = service
+        .dispatch_authoring(p, id, "workflow.validate", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(report["passed"], true);
+    let version = service
+        .dispatch_authoring(p, id, "workflow.save", json!({"revision":2}))
+        .await
+        .unwrap();
+    let request =
+        json!({"version_id":version["version_id"],"request_id":"author-run","inputs":{"value":42}});
+    let first = service
+        .dispatch_authoring(p, id, "workflow.run", request.clone())
+        .await
+        .unwrap();
+    let retry = service
+        .dispatch_authoring(p, id, "workflow.run", request)
+        .await
+        .unwrap();
+    assert_eq!(first["run_id"], retry["run_id"]);
+    assert_eq!(service.host.starts.load(Ordering::SeqCst), 1);
+    let run = service
+        .dispatch_authoring(p, id, "run.get", json!({"run_id":first["run_id"]}))
+        .await
+        .unwrap();
+    assert_eq!(run["workflow_id"], id);
+    assert_eq!(run["status"], "running");
+    service
+        .dispatch_authoring(p, id, "run.steps", json!({"run_id":first["run_id"]}))
+        .await
+        .unwrap();
+    // A child can be edited explicitly without changing the active canvas.
+    let child = service
+        .dispatch_authoring(p, id, "canvas.create", json!({"name":"Child"}))
+        .await
+        .unwrap();
+    let loaded = service
+        .dispatch_authoring(
+            p,
+            id,
+            "canvas.get",
+            json!({"workflow_id":child["workflow_id"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(loaded["workflow_id"], child["workflow_id"]);
+    service.host.locked.store(true, Ordering::SeqCst);
+    assert_eq!(
+        service
+            .dispatch_authoring(p, id, "canvas.get", json!({}))
+            .await
+            .unwrap_err()
+            .code,
+        "product_auth_required"
+    );
+}
+
 #[test]
 fn layout_changes_do_not_invalidate_content_revision() {
     let (_dir, service, p, _) = fixture();

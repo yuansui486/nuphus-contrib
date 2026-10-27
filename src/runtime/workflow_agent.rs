@@ -26,6 +26,9 @@ use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod authoring_tests;
+
 /// Optional host-owned authoring backend. The ordinary Agent keeps its original
 /// tools and persistence; editions can reuse its conversation loop without
 /// routing structured edits through filesystem writes or a second Agent.
@@ -34,6 +37,19 @@ pub trait WorkflowAuthoring: Send + Sync {
     fn schemas(&self) -> Vec<crate::api::ToolDefinition>;
     fn system_prompt(&self) -> String;
     async fn execute(&self, tool: &str, params: &serde_json::Value) -> ToolResult;
+
+    fn handles(&self, tool: &str) -> bool {
+        self.schemas()
+            .iter()
+            .any(|schema| schema.function.name == tool)
+    }
+    fn authorize(&self) -> Result<crate::permissions::ToolPermissions, String>;
+    fn tool_category(&self, _tool: &str) -> crate::permissions::ToolCategory {
+        crate::permissions::ToolCategory::Core
+    }
+    fn preserve_output(&self, tool: &str, text: &str) -> bool {
+        self.handles(tool) && serde_json::from_str::<serde_json::Value>(text).is_ok()
+    }
 }
 
 /// WorkflowAgent 配置
@@ -199,6 +215,7 @@ impl WorkflowAgent {
         self.authoring = Some(authoring);
         self.cached_prompt = None;
         self.cached_tools = None;
+        self.session.clear_prompt_snapshot();
     }
 
     /// Emit event through shared emitter
@@ -508,16 +525,21 @@ impl WorkflowAgent {
     /// 此处直接取全量，无需二次过滤（LEADER_ONLY 工具本就不在其中）。
     fn get_filtered_schemas(&self) -> Vec<crate::api::ToolDefinition> {
         if let Some(authoring) = &self.authoring {
-            return authoring.schemas();
+            let overrides = authoring.schemas();
+            let mut tools = self.tools.get_schemas();
+            tools.retain(|tool| {
+                !overrides
+                    .iter()
+                    .any(|replacement| replacement.function.name == tool.function.name)
+            });
+            tools.extend(overrides);
+            return tools;
         }
         self.tools.get_schemas()
     }
 
     /// Build system prompt (cached)
     fn build_system_prompt(&mut self) -> String {
-        if let Some(authoring) = &self.authoring {
-            return authoring.system_prompt();
-        }
         if self.cached_prompt.is_none() {
             // prompt 内的工具段只渲染「分组 + 工具名」（与 Leader 同一契约）：
             // 完整 schema 只由请求的 API tools 字段下发一次。此处传本体 schema
@@ -528,7 +550,7 @@ impl WorkflowAgent {
             // 主模型 supports_vision：统一消歧入口（经 resolve_supports_vision 同源）
             let main_supports_vision =
                 Self::resolve_supports_vision(&self.model_label, self.llm.provider_name());
-            self.cached_prompt = Some(crate::agent::prompt::build_workagent_prompt(
+            self.cached_prompt = Some(crate::agent::prompt::build_workagent_prompt_for_host(
                 &self.model_label,
                 Some(self.llm.provider_name()),
                 main_supports_vision,
@@ -536,6 +558,10 @@ impl WorkflowAgent {
                 &self.user_label,
                 &self.assistant_name,
                 vision_model.as_deref(),
+                self.authoring
+                    .as_ref()
+                    .map(|host| host.system_prompt())
+                    .as_deref(),
             ));
         }
         self.cached_prompt
@@ -1062,7 +1088,11 @@ impl WorkflowAgent {
                 };
 
                 // ── workflow_validate: 静态编译检查 ──
-                let mut result = if let Some(authoring) = &self.authoring {
+                let mut result = if let Some(authoring) = self
+                    .authoring
+                    .as_ref()
+                    .filter(|host| host.handles(&call.tool))
+                {
                     authoring.execute(&call.tool, &exec_params).await
                 } else if call.tool == "workflow_validate" {
                     let raw_id = call.params.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1332,7 +1362,15 @@ impl WorkflowAgent {
                     Some(&call.params),
                     &filtered,
                 );
-                let truncated = crate::utils::truncate_tool_output(&filtered, 8000, &call.tool);
+                let truncated = if self
+                    .authoring
+                    .as_ref()
+                    .is_some_and(|host| host.preserve_output(&call.tool, &filtered))
+                {
+                    filtered
+                } else {
+                    crate::utils::truncate_tool_output(&filtered, 8000, &call.tool)
+                };
                 self.session
                     .push_tool_result(call.id.clone(), truncated, !result.success);
 
@@ -1830,21 +1868,23 @@ impl WorkflowAgent {
         cancel_flag: &AtomicBool,
     ) -> Option<ToolResult> {
         if let Some(authoring) = &self.authoring {
-            return if authoring
-                .schemas()
-                .iter()
-                .any(|schema| schema.function.name == call.tool)
-            {
-                None // The host supplies only scoped, non-executing authoring operations.
-            } else {
-                Some(ToolResult::failure(
-                    "Tool is not available in this authoring workspace",
-                ))
-            };
+            match authoring.authorize() {
+                Ok(permissions) => self.tool_permissions = permissions,
+                Err(error) => return Some(ToolResult::failure(error)),
+            }
         }
         // Use permissions inherited from Runtime (synced before each run via set_tool_permissions)
+        let mut categories = self.tools.all_tool_categories();
+        if let Some(host) = &self.authoring {
+            categories.extend(host.schemas().iter().map(|schema| {
+                (
+                    schema.function.name.clone(),
+                    host.tool_category(&schema.function.name),
+                )
+            }));
+        }
         let policy = crate::permissions::PermissionPolicy::new(self.tool_permissions)
-            .with_categories(self.tools.all_tool_categories());
+            .with_categories(categories);
 
         let emitter: Option<&dyn EventEmitter> = self.emitter.as_deref();
 

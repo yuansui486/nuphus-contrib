@@ -114,6 +114,28 @@ impl<H: Host> Service<H> {
             .await
     }
 
+    /// The internal author uses the same service as the canvas and MCP, with
+    /// its current project and optional active-canvas default supplied by the host.
+    pub async fn dispatch_authoring(
+        &self,
+        project: &str,
+        workflow: &str,
+        operation: &str,
+        mut args: Value,
+    ) -> Result<Value> {
+        if !args.is_object() {
+            return Err(ApiError::new(
+                "invalid_params",
+                "Arguments must be an object",
+            ));
+        }
+        args["project_id"] = json!(project);
+        if args.get("workflow_id").is_none() {
+            args["workflow_id"] = json!(workflow);
+        }
+        self.dispatch(&Principal::LocalUi, operation, args).await
+    }
+
     async fn dispatch_inner(
         &self,
         principal: &Principal,

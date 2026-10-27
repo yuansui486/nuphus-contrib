@@ -1022,7 +1022,7 @@ const WORKAGENT_L2_COMMON: &str = r#"## Skill Routing（按需读取——走到
 ## Phase 3：梳理设计
 执行顺序：
 1. 确认实际操作流程与快捷键（用户实战经验优先于探索推测）——**有意图骨架时此步收敛为「只补细节」**（骨架已在输入中确认，禁止整体重问流程）；无骨架才完整确认流程
-2. 写 `params.json` → 3. 写 `workflow.json`（表单阶段名保留为步骤分组/阶段注释）→ 4. 写 `guide.md` → 5. 更新 `index.json`
+{workflow_design_storage}
 
 退出：设计检查清单全部勾选。
 
@@ -1033,17 +1033,7 @@ const WORKAGENT_L2_COMMON: &str = r#"## Skill Routing（按需读取——走到
 
 ## Output Specification
 
-### 文件结构
-```
-plugin/workflows/{id}/
-├── workflow.json      ← 主工作流（子工作流同目录独立 JSON，用 call 引用）
-├── params.json        ← 固化参数
-└── guide.md           ← 概述 + 前置条件 + 步骤引导 + 故障修复
-
-plugin/workflows/index.json  ← 注册（id / name / status / step_count / updated_at）
-```
-
-**status 生命周期**：设计保存时一律写 `Draft`；`Ready / Running / Completed / Error` 由应用与运行引擎随运行管理，不要手工改 index.json 的状态字段。
+{workflow_delivery}
 
 workflow.json 字段、步骤 V2 schema（13 种 do）、变量引用与条件表达式的完整规范 → skill: workflow-design。禁止未读 schema 凭记忆写步骤。
 
@@ -1060,6 +1050,20 @@ Phase 3 提交前逐项勾选：
 - [ ] `wait` 步骤 prompt 对用户友好（不含内部变量名）
 - [ ] 无敏感数据写入任何文件
 - [ ] 子工作流文件与主工作流同目录"#;
+
+const WORKAGENT_FILE_DESIGN: &str = "2. 写 `params.json` → 3. 写 `workflow.json`（表单阶段名保留为步骤分组/阶段注释）→ 4. 写 `guide.md` → 5. 更新 `index.json`";
+const WORKAGENT_HOST_DESIGN: &str = "2. 在项目目录固化参数和说明 → 3. 用 canvas_update 保存步骤（保留表单阶段分组）→ 4. workflow_validate → 5. workflow_save 发布冻结版本 → workflow_run 验证。不得通过文件写入替代画布修订检查。";
+const WORKAGENT_FILE_DELIVERY: &str = r#"### 文件结构
+```
+plugin/workflows/{id}/
+├── workflow.json      ← 主工作流（子工作流同目录独立 JSON，用 call 引用）
+├── params.json        ← 固化参数
+└── guide.md           ← 概述 + 前置条件 + 步骤引导 + 故障修复
+
+plugin/workflows/index.json  ← 注册（id / name / status / step_count / updated_at）
+```
+
+**status 生命周期**：设计保存时一律写 `Draft`；`Ready / Running / Completed / Error` 由应用与运行引擎随运行管理，不要手工改 index.json 的状态字段。"#;
 
 fn workflow_desktop_capabilities(tools: &[crate::api::ToolDefinition]) -> String {
     // Inspect actual function names, not descriptions that may mention unavailable tools.
@@ -1099,6 +1103,30 @@ pub fn build_workagent_prompt(
     user_label: &str,
     assistant_name: &str,
     vision_model: Option<&str>,
+) -> String {
+    build_workagent_prompt_for_host(
+        model,
+        provider,
+        supports_vision,
+        tools,
+        user_label,
+        assistant_name,
+        vision_model,
+        None,
+    )
+}
+
+/// The host changes only the delivery/storage contract; methodology stays upstream-owned.
+#[allow(clippy::too_many_arguments)]
+pub fn build_workagent_prompt_for_host(
+    model: &str,
+    provider: Option<&str>,
+    supports_vision: bool,
+    tools: &[crate::api::ToolDefinition],
+    user_label: &str,
+    assistant_name: &str,
+    vision_model: Option<&str>,
+    host_contract: Option<&str>,
 ) -> String {
     let address_rule = if user_label != "用户" && !user_label.eq_ignore_ascii_case("user") {
         format!(
@@ -1150,7 +1178,26 @@ pub fn build_workagent_prompt(
     parts.push(mcp_tools_section());
 
     // L2: Common methodology
-    parts.push(WORKAGENT_L2_COMMON.to_string());
+    let mut methodology = WORKAGENT_L2_COMMON
+        .replace(
+            "{workflow_delivery}",
+            host_contract.unwrap_or(WORKAGENT_FILE_DELIVERY),
+        )
+        .replace(
+            "{workflow_design_storage}",
+            if host_contract.is_some() {
+                WORKAGENT_HOST_DESIGN
+            } else {
+                WORKAGENT_FILE_DESIGN
+            },
+        );
+    if host_contract.is_some() {
+        methodology = methodology.replace(
+            "- [ ] 子工作流文件与主工作流同目录",
+            "- [ ] 子工作流通过宿主的同项目工作流接口保存",
+        );
+    }
+    parts.push(methodology);
 
     parts.join("\n")
 }

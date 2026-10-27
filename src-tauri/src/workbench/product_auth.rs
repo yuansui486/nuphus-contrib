@@ -312,7 +312,7 @@ async fn stop_work(app: AppHandle) {
     };
     if let Ok(flags) = state.generations.lock() {
         for flag in flags.values() {
-            flag.store(true, Ordering::SeqCst);
+            flag.cancel.store(true, Ordering::SeqCst);
         }
     }
     if let Ok(flags) = state.service.host.cancelled.lock() {

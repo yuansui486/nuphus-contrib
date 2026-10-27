@@ -34,7 +34,8 @@ pub fn truncate_tool_output(text: &str, max_chars: usize, tool_name: &str) -> St
     // statuses. Preserve valid structured results across every agent loop.
     if matches!(
         tool_name,
-        "desktop_semantic_observe"
+        "workbench_schema"
+            | "desktop_semantic_observe"
             | "desktop_semantic_candidate"
             | "desktop_semantic_execute"
             | "desktop_semantic_action"
@@ -757,6 +758,9 @@ pub fn resolve_project_root() -> PathBuf {
 /// 所有运行时**写入**路径应统一走这里；`resolve_project_root` 保留给路径信任
 /// 边界（workspace 内/外判定）等只读场景。
 pub fn nuphus_data_dir() -> PathBuf {
+    if let Some(root) = crate::profile::author_data_dir() {
+        return root;
+    }
     if crate::profile::WORKBENCH {
         return crate::profile::workbench_data_dir();
     }
@@ -1419,11 +1423,7 @@ pub fn init_logging() {
 
 /// 当前生效的项目标签：实时从项目目录配置派生（空串视为未配置）。
 pub fn active_project_tag() -> Option<String> {
-    let dir = crate::config::UserPreferences::load().project_dir;
-    if dir.trim().is_empty() {
-        return None;
-    }
-    derive_project_tag_from_dir(&dir)
+    active_project().map(|(tag, _)| tag)
 }
 
 /// 当前生效的项目归属：`(派生标签, 配置的完整目录)`，未配置目录 → None。
@@ -1431,6 +1431,10 @@ pub fn active_project_tag() -> Option<String> {
 /// 与 [`active_project_tag`] 同源同值（同一派生函数、同一输入），额外返回目录本身：
 /// 标签含 8 位路径哈希**不可逆**，会话台「项目文件夹」分组展示必须另存原始路径。
 pub fn active_project() -> Option<(String, String)> {
+    if let Some(context) = crate::workflow::run_context::current() {
+        let dir = context.project_dir.to_string_lossy().to_string();
+        return Some((derive_project_tag_from_dir(&dir)?, dir));
+    }
     let dir = crate::config::UserPreferences::load().project_dir;
     if dir.trim().is_empty() {
         return None;
@@ -1517,6 +1521,9 @@ pub fn work_root() -> PathBuf {
 /// 系统提示词据此决定是否注入「相对路径以项目目录为基准」——未配置时必须说明
 /// 基准是工作目录，避免模型自行推断出「项目目录 = 工作目录」的等价关系。
 pub fn has_configured_project_dir() -> bool {
+    if crate::workflow::run_context::current().is_some() {
+        return true;
+    }
     !crate::config::UserPreferences::load()
         .project_dir
         .trim()

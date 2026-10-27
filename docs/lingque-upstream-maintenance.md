@@ -85,6 +85,27 @@ gh run list -R yuansui486/nuphus-contrib --workflow workbench-dispatch.yml --eve
 
 ## 持续同步协议
 
+### 工作台作者与原版保持一致
+
+工作台复用 `ToolRegistry::work_agent()`、`WorkflowAgent` 对话循环、三份 workflow
+技能及共用提示词。宿主只替换交付位置：原版文件交付对应灵雀画布 revision 和已发布
+version，不复制一套设计方法。工具按名称合并；上游新增工具自然进入工作台。
+
+- 桌面、浏览器、Shell、文件与技能执行沿用原版；权限来自当前设置并随调用刷新。
+  不添加灵雀工具白名单、设计阶段确认或单独的操作审批。原版要求的输入和权限提示
+  复用原版组件，通过当前生成轮次回传；全权限配置遵循原版全权限行为。
+- 登录、项目归属、画布修订、版本运行、MCP、调度和产品品牌继续保留。
+  `canvas_*`、`workflow_*`、`run_*`、`automation_*` 调用既有工作台服务；
+  `schedule_cron` 映射项目调度，作者的 `wf_call` 启动已保存版本并返回 run_id，
+  后续使用 `run_get` / `run_steps` 查结果。工作流 IR 中的子流程输出映射不变。
+- `workflow_schema` 返回完整原生规格，`workflow_tools` 分页返回完整工具定义；
+  旧 `workbench_schema` 仍兼容。结构化宿主结果不按字符切断，普通输出仍沿用上游截断。
+- 原版记忆和会话机制继续工作，数据落在当前项目 `.nuphus-workbench/author`；
+  上下文传递到阻塞工具线程，不修改进程环境或普通版的默认目录。
+- 维护时优先检查共享提示词、工具合并、提示回复、取消和项目数据上下文。
+  回归测试覆盖真实下一次模型请求中的完整 Schema、原版工具与方法继承、动态权限、
+  项目记忆、画布修订冲突、版本化运行重试及前端提示恢复；纳入现有工作台三平台 CI。
+
 GitHub 计划任务只从默认分支执行，所以保留轻量 dispatcher，调用产品分支内的
 `workbench-sync.yml` 与 `workbench-release.yml`。计划表达式为每小时第 17 分钟；
 GitHub 可能延迟执行，不能承诺准确到分钟或每次都准时启动。

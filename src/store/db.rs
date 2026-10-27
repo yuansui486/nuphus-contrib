@@ -64,10 +64,14 @@ fn default_db_path() -> PathBuf {
 /// RAII guard：持有从池中取出的连接，drop 时自动归还
 pub struct PoolGuard {
     conn: Option<Connection>,
+    pooled: bool,
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
         if let Some(conn) = self.conn.take() {
             if let Some(pool) = POOL.get() {
                 if let Ok(mut free) = pool.free.lock() {
@@ -150,6 +154,19 @@ fn build_pool() -> crate::Result<ConnectionPool> {
 /// 返回的 `PoolGuard` 实现了 `Deref<Target = Connection>`，
 /// 可直接调用 `Connection` 的方法。drop 时自动归还并唤醒等待者。
 pub fn acquire() -> crate::Result<PoolGuard> {
+    if let Some(root) = crate::profile::author_data_dir() {
+        std::fs::create_dir_all(&root)
+            .map_err(|e| crate::StoreError::ConnectionFailed(e.to_string()))?;
+        let conn = Connection::open(root.join("nuphus.db"))
+            .map_err(|e| crate::StoreError::ConnectionFailed(e.to_string()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| crate::StoreError::ConnectionFailed(e.to_string()))?;
+        init_tables(&conn).map_err(|e| crate::StoreError::MigrationFailed(e.to_string()))?;
+        return Ok(PoolGuard {
+            conn: Some(conn),
+            pooled: false,
+        });
+    }
     let pool = get_or_init_pool()?;
     let start = std::time::Instant::now();
     // 锁中毒时恢复数据继续使用（池中 Vec<Connection> 无一致性风险）
@@ -165,7 +182,10 @@ pub fn acquire() -> crate::Result<PoolGuard> {
                     free.len()
                 );
             }
-            return Ok(PoolGuard { conn: Some(conn) });
+            return Ok(PoolGuard {
+                conn: Some(conn),
+                pooled: true,
+            });
         }
         let remaining = ACQUIRE_TIMEOUT.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -356,6 +376,11 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
 
 /// 获取数据库文件大小（字节）
 pub fn db_size() -> u64 {
+    if let Some(root) = crate::profile::author_data_dir() {
+        return std::fs::metadata(root.join("nuphus.db"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
     let path = db_path();
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }

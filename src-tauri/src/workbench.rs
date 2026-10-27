@@ -35,7 +35,7 @@ pub struct WorkbenchState {
     pub service: Arc<Service<NativeHost>>,
     pub endpoint: Arc<Mutex<Value>>,
     local_endpoint: Arc<Mutex<Value>>,
-    generations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    generations: Arc<Mutex<HashMap<String, authoring::Generation>>>,
     // Retained for the host lifetime: a second instance must not mark the first
     // instance's live runs interrupted during startup recovery.
     _instance_lock: std::fs::File,

@@ -382,10 +382,11 @@ impl ToolRegistry {
     ) -> std::result::Result<ToolResult, String> {
         crate::profile::require_product()?;
         if crate::profile::WORKBENCH
-            && matches!(
+            && (matches!(
                 tool_name,
-                "workflow_run" | "workflow_validate" | "workflow_memory_update" | "schedule_cron"
-            )
+                "workflow_run" | "workflow_validate" | "schedule_cron"
+            ) || (tool_name == "workflow_memory_update"
+                && crate::profile::author_data_dir().is_none()))
         {
             return Err("灵雀请通过当前项目的工作台接口管理、运行和调度工作流。".into());
         }
@@ -482,14 +483,22 @@ impl ToolRegistry {
         // 超时分档与每档取值推导见 Self::tool_timeout（无出处魔数禁止入链）
         let timeout = Self::tool_timeout(tool_name);
         let run_context = crate::workflow::run_context::current();
+        let author_data_dir = crate::profile::author_data_dir();
         let cancel_flag = self.cancel_flag.clone();
         let joined = tokio::task::spawn_blocking(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(context) = run_context {
-                    crate::workflow::run_context::CURRENT
-                        .sync_scope(context, || executor(&params_owned, &ctx))
+                let execute = || {
+                    if let Some(context) = run_context {
+                        crate::workflow::run_context::CURRENT
+                            .sync_scope(context, || executor(&params_owned, &ctx))
+                    } else {
+                        executor(&params_owned, &ctx)
+                    }
+                };
+                if let Some(root) = author_data_dir {
+                    crate::profile::AUTHOR_DATA_DIR.sync_scope(root, execute)
                 } else {
-                    executor(&params_owned, &ctx)
+                    execute()
                 }
             }))
         });
