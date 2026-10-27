@@ -30,6 +30,7 @@
  * 消息底部给全三 slot；紧凑场景（如移动端）可只给 `['duration']`。
  */
 
+import { useEffect, useState } from 'react'
 import { useLanguage } from '../locales'
 import type { TurnMeta } from '../core/types'
 import { isTurnMetaEmpty, resolveTurnCalls, resolveTurnDuration } from '../core/types'
@@ -43,13 +44,30 @@ export interface TurnMetaBarProps {
    *   · 有 `durationMs`（turn 已结束）→ 直接显示
    *   · 否则有 `startedAtMs`（进行中）→ `Date.now() - startedAtMs` 实时推算
    * 故本组件**不接受**调用方传入的实时值——那会让同一指标出现第二个来源。
-   * 走秒由调用方的 tick 触发重渲染。
+   *
+   * 走秒（2026-10-19 局部化改造，节奏按大王定调 200ms）：进行中的轮次**由本组件
+   * 内部自tick**——只重渲染这一条元数据条，不再由调用方在顶层 forceTick 整树。
+   * 历史原因：顶层 tick 曾在巨大会话（1056 消息）执行期把主线程压到心跳饿死。
+   * 已结束的轮次（有 durationMs）不 tick，历史消息零定时器成本。
    */
   meta: TurnMeta | null | undefined
   /** 展示哪些槽位（默认全三 slot：耗时 / 令牌 / 步数） */
   slots?: TurnMetaSlot[]
   /** 附加 class（消息内 / 弹窗内视觉微调） */
   className?: string
+  /**
+   * 当前正在执行的工具（实时 timeline 最后一个 running 的 tool_call，大王
+   * 2026-10-22 定）：执行态提示只跟随**这一条工具**——命令结束（成功或失败）
+   * 立即消失，不等整轮结束。
+   */
+  activeTool?: TurnMetaBarActiveTool | null
+}
+
+/** 当前执行中的工具（只需 name / params 用于判断命令类型） */
+export interface TurnMetaBarActiveTool {
+  id: string
+  toolName?: string
+  params?: unknown
 }
 
 /** 毫秒 → 紧凑可读时长（与执行面板 / 输入栏同款格式，避免三处各写一套） */
@@ -69,12 +87,192 @@ function formatTokens(n: number): string {
   return String(n)
 }
 
+/** 命令动作分类（2026-10-26 重做，大王实测驱动）。
+ *
+ * ## 旧实现的三个问题
+ *  ① **类别优先级抢判定**（测试 > 构建 > 检查）：我（模型）常把一条命令写成
+ *     `cd …; cargo fmt …; cargo check …; cargo test …` 串联，只要句子里出现 test，
+ *     整条就显示 Testing —— 用户在前两个阶段看到的文案是错的；
+ *  ② 宽正则误伤：`lint` / `--check` 会命中路径、参数等非动作文本；
+ *  ③ 覆盖窄：install / download / sleep 一律退化 Running，用户看不出在干什么。
+ *
+ * ## 新规则（可解释、可测）
+ *  1. **剥壳**：`pwsh|powershell [-开关] -Command "…"` 取内层命令；
+ *  2. **切段**：按 `;` / `&&` / `||` / 换行 切成命令段；段内取**管道最左侧**命令
+ *     （`… | Select-String` 的右侧是消费端，不是动作）；
+ *  3. **跳过噪声段**：cd / set / echo / mkdir / $env: / exit 之类没有动作语义；
+ *  4. **取首个命中类别的段**：命令序列通常"先做什么，动作就从那句开始"，
+ *     不再按类别优先级抢（那正是 check 被 test 吞掉的根因）；
+ *  5. 逐类别**动词级**匹配；全都判不出 → Running...（不猜）。
+ *
+ * 无中英对照需求，直接用英文（2026-10-22 大王定）。
+ */
+
+/** 噪声段：没有动作语义的前置/配置命令 */
+const SHELL_NOISE_SEG =
+  /^\s*(cd|set|setx|mkdir|md|echo|write-output|write-host|exit|\$env:|if|else|try|fi|then|do|done)\b/i
+
+/** 命令段拆分：剥壳 → 切段 → 段内取管道左侧 → 去噪声 */
+function shellSegments(command: string): string[] {
+  let cmd = command
+  // 剥壳：pwsh / powershell 的 -Command "…" 内层才是真命令
+  const wrapped = cmd.match(
+    /(?:pwsh|powershell)(?:\.exe)?\b[^"'`]*?-c(?:ommand)?\s+(["'`])([\s\S]*)\1/i,
+  )
+  if (wrapped) cmd = wrapped[2]
+  return cmd
+    .split(/;|&&|\|\||\r?\n/)
+    .map(seg => seg.split('|')[0].trim())
+    .filter(seg => seg.length > 0 && !SHELL_NOISE_SEG.test(seg))
+}
+
+/** 类别判定表：**顺序即类别顺序**，逐段试探（动词级匹配，避免子串误伤） */
+const SHELL_ACTION_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [
+    /\b(cargo\s+(test|nextest)|nextest|vitest|pytest|jest|mocha|npm\s+(run\s+)?test|pnpm\s+(run\s+)?test|yarn\s+(run\s+)?test|go\s+test|dotnet\s+test|ctest)\b/i,
+    'Testing...',
+  ],
+  [
+    /\b(cargo\s+install|npm\s+(i|install|ci)|pnpm\s+(i|install|add)|yarn\s+(add|install)|bun\s+(add|install)|pip3?\s+install|winget\s+install|choco\s+install|scoop\s+install|apt(-get)?\s+install|brew\s+install|dotnet\s+(add|tool))\b/i,
+    'Installing...',
+  ],
+  [
+    /\b(curl|wget|invoke-webrequest|start-bitstransfer|git\s+(clone|pull|fetch)|gh\s+release\s+download)\b/i,
+    'Downloading...',
+  ],
+  [
+    /\b(cargo\s+(build|rustc)|tauri\s+build|npm\s+run\s+build|pnpm\s+(run\s+)?build|yarn\s+(run\s+)?build|vite\s+build|webpack|rollup|esbuild|go\s+build|dotnet\s+build|msbuild|cmake|make)\b/i,
+    'Building...',
+  ],
+  [
+    /\b(cargo\s+(check|clippy|fmt)|rustfmt|tsc|eslint|prettier|stylelint|ruff|mypy|pyright|golangci-lint|go\s+vet|lint|--check|--noemit|-d\s+warnings)\b/i,
+    'Checking...',
+  ],
+  [/\b(start-sleep|sleep|timeout|wait)\b/i, 'Waiting...'],
+  [/\b(stop-process|taskkill|process_kill|kill)\b/i, 'Stopping...'],
+]
+
+/** 执行态提示文案（大王 2026-10-22 定）：按 system_shell 命令类型**单项显示**；
+ *  判断不出类型或非 shell 工具回落 Running。细则见上方分类说明。 */
+export function runningToolLabel(tool: TurnMetaBarActiveTool): string {
+  const isShell = tool.toolName === 'system_shell' || tool.toolName === 'shell'
+  if (!isShell) return 'Running...'
+  const p = tool.params as { command?: unknown } | null | undefined
+  const cmd = typeof p?.command === 'string' ? p.command : ''
+  if (!cmd.trim()) return 'Running...'
+  for (const seg of shellSegments(cmd)) {
+    for (const [re, label] of SHELL_ACTION_PATTERNS) {
+      if (re.test(seg)) return label
+    }
+  }
+  return 'Running...'
+}
+
+/** 耐心阈值（毫秒）：单条工具执行超过 60s 才提示（HUD 单次运行同款节奏） */
+const PATIENCE_DELAY_MS = 60_000
+
+/** 执行中状态指示（2026-10-25 大王定 v3「突触回路」）：两枚神经元由一条
+ *  微光线相连，脉冲沿回路往返行进——到达即端点闪爆 + 小涟漪，反向再发。
+ *  语义与 agent 执行回路同构（输入→思考→输出→反馈），读「在推进」而非
+ *  「加载等待」。契约延续：**不做旋转**（旋转语义是加载等待，长任务会被
+ *  读成卡住）。SVG 10×10 无边框无背景，chip 左间距仍由图标自身宽度承担。 */
+function LiveThinking() {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 10 10"
+      fill="none"
+      className="turn-meta-thinking"
+      aria-hidden="true"
+    >
+      {/* 涟漪 ×2：随脉冲抵达自端点迸出（置底层）；常态 opacity 0，降级时隐没 */}
+      <circle
+        cx="2.2"
+        cy="5"
+        r="1.9"
+        stroke="currentColor"
+        strokeWidth="0.5"
+        opacity="0"
+        className="turn-meta-thinking-ring-l"
+      />
+      <circle
+        cx="7.8"
+        cy="5"
+        r="1.9"
+        stroke="currentColor"
+        strokeWidth="0.5"
+        opacity="0"
+        className="turn-meta-thinking-ring-r"
+      />
+      {/* 回路轨道：恒显微弱，把两枚神经元系成"一条回路"的语义锚 */}
+      <path
+        d="M 2.2 5 L 7.8 5"
+        stroke="currentColor"
+        strokeWidth="0.55"
+        opacity="0.22"
+        className="turn-meta-thinking-axis"
+      />
+      <circle cx="2.2" cy="5" r="1.2" fill="currentColor" className="turn-meta-thinking-node-l" />
+      <circle cx="7.8" cy="5" r="1.2" fill="currentColor" className="turn-meta-thinking-node-r" />
+      {/* 彗尾：与脉冲同拍但 +0.05s 延迟+小一号暗一档，形成拖尾；基态 opacity 0（降级时隐没） */}
+      <circle
+        cx="2.2"
+        cy="5"
+        r="0.55"
+        fill="currentColor"
+        opacity="0"
+        className="turn-meta-thinking-tail"
+      />
+      {/* 行进脉冲：0-20% 左→右、33-52% 右→左，到端点即被吸收，端点负责闪；
+          基态 opacity 0，仅由关键帧点亮，降级时静场只剩轨道+双端 */}
+      <circle
+        cx="2.2"
+        cy="5"
+        r="0.9"
+        fill="currentColor"
+        opacity="0"
+        className="turn-meta-thinking-pulse"
+      />
+    </svg>
+  )
+}
+
 export function TurnMetaBar({
   meta,
   slots = ['duration', 'tokens', 'steps'],
   className,
+  activeTool,
 }: TurnMetaBarProps) {
   const { t } = useLanguage()
+
+  // 进行中走秒：仅当「有起点、无终值」（轮次进行中）时本组件内部 200ms 自tick。
+  // 只重渲染这一条 bar（useState 在本组件），历史轮次（有 durationMs）不挂定时器。
+  const isLive = meta?.durationMs == null && (meta?.startedAtMs ?? 0) > 0
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    if (!isLive) return
+    const timer = window.setInterval(() => forceTick(n => n + 1), 200)
+    return () => window.clearInterval(timer)
+  }, [isLive])
+
+  // 执行态提示（大王 2026-10-22 定调，两次修正）：
+  //   · 只跟随**当前这一条工具**（activeTool），工具结束（成功或失败）立即消失，
+  //     不等整轮结束——失败 / 中断若没收到 tool_call_end，轮次收尾时 activeTool
+  //     也会变 null，同样立即消失；
+  //   · 单条工具执行**超过 60s** 才出现（HUD 耐心提示同款节奏）；
+  //   · 文案按 system_shell 命令类型单项显示（Testing / Building / Checking），
+  //     判不出类型回落 Running...（无中英对照需求，直接英文）。
+  // 只依赖 activeTool.id 起定时器：timeline 每来一行输出都会产生新数组/新对象，
+  // 若依赖对象本身会把计时器反复重置，60s 永远到不了。
+  const activeToolId = activeTool?.id ?? null
+  const [patience, setPatience] = useState(false)
+  useEffect(() => {
+    setPatience(false)
+    if (!isLive || !activeToolId) return
+    const timer = window.setTimeout(() => setPatience(true), PATIENCE_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [isLive, activeToolId])
 
   // 判空：duration / token / steps 全空**且无起点**才不渲染（无起点连耗时都推不出）。
   // startedAtMs 必须单独计入判据——「仅带起点」的轮次有耗时可展示，不能当空壳条。
@@ -92,8 +290,10 @@ export function TurnMetaBar({
   const ctxDelta = m.contextDeltaTokens ?? 0
   const steps = resolveTurnCalls(meta)
 
-  // 图标一律不配：三个 chip 都是纯文字（时间/上下文/步数）。曾给令牌项加过一个
-  // CPU 图标——既把 chip 拉宽挤同行其它项，又与「纯只读信息、不是按钮」的定位不符。
+  // 图标策略（2026-10-22 大王定）：**仅 duration slot 且执行中（isLive）**配 HUD
+  // 同款旋转 spinner——它是状态指示（「在跑」vs「已完成」的区分），不是装饰。
+  // 其余 slot（令牌/步数）保持纯文字：只读信息、不是按钮，图标只会拉宽 chip
+  // 挤同行其它项（曾给令牌项加 CPU 图标的教训）。
   const chips: { key: TurnMetaSlot; label: string; value: string }[] = []
   for (const slot of slots) {
     if (slot === 'duration' && durationMs > 0) {
@@ -116,10 +316,16 @@ export function TurnMetaBar({
     <div className={`turn-meta-bar${className ? ` ${className}` : ''}`}>
       {chips.map(c => (
         <span key={c.key} className={`turn-meta-chip turn-meta-chip--${c.key}`}>
+          {c.key === 'duration' && isLive && <LiveThinking />}
           <span className="turn-meta-chip-label">{c.label}</span>
           <span className="turn-meta-chip-value">{c.value}</span>
         </span>
       ))}
+      {isLive && patience && activeTool && (
+        <span className="turn-meta-chip turn-meta-chip--patience">
+          {runningToolLabel(activeTool)}
+        </span>
+      )}
     </div>
   )
 }

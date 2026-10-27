@@ -61,6 +61,31 @@ const IMAGE_MIME: Record<string, string> = {
 }
 
 /**
+ * HTML 预览 URL：`convertFileSrc` 把整条绝对路径 encodeURIComponent 成
+ * **单个 path 段**（Windows: `C%3A%5CUsers%5C...%5Cindex.html`）。浏览器解析
+ * 相对资源时按 URL 的 `/` 定目录——`%5C` / `%2F` 不是 `/`，目录边界消失：
+ * `assets/site.css` 会被解析到 `http://preview.localhost/assets/site.css`，
+ * `../assets/site.css` 更是直接丢掉整条路径。官网这类带相对 CSS/JS 的页面
+ * 因此无样式、无脚本。
+ *
+ * 把编码分隔符还原成真实 `/`，让 URL 恢复目录结构：
+ * - Windows → `C%3A/Users/.../index.html`
+ * - Unix    → `%2FUsers/.../index.html`（首个 `%2F` 保留：协议端
+ *   `trim_start_matches('/')` 会剥掉真实前导斜杠，保留编码形式才能还原绝对路径）
+ *
+ * 协议端 percent_decode 后仍是合法绝对路径（Windows 接受 `/` 与 `\` 混用）。
+ * 文件名本身不可能包含 `\` / `/`，替换不会误伤。
+ */
+export function previewFileSrc(path: string): string {
+  const url = convertFileSrc(path, 'preview')
+  if (url.includes('%5C')) return url.replace(/%5C/gi, '/')
+  const first = url.indexOf('%2F')
+  if (first < 0) return url
+  // 保留首个编码斜杠（Unix 绝对路径根），其余分隔符还原为真实 '/'
+  return url.slice(0, first + 3) + url.slice(first + 3).replace(/%2F/gi, '/')
+}
+
+/**
  * P3 持久化：标注快照按预览文件路径存**父窗口** localStorage。
  *
  * 为什么不在 iframe 内存：iframe 经 preview:// 协议加载（http://preview.localhost/…），
@@ -571,7 +596,7 @@ export function FilePreviewContent({
           ref={iframeRef}
           className="pv-iframe"
           title={path}
-          src={convertFileSrc(path, 'preview')}
+          src={previewFileSrc(path)}
           sandbox="allow-scripts allow-same-origin allow-pointer-lock allow-modals allow-forms"
           onLoad={onIframeLoad}
         />

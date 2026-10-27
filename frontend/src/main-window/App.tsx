@@ -44,7 +44,7 @@ import {
   IconRefresh,
 } from '../ui/Icons'
 import { CommandPalette } from '../ui/CommandPalette'
-import { routePrimaryK } from './shortcutRouting'
+import { routePrimaryF, routePrimaryK } from './shortcutRouting'
 import { useLanguage } from '../locales'
 import { ErrorBoundary } from '../ui/ErrorBoundary'
 import { Button, IconButton } from '../ui/Button'
@@ -52,6 +52,7 @@ import { useKeyboard } from '../hooks/useKeyboard'
 import { SplashScreen } from '../ui/SplashScreen'
 import { ErrorScreen } from '../ui/ErrorScreen'
 import { TaskBubble } from './chat/TaskBubble'
+import { ExecIndicator } from './chat/ExecIndicator'
 import { WorkflowTaskPanel } from './layout/WorkflowTaskPanel'
 import { BackgroundTasksPanel } from './layout/BackgroundTasksPanel'
 import { UserInputPrompt } from './layout/UserInputPrompt'
@@ -59,6 +60,8 @@ import { RegionPicker } from './tools/RegionPicker'
 import { ScreenCaptureTool } from './tools/ScreenCaptureTool'
 import { DesktopToolbar } from './tools/DesktopToolbar'
 import { MacosPermissionNotice } from './components/MacosPermissionNotice'
+import { UpdateNotice } from './components/UpdateNotice'
+import { useAppUpdate } from './hooks/useAppUpdate'
 import { useSession } from '../hooks/useSession'
 import { useEvents } from '../hooks/useEvents'
 import { playPopupSound, ensureAudioCtx } from '../ui/sound'
@@ -132,6 +135,7 @@ export default function App() {
   // ── Hooks ──
   const { t } = useLanguage()
   const s = useSession()
+  const updater = useAppUpdate(s.appState === 'ready', s.busy)
   /** +号菜单记忆弹窗：'tenets' | 'annotations' | null */
   const [memoryDialog, setMemoryDialog] = useState<'tenets' | 'annotations' | null>(null)
   const [modelsInitialView, setModelsInitialView] = useState<ModelsInitialView>('provider')
@@ -281,17 +285,21 @@ export default function App() {
       key: 'k',
       ctrl: true,
       handler: () => {
-        // 设置中心宿主（z-index 2500）会盖住 Ctrl+K 两条分支的目标弹层
-        //（命令面板 300 / 工作流列表 150）→ 先退出设置中心，保证面板可见可用
+        // 设置中心宿主（z-index 2500）会盖住命令面板（300）→ 先退出，保证面板可见可用
         setShowSettingsCenter(false)
-        routePrimaryK(
-          s.mode,
-          () => {
-            s.setCmdPaletteOpen(false)
-            s.setShowWorkflow(true)
-          },
-          () => s.setCmdPaletteOpen((p: boolean) => !p),
-        )
+        routePrimaryK(() => s.setCmdPaletteOpen((p: boolean) => !p))
+      },
+    },
+    {
+      // 工作流列表：所有模式一致（Workflow 会话不再抢占 Ctrl+K）
+      key: 'f',
+      ctrl: true,
+      handler: () => {
+        setShowSettingsCenter(false)
+        routePrimaryF(() => {
+          s.setCmdPaletteOpen(false)
+          s.setShowWorkflow(true)
+        })
       },
     },
     {
@@ -477,6 +485,7 @@ export default function App() {
           />
           <MacosPermissionNotice mode={s.mode} onOpenSettings={() => s.setShowSecurity(true)} />
           <div className="chat-area">
+            <UpdateNotice updater={updater} onOpen={() => s.setShowUpdate(true)} />
             {/*
               ⛔ 禁止把「外部 Agent 列表栏」等 UI 反馈写进 s.messages（addMessage）：
               执行期「messages 最后一条 = 正在流式的 agent 气泡」是强约定
@@ -488,6 +497,7 @@ export default function App() {
             */}
             <ChatPanel
               messages={s.messages}
+              timeline={s.timeline}
               // 唯一执行态（后端 ExecutionStage + 事件推送）：ChatPanel 内部派生
               // 「主循环在迭代中」与「后端仍占用」两个谓词，不再各自订阅不同来源
               executionStage={s.executionStage}
@@ -556,6 +566,12 @@ export default function App() {
               appearanceOpen={s.showThemes}
               onAppearanceDismiss={() => s.setShowThemes(false)}
               onRate={s.handleRate}
+              /* 聊天区左上角常驻「Exec 执行指示器」：数据源 = 本轮 task_runs 台账
+                 （与 TaskBubble 同一份快照），点击沿用本层既有的 showExecTrace 开关
+                 （不动 execTraceOverride → 面板展示全局 timeline，而非某轮历史回溯）。 */
+              execIndicator={
+                <ExecIndicator runs={s.taskRuns} onOpenTrace={() => s.setShowExecTrace(true)} />
+              }
               onShowExecTrace={trace => {
                 s.setExecTraceOverride(trace)
                 s.setShowExecTrace(true)
@@ -636,6 +652,16 @@ export default function App() {
               onExpand={() => s.setShowExecTrace(true)}
               onClose={() => s.setDismissThinking(true)}
             />
+
+            {/* ── Desktop toolbar：右侧固定竖条，hover 显隐（无快捷键 / 无关闭）──
+              必须挂在 .chat-area **内**：.chat-area 自身 z-index:1（components.css，
+              压皮肤背景层）是一个 stacking context，header 三钮（.chat-header-right
+              z10）与外观面板（.apnp-panel z60）的层级都是 chat-area **局部**的。
+              dock 若留在 app-shell 根级，其 z10 是根层值 —— 会浮在整个 chat 区
+              之上，压住右锚定浮层（2026-10-24 事故：压住外观面板行内恢复小钮）。
+              移进来后 dock 的 z10 与 .chat-header-right 同上下文同值 = 真正同级：
+              高于消息内容，低于思考条 40 / 浮层（面板 60 等）。 */}
+            <DesktopToolbar onOpenTools={() => s.setShowTools(true)} />
           </div>
 
           <ExecutionTraceFloating
@@ -930,7 +956,7 @@ export default function App() {
             size="sm"
           >
             <Suspense fallback={null}>
-              <UpdatePage />
+              <UpdatePage updater={updater} />
             </Suspense>
           </CompactModal>
           <CompactModal
@@ -1103,6 +1129,7 @@ export default function App() {
           {showSettingsCenter && (
             <Suspense fallback={null}>
               <SettingsCenter
+                updater={updater}
                 onClose={() => setShowSettingsCenter(false)}
                 onRunWorkflow={wf => {
                   // 运行确认弹窗（wcf-wrapper z-index 100）低于设置中心宿主（2500）→
@@ -1201,9 +1228,6 @@ export default function App() {
       {memoryDialog === 'annotations' && (
         <AnnotationsDialog onClose={() => setMemoryDialog(null)} />
       )}
-
-      {/* ── Desktop toolbar：右侧固定竖条，hover 显隐（无快捷键 / 无关闭） ── */}
-      <DesktopToolbar onOpenTools={() => s.setShowTools(true)} />
     </div>
   )
 }

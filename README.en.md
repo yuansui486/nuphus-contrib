@@ -8,7 +8,15 @@
 
 **English** | [中文](README.md)
 
-> **Version**: 0.2.30 · **Status**: Alpha (under active development) · **Platforms**: Windows / macOS / Linux
+> **Official website**: [www.nuphus.com](https://www.nuphus.com) — product overview, installers, changelog and documentation
+
+<p align="center">
+  <a href="https://www.nuphus.com/download.html"><img src="https://img.shields.io/badge/Download-Windows%20%7C%20macOS%20%7C%20Linux-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download Nuphus 1.1.0"></a>
+  &nbsp;
+  <a href="https://github.com/mrpulor-gh/nuphus/releases/latest"><img src="https://img.shields.io/badge/GitHub%20Release-v1.1.0-111827?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Release v1.1.0"></a>
+</p>
+
+> **Version**: 1.1.0 · **Status**: Release (stable) · **Platforms**: Windows / macOS / Linux
 > **Tech Stack**: Tauri v2 · Rust · React 18 · TypeScript
 
 <p align="center">
@@ -135,7 +143,7 @@ Then type `nuphus` in your terminal to launch.
 
 For users unfamiliar with the command line — **no CLI, no Node.js / Rust required**:
 
-1. Download the installer for your platform from [GitHub Releases](https://github.com/mrpulor-gh/nuphus/releases):
+1. Download the installer for your platform from the [official website](https://www.nuphus.com/download.html) (fast in China) or [GitHub Releases](https://github.com/mrpulor-gh/nuphus/releases):
    - **Windows**: `.exe` (NSIS installer, per-user, **no admin rights needed**)
    - **macOS**: `.dmg`
    - **Linux**: `.deb` / `.AppImage`
@@ -275,6 +283,19 @@ All plugins are plain-text files (.md / .json); drop them into the matching `plu
 ---
 
 ## Acknowledgements
+
+### v1.0.0 Contributors
+
+No external pull requests were merged in this release; all changes were made by the maintainer.
+
+### v0.2.31 Contributors
+
+Thanks to the community contributors who submitted pull requests in this release:
+
+| Contributor | PR | Summary |
+|--------|-----|------|
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#107](https://github.com/mrpulor-gh/nuphus/pull/107) | ChatGPT plan sign-in and Responses inference: generic OAuth, secure credential storage, per-model protocol routing and request constraints |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#108](https://github.com/mrpulor-gh/nuphus/pull/108) | Fix IPC parameter casing for execution reviews, inline config and new sessions (top-level camelCase) |
 
 ### v0.2.30 Contributors
 

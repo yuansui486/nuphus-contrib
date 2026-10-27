@@ -270,6 +270,26 @@ export function resolveTurnDuration(
 }
 
 /**
+ * 终止即封口（2026-10-26）：把「进行中」的本轮元数据定格为已结束。
+ *
+ * 与 `resolveTurnDuration` 同一出口——封口值就是它此刻的推算值，不另写算法。
+ *
+ * 为什么必须有：唯一自然封口通道是 `execution_completed`（后端权威 durationMs）。
+ * 中断 / API error / 直接回复等收尾路径没有这个事件，若不显式定格，气泡
+ * （`msg.meta`）与 ctx 弹窗（`turnMeta`）会永远按 `startedAtMs` 推算下去 ——
+ * 「中断后时长 chip 仍在计时」的直接来源。输入框之所以正常，是因为它的 tick 由
+ * 执行状态门控（`isProcessing`）；封口让消息侧与它同源：执行状态终止即停表。
+ *
+ * 已结束（durationMs 有值）或无线索（无 startedAtMs）时原样返回，不伪造数据。
+ */
+export function sealTurnDuration(meta: TurnMeta | null | undefined): TurnMeta {
+  if (!meta) return {}
+  if (meta.durationMs != null) return meta
+  const sealed = resolveTurnDuration(meta)
+  return sealed > 0 ? { ...meta, durationMs: sealed } : meta
+}
+
+/**
  * 轮询快照（`get_execution_state`）合入本轮 turnMeta —— 步数实时值的唯一入口。
  *
  * 后端 `SignalState::execution_tool_calls` 只在本轮「空闲 → Running」那一跳归零
@@ -937,10 +957,14 @@ export interface BackgroundTaskView {
   tool: string
   /** 命令文本（后端已截断，仅供展示） */
   command: string
+  /** 简短标题（可选，调用方填）：展示层**优先显示它**——普通用户看不懂裸命令 */
+  title?: string | null
   pid: number
   started_at_ms: number
   /** 已运行时长（毫秒）——前端本地格式化，避免自算起点与后端漂移 */
   elapsed_ms: number
+  /** 进程存活上限（秒）：到点由系统兜底结束（面板显示「最长存活 / 剩余」） */
+  max_lifetime_secs: number
   /** 显式保留意图：true = 用户/Agent 要求留在后台，取消不会杀它 */
   retain: boolean
   /** 输出日志路径（可读取），没有则为 null */

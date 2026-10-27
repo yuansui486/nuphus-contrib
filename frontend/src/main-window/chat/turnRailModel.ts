@@ -115,8 +115,18 @@ export function boundPreview(text: string, max: number): string {
  * - 空 user 消息仍占一轮（用户可能只发了附件）。
  */
 export function buildTurnAnchors(messages: readonly TurnSourceMessage[]): TurnAnchor[] {
+  // refine 是分界线：只保留最后一个 refine 之后的 turn，refine 前的历史不进 rail
+  // （多轮 refine 后 turn-rail 不无限膨胀；查看 refine 前历史由用户手动上滑/点折叠条）。
+  let startIdx = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'refine') {
+      startIdx = i + 1
+      break
+    }
+  }
   const anchors: TurnAnchor[] = []
-  for (const message of messages) {
+  for (let i = startIdx; i < messages.length; i++) {
+    const message = messages[i]
     if (message.role === 'user') {
       anchors.push({
         turn: anchors.length + 1,

@@ -112,13 +112,19 @@ const zh: Record<string, string> = {
   'interrupt.reportFailed': '中断未完全生效 · {0}',
   'interrupt.retained': '仍有 {0} 个后台任务在运行（点右下角胶囊可查看或结束）',
 
-  'backgroundTasks.entryTitle': '后台任务',
   'backgroundTasks.entryLabel': '后台任务（{0} 个仍在运行）',
+  'backgroundTasks.entryTip': '正在执行·非卡死——验证通过后完整交付',
   'backgroundTasks.title': '后台任务',
+  'backgroundTasks.hint': '（验证/构建/测试）较耗时，正在进行..',
   'backgroundTasks.close': '关闭',
   'backgroundTasks.loading': '读取中…',
   'backgroundTasks.empty': '当前没有仍在运行的后台任务',
   'backgroundTasks.badgeRetained': '后台保留',
+  'backgroundTasks.stateRunning': '运行中',
+  'backgroundTasks.stateRetained': '保留在后台',
+  'backgroundTasks.elapsed': '已运行 {0}',
+  'backgroundTasks.remaining': '剩余约 {0}',
+  'backgroundTasks.expiring': '即将到上限，系统会自动结束',
   'backgroundTasks.startedAt': '起于 {0}',
   'backgroundTasks.kill': '结束',
   'backgroundTasks.killFailed': '结束后台任务失败',
@@ -145,7 +151,7 @@ const zh: Record<string, string> = {
   'preview.exitAnnotateMode': '退出标注模式',
 
   // ── 应用内浏览器（独立窗口：壳页面 44px 控制器 + 远程内容页）──
-  'browser.toggle': '应用内浏览器',
+  'browser.toggle': '浏览器',
   'browser.toggleTitle': '打开 / 唤出浏览器窗口',
   'browser.starting': '正在启动浏览器…',
   'browser.addressPlaceholder': '输入网址后回车，例如 https://example.com',
@@ -280,13 +286,13 @@ const zh: Record<string, string> = {
   'input.ctx.tokens': '令牌',
   'input.ctx.capacity': '容量',
   'input.ctx.steps': '步数',
-  'input.ctx.time': '耗时',
+  'input.ctx.time': '用时',
   'input.ctx.ttft': '首字',
   'input.ctx.speed': '速度',
 
   // ── 一轮执行元数据条（耗时 / 上下文增量 / 步数）──
   // 消息底部 / ctx 弹窗 / 移动端共用同一组件与词条，禁止各处另写字面量
-  'turn.duration': '耗时',
+  'turn.duration': '用时',
   // 本轮上下文增量（轮末占用 − 轮初占用，后端权威，两个值都取自 API usage）。
   // 不是「累计消耗」——同一段上下文在同轮多次调用里被反复计入，累加和会膨胀到
   // 11.2M 这种没有信息量的数字（缺陷实证），那项已从界面移除。
@@ -369,6 +375,7 @@ const zh: Record<string, string> = {
   'sessionRail.newChatBrowse': '浏览本地目录…',
   'sessionRail.newChatSwitchFail': '切换项目失败，未创建对话',
   'sessionRail.newChatBrowseFail': '未能打开目录选择器',
+  'sessionRail.editProjectTenets': '编辑项目原则',
   // ── 会话工作台：「项目」行 ⋯ 菜单（整理 / 排序 / 恢复隐藏项目）+ 📁+ ──
   'sessionRail.projectsMenu': '项目菜单',
   'sessionRail.newProjectFolder': '新建项目文件夹',
@@ -529,6 +536,14 @@ const zh: Record<string, string> = {
   'update.latest': '当前已是最新版本',
   'update.available': '发现新版本 v{0}',
   'update.downloadInstall': '下载并安装',
+  'update.installRestart': '安装并重启',
+  'update.downloadReady': '安装包已下载。点击「安装并重启」继续更新。',
+  'update.waitForIdle': '请等待任务执行和保存完成后再安装，避免重启中断当前任务。',
+  'update.stateUnavailable': '无法确认任务状态，已暂停安装。请稍后再次点击安装。',
+  'update.noticeHint': '安装后将重启 Nuphus，你可以稍后再更新。',
+  'update.noticeFailed': '更新未完成，查看详情后重试。',
+  'update.viewDetails': '查看详情',
+  'update.later': '稍后',
   'update.downloading': '正在下载更新（{0}）',
   'update.failed': '{0}',
   'update.retry': '重试',
@@ -539,6 +554,8 @@ const zh: Record<string, string> = {
   'update.errPlatform': '当前系统平台不在更新清单内。请把下方错误信息反馈给我们。',
   'update.errPermission': '没有写入权限，无法完成安装。请检查安装目录权限后重试。',
   'update.errUnknown': '更新未完成。请把下方错误信息反馈给我们。',
+  'update.stallHint':
+    '下载进展缓慢或停滞。常见原因：本机代理把更新服务器分流出境（服务器在国内）。可在代理软件把 nuphus.com 与 gitee.com 设为直连（DIRECT）后重试，或改从下载页的 Gitee 镜像手动安装。',
   'update.changesTitle': '本版更新内容',
   'update.changesEmpty': '暂无本版变更记录',
   'update.changesUnavailable': '无法读取变更记录',
@@ -1087,6 +1104,8 @@ const zh: Record<string, string> = {
   'models.hotModelsTitle': '热门模型',
   'models.baseUrlLabel': '接口地址',
   'models.baseUrlHelp': '中转站或网关的接口地址，通常以 /v1 结尾',
+  'models.stepfunChannelApi': 'API Key 按量计费',
+  'models.stepfunChannelPlan': 'Step Plan 订阅通道',
   'models.headerSectionLabel': '自定义标头',
   'models.headerSectionHelp': '部分中转站要求附加请求头；留空则不发送',
   'models.headerNamePlaceholder': '头名称，如 X-Gateway',
@@ -1504,6 +1523,7 @@ const zh: Record<string, string> = {
   'themes.customDefaultName': '我的主题',
   'themes.customDiscard': '放弃修改',
   'themes.customDiscardDone': '已放弃未保存的修改',
+  'themes.resetItem': '恢复默认',
   'themes.myThemeActivate': '点击使用此主题',
   'themes.myThemeDelete': '删除此主题',
   'themes.customSwitchConfirm': '当前有未保存的修改，切换将放弃。继续？',
@@ -1691,10 +1711,18 @@ const zh: Record<string, string> = {
 
   'sessionDivider.refined': '会话已提炼',
   'sessionDivider.messages': '{0}条消息',
+  'refineCollapse.archived': '已归档 {n} 条',
+  'refineCollapse.expand': '展开历史消息',
+  'refineCollapse.collapse': '折叠历史消息',
 
   'taskBubble.idle': '待命',
   'taskBubble.failed': ' · {0}失败',
   'taskBubble.interrupted': ' · {0}未结算',
+
+  // 聊天区左上角「Exec 执行指示器」（圆形头像 + 状态，点击进执行追踪面板）
+  'execIndicator.running': 'Exec 子任务执行中',
+  'execIndicator.completed': 'Exec 子任务已完成',
+  'execIndicator.openTrace': '查看执行过程',
 
   // 任务详情弹窗（点面板任一行弹出）——四态齐备，interrupted 不混进 failed
   'taskBubble.detail.stateRunning': '执行中',
@@ -2009,6 +2037,22 @@ const zh: Record<string, string> = {
   'memory.tenet.content': '原则内容 *',
   'memory.tenet.placeholder': '例如：涉及用户隐私的操作必须先征得同意',
   'memory.tenet.priority': '优先级',
+  'memory.tenet.generalTitle': '通用原则',
+  'memory.tenet.projectTitle': '项目原则',
+  'memory.tenet.projectTitleWithName': '项目原则 · {0}',
+  'memory.tenet.projectGuide':
+    '仅对「{0}」生效；切换项目后自动改用该项目的原则。修改将在下一条消息生效。',
+  'memory.tenet.projectEmpty': '该项目暂未设置原则',
+  'memory.tenet.addProject': '添加项目原则',
+  'memory.tenet.allTitle': '教导原则',
+  'memory.tenet.allGuide':
+    '通用原则对所有项目生效；项目原则仅对对应项目生效。修改将在下一条消息生效。',
+  'memory.tenet.scope': '作用域',
+  'memory.tenet.edit': '编辑原则',
+  'memory.tenet.priority.critical': '核心',
+  'memory.tenet.priority.high': '重要',
+  'memory.tenet.priority.medium': '一般',
+  'memory.tenet.priority.low': '提醒',
   'memory.noTenets': '暂无教导原则。在对话中 Nuphus 会自主总结经验，也可通过审批流添加原则。',
   'memory.noPatterns': '暂无可复用经验（来源：用户点评 / 系统提炼）',
   'memory.annotation.guide':
@@ -2166,7 +2210,8 @@ const zh: Record<string, string> = {
   'help.action': '操作',
   'help.shortcut.send': '发送消息',
   'help.shortcut.newline': '换行',
-  'help.shortcut.palette': '打开命令面板；Workflow 模式下打开工作流列表',
+  'help.shortcut.palette': '打开命令面板',
+  'help.shortcut.workflowList': '打开工作流列表',
   'help.shortcut.focusInput': '聚焦输入框',
   'help.shortcut.newChat': '新建会话（当前对话归档）',
   'help.shortcut.workflowPanel': '工作流步骤面板：收起 / 展开（运行中有步骤时可用）',

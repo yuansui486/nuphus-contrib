@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { IconFolderPlus } from '../../ui/Icons'
 import { useLanguage } from '../../locales'
 import { CompactModal } from '../layout/CompactModal'
+import { ProjectTenetsPanel } from '../dialogs/ProjectTenetsPanel'
+import { dirDisplayName } from './sessionGroups'
 import './create-project-modal.css'
 
 /** 项目名称长度上限（UI 稿：最多 80 个字符，输入框内直接截断，不报错） */
@@ -65,6 +67,9 @@ export function CreateProjectModal({
   }, [open, onClose])
 
   const canSubmit = name.trim().length > 0 && !!pickedPath && !busy
+  const pickedProject = pickedPath
+    ? { name: name.trim() || dirDisplayName(pickedPath), path: pickedPath }
+    : null
 
   const handlePick = async () => {
     if (busy) return
@@ -159,6 +164,9 @@ export function CreateProjectModal({
             </span>
           )}
         </div>
+
+        {/* 项目原则编辑入口：创建项目时即可为该项目预置作用域原则 */}
+        {pickedProject && <ProjectTenetsPanel project={pickedProject} />}
       </div>
     </CompactModal>
   )

@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
-import { TurnMetaBar, formatTurnDuration } from '../ui/TurnMetaBar'
+import { act, render } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+import { TurnMetaBar, formatTurnDuration, runningToolLabel } from '../ui/TurnMetaBar'
 import { isTurnMetaEmpty, type TurnMeta } from '../core/types'
 import { LangProvider } from '../locales'
 
@@ -40,16 +40,80 @@ describe('TurnMetaBar 契约', () => {
     expect(isTurnMetaEmpty(null)).toBe(true)
   })
 
-  it('② 仅有起点 → 由起点推算耗时并渲染', () => {
+  it('② 仅有起点 → 由起点推算耗时并渲染（未满 60s 不出耐心 chip）', () => {
     // 起点取「当前时刻 - 12.5s」，使 resolveTurnDuration 推出 12.5s
     const meta: TurnMeta = { startedAtMs: Date.now() - 12_500 }
     const { container } = renderBar(<TurnMetaBar meta={meta} />)
     const chips = container.querySelectorAll('.turn-meta-chip')
-    // 只有耗时一 chip（token / 步数尚为 0，被跳过）
+    // 只有耗时一 chip（token / 步数尚为 0，被跳过）；耐心 chip 未满 60s 不显示
     expect(chips.length).toBe(1)
     expect(container.querySelector('.turn-meta-chip--duration')?.textContent).toContain('12.5s')
+    expect(container.querySelector('.turn-meta-chip--patience')).toBeNull()
     expect(container.querySelector('.turn-meta-chip--tokens')).toBeNull()
     expect(container.querySelector('.turn-meta-chip--steps')).toBeNull()
+  })
+
+  it('②-b 工具执行超过 60s 才提示、工具结束（成功或失败）立即消失', () => {
+    vi.useFakeTimers()
+    try {
+      const meta: TurnMeta = { startedAtMs: Date.now() - 90_000 }
+      const tool = {
+        id: 'call-1',
+        toolName: 'system_shell',
+        params: { command: 'npm run build' },
+      }
+      const { container, rerender } = renderBar(<TurnMetaBar meta={meta} activeTool={tool} />)
+      // 未满 60s → 不出现
+      expect(container.querySelector('.turn-meta-chip--patience')).toBeNull()
+      act(() => {
+        vi.advanceTimersByTime(60_000)
+      })
+      // 到点 → 按命令类型单项显示
+      expect(container.querySelector('.turn-meta-chip--patience')?.textContent).toBe('Building...')
+      // 工具结束（失败/成功都会让 activeTool 变 null）→ 立即消失，不等整轮结束
+      rerender(
+        <LangProvider>
+          <TurnMetaBar meta={meta} activeTool={null} />
+        </LangProvider>,
+      )
+      expect(container.querySelector('.turn-meta-chip--patience')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('②-c system_shell 命令类型判定（判不出回落 Running...）', () => {
+    const shell = (command: string) =>
+      runningToolLabel({ id: 'x', toolName: 'system_shell', params: { command } })
+    expect(shell('cargo test --release -p nuphus-desktop')).toBe('Testing...')
+    expect(shell('npx vitest run')).toBe('Testing...')
+    expect(shell('npm run build')).toBe('Building...')
+    expect(shell('cargo build --release')).toBe('Building...')
+    expect(shell('cargo clippy --all-targets -- -D warnings')).toBe('Checking...')
+    expect(shell('npx tsc --noEmit')).toBe('Checking...')
+    expect(shell('dir C:\\Users')).toBe('Running...')
+    // 非 shell 工具（如 Read）不猜类型
+    expect(runningToolLabel({ id: 'y', toolName: 'Read' })).toBe('Running...')
+
+    // ── 回归（2026-10-26 大王实测抱怨）──
+    // 一条命令里同时含 fmt / check / test：不得再被 test 抢走类别，
+    // 取**首个实质动作段** → 这里首段是 `cargo fmt` → Checking...
+    expect(
+      shell(
+        'cd C:\\Users\\Administrator\\Nuphus; cargo fmt -p nuphus 2>&1 | Out-Null; cargo check --release -p nuphus 2>&1 | Select-String -Pattern "error"; cargo test --release -p nuphus',
+      ),
+    ).toBe('Checking...')
+    // 纯 test 命令仍是 Testing
+    expect(shell('cargo test --release -p nuphus --lib hud_arbiter')).toBe('Testing...')
+    // 剥壳：powershell -Command "…" 看内层
+    expect(shell('powershell -NoProfile -Command "cargo build --release"')).toBe('Building...')
+    // 新类别：安装 / 下载 / 等待 / 终止（旧实现一律退化 Running）
+    expect(shell('npm install')).toBe('Installing...')
+    expect(shell('curl -L https://example.com/x.zip -o x.zip')).toBe('Downloading...')
+    expect(shell('Start-Sleep -Seconds 30')).toBe('Waiting...')
+    expect(shell('Stop-Process -Id 1234')).toBe('Stopping...')
+    // 管道右侧只是消费端，不参与判定
+    expect(shell('cargo check 2>&1 | Select-String error')).toBe('Checking...')
   })
 
   it('③ 完成后用后端权威 durationMs；令牌项 = 上下文增量（不是累计消耗）', () => {

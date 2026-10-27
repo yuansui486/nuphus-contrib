@@ -14,6 +14,10 @@ pub struct Tenet {
     pub id: String,
     /// Principle content text (user natural language description)
     pub content: String,
+    /// Owning project directory; None/empty = general tenet applying to every project.
+    /// Legacy entries without this field load as general (serde default).
+    #[serde(default)]
+    pub project_path: Option<String>,
     /// Source
     #[serde(default)]
     pub source: TenetSource,
@@ -112,6 +116,9 @@ pub struct TenetAlert {
 
 /// Maximum tenets storage limit
 const MAX_TENETS: usize = 20;
+
+/// Per-scope cap for prompt injection (general / current project independently).
+const MAX_PROMPT_TENETS_PER_SCOPE: usize = 10;
 
 /// Tenet storage
 pub struct TenetStore {
@@ -355,24 +362,34 @@ impl TenetStore {
         alerts
     }
 
-    /// Generate tenet list text for prompt injection
-    pub fn format_for_prompt(&self) -> Option<String> {
-        let active: Vec<&Tenet> = self.active();
-        if active.is_empty() {
+    /// Generate tenet list text for prompt injection.
+    ///
+    /// Only general tenets plus tenets owned by `current_project` are emitted.
+    /// Project tenets never leak into other projects' prompts.
+    pub fn format_for_prompt(&self, current_project: Option<&str>) -> Option<String> {
+        let mut general: Vec<&Tenet> = Vec::new();
+        let mut project: Vec<&Tenet> = Vec::new();
+        for t in self.tenets.iter().filter(|t| t.active) {
+            match t.project_path.as_deref().map(str::trim) {
+                None | Some("") => general.push(t),
+                Some(path) if current_project.is_some_and(|cur| same_project_path(path, cur)) => {
+                    project.push(t)
+                }
+                Some(_) => {}
+            }
+        }
+        if general.is_empty() && project.is_empty() {
             return None;
         }
-        let mut lines = Vec::new();
-        lines.push("### User-set immutable principles".to_string());
-        for t in active.iter().take(10) {
-            lines.push(format!(
-                "- [{}][{}] {}",
-                t.priority.label(),
-                t.enforce_level.label(),
-                t.content
-            ));
+
+        let mut lines = vec!["### User-set immutable principles".to_string()];
+        if !general.is_empty() {
+            lines.push("#### 通用原则（所有项目适用）".to_string());
+            push_tenet_lines(&mut lines, &general);
         }
-        if active.len() > 10 {
-            lines.push(format!("- ... {} more tenets not shown", active.len() - 10));
+        if !project.is_empty() {
+            lines.push("#### 当前项目原则（仅当前项目适用）".to_string());
+            push_tenet_lines(&mut lines, &project);
         }
         Some(lines.join("\n"))
     }
@@ -406,6 +423,37 @@ impl TenetStore {
         let tenets: Vec<Tenet> =
             serde_json::from_str(&json).map_err(|e| TenetStoreError::Serialize(e.to_string()))?;
         Ok(tenets)
+    }
+}
+
+fn push_tenet_lines(lines: &mut Vec<String>, tenets: &[&Tenet]) {
+    for t in tenets.iter().take(MAX_PROMPT_TENETS_PER_SCOPE) {
+        lines.push(format!(
+            "- [{}][{}] {}",
+            t.priority.label(),
+            t.enforce_level.label(),
+            t.content
+        ));
+    }
+    if tenets.len() > MAX_PROMPT_TENETS_PER_SCOPE {
+        lines.push(format!(
+            "- ... {} more tenets not shown",
+            tenets.len() - MAX_PROMPT_TENETS_PER_SCOPE
+        ));
+    }
+}
+
+/// Project path equality: trim, ignore trailing separators, Windows case-insensitive.
+fn same_project_path(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_string();
+    let (a, b) = (norm(a), norm(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
     }
 }
 
@@ -484,6 +532,7 @@ mod tests {
             let t = Tenet {
                 id: format!("t{}", i),
                 content: format!("test {}", i),
+                project_path: None,
                 source: TenetSource::UserManual,
                 priority: TenetPriority::High,
                 enforce_level: EnforceLevel::Warning,
@@ -510,6 +559,7 @@ mod tests {
             .add(Tenet {
                 id: "t1".to_string(),
                 content: "不要操作注册表".to_string(),
+                project_path: None,
                 source: TenetSource::UserManual,
                 priority: TenetPriority::Critical,
                 enforce_level: EnforceLevel::Block,
@@ -535,6 +585,7 @@ mod tests {
             .add(Tenet {
                 id: "t1".to_string(),
                 content: "改动文件前先备份".to_string(),
+                project_path: None,
                 source: TenetSource::UserManual,
                 priority: TenetPriority::High,
                 enforce_level: EnforceLevel::Warning,
@@ -545,11 +596,111 @@ mod tests {
             })
             .unwrap();
 
-        let prompt = store.format_for_prompt();
+        let prompt = store.format_for_prompt(None);
         assert!(prompt.is_some());
         let text = prompt.unwrap();
         assert!(text.contains("User-set immutable principles"));
         assert!(text.contains("[Important][Warning]"));
         assert!(text.contains("改动文件前先备份"));
+    }
+
+    fn scoped_tenet(id: &str, content: &str, project: Option<&str>) -> Tenet {
+        Tenet {
+            id: id.to_string(),
+            content: content.to_string(),
+            project_path: project.map(str::to_string),
+            source: TenetSource::UserManual,
+            priority: TenetPriority::High,
+            enforce_level: EnforceLevel::Warning,
+            immutable: true,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            active: true,
+        }
+    }
+
+    /// 只注入「通用 + 当前项目」：其他项目的原则绝不能泄漏。
+    #[test]
+    fn format_for_prompt_scopes_to_general_and_current_project() {
+        let mut store =
+            TenetStore::with_path(std::env::temp_dir().join("nuphus_test_tenets_scope.json"));
+        store.tenets.clear();
+        for (id, content, project) in [
+            ("g", "通用规则", None),
+            ("a", "项目 A 规则", Some(r"E:\proj\A")),
+            ("b", "项目 B 规则", Some(r"E:\proj\B")),
+        ] {
+            store.add(scoped_tenet(id, content, project)).unwrap();
+        }
+
+        let text = store.format_for_prompt(Some(r"E:\proj\A")).unwrap();
+        assert!(text.contains("通用规则"));
+        assert!(text.contains("项目 A 规则"));
+        assert!(!text.contains("项目 B 规则"), "不得注入其它项目的原则");
+        assert!(text.contains("通用原则"));
+        assert!(text.contains("当前项目原则"));
+
+        let general_only = store.format_for_prompt(None).unwrap();
+        assert!(general_only.contains("通用规则"));
+        assert!(!general_only.contains("项目 A 规则"));
+        assert!(!general_only.contains("项目 B 规则"));
+    }
+
+    /// Windows 下大小写/尾分隔符不同仍视为同一项目。
+    #[test]
+    fn format_for_prompt_matches_project_path_case_insensitively_on_windows() {
+        let mut store =
+            TenetStore::with_path(std::env::temp_dir().join("nuphus_test_tenets_case.json"));
+        store.tenets.clear();
+        store
+            .add(scoped_tenet("a", "项目规则", Some(r"E:\Proj\A")))
+            .unwrap();
+
+        let text = store
+            .format_for_prompt(Some(r"e:\proj\a\"))
+            .unwrap_or_default();
+        if cfg!(windows) {
+            assert!(text.contains("项目规则"));
+        } else {
+            assert!(!text.contains("项目规则"));
+        }
+    }
+
+    #[test]
+    fn update_changes_content_and_priority_but_preserves_scope() {
+        let mut store =
+            TenetStore::with_path(std::env::temp_dir().join("nuphus_test_tenets_update.json"));
+        store.tenets.clear();
+        store
+            .add(scoped_tenet("a", "旧内容", Some(r"E:\proj\A")))
+            .unwrap();
+
+        assert!(store
+            .update("a", "新内容", TenetPriority::Low, EnforceLevel::Block)
+            .unwrap());
+        let updated = store.get("a").unwrap();
+        assert_eq!(updated.content, "新内容");
+        assert_eq!(updated.priority, TenetPriority::Low);
+        assert_eq!(updated.enforce_level, EnforceLevel::Block);
+        assert_eq!(updated.project_path.as_deref(), Some(r"E:\proj\A"));
+
+        assert!(!store
+            .update("missing", "x", TenetPriority::High, EnforceLevel::Warning)
+            .unwrap());
+    }
+
+    /// 旧版 tenets.json 没有 project_path 字段，必须按通用原则加载。
+    #[test]
+    fn legacy_tenet_without_project_path_loads_as_general() {
+        let json = r#"[{
+            "id": "legacy",
+            "content": "旧原则",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }]"#;
+        let tenets: Vec<Tenet> = serde_json::from_str(json).expect("旧数据必须可反序列化");
+        assert_eq!(tenets.len(), 1);
+        assert!(tenets[0].project_path.is_none());
+        assert!(tenets[0].active);
     }
 }

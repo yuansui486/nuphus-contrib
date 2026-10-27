@@ -660,9 +660,9 @@ impl ToolRegistry {
             )
         } else if tool_name == "system_shell" {
             format!(
-                "工具 'system_shell' 已等待 {}秒仍未结束（到达等待上限）。\n\
-                 若本次调用 timeout > 300s（长任务：构建/全量测试/大下载），进程**未被终止**，仍在后台运行 —— 输出若重定向到文件，稍后直接读取，**勿重复执行**。\n\
-                 若为普通命令，进程已被终止，可修正后重试。",
+                "工具 'system_shell' 已等待 {}秒仍未结束（到达等待上限，非取消）。\n\
+                 默认语义：进程**未被终止**，仍在后台运行 —— 输出持续追加到文件，稍后直接读取续取，**勿重复执行**（重复触发会让长任务从零重跑）。\n\
+                 仅当本次调用显式声明 background=false 时，进程才会在超时（或取消）时被终止（含子孙进程）。",
                 timeout.as_secs()
             )
         } else {
@@ -1252,7 +1252,7 @@ impl ToolRegistry {
         // wf_call — 调用已保存的子工作流（Executor 内部处理）
         self.register(ToolDef {
             name: "wf_call".to_string(),
-            description: "调用已保存的子工作流模块。传入 workflow_id 和 inputs，子流程执行后 outputs 回写父流程变量。支持模块复用和嵌套。".to_string(),
+            description: "调用已保存的子工作流模块：inputs 传入子变量，子流程产出经 outputs 回写父变量池。支持模块复用与嵌套。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1863,10 +1863,9 @@ mod tests {
     /// issue #69 方向 3 回归：超时文案必须讲实情——spawn_blocking 不可取消，
     /// 禁止出现「已取消」这类与实现矛盾的表述（诱导安全重试 ⇒ 双投递/双执行）。
     ///
-    /// 第二个断言只要求「不断言进程已被取消」：system_shell 自超时分层后，
-    /// 普通命令（timeout ≤ 300s）确实是**会被终止**的，说「仍在后台运行」反而
-    /// 与实现矛盾。故改为按工具分辨：dispatch/其余工具仍是「不可取消」口径，
-    /// system_shell 只要不断言「未取消」即可（它按任务类型区分）。
+    /// 第二个断言对齐 2026-10-22 的新超时语义：默认**保留进程**（未被终止，
+    /// 输出续取），只有本次调用显式声明 `background=false` 才在超时/取消时终止。
+    /// 因此文案必须同时给出「默认未终止」与「显式 background=false 才终止」。
     #[test]
     fn test_timeout_message_tells_the_truth() {
         for tool in ["agent_dispatch", "Read", "Write"] {
@@ -1881,15 +1880,15 @@ mod tests {
             );
         }
 
-        // system_shell：分层措辞，两种结局都要说明，且都不得声称「已取消」
+        // system_shell：默认保留进程，只有显式 background=false 才终止
         let shell_msg = ToolRegistry::timeout_message("system_shell", Duration::from_secs(180));
         assert!(
             !shell_msg.contains("已取消"),
             "system_shell 不得声称「已取消」: {shell_msg}"
         );
         assert!(
-            shell_msg.contains("未被终止") && shell_msg.contains("已被终止"),
-            "system_shell 文案必须同时说明长任务未终止与普通命令已终止两种结局: {shell_msg}"
+            shell_msg.contains("未被终止") && shell_msg.contains("background=false"),
+            "system_shell 文案必须说明默认保留（未终止）与显式 background=false 才终止: {shell_msg}"
         );
         // agent_dispatch 专属文案必须带「先核对实况、已进终端勿重投」指引
         let msg = ToolRegistry::timeout_message("agent_dispatch", Duration::from_secs(180));

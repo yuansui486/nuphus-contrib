@@ -9,6 +9,8 @@ export interface SessionDividerProps {
   messageCount: number
   sessionId: string
   streamingContent?: string | null
+  /** 滚动锚定 id：折叠/展开 refine 前历史时，外层据此保持本分隔线视口位置不跳顶 */
+  anchorId?: string
 }
 
 function computeRatio(original: number): string | null {
@@ -21,6 +23,7 @@ export function SessionDivider({
   messageCount,
   sessionId,
   streamingContent,
+  anchorId,
 }: SessionDividerProps) {
   const { t } = useLanguage()
   const isStreaming = streamingContent != null
@@ -48,7 +51,7 @@ export function SessionDivider({
   const labelText = isStreaming ? t('refine.processing') : t('sessionDivider.refined')
 
   return (
-    <div className="message-row">
+    <div className="message-row" data-refine-anchor={anchorId}>
       <div className={`message-bubble refine ${isStreaming ? 'refine-streaming' : ''}`}>
         {/* ── Header：仿 agent 气泡的名称+时间 ── */}
         <div

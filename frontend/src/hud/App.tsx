@@ -40,7 +40,10 @@ interface HudState {
   phase: HudPhase
   paused?: boolean
   step_kind?: string | null
-  /// 单次运行超过 1 分钟后的耐心提示态：标题切换为「正在执行，请耐心等待...」。
+  /// 单次运行超过 1 分钟的耐心提示态：**只在 meta 行加一行小字**（「仍在推进 · 请稍候」），
+  /// 主文本始终保留当前动作标题 —— 旧实现整段替换文本，会把标题吞掉（2026-10-26 大王指出）。
+  /// 文案纪律（同日修订）：**不复述时长**（meta 行已有 elapsed）、**不用告警语气**
+  /// （"已超 X 分钟"会被读成"卡住了/超时了"）—— 这里是安抚"正常的长任务在推进"。
   /// 只由前端计时触发，不影响 phase（成败仍由后端 ToolResult 决定）。
   patience?: boolean
 }
@@ -309,6 +312,9 @@ function useLiveTimer(running: boolean, resetKey: string): number {
       startRef.current = Date.now()
       setElapsed(0)
       const id = setInterval(() => {
+        // 乱序卡 running 已在消费端按 seq 单调消费根治（applyHudUpdate 丢弃
+        // 迟到事件，迟到的 running 不会覆盖已落地的终态 done），删除旧 90s
+        // 防御性封顶：长任务（shell/验证）显示真实时长，完成即退表。
         setElapsed(Date.now() - startRef.current!)
       }, 200)
       return () => clearInterval(id)
@@ -340,6 +346,13 @@ export function HudOverlay() {
 
   // Phase transition animation key — change triggers CSS class swap
   const animRef = useRef(0)
+
+  // 全局事件序号消费水位。Rust TauriEventEmitter 给每条事件分配单调递增
+  // seq；并行工具生命周期事件在双通道上竞争 last-write-wins 显示，迟到的
+  // stale running 落在终态 done 之后会把 phase 卡回 running、计时器永不
+  // 退表（旧实现只能对计时数字封顶 90s 兜底）。seq <= 已见水位的事件直接
+  // 丢弃；0 / 缺省（main.rs、llm.rs、hud_update 命令等直调旁路）恒生效。
+  const lastSeq = useRef(0)
 
   const clearHideTimer = useCallback(() => {
     if (hideTimer.current !== null) {
@@ -375,7 +388,11 @@ export function HudOverlay() {
 
   /// Shared handler for both HUD event channels
   const applyHudUpdate = useCallback(
-    (text: string, phase: HudPhase, step_kind?: string | null) => {
+    (text: string, phase: HudPhase, step_kind?: string | null, seq?: number) => {
+      if (seq && seq > 0) {
+        if (seq <= lastSeq.current) return
+        lastSeq.current = seq
+      }
       if (hideTimer.current !== null) {
         clearTimeout(hideTimer.current)
         hideTimer.current = null
@@ -398,17 +415,17 @@ export function HudOverlay() {
     // Channel A: global nuphus-event bus (Rust agent emits HudUpdate → emitter → here)
     const unlistenGlobal = listen<{ seq: number; event: NuphusEvent }>(
       'nuphus-event',
-      ({ event }) => {
+      ({ seq, event }) => {
         if (event.type === 'hud_update') {
-          applyHudUpdate(event.text, event.phase as HudPhase, event.step_kind)
+          applyHudUpdate(event.text, event.phase as HudPhase, event.step_kind, seq)
         }
       },
     )
     // Channel B: window-local hud-update (frontend invoke → show() → here)
-    const unlistenLocal = listen<{ text: string; phase: string }>(
+    const unlistenLocal = listen<{ text: string; phase: string; seq?: number }>(
       'hud-update',
-      ({ text, phase }) => {
-        applyHudUpdate(text, phase as HudPhase)
+      ({ text, phase, seq }) => {
+        applyHudUpdate(text, phase as HudPhase, undefined, seq)
       },
     )
     return () => {
@@ -542,13 +559,18 @@ export function HudOverlay() {
 
       {/* ── Content area ── */}
       <div className="hud-content">
+        {/* 主行**永远**显示当前文本（= 调用方标题 / 系统族文案）：60s 耐心态只降级到
+            meta 行的小字，绝不吞掉标题（2026-10-26 大王指出的覆盖隐患）。 */}
         <span className="hud-text" style={{ color: colors.text }} key={`text-${animKey}`}>
-          {state.phase === 'running' && state.patience ? '正在执行，请耐心等待...' : state.text}
+          {state.text}
         </span>
 
-        {/* ── Meta row: elapsed time / workflow paused indicator ── */}
+        {/* ── Meta row: elapsed time / patience hint / workflow paused indicator ── */}
         <span className="hud-meta">
           {isBusy && elapsed > 0 && <span className="hud-elapsed">{formatElapsed(elapsed)}</span>}
+          {state.phase === 'running' && state.patience && (
+            <span className="hud-patience-label">仍在推进 · 请稍候</span>
+          )}
           {state.paused && <span className="hud-paused-label">已暂停</span>}
         </span>
       </div>
@@ -668,7 +690,8 @@ export function HudOverlay() {
 }
 
 .hud-elapsed,
-.hud-paused-label {
+.hud-paused-label,
+.hud-patience-label {
   display: inline-flex;
   align-items: center;
 }
@@ -686,6 +709,12 @@ export function HudOverlay() {
 
 .hud-paused-label {
   color: var(--hud-meta-color);
+}
+
+/* 60s 耐心提示：只在 meta 行露出，主文本永远留给当前动作标题 */
+.hud-patience-label {
+  color: var(--hud-meta-color);
+  opacity: 0.85;
 }
 
 /* ── Workflow controls ── */

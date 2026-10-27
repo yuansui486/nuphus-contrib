@@ -141,7 +141,15 @@ fn is_browser_exe(exe: &std::path::Path) -> bool {
     exe.file_name()
         .map(|n| {
             let n = n.to_string_lossy().to_lowercase();
-            n.contains("chrome") || n.contains("browser") || n.contains("edge")
+            if n.contains("chrome") || n.contains("browser") || n.contains("edge") {
+                return true;
+            }
+            // ego lite (Citro Labs) — its binary is `ego.exe`, which matches
+            // none of the Chromium-family names above. Matched exactly rather
+            // than as a substring: "ego" occurs inside unrelated names
+            // (e.g. "categories.exe"), and a false positive here would make
+            // the detector probe a non-browser process.
+            n == "ego.exe" || n == "ego"
         })
         .unwrap_or(false)
 }
@@ -166,6 +174,14 @@ fn infer_browser_name(exe: &std::path::Path) -> String {
         ("yunlogin", "云登浏览器"),
         ("云登", "云登浏览器"),
         ("maskfog", "MaskFog"),
+        // ego lite (Citro Labs). Two copies exist on a typical install and the
+        // running process may report either:
+        //   - "C:\Program Files\Citro Labs\ego lite\Application\ego.exe" (installer)
+        //   - "E:\...\ego-lite\Application\ego.exe"              (runtime/user dir)
+        // So match both spellings — "ego-lite" (hyphen) as well as "ego lite".
+        ("ego-lite", "ego lite"),
+        ("ego lite", "ego lite"),
+        ("citro labs", "ego lite"),
         ("chrome", "Chrome"),
         ("msedge", "Edge"),
     ];
@@ -427,10 +443,10 @@ fn project_dir_payload(path: &str) -> serde_json::Value {
 /// 因此切换发生在任何时刻（含执行中 agent 不在槽内）都不会错过通知。
 fn project_state_reminder(path: &str) -> String {
     if path.trim().is_empty() {
-        return "当前项目目录：未设置（相对路径以运行目录为准）。".to_string();
+        return "当前项目目录：未设置（相对路径以运行目录为准）。此前注入的用户原则清单不再适用，以本次系统提示中的原则为准。".to_string();
     }
     format!(
-        "当前项目目录：{}（项目「{}」，记忆文件 memory/{}.md）——相对路径以该目录为基准；其它项目的路径与既有结论不再沿用。",
+        "当前项目目录：{}（项目「{}」，记忆文件 memory/{}.md）——相对路径以该目录为基准；其它项目的路径与既有结论不再沿用。此前注入的用户原则清单不再适用，以本次系统提示中的原则为准。",
         path,
         project_dir_display_name(path),
         project_tag_of(path)
@@ -446,10 +462,11 @@ pub fn get_project_dir() -> Result<serde_json::Value, String> {
 
 /// 设置 / 切换项目目录 —— 项目中心的唯一入口。
 ///
-/// 设计约束（2026-09-15 定稿）：
-/// - **不做提示缓存失效**：L1 是稳定前缀，失效会破坏上游 prompt cache 命中率；
-/// - 切换改由 **user 内部消息** 传达（`push_user_internal`：只进 LLM 上下文、
-///   前端历史拉取时过滤不显示），模型下一轮即以新工作目录 / 新记忆文件为准；
+/// 设计约束：
+/// - 「当前项目原则」随项目作用域注入系统提示词，切换后必须重建 prompt 缓存，
+///   否则旧项目原则会滞留在 L1 中；
+/// - 切换同时以 **user 内部消息** 传达（`push_user_internal`：只进 LLM 上下文、
+///   前端历史拉取时过滤不显示），覆盖工作目录 / 记忆文件等其它项目态信息；
 /// - 覆盖全部活跃槽（leader + workflow），不再只通知 leader 一侧。
 #[tauri::command(async)]
 pub fn set_project_dir(
@@ -471,6 +488,24 @@ pub fn set_project_dir(
     // 一次即消费（与执行中追加指令 append_queue 同一条链路），因此项目目录在**执行中**
     // 被切换同样不会丢失提示；也不触碰系统提示前缀缓存，不会每轮重复注入。
     nuphus::state::SignalState::push_notice(&state.signals, project_state_reminder(&path));
+
+    // 项目原则是系统提示词的一部分：换项目后丢弃旧缓存，下一轮按新项目重建。
+    // 若刚切到归属同一项目的会话，其 prompt_snapshot 仍然有效，保留以命中前缀缓存。
+    let project = if path.is_empty() {
+        None
+    } else {
+        Some(path.as_str())
+    };
+    if let Ok(mut ctx) = state.runtime.lock() {
+        if let Some(runtime) = ctx.leader_agent.as_mut() {
+            runtime
+                .agent_mut()
+                .invalidate_prompt_cache_for_project(project);
+        }
+        if let Some(agent) = ctx.workflow_agent.as_mut() {
+            agent.invalidate_prompt_cache_for_project(project);
+        }
+    }
 
     tracing::info!("Project dir changed: {} -> {}", old_path, path);
     Ok(project_dir_payload(&path))
@@ -665,6 +700,66 @@ fn apply_pinned_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ego lite (Citro Labs) 必须被识别为浏览器 —— 它的可执行文件叫 `ego.exe`，
+    /// 不含 chrome/browser/edge 任何一个子串。漏判 → 设置页扫不到它。
+    ///
+    /// 路径按平台逐段拼接，不用字面量 `C:\...`：Windows 上反斜杠不是 Linux/macOS
+    /// 的路径分隔符，`Path::file_name()` 在那里取不到文件名，测试会在 Ubuntu
+    /// runner 上假失败。
+    #[test]
+    fn ego_lite_is_recognized_as_browser() {
+        let ego = ego_lite_exe_path(&["Citro Labs", "ego lite", "Application"]);
+        assert!(
+            is_browser_exe(&ego),
+            "ego.exe 必须被判为浏览器 exe，否则 detect_cdp_browsers 扫不到 ego lite"
+        );
+    }
+
+    /// 反向钉点："ego" 作为子串会误伤无关进程（如 categories.exe 含 "ego"），
+    /// 误判会让探测器去探测非浏览器进程。
+    #[test]
+    fn ego_substring_does_not_match_unrelated_exes() {
+        for name in ["categories.exe", "ego2helper.exe", "myego.exe"] {
+            assert!(
+                !is_browser_exe(std::path::Path::new(name)),
+                "{name} 含 'ego' 但不是浏览器 exe，不得误判"
+            );
+        }
+    }
+
+    /// ego lite 的展示名：安装路径是 ...\Citro Labs\ego lite\Application\ego.exe，
+    /// 旧逻辑会落到父目录名 "Application"（毫无意义）。
+    ///
+    /// 同一台机器上存在两份 ego lite（安装目录 + 用户数据/运行目录），运行中的
+    /// 进程可能报出任意一个，两种拼写都必须识别为 "ego lite"。
+    #[test]
+    fn ego_lite_display_name() {
+        for dirs in [
+            &["Citro Labs", "ego lite", "Application"][..],
+            &["ruanjian", "ego-lite", "Application"][..],
+        ] {
+            let exe = ego_lite_exe_path(dirs);
+            assert_eq!(
+                infer_browser_name(&exe),
+                "ego lite",
+                "ego lite 的展示名必须正确：{}",
+                exe.display()
+            );
+        }
+    }
+
+    /// Build a platform-native path ending in `ego.exe` under the given
+    /// directory components — so the tests behave the same on Windows,
+    /// Linux and macOS runners.
+    fn ego_lite_exe_path(dirs: &[&str]) -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::new();
+        for d in dirs {
+            p.push(d);
+        }
+        p.push("ego.exe");
+        p
+    }
 
     /// 自管 profile 判据：Nuphus 自己启动的 Chrome 必须被识别为「自己」。
     /// managed 目录 = dirs::data_dir()/Nuphus/browser_profile_v2。

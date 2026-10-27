@@ -4,6 +4,7 @@
 
 // Shelf 退出持久化经 commands::process::shelf::persist_and_mirror（元数据行+镜像一并落盘）
 use nuphus::agent::events::EventEmitter;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
@@ -23,12 +24,64 @@ mod resource_gate;
 mod shortcut;
 mod speech;
 mod splash;
+mod stall_probe;
 mod startup_guard;
 mod state;
-mod ui_watchdog;
 mod utils;
 mod video;
 mod workbench;
+
+/// 退出持久化只允许启动一次：窗口关闭与托盘退出可能并发触发。
+static EXIT_FLUSH_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// 退出前保存当前 session（元数据行 + Shelf 磁盘镜像），再退出应用。
+///
+/// 序列化大快照（可达数 MB）、等待数据库连接、执行快照裁剪都可能耗时数秒；
+/// 原实现直接跑在主线程上，窗口关闭/托盘退出会表现为「点了没反应」。
+/// 这里放到后台线程，主线程立即返回事件循环；另起看门狗兜底，避免持久化
+/// 自身卡住（DB 等待上限 30s）时应用永远退不掉。
+///
+/// 时序约定（2026-10-19 大王定调）：**持久化完成即退**，不等待、不延时；
+/// 看门狗 8s 只是「持久化卡死」的兜底上限——正常路径 1~2s 内完成，8s
+/// 已远超合理耗时，缩小残留窗口（关窗后 1~2s 内重开不撞旧进程）。
+fn spawn_exit_flush_and_exit(app: tauri::AppHandle) {
+    if EXIT_FLUSH_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let persist_app = app.clone();
+    std::thread::spawn(move || {
+        let persist = || {
+            if let Some(state) = persist_app.try_state::<crate::state::AppState>() {
+                // 快照保护名单先于 runtime 锁收集，避免嵌套加锁
+                let protected =
+                    crate::commands::process::shelf::protected_snapshot_ids(state.inner());
+                if let Ok(guard) = state.runtime.lock() {
+                    if let Some(rt) = guard.leader_agent.as_ref() {
+                        crate::commands::process::shelf::persist_and_mirror(
+                            "leader",
+                            rt.session(),
+                            &protected,
+                        );
+                    }
+                    if let Some(wa) = guard.workflow_agent.as_ref() {
+                        crate::commands::process::shelf::persist_and_mirror(
+                            "workflow",
+                            wa.session(),
+                            &protected,
+                        );
+                    }
+                }
+            }
+        };
+        // 持久化是 best-effort：panic 也不能阻止退出
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(persist));
+        persist_app.exit(0);
+    });
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        app.exit(0);
+    });
+}
 
 /// 桌面工具热键映射：`Ctrl+1/2/3` → 工具模式。
 ///
@@ -89,6 +142,60 @@ fn apply_win11_rounded_corners<R: tauri::Runtime>(window: &tauri::WebviewWindow<
     }
 }
 
+/// Windows Shell 图标缓存自愈（dev 场景专项）。
+///
+/// 根因（2026-10-25 实证）：`cargo build`（含 opencode 每轮 build 验证）会 in-place
+/// 覆盖 nuphus.exe，Explorer 若在写入窗口期读到半写 PE，会把「白纸/空白文件图标」
+/// 按「路径 + 时间戳/大小」为键写进图标缓存并长期驻留——桌面快捷方式此后一直显示
+/// 空白图标，与 icon.ico / exe 内嵌资源是否完好无关（三层验证：源文件、本地 exe、
+/// CI 安装包的图标提取均逐像素一致）。安装/升级/updater 链路的同类刷新见
+/// src-tauri/installer-hooks.nsh。
+///
+/// 这里在每次 GUI 启动时对 exe 文件及其所在目录发 SHChangeNotify，促使 Explorer
+/// 重取文件信息（含图标），坏条目在下次启动即自愈：
+/// - SHCNE_UPDATEITEM(0x2000)：单文件属性/图标已变
+/// - SHCNE_UPDATEDIR(0x1000)：目录内容已变，重读目录视图
+///
+/// 均为用户级通知、无返回值、失败无副作用；CLI 形态（task 子命令）不走本路径。
+#[cfg(target_os = "windows")]
+fn refresh_shell_icon_cache() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        SHChangeNotify, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATH,
+    };
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let mut exe_wide: Vec<u16> = exe.as_os_str().encode_wide().collect();
+    exe_wide.push(0);
+    let mut dir_wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    dir_wide.push(0);
+
+    // SAFETY: shell32!SHChangeNotify 为稳定公开 API；dwItem1 传以 NUL 结尾的宽路径
+    // （SHCNF_PATH 语义），dwItem2 为空；调用不转移内存所有权、无返回值。
+    unsafe {
+        SHChangeNotify(
+            SHCNE_UPDATEITEM as i32,
+            SHCNF_PATH,
+            exe_wide.as_ptr().cast(),
+            std::ptr::null(),
+        );
+        SHChangeNotify(
+            SHCNE_UPDATEDIR as i32,
+            SHCNF_PATH,
+            dir_wide.as_ptr().cast(),
+            std::ptr::null(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn refresh_shell_icon_cache() {}
+
 fn main() {
     if nuphus::profile::WORKBENCH {
         let models_dir = nuphus::profile::workbench_data_dir().join("models");
@@ -129,6 +236,10 @@ fn main() {
             1
         });
     }
+    // Windows：启动即自愈 Shell 图标缓存坏条目（构建覆盖 exe 后被 Explorer
+    // 缓存的「白纸图标」）。放在 CLI 分支之后——task 形态不建窗口、无需刷新。
+    refresh_shell_icon_cache();
+
     // Inject the persisted external-browser CDP endpoint into the process env so
     // future BrowserClient::new() picks it up; any MCP server child process
     // spawned later inherits it.
@@ -191,8 +302,58 @@ fn main() {
         // Keep main's visible-at-creation contract for Windows drag/drop registration;
         // workbench::install immediately hides it without ever requesting focus.
     }
-    let app = preview_protocol::register(tauri::Builder::default())
-        .manage(state::AppState::default())
+    // ── 单实例守卫（默认开启）──────────────────────────────────────────────
+    // 上面的 `task` 子命令分支已提前 return，不会走到这里；其余启动形态（快捷方式、
+    // 开始菜单、托盘重开）一律受守卫约束。
+    //
+    // dev / 自动化需要两个实例并存时设 NUPHUS_ALLOW_MULTI_INSTANCE=1 绕过，默认拦截。
+    // 拦截不是静默退出：第二实例的 argv/cwd 交给第一实例，回调里还原并聚焦主窗
+    // （用户感知为「点图标 = 打开已有窗口」，与托盘「显示」同一套动作）。
+    let allow_multi_instance = std::env::var("NUPHUS_ALLOW_MULTI_INSTANCE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if allow_multi_instance {
+        tracing::warn!(
+            "[SingleInstance] NUPHUS_ALLOW_MULTI_INSTANCE=1，本次允许多开（调试用，勿用于发布）"
+        );
+    }
+
+    let mut builder =
+        preview_protocol::register(tauri::Builder::default()).manage(state::AppState::default());
+
+    // 必须是**第一个** plugin（官方硬要求）：插件按注册顺序执行，第二实例要在其余
+    // setup 之前被裁掉——否则会先建 splash/主窗、抢全局热键、抢 18771 门铃端口。
+    if !allow_multi_instance {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            // MCP may re-request a tray host. A background launch must never
+            // raise the existing Lingque window or steal the user's focus.
+            if nuphus::profile::WORKBENCH && argv.iter().any(|arg| arg == "--background") {
+                return;
+            }
+            // 主窗在 setup 里被 hide()（splash 期间），此时 show 会露出尚未渲染的白页；
+            // 启动未完成就什么都不做——finish_startup 自己会 show + set_focus。
+            if !crate::commands::toolbar::STARTUP_FINISHED.load(Ordering::SeqCst) {
+                tracing::info!(
+                    "[SingleInstance] 已有实例正在启动中，第二实例退出（splash 继续；argv={argv:?}, cwd={cwd}）"
+                );
+                return;
+            }
+            match app.get_webview_window("main") {
+                Some(window) => {
+                    // 与托盘「显示」/ 托盘左键同一套动作：先还原再显示，最后抢焦点
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    tracing::info!("[SingleInstance] 已有实例在运行，已唤醒主窗并退出第二实例");
+                }
+                None => tracing::warn!(
+                    "[SingleInstance] 已有实例在运行，但 main 窗口缺失，无法唤醒（argv={argv:?}, cwd={cwd}）"
+                ),
+            }
+        }));
+    }
+
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -235,6 +396,7 @@ fn main() {
                                     &app,
                                     "当前没有正在运行的工作流",
                                     "warning",
+                                    0,
                                 );
                                 return;
                             };
@@ -439,6 +601,7 @@ fn main() {
             commands::reject_user_input,
             commands::get_tenets,
             commands::add_tenet,
+            commands::update_tenet,
             commands::delete_tenet,
             commands::skill_install,
             commands::skill_install_git,
@@ -538,7 +701,6 @@ fn main() {
             commands::take_capture_result,
             // -- HUD overlay --
             commands::hud::hud_update,
-            commands::ui_link::ui_heartbeat,
             commands::hud::hud_hide,
             commands::hud::hud_pause,
             commands::hud::hud_resume,
@@ -1179,27 +1341,12 @@ fn main() {
                             }
                         }
                         "quit" => {
-                            // 退出前保存当前 session（元数据行 + Shelf 磁盘镜像）
-                            if let Some(state) = app.try_state::<crate::state::AppState>() {
-                                // 快照保护名单先于 runtime 锁收集，避免嵌套加锁
-                                let protected =
-                                    crate::commands::process::shelf::protected_snapshot_ids(
-                                        state.inner(),
-                                    );
-                                if let Ok(guard) = state.runtime.lock() {
-                                    if let Some(rt) = guard.leader_agent.as_ref() {
-                                        crate::commands::process::shelf::persist_and_mirror("leader", rt.session(), &protected);
-                                    }
-                                    if let Some(wa) = guard.workflow_agent.as_ref() {
-                                        crate::commands::process::shelf::persist_and_mirror("workflow", wa.session(), &protected);
-                                    }
-                                }
-                            }
-                            // 销毁窗口并退出
+                            // 退出前保存当前 session（元数据行 + Shelf 磁盘镜像）。
+                            // 持久化在后台线程执行，窗口先隐藏给用户即时反馈。
                             if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.destroy();
+                                let _ = window.hide();
                             }
-                            app.exit(0);
+                            spawn_exit_flush_and_exit(app.clone());
                         }
                         _ => {}
                     }
@@ -1232,11 +1379,10 @@ fn main() {
             // 保障是时间驱动的，不依赖用户打开面板。
 nuphus::tools::background_tasks::start_watchdog();
 
-            // ── 界面自愈看门狗 ──
-            // 事件静默期（窗口闲置）也要巡检：心跳停摆 90s 判死后，先自动重载主界面，
-            // 仍不恢复则弹原生对话框给出「重新加载 / 重启」出口——用户不再被锁在
-            // 透明/空白窗口里（2026-10-15 用户报告，详见 ui_watchdog 头注）。
-            crate::ui_watchdog::spawn(app.handle().clone());
+            // ── 主线程停摆探针 ──
+            // 15s tick：向主线程投一条空任务，>3s 未执行即记 ERROR 日志
+            // （2026-10-16 主线程阻塞排查的留证工具）。只打日志、不做任何干预。
+            crate::stall_probe::spawn(app.handle().clone());
 
             // ── 账本变更 → 双推事件（事件驱动的显示链路，2026-10-11）──
             // lib crate 的账本不能依赖 bin crate 的发射器（反向依赖会成环），
@@ -1292,29 +1438,14 @@ nuphus::tools::background_tasks::start_watchdog();
                         }
                         return;
                     }
-                    // 关闭前保存当前 session（元数据行 + Shelf 磁盘镜像）
-                    if let Some(state) = app_handle.try_state::<crate::state::AppState>() {
-                        let protected =
-                            crate::commands::process::shelf::protected_snapshot_ids(state.inner());
-                        if let Ok(guard) = state.runtime.lock() {
-                            if let Some(rt) = guard.leader_agent.as_ref() {
-                                crate::commands::process::shelf::persist_and_mirror(
-                                    "leader",
-                                    rt.session(),
-                                    &protected,
-                                );
-                            }
-                            if let Some(wa) = guard.workflow_agent.as_ref() {
-                                crate::commands::process::shelf::persist_and_mirror(
-                                    "workflow",
-                                    wa.session(),
-                                    &protected,
-                                );
-                            }
-                        }
+                    // 关闭前保存当前 session（元数据行 + Shelf 磁盘镜像）。
+                    // 拦截默认关闭，先隐藏窗口，持久化完成后由后台线程退出；
+                    // 主线程不被大快照序列化/DB 等待阻塞。
+                    api.prevent_close();
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.hide();
                     }
-                    // 直接退出应用
-                    app_handle.exit(0);
+                    spawn_exit_flush_and_exit(app_handle.clone());
                 }
             }
         }

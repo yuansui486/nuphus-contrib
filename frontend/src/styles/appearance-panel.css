@@ -28,7 +28,9 @@
 .apnp-panel {
   position: fixed;
   top: 56px;
-  right: 20px;
+  /* 右让位 55px：行内「恢复默认」小钮在每行控制区右端，right 太小时被
+     右侧 tools bar 压住，点不到。 */
+  right: 55px;
   z-index: 60;
   width: 380px;
   /* 底部预留 200px：输入 dock +  refine  chip 一列 header 之下的可视余量，
@@ -533,6 +535,43 @@
   height: 1px;
   margin: 3px 6px;
   background: var(--line-1);
+}
+
+/* ── 行内「恢复默认」小钮（5 个不透明度行 + 5 个颜色行各一个）──
+   语义：只回退**未保存草稿**里的覆盖键，绝不触碰已保存的自定义主题数据。
+   常驻渲染、没有可恢复内容时 disabled（不做条件渲染 —— 面板形态约束：
+   「放弃修改」是全面板唯一的条件按钮）。视觉沿用同文件的 .apnp-theme-edit。 */
+.apnp-reset-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.apnp-reset-btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--fg-1);
+}
+
+.apnp-reset-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 无可恢复内容：留位但不可点（布局不跳、行序不乱）。
+   光标保持 pointer（不按回 default）：小钮常态 disabled，hover 也要有
+   「这是可点控件」的样式反馈，而非默认箭头。 */
+.apnp-reset-btn:disabled {
+  opacity: 0.35;
 }
 
 /* ── 380px 窄窗适配 ──

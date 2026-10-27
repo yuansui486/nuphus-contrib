@@ -277,3 +277,90 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" latest.json --clobber
           echo "latest.json uploaded to $GITHUB_REF_NAME"
+
+
+  sync-server:
+    name: Sync artifacts to nuphus.com server
+    needs: [metadata]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH key
+        env:
+          SSH_KEY: ${{ secrets.SERVER_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 43.161.235.81 >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload updater artifacts (5 files)
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          VER="${VER#v}"
+          BASE="https://github.com/mrpulor-gh/nuphus/releases/download/v${VER}"
+          ssh -i ~/.ssh/deploy_key ubuntu@43.161.235.81 "sudo mkdir -p /opt/downloads/${VER}"
+          # updater 专属产物（macOS/Linux 与手动下载文件名不同：手动安装包 + 签名）
+          for f in \
+            "nuphus-win32-x64-${VER}-setup.exe" \
+            "nuphus-osx-arm64-${VER}.zip" \
+            "nuphus-linux-x64-${VER}.tar.gz" \
+            "Nuphus.app.tar.gz" \
+            "Nuphus.app.tar.gz.sig" \
+            "Nuphus_${VER}_amd64.AppImage" \
+            "Nuphus_${VER}_amd64.AppImage.sig"; do
+            echo "fetching ${f}"
+            curl -fsSL -o "/tmp/${f}" "${BASE}/${f}"
+            scp -i ~/.ssh/deploy_key "/tmp/${f}" "ubuntu@43.161.235.81:/tmp/${f}"
+            ssh -i ~/.ssh/deploy_key ubuntu@43.161.235.81 "sudo mv /tmp/${f} /opt/downloads/${VER}/${f}"
+          done
+
+      - name: Generate and upload latest.json (dl.nuphus.com URLs)
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          VER="${VER#v}"
+          # authoritative .sig from GitHub Release (content-verified by minisign; transport channel is swappable)
+          BASE="https://github.com/mrpulor-gh/nuphus/releases/download/v${VER}"
+          fetch_sig() { curl -fsSL "${BASE}/$1" | tr -d '\n\r'; }
+          WIN_SIG=$(fetch_sig "Nuphus_${VER}_x64-setup.exe.sig")
+          MAC_SIG=$(fetch_sig "Nuphus.app.tar.gz.sig")
+          LIN_SIG=$(fetch_sig "Nuphus_${VER}_amd64.AppImage.sig")
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # all updater URLs point to dl.nuphus.com (self-hosted line, reachable from CN and global)
+          cat > /tmp/latest.json <<JSONEOF
+          {
+            "version": "${VER}",
+            "notes": "Nuphus ${VER}",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "${WIN_SIG}",
+                "url": "https://dl.nuphus.com/${VER}/nuphus-win32-x64-${VER}-setup.exe"
+              },
+              "darwin-aarch64": {
+                "signature": "${MAC_SIG}",
+                "url": "https://dl.nuphus.com/${VER}/Nuphus.app.tar.gz"
+              },
+              "linux-x86_64": {
+                "signature": "${LIN_SIG}",
+                "url": "https://dl.nuphus.com/${VER}/Nuphus_${VER}_amd64.AppImage"
+              }
+            }
+          }
+          JSONEOF
+          scp -i ~/.ssh/deploy_key /tmp/latest.json ubuntu@43.161.235.81:/tmp/latest.json
+          ssh -i ~/.ssh/deploy_key ubuntu@43.161.235.81 "sudo mv /tmp/latest.json /opt/downloads/latest.json"
+
+      - name: Verify deployment
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          sleep 3
+          echo "latest.json:"
+          curl -fsSL "https://dl.nuphus.com/latest.json" | head -8
+          for f in "nuphus-win32-x64-${VER}-setup.exe" "Nuphus.app.tar.gz" "Nuphus_${VER}_amd64.AppImage"; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I "https://dl.nuphus.com/${VER}/${f}")
+            echo "${f}: HTTP ${code}"
+            test "${code}" = "200"
+          done
+          echo "SYNC OK"

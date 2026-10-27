@@ -570,6 +570,11 @@ impl Runtime {
         self.agent.session_mut()
     }
 
+    /// 丢弃运行时构建缓存，但保留会话自身的提示词快照（切换会话时用）。
+    pub fn drop_prompt_prefix_cache(&mut self) {
+        self.agent.drop_prompt_prefix_cache();
+    }
+
     /// Set Session (used when restoring from history)
     pub fn set_session(&mut self, session: Session) {
         self.agent.set_session(session);
@@ -715,6 +720,10 @@ impl Runtime {
         );
 
         // 4. Inline ReAct loop
+        // 85% 硬止损的提炼与接力发生在 react_loop 检查点内部（refine_in_loop：
+        // 越线当场提炼、accumulate 压缩后从摘要就地续跑）——此处不再有收尾
+        // 替换/接力逻辑：force 线只做软劝导（模型自己收敛），turn-end
+        // maybe_refine_session 正常 refine 兜底，均不接力（2026-10-25 定权）。
         let output = self
             .react_loop(&effective_input, images, cancel_flag, false)
             .await?;
@@ -761,5 +770,110 @@ impl Runtime {
 
         // goal 作为 input 传入但不 push——供 wants_file_output 等回合级启发式使用
         self.react_loop(goal, &None, cancel_flag, true).await
+    }
+
+    /// 执行中提炼（in-loop refine）——**85% 硬止损专用**（2026-10-25 定权：
+    /// 85% 是唯一的最后兜底线与唯一接力点；force 线只做软劝导不接力）。
+    ///
+    /// 与 turn-end 的 `execute_session_refine` **同构**：push 未闭合提示词 →
+    /// resume 跑一轮提炼（`tools_suppressed` **代码级**禁工具）→ 摘要 commit
+    /// （accumulate_distill：对话全清、旧摘要不累加 + 归档）→ 返回 true，外层
+    /// react_loop 从压缩后的会话**就地继续**——任务未闭合，从摘要接力续跑，
+    /// 不硬杀、不丢任务。
+    ///
+    /// 失败路径（超时 / API 错 / 空输出）**先调用后 commit**——truncate 回滚
+    /// 注入的提示词消息，session 原样不动，返回 false 由调用方降级为硬劝导；
+    /// turn-end 正常 refine 兜底。同轮上限 [`MAX_IN_LOOP_REFINES`] 次，尝试即
+    /// 计数（含失败）：防「越线→尝试→超时失败→再越线→再尝试」烧穿超时预算。
+    ///
+    /// 为什么必须在 85% 当场动作（而不是注入提示词等模型下一轮收敛）：
+    /// 注入动作本身需要一次新请求，若越线时上下文已逼近上限，这次请求可能
+    /// 直接超限（TooLong 不可重试）——提示词从未被模型读到。当场提炼 + 失败
+    /// 回滚是唯一确定性可控的形态；85% 保留的 15% 余量正是给「提炼请求 +
+    /// 摘要输出」用的最后安全空间。
+    pub async fn refine_in_loop(&mut self, cancel_flag: &AtomicBool) -> bool {
+        use crate::agent::distill::{
+            commit_in_loop_refine, RefineStreamFilter, MAX_IN_LOOP_REFINES,
+            REFINE_PROMPT_UNFINISHED,
+        };
+
+        if self.agent.refine_count >= MAX_IN_LOOP_REFINES {
+            tracing::info!(
+                "[REFINE] in-loop skipped: refine_count {} >= max {}",
+                self.agent.refine_count,
+                MAX_IN_LOOP_REFINES
+            );
+            return false;
+        }
+        self.agent.refine_count += 1;
+
+        let before = self.agent.session.messages().len();
+        self.agent
+            .session
+            .push_user_internal(REFINE_PROMPT_UNFINISHED.to_string());
+
+        // 代码级禁工具：请求不携带 tools（build_request）+ react_loop 剔除
+        // 模型产出的 tool_use 块——双保险防提炼轮继续膨胀上下文。
+        self.agent.tools_suppressed = true;
+
+        // 与 turn-end 同款：过滤器替换而非全静默——LlmTextDelta 放行（前端
+        // 提炼气泡流式），ExecutionStarted 等生命周期事件静默（in-loop 提炼
+        // 不应在前端表现为一次新的「执行开始」）。
+        let saved = self.take_emitter();
+        if let Some(ref e) = saved {
+            self.restore_emitter(Some(Arc::new(RefineStreamFilter { inner: e.clone() })));
+        }
+
+        // 墙钟预算 300s（本地端点预 fill 慢模型可能远超云端默认；此处只防
+        // 「resume 整体挂死」，到点即回滚，不留半提炼状态）。
+        // Box::pin 断异步递归环：refine_in_loop → resume → react_loop → refine_in_loop。
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            Box::pin(self.resume(REFINE_PROMPT_UNFINISHED, cancel_flag)),
+        )
+        .await
+        .map_err(|_| "提炼超时（300s）".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+
+        self.agent.tools_suppressed = false;
+        let _ = self.take_emitter();
+        self.restore_emitter(saved);
+
+        match result {
+            Ok(output) if output.success && !output.message.trim().is_empty() => {
+                let summary = output.message.trim().to_string();
+                if commit_in_loop_refine(
+                    &mut self.agent.session,
+                    &summary,
+                    crate::memory::entry::AgentType::Leader,
+                ) {
+                    tracing::info!(
+                        "[REFINE] in-loop done: {} chars compacted (refine_count={})",
+                        summary.len(),
+                        self.agent.refine_count
+                    );
+                    // 提炼落地后重建 L1（distill 标题索引/记忆尾部随之刷新），
+                    // 与 turn-end refine 同一纪律（2026-10-25 定权）。
+                    self.agent.invalidate_l1_prompt_cache();
+                    true
+                } else {
+                    self.agent.session.truncate_messages(before);
+                    false
+                }
+            }
+            Ok(_) => {
+                self.agent.session.truncate_messages(before);
+                tracing::warn!("[REFINE] in-loop: empty output, session rolled back");
+                false
+            }
+            Err(reason) => {
+                self.agent.session.truncate_messages(before);
+                tracing::warn!(
+                    "[REFINE] in-loop failed ({}), session rolled back; soft warning degraded",
+                    reason
+                );
+                false
+            }
+        }
     }
 }

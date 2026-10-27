@@ -8,7 +8,15 @@
 
 **中文** | [English](README.en.md)
 
-> **版本**: 0.2.30 · **状态**: Alpha（积极开发中） · **平台**: Windows / macOS / Linux
+> **官方网站**: [www.nuphus.com](https://www.nuphus.com) — 产品介绍、下载安装包、更新日志与使用文档
+
+<p align="center">
+  <a href="https://www.nuphus.com/download.html"><img src="https://img.shields.io/badge/%E4%B8%8B%E8%BD%BD-Windows%20%7C%20macOS%20%7C%20Linux-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="下载 Nuphus 1.1.2"></a>
+  &nbsp;
+  <a href="https://github.com/mrpulor-gh/nuphus/releases/latest"><img src="https://img.shields.io/badge/GitHub%20Release-v1.1.2-111827?style=for-the-badge&logo=github&logoColor=white" alt="GitHub Release v1.1.2"></a>
+</p>
+
+> **版本**: 1.1.2 · **状态**: Release（稳定版） · **平台**: Windows / macOS / Linux
 > **技术栈**: Tauri v2 · Rust · React 18 · TypeScript
 
 <p align="center">
@@ -141,7 +149,7 @@ npx @nuphus/nuphus-desktop
 
 面向不熟悉命令行的用户，**无需命令行、无需 Node.js / Rust 环境**：
 
-1. 从 [GitHub Releases](https://github.com/mrpulor-gh/nuphus/releases) 下载对应平台的安装包：
+1. 从 [官方网站](https://www.nuphus.com/download.html)（国内访问快）或 [GitHub Releases](https://github.com/mrpulor-gh/nuphus/releases) 下载对应平台的安装包：
    - **Windows**：`.exe`（NSIS 安装包，用户级安装，**无需管理员权限**）
    - **macOS**：`.dmg`
    - **Linux**：`.deb` / `.AppImage`
@@ -308,6 +316,46 @@ Nuphus 是一个社区驱动的开源项目。除了代码贡献，你还可以�
 ---
 
 ## 致谢
+
+### v1.1.2 贡献者
+
+本版本无社区 Pull Request，变更全部由维护者完成。
+
+
+### v1.1.1 贡献者
+
+感谢本版本提交 Pull Request 的社区贡献者：
+
+| 贡献者 | PR | 内容 |
+|--------|-----|------|
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#115](https://github.com/mrpulor-gh/nuphus/pull/115) | ego lite 外部 CDP 浏览器识别（`ego.exe` 精确匹配 + 名称推断 + 双安装路径覆盖） |
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#116](https://github.com/mrpulor-gh/nuphus/pull/116) | 切换主题后背景图残留修复（预设卡无条件回退 + 异步解析序号守卫 + HUD 快捷切主题回退） |
+
+其余变更由维护者完成。
+
+### v1.1.0 贡献者
+
+感谢本版本提交 Pull Request 的社区贡献者：
+
+| 贡献者 | PR | 内容 |
+|--------|-----|------|
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#110](https://github.com/mrpulor-gh/nuphus/pull/110) | 启动自动检查新版本并提示用户点击更新（顶部提示条 + 手动更新页共用状态，任务执行期间延迟安装） |
+| [@zhoupeiyu515-ui](https://github.com/zhoupeiyu515-ui) | [#112](https://github.com/mrpulor-gh/nuphus/pull/112) | 外观滑块步进改 1% + 每个参数行内「恢复默认」（只回退未保存草稿，不碰已保存主题） |
+
+其余变更由维护者完成。
+
+### v1.0.0 贡献者
+
+本版本未合并外部 Pull Request，全部变更由维护者完成。
+
+### v0.2.31 贡献者
+
+感谢本版本提交 Pull Request 的社区贡献者：
+
+| 贡献者 | PR | 内容 |
+|--------|-----|------|
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#107](https://github.com/mrpulor-gh/nuphus/pull/107) | ChatGPT 套餐登录与 Responses 推理：通用 OAuth、凭据安全存储、逐模型协议路由与请求约束 |
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#108](https://github.com/mrpulor-gh/nuphus/pull/108) | 修复执行点评、内联配置与新会话的 IPC 参数（顶层统一 camelCase） |
 
 ### v0.2.30 贡献者
 

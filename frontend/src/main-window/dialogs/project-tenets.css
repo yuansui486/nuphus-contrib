@@ -1,0 +1,128 @@
+/* project-tenets.css — 项目原则内联编辑器 / 独立弹窗（.pt-* 前缀） */
+
+.compact-modal.pt-modal {
+  width: 460px;
+  max-width: 92vw;
+}
+
+.pt-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-2);
+}
+
+.pt-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pt-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-caption);
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
+}
+
+.pt-count {
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  text-align: center;
+}
+
+.pt-head > .compact-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.pt-guide {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.pt-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pt-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.pt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.pt-item {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+.pt-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pt-item-head .td-badge-project {
+  max-width: 160px;
+}
+
+.pt-item-body {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pt-item-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pt-item-edit .memdlg-textarea {
+  min-height: 60px;
+}
+
+.pt-priority-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pt-priority-row .memdlg-select {
+  max-width: 150px;
+}
+
+.pt-empty {
+  padding: 8px 0;
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+}

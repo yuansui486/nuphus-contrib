@@ -39,9 +39,17 @@ pub async fn approve_pending(
         })
         .unwrap_or(TenetPriority::Medium);
 
+    let project_path = pending
+        .metadata
+        .get("project_path")
+        .and_then(|v| v.as_str())
+        .map(|p| p.trim().trim_end_matches(['\\', '/']).to_string())
+        .filter(|p| !p.is_empty());
+
     let tenet = Tenet {
         id: String::new(),
         content: pending.content.clone(),
+        project_path,
         source: TenetSource::UserManual,
         priority,
         enforce_level: EnforceLevel::Suggestion,

@@ -35,6 +35,16 @@ fn tenet_add_handler(params: &serde_json::Value, ctx: &ToolCtx) -> Result<ToolRe
         .get("priority")
         .and_then(|v| v.as_str())
         .unwrap_or("medium");
+    let scope = params
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("project");
+    // 项目原则自动归属当前项目；没有当前项目时退化为通用原则。
+    let project_path = if scope == "global" {
+        None
+    } else {
+        crate::utils::active_project().map(|(_, dir)| dir)
+    };
 
     if title.is_empty() {
         return Ok(ToolResult::failure("title 不能为空"));
@@ -59,6 +69,7 @@ fn tenet_add_handler(params: &serde_json::Value, ctx: &ToolCtx) -> Result<ToolRe
 
     let metadata = serde_json::json!({
         "priority": priority,
+        "project_path": project_path,
     });
 
     let action_id = approval::add(&ctx.signals, "tenet", title, content, metadata);
@@ -75,7 +86,7 @@ impl ToolRegistry {
     pub(crate) fn register_tenet_add(&mut self) {
         self.register(ToolDef {
             name: "tenet_add".to_string(),
-            description: "Propose a user teaching tenet for approval. Tenets enter the system prompt every session, so keep them short: content ≤200 chars — state the rule, drop rationale and examples. Uses: user explicitly stated a general behavioral principle that will guide long-term decisions. Do NOT use for: temporary preferences, one-time instructions, or rules already covered by the Constitution / L0 prompt.".to_string(),
+            description: "Propose a user teaching tenet for approval. Tenets enter the system prompt every session, so keep them short: content ≤200 chars — state the rule, drop rationale and examples. scope=project (default) binds the tenet to the current project only; scope=global makes it apply to every project. Uses: user explicitly stated a durable behavioral principle. Do NOT use for: temporary preferences, one-time instructions, or rules already covered by the Constitution / L0 prompt.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -93,6 +104,12 @@ impl ToolRegistry {
                         "enum": ["low", "medium", "high", "critical"],
                         "default": "medium",
                         "description": "优先级"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "default": "project",
+                        "description": "原则作用域：project=仅当前项目；global=所有项目。跨项目通用规则才用 global"
                     }
                 },
                 "required": ["title", "content"]
@@ -149,6 +166,33 @@ mod tests {
         let params = serde_json::json!({ "title": "标题", "content": content });
         let r = tenet_add_handler(&params, &ctx()).expect("handler 不应 panic");
         assert!(r.success, "按字符数计算时应放行，不能按字节误拒");
+    }
+
+    /// 显式 global 时审批元数据必须为空项目路径（不再依赖扁平默认值）。
+    #[test]
+    fn global_scope_omits_project_path_in_metadata() {
+        let ctx = ctx();
+        let params = serde_json::json!({
+            "title": "跨项目规则",
+            "content": "所有项目都先读 README",
+            "scope": "global",
+        });
+        let r = tenet_add_handler(&params, &ctx).expect("handler 不应报错");
+        assert!(r.success);
+        let output = r.output.unwrap_or_default();
+        let action_id = output
+            .split("action_id=")
+            .nth(1)
+            .and_then(|s| s.split('。').next())
+            .expect("输出应包含 action_id");
+        let pending = approval::get(&ctx.signals, action_id).expect("待审批项应存在");
+        assert!(
+            pending
+                .metadata
+                .get("project_path")
+                .is_some_and(|v| v.is_null()),
+            "global 原则的 project_path 必须为 null"
+        );
     }
 
     #[test]

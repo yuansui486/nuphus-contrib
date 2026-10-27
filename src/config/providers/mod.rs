@@ -15,6 +15,7 @@ pub mod openai;
 pub mod opencode_go;
 pub mod openrouter;
 pub mod qwen;
+pub mod stepfun;
 pub mod xai;
 pub mod zhipu;
 
@@ -30,5 +31,6 @@ pub use openai::OpenAIProvider;
 pub use opencode_go::OpenCodeGoProvider;
 pub use openrouter::OpenRouterProvider;
 pub use qwen::QwenProvider;
+pub use stepfun::StepFunProvider;
 pub use xai::XaiProvider;
 pub use zhipu::ZhipuProvider;

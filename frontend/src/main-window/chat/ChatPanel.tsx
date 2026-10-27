@@ -1,4 +1,12 @@
-import React, { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
+import React, {
+  useState,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+  useMemo,
+  type ReactNode,
+} from 'react'
 import { createPortal } from 'react-dom'
 import type {
   ChatMessage,
@@ -55,6 +63,7 @@ import { RefIcon } from './ReferenceBar'
 import { WelcomeScreen } from './WelcomeScreen'
 import { OnboardingModal } from './OnboardingModal'
 import { SessionDivider } from './SessionDivider'
+import { RefineCollapseBar } from './RefineCollapseBar'
 import type { ApiHealthState } from '../../core/types'
 import { PauseOverlay } from './PauseOverlay'
 import { ChatInputBar } from './ChatInputBar'
@@ -90,7 +99,7 @@ import {
 import { RatingModal } from '../layout/ExecutionTraceFloating'
 import { MoodFace } from '../../ui/MoodFace'
 import { useLanguage } from '../../locales'
-import { TurnMetaBar } from '../../ui/TurnMetaBar'
+import { TurnMetaBar, type TurnMetaBarActiveTool } from '../../ui/TurnMetaBar'
 import type { TurnMeta } from '../../core/types'
 import { LetterAvatar } from '../../ui/LetterAvatar'
 import { playUiSound } from '../../ui/sound'
@@ -113,6 +122,12 @@ function formatTokens(n: number): string {
 
 interface ChatPanelProps {
   messages: ChatMessage[]
+  /**
+   * 实时执行时间线（useSession.timeline）：仅用于派生「当前正在跑的工具」，
+   * 驱动气泡执行态提示（工具结束——成功或失败——立即消失）。
+   * 缺省空数组，非执行场景与测试无须提供。
+   */
+  timeline?: TimelineEntry[]
   /**
    * 后端权威执行态（唯一来源，见 useExecutionState）。本组件内部只做谓词派生：
    * `running` = agent 主循环在迭代中（气泡光标 / 思考条）；`!== 'idle'` = 后端仍占用
@@ -213,6 +228,14 @@ interface ChatPanelProps {
   ) => void
   /** 气泡执行回溯：点击打开执行面板显示该轮历史执行过程（traceItems） */
   onShowExecTrace?: (trace: TimelineEntry[]) => void
+  /**
+   * 聊天区左上角（`.chat-header-left`）的自绘 chrome 槽位：**由 App 层组合**。
+   * 现在挂的是「Exec 执行指示器」（ExecIndicator）——它的数据源是本轮 task_runs
+   * 台账、点击目标是 App 层既有的 showExecTrace 开关，两者都已活在 App 层；
+   * 走槽位可避免把执行台账再穿一层 props 进本组件（本组件对执行细节零感知）。
+   * 缺省不渲染（无槽位则左组保持空）。
+   */
+  execIndicator?: ReactNode
   /** Leader 暂停是否禁用（workflow 运行时） */
   isWorkflowRunning?: boolean
   /** 输入栏最左端齿轮按钮：打开设置中心全屏覆盖层（状态由 App 层持有） */
@@ -277,6 +300,7 @@ function migrateLegacyProjectBookmarks(existing: ProjectBookmark[]): ProjectBook
 
 export function ChatPanel({
   messages: messageRecords,
+  timeline = [],
   executionStage,
   onSend,
   onGracefulStop,
@@ -334,6 +358,7 @@ export function ChatPanel({
   appearanceOpen,
   onAppearanceDismiss,
   onRate,
+  execIndicator,
   onShowExecTrace,
 }: ChatPanelProps) {
   const messages = useMemo(() => composeAssistantReplies(messageRecords), [messageRecords])
@@ -344,6 +369,21 @@ export function ChatPanel({
   // 二者都取自 executionStage 同一个值，不再出现 `!canSwitch || locked` 式多源 OR。
   const isProcessing = executionStage === 'running'
   const backendLocked = executionStage !== 'idle'
+
+  // 当前正在执行的工具（大王 2026-10-22 定）：气泡执行态提示只跟随**这一条**——
+  // 工具结束（成功或失败）立即消失，不等整轮结束。取 timeline 最后一条 running 的
+  // tool_call；非执行态 / 无工具时为 null（失败/中断若丢了 tool_call_end，
+  // isProcessing 转 false 同样清空）。
+  const activeTool = useMemo<TurnMetaBarActiveTool | null>(() => {
+    if (!isProcessing) return null
+    for (let i = timeline.length - 1; i >= 0; i--) {
+      const entry = timeline[i]
+      if (entry.kind === 'tool_call' && entry.status === 'running') {
+        return { id: entry.id, toolName: entry.toolName, params: entry.params }
+      }
+    }
+    return null
+  }, [isProcessing, timeline])
   const [pauseMode, setPauseMode] = useState<'menu' | 'preparing' | 'input'>('menu')
   const [appendInput, setAppendInput] = useState('')
   const [pauseSubmitting, setPauseSubmitting] = useState(false)
@@ -381,7 +421,11 @@ export function ChatPanel({
     browserOpeningRef.current = true
     setBrowserOpening(true)
     hudUpdate(t('browser.starting'), 'info')
-    browserShowWindow()
+    // 默认页 = Nuphus 官网：只在冷启动/空白页时被后端采纳（就地导航，不新开标签）；
+    // Agent 执行中不传——执行里浏览器页就是工作页，唤出绝不导航，防止顶掉正在
+    // 自动化的页面。窗口已有真实页面时后端同样忽略此参数。
+    const show = isProcessing ? browserShowWindow() : browserShowWindow('https://www.nuphus.com/')
+    show
       .catch(e => {
         hudUpdate(friendlyIpcError(e, '打开浏览器失败'), 'warning')
       })
@@ -389,15 +433,15 @@ export function ChatPanel({
         browserOpeningRef.current = false
         setBrowserOpening(false)
       })
-  }, [t])
+  }, [t, isProcessing])
 
-  // 执行中每 500ms 重渲染一次，让消息气泡的 TurnMetaBar 走秒。
-  // **不持有任何时间值**——耗时一律由 TurnMetaBar → resolveTurnDuration 从
-  // turnMeta/msg.meta 求出（执行中按 startedAtMs 推算、完成后取 durationMs）。
+  // 执行中重渲染节奏（2026-10-19 大王定调）：1000ms 顶层 tick——消息流里的动态
+  // 内容（执行步骤计数等）保持可见的连续感。此前为查卡死曾整树删除，实测「半天
+  // 才动一次」体验不可接受；卡死根因经审计另有其因（渲染饱和误判），节奏不是病根。
   const [, forceTick] = useState(0)
   useEffect(() => {
     if (!isProcessing) return
-    const timer = window.setInterval(() => forceTick(n => n + 1), 500)
+    const timer = window.setInterval(() => forceTick(n => n + 1), 1000)
     return () => window.clearInterval(timer)
   }, [isProcessing])
   /**
@@ -1067,10 +1111,95 @@ export function ChatPanel({
   // 执行追踪面板（ExecutionTraceFloating）不传该选项，保持原严格语义不变。
   // smoothPull = true（2026-10-11）：流式增长与回底按钮改走 rAF 追踪循环（每帧向底部
   // 收拢、目标每帧重测），「瞬移跳动」变连续滑移；程序性回填（followReset）保持瞬移。
-  const { scrollRef, showJumpButton, onScroll, jumpToBottom, followReset } = useStickyScroll(
-    messages,
-    { bottomZonePx: 80, smoothPull: true },
+  const { scrollRef, showJumpButton, onScroll, jumpToBottom, followReset, nudgeScrollTop } =
+    useStickyScroll(messages, { bottomZonePx: 80, smoothPull: true })
+
+  // ── Refine 折叠：refine 前历史消息默认折叠（小巧占位），解决多轮 refine 后
+  // 前端历史气泡累积卡顿。点击折叠条展开/折叠。expandedRefineIds 记录展开的段。
+  //
+  // 两条体验铁律（大王 10-21）：
+  // 1) refine 进行中（streaming）不折叠它前面的历史——刚触发提炼就把上文藏了，
+  //    用户看不到提炼正在处理的上下文；等 refine 完成（completed）再折叠。
+  // 2) 折叠/展开不跳顶：历史消息批量显隐会骤改滚动高度，浏览器把视口重定位到
+  //    顶部。操作前记录 refine 分隔线的视口位置，DOM 提交后补偿 scrollTop；贴底
+  //    跟随时直接回底（用户在底部看最新内容，不该被中间折叠条拽到上文去）。
+  const [expandedRefineIds, setExpandedRefineIds] = useState<Set<string>>(new Set())
+  const refineAnchorRef = useRef<{ id: string; atBottom: boolean; viewportY: number } | null>(null)
+  const toggleRefineExpand = useCallback(
+    (id: string) => {
+      const container = scrollRef.current
+      if (container) {
+        const anchor = container.querySelector(`[data-refine-anchor="${id}"]`) as HTMLElement | null
+        refineAnchorRef.current = {
+          id,
+          atBottom: !showJumpButton,
+          viewportY: anchor
+            ? anchor.getBoundingClientRect().top - container.getBoundingClientRect().top
+            : 0,
+        }
+      }
+      setExpandedRefineIds(prev => {
+        const next = new Set(prev)
+        if (next.has(id)) next.delete(id)
+        else next.add(id)
+        return next
+      })
+    },
+    [showJumpButton],
   )
+  // DOM 提交后（绘制前）恢复锚点：贴底则回底，否则把 refine 分隔线挪回原视口位置，
+  // 抵消历史消息批量显隐造成的滚动高度跳变。
+  useLayoutEffect(() => {
+    const anchor = refineAnchorRef.current
+    if (!anchor) return
+    refineAnchorRef.current = null
+    const container = scrollRef.current
+    if (!container) return
+    if (anchor.atBottom) {
+      jumpToBottom()
+      return
+    }
+    const el = container.querySelector(`[data-refine-anchor="${anchor.id}"]`) as HTMLElement | null
+    if (!el) return
+    const newViewportY = el.getBoundingClientRect().top - container.getBoundingClientRect().top
+    const delta = newViewportY - anchor.viewportY
+    if (delta !== 0) nudgeScrollTop(delta)
+  }, [expandedRefineIds, nudgeScrollTop, jumpToBottom])
+  // 按 refine 边界分段：每个 refine 消息前的连续消息为可折叠段
+  const refineSegments = useMemo(() => {
+    const segs: {
+      refineId: string
+      beforeStart: number
+      beforeEnd: number
+      count: number
+      streaming: boolean
+    }[] = []
+    let segStart = 0
+    messages.forEach((msg, idx) => {
+      if (msg.role === 'refine') {
+        segs.push({
+          refineId: msg.id,
+          beforeStart: segStart,
+          beforeEnd: idx - 1,
+          count: idx - segStart,
+          streaming: msg.refineStatus === 'streaming',
+        })
+        segStart = idx + 1
+      }
+    })
+    return segs
+  }, [messages])
+  // 折叠段内的消息索引（未展开的段）——map 时跳过，不渲染。
+  // streaming 段不折叠：提炼进行中保留上文可见（见上方铁律 1）。
+  const collapsedBeforeIds = useMemo(() => {
+    const set = new Set<number>()
+    refineSegments.forEach(seg => {
+      if (!seg.streaming && !expandedRefineIds.has(seg.refineId) && seg.count > 0) {
+        for (let i = seg.beforeStart; i <= seg.beforeEnd; i++) set.add(i)
+      }
+    })
+    return set
+  }, [refineSegments, expandedRefineIds])
   // followReset 回填：useEvents 在 App 层（本组件之上）监听 nuphus-event，
   // execution_started（新轮次恢复跟随后续流式）/ execution_completed（完成瞬间补拉）
   // 都要拉回底部 —— 函数不能经 props 上行，父层下发 followResetRef、本组件把最新闭包
@@ -1637,7 +1766,9 @@ export function ChatPanel({
           齿轮 = 全应用唯一设置入口（打开设置中心弹窗）；
           调色板 = 外观浮窗（主题 / 微调 / 我的主题 / 语言，非模态常驻）。 */}
       <div className="chat-header">
-        <div className="chat-header-left" />
+        {/* 左上角：App 层组合的常驻 chrome 槽位（Exec 执行指示器）。
+            内部元素以 absolute 落位，故不会把 header 撑高（右侧三钮位置零变化）。 */}
+        <div className="chat-header-left">{execIndicator}</div>
         {/* island 落点锚点：左右两组之间的中央留白（几何见 styles/app-pill.css 的
             .island-slot：绝对定位铺满 header 的 padding box 并 flex 居中，不参与
             space-between 排布 → 两侧内容位置不变）。
@@ -1666,9 +1797,10 @@ export function ChatPanel({
             <IconPalette size={15} />
             <span className="chat-header-btn-label">{t('app.appearance')}</span>
           </button>
-          {/* Agent 浏览器窗口：CDP 那个 Chrome，独立 profile。这里只做「唤出/置前」，
-              Agent 的浏览与自动化操作都在那个窗口内进行。启动中禁用（is-busy），
-              避免连点把单槽串行的后端排成长队。 */}
+          {/* 浏览器窗口：配了指纹浏览器时是用户那个（attach_external，绝不自启
+              自管 Chrome），未配时是 Nuphus 自管 CDP Chrome、独立 profile。这里
+              只做「唤出/置前」，Agent 的浏览与自动化都在这个窗口内进行。启动中
+              禁用（is-busy），避免连点把单槽串行的后端排成长队。 */}
           <button
             className={`chat-header-browser-btn${browserOpening ? ' is-busy' : ''}`}
             aria-label={t('browser.toggle')}
@@ -1813,18 +1945,32 @@ export function ChatPanel({
                 return (
                   <>
                     {messages.map((msg, idx) => {
+                      // Refine 折叠：未展开的 refine 前历史消息跳过渲染（小巧折叠条代替），
+                      // 解决多轮 refine 后前端历史气泡累积卡顿。
+                      if (collapsedBeforeIds.has(idx)) return null
                       // Refine message → render SessionDivider, skip normal message-row
                       if (msg.role === 'refine') {
+                        const seg = refineSegments.find(s => s.refineId === msg.id)
+                        const segExpanded = expandedRefineIds.has(msg.id)
                         return (
-                          <SessionDivider
-                            key={msg.id}
-                            summary={msg.refineStatus === 'completed' ? msg.content : ''}
-                            messageCount={msg.messageCount ?? 0}
-                            sessionId={msg.sessionId ?? ''}
-                            streamingContent={
-                              msg.refineStatus === 'streaming' ? msg.content || null : null
-                            }
-                          />
+                          <React.Fragment key={msg.id}>
+                            {seg && seg.count > 0 && !segExpanded && !seg.streaming && (
+                              <RefineCollapseBar
+                                count={seg.count}
+                                expanded={false}
+                                onToggle={() => toggleRefineExpand(msg.id)}
+                              />
+                            )}
+                            <SessionDivider
+                              summary={msg.refineStatus === 'completed' ? msg.content : ''}
+                              messageCount={msg.messageCount ?? 0}
+                              sessionId={msg.sessionId ?? ''}
+                              anchorId={msg.id}
+                              streamingContent={
+                                msg.refineStatus === 'streaming' ? msg.content || null : null
+                              }
+                            />
+                          </React.Fragment>
                         )
                       }
                       const isCurrentAgent = msg.role === 'assistant' && idx === messages.length - 1
@@ -2011,54 +2157,63 @@ export function ChatPanel({
                                 ) : null}
                               </div>
                               {msg.role === 'assistant' && (
-                                <div className="message-actions">
-                                  <IconButton
-                                    variant="msg-action"
-                                    label="复制"
-                                    title={copiedMsgId === msg.id ? '已复制' : '复制内容'}
-                                    onClick={() => handleCopy(msg.id, msg.content)}
-                                  >
-                                    {copiedMsgId === msg.id ? (
-                                      <IconCheck size={14} />
-                                    ) : (
-                                      <IconCopy size={14} />
-                                    )}
-                                  </IconButton>
-                                  <IconButton
-                                    variant="msg-action"
-                                    label="点评"
-                                    title="点评"
-                                    onClick={() => {
-                                      const userMsg =
-                                        [...messages.slice(0, idx)]
-                                          .reverse()
-                                          .find(m => m.role === 'user')?.content ?? ''
-                                      setRatingMsg({
-                                        id: msg.id,
-                                        content: msg.content,
-                                        userQuestion: userMsg,
-                                      })
-                                    }}
-                                  >
-                                    <IconStar size={14} />
-                                  </IconButton>
-                                  {msg.traceItems && msg.traceItems.length > 0 && (
-                                    <IconButton
-                                      variant="msg-action"
-                                      label="执行回溯"
-                                      title="查看该轮执行过程"
-                                      onClick={() => onShowExecTrace?.(msg.traceItems!)}
-                                    >
-                                      <IconHistory size={14} />
-                                    </IconButton>
-                                  )}
+                                <div className="message-footer-row">
                                   {/* ── 本轮元数据（耗时 / 令牌 / 步数）──
-                                      与复制/点评同排陈列，随 hover 一同显隐（招安
-                                      .message-actions 的交互与配色）。数据源 =
-                                      ChatMessage.meta（后端 TurnMeta）：实时轮次由
-                                      useEvents 写入、历史由 applyHistory 还原。
-                                      空数据由组件判空后不渲染，不留空位。 */}
-                                  <TurnMetaBar meta={msg.meta} className="turn-meta-bar--actions" />
+                                       常驻：不随 hover——执行中也能看到耗时/步数实时在涨。
+                                       数据源 = ChatMessage.meta（后端 TurnMeta）：实时轮次由
+                                       useEvents 写入、历史由 applyHistory 还原。
+                                       空数据由组件判空后不渲染，不留空位。 */}
+                                  <TurnMetaBar
+                                    meta={msg.meta}
+                                    activeTool={activeTool}
+                                    className="turn-meta-bar--actions"
+                                  />
+                                  {/* 动作按钮（复制/点评/执行回溯）跟在执行数据后，同行显示
+                                      （2026-10-24 大王定；执行完成才显示） */}
+                                  {!(isCurrentAgent && isProcessing) && (
+                                    <div className="message-actions">
+                                      <IconButton
+                                        variant="msg-action"
+                                        label="复制"
+                                        title={copiedMsgId === msg.id ? '已复制' : '复制内容'}
+                                        onClick={() => handleCopy(msg.id, msg.content)}
+                                      >
+                                        {copiedMsgId === msg.id ? (
+                                          <IconCheck size={14} />
+                                        ) : (
+                                          <IconCopy size={14} />
+                                        )}
+                                      </IconButton>
+                                      <IconButton
+                                        variant="msg-action"
+                                        label="点评"
+                                        title="点评"
+                                        onClick={() => {
+                                          const userMsg =
+                                            [...messages.slice(0, idx)]
+                                              .reverse()
+                                              .find(m => m.role === 'user')?.content ?? ''
+                                          setRatingMsg({
+                                            id: msg.id,
+                                            content: msg.content,
+                                            userQuestion: userMsg,
+                                          })
+                                        }}
+                                      >
+                                        <IconStar size={14} />
+                                      </IconButton>
+                                      {msg.traceItems && msg.traceItems.length > 0 && (
+                                        <IconButton
+                                          variant="msg-action"
+                                          label="执行回溯"
+                                          title="查看该轮执行过程"
+                                          onClick={() => onShowExecTrace?.(msg.traceItems!)}
+                                        >
+                                          <IconHistory size={14} />
+                                        </IconButton>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                               {/* user 消息首轮 LLM 失败：hover 显示重试（优雅停止气泡无此标记） */}
@@ -2809,17 +2964,49 @@ export function ChatPanel({
           }}
         />
       )}
-      {/* Lightbox overlay for image click-to-zoom */}
-      {lightboxUrl && (
-        <div className="msg-lightbox-overlay" onClick={() => setLightboxUrl(null)}>
-          <img
-            src={lightboxUrl}
-            alt="放大预览"
-            className="msg-lightbox-image"
-            onClick={e => e.stopPropagation()}
-          />
-        </div>
-      )}
+      {/* Lightbox overlay for image click-to-zoom
+          ⚠️ 必须 portal 到 body：留在 .chat-panel 内会被 .chat-area（z-index:1 的
+          层叠上下文）整体压在 TitleBar（.app-shell 直接子级、DOM 靠后）之下——
+          用户会看到「最小化/还原/关闭」浮在预览遮罩上，把应用关闭钮当成预览
+          关闭钮点（真实事故）。portal 到根层后 z-index 才由本层真实生效。
+          Esc 关闭：预览打开时唯一的活动覆盖层，键盘用户的退出路径。 */}
+      {lightboxUrl &&
+        createPortal(
+          <div
+            className="msg-lightbox-overlay"
+            onClick={() => setLightboxUrl(null)}
+            onKeyDown={e => {
+              if (e.key === 'Escape') setLightboxUrl(null)
+            }}
+          >
+            <button
+              type="button"
+              className="msg-lightbox-close"
+              aria-label="关闭预览"
+              title="关闭 (Esc)"
+              autoFocus
+              onClick={() => setLightboxUrl(null)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+            <img
+              src={lightboxUrl}
+              alt="放大预览"
+              className="msg-lightbox-image"
+              onClick={e => e.stopPropagation()}
+            />
+          </div>,
+          document.body,
+        )}
 
       {/* ── 文件预览覆盖层（AI 回复路径点击，全屏对齐画布范式） ── */}
       {previewPath && (

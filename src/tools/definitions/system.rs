@@ -185,14 +185,15 @@ impl ToolRegistry {
     pub(crate) fn register_execute_shell(&mut self) {
         self.register(ToolDef {
             name: "system_shell".to_string(),
-            description: "Execute a shell command (PowerShell on Windows, sh on Unix). Default timeout 180s; timeout > 300s automatically switches to background (the process tree survives and output goes to a file — read that file instead of re-running). Foreground commands (default) are killed with their process tree when the user cancels.".to_string(),
+description: "Execute a shell command (PowerShell on Windows, sh on Unix). IMPORTANT: always pass a short \"title\" (≤ 20 chars) for any command that takes more than a couple of seconds — builds, tests, verifications, installs, downloads, long sleeps. The desktop HUD shows that title so the user can see at a glance what is running; without it the HUD falls back to a generic label and the user cannot tell. Default timeout 180s; timeout > 300s automatically switches to background (the process tree survives and output goes to a file — read that file instead of re-running). On timeout the process is KEPT in the background by default (output goes to a file — read the file to continue, do NOT re-run); only explicit background:false kills the process tree on timeout or cancel.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "PowerShell command on Windows, sh on Unix. On Windows use ; not &&" },
-                    "timeout": { "type": "integer", "minimum": 1, "maximum": 1800, "default": 180, "description": "Max seconds this call waits for the command. NOTE: values above 300 automatically switch to background (you do NOT need to pass background:true), because a foreground run that long would be killed on timeout and force a full re-run. On timeout: default (background=false) kills the process tree; with background=true the process is kept running as a retained background task (pid + output file are reported back) — read its output file instead of re-running." },
-                    "background": { "type": "boolean", "description": "Leave unset to let the 300s rule decide. true = the whole process tree survives a timeout or a user cancel (long jobs whose progress must not be thrown away); it is reported back with pid + output file and is auto-terminated by the system after a max lifetime. Explicit false = always foreground: killed on timeout or cancel (overrides the auto rule, so it is only for commands you WANT killed on timeout)." },
-                    "cwd": { "type": "string", "description": "Working directory for the command" }
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": 1800, "default": 180, "description": "Max seconds this call waits for the command. NOTE: values above 300 automatically switch to background (you do NOT need to pass background:true), because a foreground run that long would otherwise be wasted. On timeout the process is KEPT by default — it stays in the background (pid + output file are reported back) and the output file keeps growing, so read the file to continue instead of re-running. Only explicit background:false kills the process tree on timeout." },
+                    "background": { "type": "boolean", "description": "Leave unset to let the 300s rule decide; either way, timeout keeps the process in the background by default. true = the process explicitly survives a timeout or a user cancel (long jobs whose progress must not be thrown away); it is reported back with pid + output file and is auto-terminated by the system after a max lifetime. Explicit false = the ONLY way to get the process killed on timeout or cancel (for probes whose side effects must not survive)." },
+"cwd": { "type": "string", "description": "Working directory for the command" },
+"title": { "type": "string", "description": "Short human label shown on the desktop HUD while this command runs. REQUIRED for anything non-trivial (builds, tests, installs, downloads, long sleeps): keep it under about 20 characters and write it in the user's language, e.g. \"依赖全量检查\" / \"Full test suite\". It is also the headline of the background-task panel if the command times out into the background. Omit only for instant commands." }
                 },
                 "required": ["command"]
             }),
@@ -288,6 +289,20 @@ pub struct ShellRequest {
     /// 供执行体在返回文案里说明「已自动转后台」—— 调用方看到 pid + 输出文件
     /// 才知道该去读文件，而不是以为命令还在前台等。
     pub background_auto: bool,
+    /// 超时后是否杀进程树。默认 false = **超时保留**（进程转入后台，
+    /// 输出持续落文件、读文件续取，勿重跑）；仅显式 `background: false` 时为 true。
+    ///
+    /// 语义拆分：杀只留给调用方显式声明前台的行为。默认前台超时即杀会让
+    /// 长命令（构建 / 测试 / 下载）重跑全废，故超时保留成为默认语义。
+    ///
+    /// 注意与取消（Cancelled）路径的有意差异：取消仍以 `background` 分流
+    /// （显式声明才保留，默认照杀）—— 取消是显式中止，不留孤儿进程是既有契约；
+    /// 超时是等待耗尽，进程本身没有出错，杀只会白跑。
+    pub kill_on_timeout: bool,
+    /// HUD 上显示的简短标题（可选，2026-10-26 大王定）：填了就**直显**在 HUD，
+    /// 缺省回落固定文案「执行系统命令」。显示层另有 24 字截断保护
+    /// （`hud_arbiter::HUD_TITLE_MAX_CHARS`）。
+    pub title: Option<String>,
     pub cwd: Option<String>,
 }
 
@@ -316,10 +331,20 @@ impl ShellRequest {
             timeout_secs,
             background,
             background_auto,
+            // 超时保留是默认：杀只留给显式 background:false。非布尔值（"true" 字符串等）
+            // 解析为 None，等同未声明，同样保留。
+            kill_on_timeout: explicit_background == Some(false),
             cwd: params
                 .get("cwd")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            // HUD 标题（可选）：只做 trim，长度/控制字符清洗在显示层
+            // （hud_arbiter::hud_title_from_params）统一处理。
+            title: params
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -505,6 +530,8 @@ pub fn run_system_shell(request: &ShellRequest, ctx: &ToolCtx) -> Result<ToolRes
         id: task_id.clone(),
         tool: "system_shell".to_string(),
         command: bg::truncate_command(&request.command),
+        // 调用方填的简短标题（可选）：HUD 与后台任务面板优先显示它
+        title: request.title.clone(),
         pid,
         started_at_ms: bg::now_ms(),
         retain: request.background,
@@ -568,22 +595,27 @@ pub fn run_system_shell(request: &ShellRequest, ctx: &ToolCtx) -> Result<ToolRes
             }
         }
 
-        // 超时：**按显式声明分流**——进程存亡不由超时隐式决定。
-        // - background=true（调用方显式声明长任务）：不杀，登记保留 + 到点由
-        //   看门狗兜底，把 pid / 输出位置 / 可直接结束交给 Agent。
-        // - background=false（默认前台）：按契约终止（同取消路径），返回明确事实。
+        // 超时：**按 kill_on_timeout 分流**——进程存亡只由显式声明决定。
+        // - kill_on_timeout=false（默认：未声明 / 显式 background=true / 长
+        //   timeout 自动转后台）：不杀，登记保留 + 到点由看门狗兜底，把 pid /
+        //   输出位置交给 Agent。默认前台超时即杀会让长命令重跑全废，是产品级
+        //   痛点，故保留成为默认语义。
+        // - kill_on_timeout=true（显式 background=false）：按契约终止（同取消路径），
+        //   返回明确事实。
         ShellOutcome::Timeout => {
             let produced = stderr.map(|d| d.snapshot()).unwrap_or_default();
             let produced = stdout.map(|d| d.snapshot()).unwrap_or(produced);
-            if request.background {
+            if !request.kill_on_timeout {
                 registry.set_retain(&task.id, true);
                 let trigger = if request.background_auto {
                     format!(
                         "（timeout {}s 超过 {}s 前台上限，已自动转后台）",
                         request.timeout_secs, FOREGROUND_TIMEOUT_CAP_SECS
                     )
-                } else {
+                } else if request.background {
                     "（调用方声明了 background=true）".to_string()
+                } else {
+                    "（默认语义：超时不杀，进程转入后台）".to_string()
                 };
                 let message = format!(
                     "命令已超过等待上限 ({}s)，**仍在后台继续运行**（未终止，{}）。\n\
@@ -610,7 +642,7 @@ pub fn run_system_shell(request: &ShellRequest, ctx: &ToolCtx) -> Result<ToolRes
                     exit_code: None,
                 });
             }
-            // 前台：超时即终止（与取消同一收尾路径）
+            // kill_on_timeout（显式 background=false）：超时即终止（与取消同一收尾路径）
             let killed = bg::kill_process_tree(pid);
             for _ in 0..20 {
                 if matches!(child.try_wait(), Ok(Some(_))) {
@@ -840,6 +872,49 @@ mod tests {
         );
         assert!(r.background);
         assert!(!r.background_auto, "显式 true 不该标记为规则自动置位");
+        assert!(!r.kill_on_timeout, "显式 true 是保留语义，不得超时杀");
+    }
+
+    // ── 超时保留成为默认（kill_on_timeout 语义拆分）──
+
+    /// 核心规则：未声明 background（timeout=180 默认）→ kill_on_timeout=false。
+    ///
+    /// 默认前台超时即杀会让长命令重跑全废——保留是默认，杀只留给显式声明。
+    #[test]
+    fn shell_request_retains_on_timeout_by_default() {
+        let r = ShellRequest::from_params(&serde_json::json!({"command": "cargo build --release"}));
+        assert_eq!(r.timeout_secs, 180, "默认 180s 不被本规则改写");
+        assert!(!r.background);
+        assert!(
+            !r.kill_on_timeout,
+            "未声明 background 时超时必须保留进程（默认语义）"
+        );
+    }
+
+    /// 长 timeout 自动转后台同样保留：auto 置位不等于显式声明，不得杀。
+    #[test]
+    fn shell_request_auto_background_does_not_kill_on_timeout() {
+        let r = ShellRequest::from_params(
+            &serde_json::json!({"command": "yarn build", "timeout": 600}),
+        );
+        assert!(r.background_auto);
+        assert!(
+            !r.kill_on_timeout,
+            "规则自动转后台是保留语义，显式 false 才是超时杀的唯一入口"
+        );
+    }
+
+    /// 杀只留给显式声明：background=false → kill_on_timeout=true。
+    #[test]
+    fn shell_request_explicit_false_kills_on_timeout() {
+        let r = ShellRequest::from_params(
+            &serde_json::json!({"command": "probe --side-effect", "background": false}),
+        );
+        assert!(!r.background);
+        assert!(
+            r.kill_on_timeout,
+            "显式 background=false 是超时杀进程的唯一入口"
+        );
     }
 
     /// 工具 schema 的描述必须把这条规则讲给模型听。
@@ -949,8 +1024,31 @@ mod tests {
             timeout_secs,
             background,
             background_auto: false,
+            // helper 模拟「显式声明」场景：background=false ⇒ 显式前台 ⇒ 超时杀。
+            kill_on_timeout: !background,
             cwd: None,
+            title: None,
         }
+    }
+
+    #[test]
+    fn shell_request_parses_title_and_blank_falls_back() {
+        // HUD 标题（2026-10-26）：填了就透传（长度/控制字符清洗在显示层），
+        // 空白 / 缺省 → None（调用方回落默认文案「执行系统命令」）。
+        let with_title = ShellRequest::from_params(&serde_json::json!({
+            "command": "cargo test",
+            "title": "  依赖全量检查  "
+        }));
+        assert_eq!(with_title.title.as_deref(), Some("依赖全量检查"));
+
+        let blank = ShellRequest::from_params(&serde_json::json!({
+            "command": "cargo test",
+            "title": "   "
+        }));
+        assert_eq!(blank.title, None);
+
+        let absent = ShellRequest::from_params(&serde_json::json!({ "command": "cargo test" }));
+        assert_eq!(absent.title, None);
     }
 
     /// 在 delay 之后置位取消标志

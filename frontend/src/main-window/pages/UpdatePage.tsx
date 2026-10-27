@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import { check, type Update } from '@tauri-apps/plugin-updater'
+import { useEffect, useState } from 'react'
+import type { AppUpdate } from '../hooks/useAppUpdate'
 import { getVersion } from '@tauri-apps/api/app'
-import { relaunch } from '@tauri-apps/plugin-process'
 import { useLanguage } from '../../locales'
 import { Button } from '../../ui/Button'
 import { IconRefresh } from '../../ui/Icons'
@@ -61,15 +60,20 @@ type ChangelogState =
   /** 命令调用失败 */
   | { status: 'unavailable' }
 
-export function UpdatePage() {
+export function UpdatePage({ updater }: { updater: AppUpdate }) {
   const { t } = useLanguage()
-  const [status, setStatus] = useState<
-    'idle' | 'checking' | 'available' | 'latest' | 'downloading' | 'error'
-  >('idle')
-  const [update, setUpdate] = useState<Update | null>(null)
-  const [progress, setProgress] = useState(0)
-  const [error, setError] = useState('')
-  const [, setDownloaded] = useState(0)
+  const {
+    status,
+    update,
+    progress,
+    error,
+    stalled,
+    downloaded,
+    installBlocked,
+    installGuard,
+    checkVersion,
+    install,
+  } = updater
   const [currentVersion, setCurrentVersion] = useState('—')
   const [changelog, setChangelog] = useState<ChangelogState>({ status: 'loading' })
 
@@ -104,51 +108,6 @@ export function UpdatePage() {
     }
   }, [])
 
-  const checkVersion = useCallback(async () => {
-    setStatus('checking')
-    setError('')
-    try {
-      const found = await check()
-      setUpdate(found)
-      setStatus(found ? 'available' : 'latest')
-    } catch (e) {
-      // 必须把真实错误带出来：endpoint 已配镜像 + 权威源两路，仅凭"暂时无法获取"
-      // 分不清是镜像挂了、权威源也不通、还是清单本身有问题（见 describeUpdateError）
-      setError(describeUpdateError(e, t))
-      setStatus('error')
-    }
-  }, [t])
-
-  const install = useCallback(async () => {
-    if (!update) return
-    setStatus('downloading')
-    setProgress(0)
-    setDownloaded(0)
-    try {
-      let contentLength: number | null = null
-      let downloadedBytes = 0
-      await update.download(event => {
-        if (event.event === 'Started') {
-          contentLength = event.data.contentLength ?? null
-          // Content length is kept locally for progress calculation.
-        } else if (event.event === 'Progress') {
-          downloadedBytes += event.data.chunkLength
-          setDownloaded(downloadedBytes)
-          setProgress(contentLength ? Math.min(100, (downloadedBytes / contentLength) * 100) : 0)
-        } else if (event.event === 'Finished') {
-          setProgress(100)
-        }
-      })
-      await update.install({ restartAfterInstall: true })
-      await relaunch()
-    } catch (e) {
-      // 下载与验签的失败原因完全不同（网络不通 / 404 / 验签不过），
-      // 统一文案会让用户和我们都无法判断，所以原始错误必须保留
-      setError(describeUpdateError(e, t))
-      setStatus('error')
-    }
-  }, [update, t])
-
   return (
     <div className="update-page">
       <div className="update-current">
@@ -159,8 +118,14 @@ export function UpdatePage() {
         <div className="update-available">
           <div className="update-version">{t('update.available', update.version)}</div>
           {update.body && <div className="update-notes">{update.body}</div>}
-          <Button variant="primary" onClick={install}>
-            {t('update.downloadInstall')}
+          {downloaded && <div>{t('update.downloadReady')}</div>}
+          {installGuard && (
+            <div role="status">
+              {t(installGuard === 'busy' ? 'update.waitForIdle' : 'update.stateUnavailable')}
+            </div>
+          )}
+          <Button variant="primary" onClick={install} disabled={installBlocked}>
+            {t(downloaded ? 'update.installRestart' : 'update.downloadInstall')}
           </Button>
         </div>
       ) : (
@@ -168,11 +133,14 @@ export function UpdatePage() {
           {status === 'checking' && t('update.checking')}
           {status === 'latest' && t('update.latest')}
           {status === 'idle' && t('update.hint')}
-          {status === 'error' && <span className="update-error">{t('update.failed', error)}</span>}
+          {status === 'error' && (
+            <span className="update-error">{describeUpdateError(error, t)}</span>
+          )}
           {status === 'downloading' && (
             <div className="update-progress">
               <span>{t('update.downloading', progress ? `${progress.toFixed(0)}%` : '…')}</span>
               <progress max="100" value={progress} />
+              {stalled && <div className="update-stall-note">{t('update.stallHint')}</div>}
             </div>
           )}
         </div>

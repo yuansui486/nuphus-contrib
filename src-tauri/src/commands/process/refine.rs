@@ -2,28 +2,10 @@
 
 use crate::emitter::CompoundEmitter;
 use crate::state::AppState;
+use nuphus::agent::distill::RefineStreamFilter;
 use nuphus::agent::events::{EventEmitter, NuphusEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-
-/// Refine 内部流程的过滤发射器：只放行 LlmTextDelta（前端提炼气泡流式渲染），
-/// 静默其余事件（ExecutionStarted / UserMessageReceived / ExecutionCompleted /
-/// DirectResponse / TokenUsage / ToolCall* 等）。
-/// 此前 Leader/Workflow 两路径均 take_emitter 全静默：提炼期间前端收不到任何
-/// delta，气泡空转直到 session_refined 一次性填 summary——双 mode 提炼均无
-/// 流式输出的根因（2026-08-30 修复）。REFINE_PROMPT 是纯总结任务，正常不产生
-/// 工具调用；即使 LLM 意外调工具，ToolCall* 也被静默（提炼不污染执行轨迹）。
-struct RefineStreamFilter {
-    inner: Arc<dyn EventEmitter>,
-}
-
-impl EventEmitter for RefineStreamFilter {
-    fn emit(&self, event: NuphusEvent) {
-        if matches!(event, NuphusEvent::LlmTextDelta { .. }) {
-            self.inner.emit(event);
-        }
-    }
-}
 
 /// 提炼的墙钟预算（秒）。
 ///
@@ -286,6 +268,11 @@ pub async fn execute_session_refine<R: tauri::Runtime>(
             leader.session_mut().replace_with_distill(&distill);
         }
         leader.agent_mut().refine_count += 1;
+        // refine 后重建 L1（2026-10-25 定权）：最新摘要已写入记忆库，L1 的
+        // distill 标题索引/记忆尾部必须同步刷新——「只留最新摘要」下 L1 若
+        // 不重建会与上下文形成断层，模型按索引检索看不到刚生成的记录。
+        // 代价是 system 前缀缓存一次性失效（有意取舍）。
+        leader.agent_mut().invalidate_l1_prompt_cache();
         // 提炼结果必须立刻落盘。否则 SQLite 快照/断点仍是提炼前的全量——任何非干净退出
         // （崩溃/强杀）都会把它恢复回来，重启后再次越过 force_limit →
         // 「提炼 → 丢失 → 重提炼」死循环（issue #9 RC2）。

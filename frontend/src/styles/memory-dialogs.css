@@ -177,6 +177,36 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
+}
+.td-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.td-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.td-badge-project {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-micro);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  border: 1px solid var(--border-secondary);
+  color: var(--text-muted);
+  font-weight: var(--fw-normal);
+}
+.td-badge-project--form {
+  align-self: flex-start;
 }
 .td-badge-priority {
   font-family: var(--font-mono);
@@ -186,6 +216,66 @@
   background: var(--accent-dim);
   color: var(--accent);
   font-weight: var(--fw-semibold);
+}
+.td-priority-select {
+  appearance: none;
+  font-family: inherit;
+  font-size: var(--fs-micro);
+  font-weight: var(--fw-normal);
+  line-height: 1.5;
+  padding: 1px 18px 1px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border-secondary);
+  background-color: transparent;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 9px) 50%,
+    calc(100% - 5px) 50%;
+  background-size:
+    4px 4px,
+    4px 4px;
+  background-repeat: no-repeat;
+  color: var(--text-secondary);
+  cursor: pointer;
+  outline: none;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    background-color var(--transition-fast);
+}
+.td-priority-select:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: rgba(var(--accent-rgb), 0.35);
+  background-color: var(--surface-hover);
+}
+.td-priority-select:focus-visible {
+  color: var(--text-primary);
+  border-color: rgba(var(--accent-rgb), 0.55);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+.td-priority-select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.td-priority-select option {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-weight: var(--fw-normal);
+}
+.td-card-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.td-card-edit .memdlg-textarea {
+  min-height: 64px;
+}
+.td-card-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 .td-card-body {
   font-size: var(--fs-body);

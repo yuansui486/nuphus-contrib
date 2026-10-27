@@ -15,9 +15,10 @@ use crate::agent::exec_tool;
 use crate::agent::pause::PauseDecision;
 use crate::agent::reminders::{ReminderCategory, ReminderPriority, ReminderQueue};
 use crate::runtime::protection::ProtectionGuard;
+use crate::runtime::tool_lifecycle::ToolEndGuard;
 use crate::{
     api::{ApiClient, AssistantEvent, MessageRequest},
-    session::{ContentBlock, Session},
+    session::{ContentBlock, PromptSnapshot, Session},
     tools::ToolRegistry,
     AgentOutput, ToolCall, ToolResult,
 };
@@ -101,7 +102,8 @@ pub struct WorkflowAgent {
     /// 本轮元数据累加器（耗时 / token / 步数）——与 ReactAgent/SubTaskRunner
     /// 同一结构与口径，完成时作为 ExecutionCompleted.meta 下发。
     pub(crate) turn_meta: crate::agent::turn_meta::TurnMeta,
-    /// Session refine counter (max 2 auto-refines)
+    /// Session refine counter（turn-end maybe_refine_session 分档计数用；
+    /// in-loop 注入不再计数——整体替换后 token 清零、消息归 1，天然不循环）
     pub(crate) refine_count: u32,
     /// Refine threshold (inherited from Runtime config, same as Leader)
     pub(crate) large_force_threshold: f64,
@@ -125,6 +127,9 @@ pub struct WorkflowAgent {
     /// 且不重复 push（调用方已手动 push_user_internal）。
     pub(crate) internal_input: bool,
     authoring: Option<Arc<dyn WorkflowAuthoring>>,
+    /// 提炼轮禁工具开关（**代码级**）：true 时请求不携带 tools、tool_use 块被
+    /// 剔除——in-loop refine 的提炼轮只能输出摘要（与 Leader ReactAgent 同构）。
+    pub(crate) tools_suppressed: bool,
 }
 
 impl WorkflowAgent {
@@ -172,6 +177,7 @@ impl WorkflowAgent {
             source: "desktop".to_string(),
             internal_input: false,
             authoring: None,
+            tools_suppressed: false,
         }
         .apply_supports_vision()
     }
@@ -242,8 +248,8 @@ impl WorkflowAgent {
         self.supports_vision = Self::resolve_supports_vision(&model_label, llm.provider_name());
         self.llm = llm;
         self.model_label = model_label;
-        self.cached_prompt = None;
-        self.cached_tools = None;
+        self.drop_prompt_prefix_cache();
+        self.session.clear_prompt_snapshot();
     }
 
     /// Enable or disable the enhanced decision layer for this WorkflowAgent.
@@ -252,8 +258,9 @@ impl WorkflowAgent {
     pub fn set_enhanced_mode(&mut self, enabled: bool) {
         if self.tools.enhanced_mode() != enabled {
             self.tools.set_enhanced_mode(enabled);
-            self.cached_prompt = None;
-            self.cached_tools = None;
+            // 工具集变化 → 旧快照的 tools/system_prompt 均不再成立；
+            // 由 prepare_session_prompt_snapshot 的 tools 比对兜底拒绝。
+            self.drop_prompt_prefix_cache();
         }
     }
 
@@ -285,10 +292,123 @@ impl WorkflowAgent {
             .unwrap_or(false)
     }
 
+    fn current_vision_model(&self) -> Option<String> {
+        match crate::config::resolve_vision_strategy() {
+            crate::config::VisionStrategy::Capability(name) => Some(name),
+            crate::config::VisionStrategy::Main => Some(self.model_label.clone()),
+            crate::config::VisionStrategy::None => None,
+        }
+    }
+
+    fn snapshot_matches(
+        &self,
+        snapshot: &PromptSnapshot,
+        tools: &[crate::api::ToolDefinition],
+    ) -> bool {
+        snapshot.provider == self.llm.provider_name()
+            && snapshot.model == self.model_label
+            && snapshot.mode == "workflow"
+            && snapshot.project_path == crate::utils::active_project().map(|(_, dir)| dir)
+            && snapshot.supports_vision
+                == Self::resolve_supports_vision(&self.model_label, self.llm.provider_name())
+            && snapshot.vision_model == self.current_vision_model()
+            && snapshot.tools == tools
+    }
+
+    /// 只丢弃内存里的运行时构建缓存（不动会话快照）。
+    pub fn drop_prompt_prefix_cache(&mut self) {
+        self.cached_prompt = None;
+        self.cached_tools = None;
+    }
+
+    pub(crate) fn prepare_session_prompt_snapshot(&mut self) {
+        let Some(snapshot) = self.session.prompt_snapshot().cloned() else {
+            return;
+        };
+        let tools = self.get_filtered_schemas();
+        if !self.snapshot_matches(&snapshot, &tools) {
+            self.drop_prompt_prefix_cache();
+            self.session.clear_prompt_snapshot();
+            return;
+        }
+        self.cached_prompt = Some(snapshot.system_prompt);
+        self.cached_tools = Some(snapshot.tools);
+        tracing::info!("[PromptSnapshot] restored workflow prompt prefix");
+    }
+
+    pub(crate) fn capture_session_prompt_snapshot(&mut self) {
+        if self.session.prompt_snapshot().is_some() {
+            return;
+        }
+        let (Some(system_prompt), Some(tools)) =
+            (self.cached_prompt.clone(), self.cached_tools.clone())
+        else {
+            return;
+        };
+        self.session.set_prompt_snapshot(PromptSnapshot {
+            system_prompt,
+            tools,
+            provider: self.llm.provider_name().to_string(),
+            model: self.model_label.clone(),
+            mode: "workflow".to_string(),
+            project_path: crate::utils::active_project().map(|(_, dir)| dir),
+            // workflow 无 Custom 卡片概念，恒为 None
+            custom_agent_id: None,
+            supports_vision: Self::resolve_supports_vision(
+                &self.model_label,
+                self.llm.provider_name(),
+            ),
+            vision_model: self.current_vision_model(),
+            tenets_section: crate::agent::prompt::tenets_section(),
+        });
+        tracing::info!("[PromptSnapshot] captured workflow prompt prefix");
+    }
+
+    pub(crate) fn inject_tenet_update(&mut self) -> bool {
+        let current = crate::agent::prompt::tenets_section();
+        let previous = match self.session.prompt_snapshot() {
+            Some(snapshot) => snapshot.tenets_section.clone(),
+            None => return false,
+        };
+        if previous == current {
+            return false;
+        }
+        self.session
+            .push_user_internal(crate::agent::prompt::format_tenet_update(&current));
+        self.session.set_prompt_snapshot_tenets(current);
+        tracing::info!(
+            "[PromptSnapshot] injected workflow tenet update ({} -> {} chars)",
+            previous.len(),
+            self.session
+                .prompt_snapshot()
+                .map(|s| s.tenets_section.len())
+                .unwrap_or(0)
+        );
+        true
+    }
+
+    /// Drop the cached system prompt (project-scoped tenets/memory changed).
+    pub fn invalidate_prompt_cache(&mut self) {
+        self.drop_prompt_prefix_cache();
+        self.session.clear_prompt_snapshot();
+    }
+
+    pub fn invalidate_prompt_cache_for_project(&mut self, project: Option<&str>) {
+        self.drop_prompt_prefix_cache();
+        let unchanged = self
+            .session
+            .prompt_snapshot()
+            .map(|snapshot| snapshot.project_path.as_deref() == project)
+            .unwrap_or(false);
+        if !unchanged {
+            self.session.clear_prompt_snapshot();
+        }
+    }
     /// Update user/assistant names and invalidate prompt cache
     pub fn set_names(&mut self, user_label: String, assistant_name: String) {
         if self.user_label != user_label || self.assistant_name != assistant_name {
-            self.cached_prompt = None; // invalidate cache
+            self.drop_prompt_prefix_cache();
+            self.session.clear_prompt_snapshot();
         }
         self.user_label = user_label;
         self.assistant_name = assistant_name;
@@ -399,16 +519,12 @@ impl WorkflowAgent {
             return authoring.system_prompt();
         }
         if self.cached_prompt.is_none() {
-            let tool_schemas = {
-                let schemas = self.get_filtered_schemas();
-                serde_json::to_string(&schemas).unwrap_or_default()
-            };
+            // prompt 内的工具段只渲染「分组 + 工具名」（与 Leader 同一契约）：
+            // 完整 schema 只由请求的 API tools 字段下发一次。此处传本体 schema
+            // 切片，既供名字渲染，也供桌面能力探测（不能传已渲染的字符串）。
+            let tools = self.get_filtered_schemas();
             // Check vision availability: capabilities.vision > main model supports_vision > none
-            let vision_model = match crate::config::resolve_vision_strategy() {
-                crate::config::VisionStrategy::Capability(name) => Some(name),
-                crate::config::VisionStrategy::Main => Some(self.model_label.clone()),
-                crate::config::VisionStrategy::None => None,
-            };
+            let vision_model = self.current_vision_model();
             // 主模型 supports_vision：统一消歧入口（经 resolve_supports_vision 同源）
             let main_supports_vision =
                 Self::resolve_supports_vision(&self.model_label, self.llm.provider_name());
@@ -416,7 +532,7 @@ impl WorkflowAgent {
                 &self.model_label,
                 Some(self.llm.provider_name()),
                 main_supports_vision,
-                &tool_schemas,
+                &tools,
                 &self.user_label,
                 &self.assistant_name,
                 vision_model.as_deref(),
@@ -463,6 +579,9 @@ impl WorkflowAgent {
         self.max_warning_injected = 0;
         self.user_terminated = false;
         self.pending_warnings.clear();
+        self.prepare_session_prompt_snapshot();
+        // 原则变更通知须排在用户提问之前入 session（顺序见 react_loop 同名注释）
+        self.inject_tenet_update();
 
         // 1. Push user input (with optional images) to our session
         // internal_input=true（refine 内部流程）：调用方已手动 push_user_internal，此处跳过
@@ -523,6 +642,10 @@ impl WorkflowAgent {
         });
 
         let mut user_requested_stop = false;
+        // ── 跨迭代 text 边界分隔 ──
+        // 与 leader 共用 agent::common::TextBoundary 唯一实现：前端对
+        // llm_text_delta 纯字符串拼接，迭代边界只能由后端补。禁止另写一套。
+        let text_boundary = crate::agent::common::TextBoundary::new();
 
         for iteration in 0..self.config.max_iterations {
             if cancel_flag.load(Ordering::SeqCst) {
@@ -632,16 +755,59 @@ impl WorkflowAgent {
                 );
             }
 
-            // ── Context watermark warning (WorkflowAgent 无压缩机制) ──
-            if self.inject_context_warning() {
-                // Forbidden warning injected, give LLM one more chance
-            } else if self.max_warning_injected >= 4 {
-                tracing::warn!("[WORKFLOW-FORBID] Context watermark exceeded limit");
-                break;
+            // ── 上下文预算：执行中防溢出（两级，与 Leader 同机制，2026-10-25 定权）──
+            // 1) force 线（分档 75/80/50–80 可调）：渐进警告 + 软劝导——模型
+            //    自己收敛，本轮结束即 turn-end 正常 refine（**不接力**；
+            //    turn-end 的 50%（50%–80% 可设）强制 refine 是独立且正常的
+            //    既有链路，本检查点不替代、不影响它）；
+            // 2) 85% 绝对硬线：唯一保命线与**唯一接力点**——当场提炼（代码级
+            //    禁工具）、accumulate 压缩后本迭代继续，任务从摘要接续。
+            // 未越线维持原有渐进警告（inject_context_warning）与 FORBID break 语义。
+            {
+                let ctx_window = crate::agent::goal_types::get_context_window_of(self.llm.as_ref());
+                if ctx_window > 0 {
+                    // 口径与 Leader 检查点统一：estimate_token_usage = max(官方
+                    // 读数, 字符估算) 的保守值——官方读数覆盖不到本迭代刚追加
+                    // 的工具结果，取 max 才不会漏判。
+                    let usage = self.session.estimate_token_usage();
+                    if usage > 0 {
+                        let ratio = usage as f64 / ctx_window as f64;
+                        let can_hard_stop =
+                            self.refine_count < crate::agent::distill::MAX_IN_LOOP_REFINES;
+                        if ratio >= 0.85 && can_hard_stop {
+                            // 85% 硬止损：当场提炼 + 压缩 + 就地续跑（唯一接力点）。
+                            // 提炼失败/达上限 → 降级渐进警告 / FORBID break（衔接老语义）。
+                            tracing::warn!(
+                                "[REFINE] workflow 85% hard stop: {}/{} ({:.1}%) — in-loop refine",
+                                usage,
+                                ctx_window,
+                                ratio * 100.0
+                            );
+                            if !self.refine_in_loop(cancel_flag).await {
+                                if self.inject_context_warning() {
+                                    // Forbidden warning injected, give LLM one more chance
+                                } else if self.max_warning_injected >= 4 {
+                                    tracing::warn!(
+                                        "[WORKFLOW-FORBID] Context watermark exceeded limit"
+                                    );
+                                    break;
+                                }
+                            }
+                        } else if self.inject_context_warning() {
+                            // 渐进警告（60/75/88/95% 四档劝导文案）——force 线以内
+                            // 各档软劝导由它承担，给模型自己收敛的机会，不接力。
+                        } else if self.max_warning_injected >= 4 {
+                            tracing::warn!("[WORKFLOW-FORBID] Context watermark exceeded limit");
+                            break;
+                        }
+                    }
+                }
             }
 
             // ── LLM call with real-time streaming ──
-            let events = self.llm_stream_with_streaming(cancel_flag).await?;
+            let events = self
+                .llm_stream_with_streaming(cancel_flag, &text_boundary)
+                .await?;
             if cancel_flag.load(Ordering::SeqCst) {
                 continue; // Report cancellation at the next loop boundary; do not dispatch.
             }
@@ -665,7 +831,14 @@ impl WorkflowAgent {
                 continue;
             }
 
-            let tool_calls = crate::agent::common::extract_tool_calls(&assistant_blocks);
+            // 提炼轮（tools_suppressed）代码级禁工具第二道保险：请求已不带
+            // tools，仍可能从 XML content tag 产生 tool_use——按空 tool_calls
+            // 处理（下方 filtered_blocks 自动剔除全部 ToolUse 块），只留文本。
+            let tool_calls = if self.tools_suppressed {
+                Vec::new()
+            } else {
+                crate::agent::common::extract_tool_calls(&assistant_blocks)
+            };
 
             let valid_ids: std::collections::HashSet<&str> =
                 tool_calls.iter().map(|c| c.id.as_str()).collect();
@@ -802,6 +975,14 @@ impl WorkflowAgent {
                     iteration: iteration as u32,
                     from_task: false,
                 });
+                // Start 之后立刻挂守卫：本 call 的任何早退（含下方 continue 与
+                // 提前 return）都由 Drop 补一条 stub End，HUD 活跃集不泄漏。
+                let mut end_guard = ToolEndGuard::arm(
+                    self.emitter.as_ref(),
+                    &call.id,
+                    &call.tool,
+                    std::time::Instant::now(),
+                );
 
                 // Protection check
                 let alert = self.protection.check_pre_call(call);
@@ -823,6 +1004,7 @@ impl WorkflowAgent {
                         error: err_result.error.clone(),
                         from_task: false,
                     });
+                    end_guard.disarm(); // 上面已发真实 End，勿再补
 
                     match exec_tool::breaker_check(self.safety_failures) {
                         exec_tool::BreakerAction::Halt => {
@@ -1141,6 +1323,7 @@ impl WorkflowAgent {
                     error: result.error.clone(),
                     from_task: false,
                 });
+                end_guard.disarm(); // 正常路径：真实 End 已发
 
                 // External content: sanitize + injection scan + untrusted boundary (unified entry)
                 let filtered = crate::filter::ToolOutputFilter::apply(&call.tool, output_str);
@@ -1310,11 +1493,17 @@ impl WorkflowAgent {
     async fn llm_stream_with_streaming(
         &mut self,
         cancel_flag: &AtomicBool,
+        text_boundary: &crate::agent::common::TextBoundary,
     ) -> crate::Result<Vec<AssistantEvent>> {
         const MAX_RETRIES: u32 = 2;
 
-        // Tool schemas cached
-        let tools = {
+        // 本迭代边界句柄（与 leader 同一共享实现，禁止复制状态机）。
+        let iteration_break = text_boundary.begin_iteration();
+
+        // Tool schemas cached（提炼轮 tools_suppressed：不构建、不携带——代码级禁工具）
+        let tools = if self.tools_suppressed {
+            Vec::new()
+        } else {
             if self.cached_tools.is_none() {
                 self.cached_tools = Some(self.get_filtered_schemas());
             }
@@ -1347,9 +1536,12 @@ impl WorkflowAgent {
                 }
             }
             let messages = self.session.to_api_messages(self.supports_vision);
-            let request = MessageRequest::new("", messages)
-                .with_system(base.clone())
-                .with_tools(tools.clone());
+            let mut request = MessageRequest::new("", messages).with_system(base.clone());
+            // 提炼轮禁工具：请求体完全不携带 tools 字段（代码级，与 Leader 同构）。
+            if !self.tools_suppressed {
+                request = request.with_tools(tools.clone());
+            }
+            self.capture_session_prompt_snapshot();
 
             // Collect events while streaming text deltas to frontend in real-time
             // AtomicU32 tracks nesting depth to prevent premature close when
@@ -1366,22 +1558,25 @@ impl WorkflowAgent {
                 .get(self.llm.provider_kind().as_str())
                 .map(|p| p.quirks().content_tool_tags)
                 .unwrap_or(&[]);
+            // 每次 attempt 各自持句柄 clone：closure 是 move，不能把外层句柄移走
+            let iteration_break = iteration_break.clone();
             let emitter = Box::new(move |event: crate::api::AssistantEvent| {
                 if let crate::api::AssistantEvent::TextDelta(text) = &event {
+                    // 跨迭代边界：本迭代首个 TextDelta 前补一个换行
+                    iteration_break.before_delta(stream_emitter.as_deref(), false);
                     // Single routing entry: process_text_delta (think split +
                     // tool-XML strip with the provider tag set), then emit
                     // thinking (is_thinking=true) before content
                     // (is_thinking=false) so the frontend order is stable.
-                    // 返回值（是否产出可见 text）暂不使用：工作流步骤的过程 text
-                    // 不进跨迭代边界分隔（见 `emit_text_break` 与 react_loop 的
-                    // stream_text_seen）。
-                    let _ = crate::agent::common::route_stream_text_delta(
+                    if crate::agent::common::route_stream_text_delta(
                         text,
                         &think_state,
                         content_tool_tags,
                         false,
                         stream_emitter.as_deref(),
-                    );
+                    ) {
+                        iteration_break.mark_emitted();
+                    }
                 }
                 if let crate::api::AssistantEvent::Reasoning(text) = &event {
                     // DeepSeek thinking mode: reasoning_content deltas arrive as
@@ -1533,6 +1728,101 @@ impl WorkflowAgent {
         level >= 4
     }
 
+    /// 执行中提炼（in-loop refine）——与 Leader（Runtime::refine_in_loop）
+    /// **同机制同构件**（2026-10-25 定权：WorkflowAgent 与 Leader 走一致机制；
+    /// 85% 是唯一硬止损线与**唯一接力点**，force 线只软劝导不接力）。
+    ///
+    /// 就地完成 refine：push 未闭合提示词 → run 跑一轮提炼（`tools_suppressed`
+    /// **代码级**禁工具）→ 摘要 commit（accumulate_distill：对话全清、旧摘要
+    /// 不累加 + 归档）→ 本迭代继续，任务从摘要接续（不硬杀、不丢任务）。
+    ///
+    /// 失败（超时 / API 错 / 空输出）：truncate 回滚提示词消息，session 原样
+    /// 不动，返回 false 由调用方降级到渐进警告（inject_context_warning）兜底。
+    /// 同轮上限 [`MAX_IN_LOOP_REFINES`] 次，尝试即计数（含失败）。
+    ///
+    /// 为什么必须在 85% 当场动作（而不是注入提示词等下一轮收敛）：注入依赖
+    /// 下一次请求被读到，若上下文已逼近上限，该请求可能直接 TooLong（不可
+    /// 重试）——85% 留出的 15% 余量正是提炼请求 + 摘要输出的安全空间。
+    async fn refine_in_loop(&mut self, cancel_flag: &AtomicBool) -> bool {
+        use crate::agent::distill::{
+            commit_in_loop_refine, RefineStreamFilter, MAX_IN_LOOP_REFINES,
+            REFINE_PROMPT_UNFINISHED,
+        };
+
+        if self.refine_count >= MAX_IN_LOOP_REFINES {
+            tracing::info!(
+                "[REFINE] workflow in-loop skipped: refine_count {} >= max {}",
+                self.refine_count,
+                MAX_IN_LOOP_REFINES
+            );
+            return false;
+        }
+        self.refine_count += 1;
+
+        let before = self.session.messages().len();
+        self.session
+            .push_user_internal(REFINE_PROMPT_UNFINISHED.to_string());
+        // 代码级禁工具：请求不携带 tools（llm_stream_with_streaming）+
+        // tool_use 块被剔除（run 的 iterate 处）——双保险。
+        self.tools_suppressed = true;
+        // internal_input=true 让 run 跳过重复 push_user（同 turn-end workflow
+        // refine 路径）；过滤器静默 ExecutionStarted 等生命周期事件、放行
+        // LlmTextDelta 供前端提炼气泡流式渲染。
+        self.set_internal_input(true);
+        let saved = self.take_emitter();
+        if let Some(ref e) = saved {
+            self.set_emitter(Some(Arc::new(RefineStreamFilter { inner: e.clone() })));
+        }
+        // Box::pin 断异步递归环：refine_in_loop → run → 迭代循环 → refine_in_loop。
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            Box::pin(self.run(REFINE_PROMPT_UNFINISHED, &None, cancel_flag)),
+        )
+        .await
+        .map_err(|_| "提炼超时（300s）".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()));
+        self.set_internal_input(false);
+        self.tools_suppressed = false;
+        let _ = self.take_emitter();
+        self.set_emitter(saved);
+
+        match result {
+            Ok(output) if output.success && !output.message.trim().is_empty() => {
+                let summary = output.message.trim().to_string();
+                if commit_in_loop_refine(
+                    &mut self.session,
+                    &summary,
+                    // workflow refine 归档归 WorkAgent（与既有 workflow 提炼
+                    // 路径的 save_refine_entry 归属一致）。
+                    crate::memory::entry::AgentType::WorkAgent,
+                ) {
+                    tracing::info!(
+                        "[REFINE] workflow in-loop done: {} chars compacted (refine_count={})",
+                        summary.len(),
+                        self.refine_count
+                    );
+                    true
+                } else {
+                    self.session.truncate_messages(before);
+                    false
+                }
+            }
+            Ok(_) => {
+                self.session.truncate_messages(before);
+                tracing::warn!("[REFINE] workflow in-loop: empty output, rolled back");
+                false
+            }
+            Err(reason) => {
+                self.session.truncate_messages(before);
+                tracing::warn!(
+                    "[REFINE] workflow in-loop failed ({}), session rolled back; warning degraded",
+                    reason
+                );
+                false
+            }
+        }
+    }
+
     /// Safety check: session authorization → permissions → SecurityGuard
     async fn check_tool_safety(
         &mut self,
@@ -1570,6 +1860,220 @@ impl WorkflowAgent {
             &mut self.pending_warnings,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::WorkflowAgent;
+    use crate::api::{ApiClient, MessageRequest, ProviderKind};
+    use crate::tools::ToolRegistry;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    /// 快照逻辑不发起真实请求，只需满足 WorkflowAgent::new 签名。
+    struct NoopApiClient;
+
+    #[async_trait]
+    impl ApiClient for NoopApiClient {
+        async fn stream(
+            &self,
+            _request: MessageRequest,
+        ) -> crate::Result<Vec<crate::api::AssistantEvent>> {
+            Ok(vec![])
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        fn provider_kind(&self) -> ProviderKind {
+            ProviderKind::MiniMax
+        }
+
+        fn provider_name(&self) -> &str {
+            "provider-a"
+        }
+    }
+
+    fn agent() -> WorkflowAgent {
+        WorkflowAgent::new(
+            Arc::new(NoopApiClient),
+            ToolRegistry::work_agent(),
+            None,
+            None,
+            "model-1".to_string(),
+            "用户".to_string(),
+            "Nuphus".to_string(),
+            crate::permissions::ToolPermissions::default(),
+            0.5,
+        )
+    }
+
+    /// 先让 agent 具备可捕获的 prompt/tools 缓存，再捕获快照。
+    fn agent_with_snapshot() -> WorkflowAgent {
+        let mut wa = agent();
+        wa.session_mut().push_user("hi".to_string());
+        let tools = wa.get_filtered_schemas();
+        wa.cached_prompt = Some("SNAP".to_string());
+        wa.cached_tools = Some(tools);
+        wa.capture_session_prompt_snapshot();
+        assert!(wa.session().prompt_snapshot().is_some());
+        wa
+    }
+
+    /// 切走再切回：运行时缓存被清空后，快照应把系统提示前缀还原回来。
+    #[test]
+    fn workflow_snapshot_restores_prefix_after_cache_drop() {
+        let mut wa = agent_with_snapshot();
+        wa.drop_prompt_prefix_cache();
+        assert!(wa.cached_prompt.is_none());
+        assert!(wa.cached_tools.is_none());
+
+        // 切走不清快照（切换会话路径只丢运行时缓存）
+        assert!(wa.session().prompt_snapshot().is_some());
+
+        wa.prepare_session_prompt_snapshot();
+        assert_eq!(wa.cached_prompt.as_deref(), Some("SNAP"));
+        assert!(wa.cached_tools.is_some());
+        assert!(wa.session().prompt_snapshot().is_some(), "命中后快照应保留");
+    }
+
+    /// 模型变更 → `set_llm` 主动丢缓存 + 丢快照，不得还原旧前缀。
+    #[test]
+    fn workflow_set_llm_drops_snapshot() {
+        let mut wa = agent_with_snapshot();
+        wa.set_llm(Arc::new(NoopApiClient), "model-2".to_string());
+        assert!(
+            wa.session().prompt_snapshot().is_none(),
+            "换模型应主动清快照"
+        );
+        assert!(wa.cached_prompt.is_none());
+        assert!(wa.cached_tools.is_none());
+    }
+
+    /// 模型判据本身：快照 model 与当前 agent 不符时必须被拒。
+    /// （上一条只覆盖 set_llm 的主动清空，不覆盖 `snapshot_matches` 的 model 分支。）
+    #[test]
+    fn workflow_snapshot_rejected_on_model_mismatch() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut().prompt_snapshot.as_mut().unwrap().model = "model-other".to_string();
+        wa.prepare_session_prompt_snapshot();
+        assert!(
+            wa.session().prompt_snapshot().is_none(),
+            "model 判据不成立应丢弃快照"
+        );
+        assert!(wa.cached_prompt.is_none());
+    }
+
+    /// provider 判据：换服务商但模型名相同时必须被拒（同模型名跨服务商很常见）。
+    #[test]
+    fn workflow_snapshot_rejected_on_provider_mismatch() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut().prompt_snapshot.as_mut().unwrap().provider = "provider-b".to_string();
+        wa.prepare_session_prompt_snapshot();
+        assert!(wa.session().prompt_snapshot().is_none());
+    }
+
+    /// 工具集变化（enhanced 开关 / work_agent 工具增减）→ 快照必须被拒。
+    #[test]
+    fn workflow_snapshot_rejected_on_tools_change() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut()
+            .prompt_snapshot
+            .as_mut()
+            .unwrap()
+            .tools
+            .clear();
+        wa.prepare_session_prompt_snapshot();
+        assert!(
+            wa.session().prompt_snapshot().is_none(),
+            "判据不成立应丢弃快照"
+        );
+        assert!(wa.cached_prompt.is_none());
+    }
+
+    /// 项目目录变更 → 快照被拒（项目原则随项目作用域注入）。
+    #[test]
+    fn workflow_snapshot_rejected_on_project_change() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut()
+            .prompt_snapshot
+            .as_mut()
+            .unwrap()
+            .project_path = Some("__other_project__".to_string());
+        wa.prepare_session_prompt_snapshot();
+        assert!(wa.session().prompt_snapshot().is_none());
+    }
+
+    /// mode 判据硬编码为 "workflow"：伪造别的 mode 必须被拒，
+    /// 防止 Leader 快照被 Workflow 槽误用。
+    #[test]
+    fn workflow_snapshot_rejected_on_foreign_mode() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut().prompt_snapshot.as_mut().unwrap().mode = "leader".to_string();
+        wa.prepare_session_prompt_snapshot();
+        assert!(wa.session().prompt_snapshot().is_none());
+    }
+
+    /// 捕获幂等：快照已存在时不得覆盖（否则 tenets 基线被重置，
+    /// 每轮都会重复注入原则更新）。
+    #[test]
+    fn workflow_capture_keeps_existing_snapshot() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut()
+            .set_prompt_snapshot_tenets("stale-tenets".to_string());
+        wa.capture_session_prompt_snapshot();
+        assert_eq!(
+            wa.session().prompt_snapshot().unwrap().tenets_section,
+            "stale-tenets",
+            "已有快照不得被二次 capture 覆盖"
+        );
+    }
+
+    /// 原则清单变化 → 注入一次 internal user 消息并同步基线；再次调用不重复。
+    #[test]
+    fn workflow_tenet_update_injected_once() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut()
+            .set_prompt_snapshot_tenets("stale-tenets".to_string());
+        let before = wa.session().len();
+
+        assert!(wa.inject_tenet_update(), "原则已变应注入");
+        assert_eq!(wa.session().len(), before + 1);
+        assert!(!wa.inject_tenet_update(), "基线已同步，不得重复注入");
+        assert_eq!(wa.session().len(), before + 1);
+        assert_eq!(
+            wa.session().prompt_snapshot().unwrap().tenets_section,
+            crate::agent::prompt::tenets_section()
+        );
+    }
+
+    /// 无快照时不注入原则更新（无基线可比，且 capture 尚未发生）。
+    #[test]
+    fn workflow_tenet_update_skipped_without_snapshot() {
+        let mut wa = agent();
+        let before = wa.session().len();
+        assert!(!wa.inject_tenet_update());
+        assert_eq!(wa.session().len(), before);
+    }
+
+    /// 注入的消息必须是 internal（前端历史过滤掉，不上屏）且声明旧清单作废。
+    #[test]
+    fn workflow_tenet_update_message_is_internal_and_declares_obsolete() {
+        let mut wa = agent_with_snapshot();
+        wa.session_mut()
+            .set_prompt_snapshot_tenets("stale-tenets".to_string());
+        assert!(wa.inject_tenet_update());
+
+        let msg = wa.session().messages().last().expect("应有注入消息");
+        assert!(msg.internal, "原则更新不得上屏，必须 internal");
+        assert_eq!(msg.role, crate::session::MessageRole::User);
+        let text = msg.text_content();
+        assert!(
+            text.contains("此前系统提示中的原则清单作废") || text.contains("没有生效中的用户原则"),
+            "必须显式声明旧清单作废，否则模型会并存两套原则：{text}"
+        );
     }
 }
 

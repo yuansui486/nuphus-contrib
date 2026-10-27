@@ -69,6 +69,14 @@
   gap: 4px;
   pointer-events: auto;
 }
+/* 左上角槽位贴 header 顶部（2026-10-26，Exec 指示器需求）：
+   header 因右侧纵向三钮被撑到约百像素高，默认 align-items:center 会把 0 尺寸的
+   左组落在垂直中线上 —— 挂进该槽位的指示器观感即「偏下」。抬到顶部后，槽位内
+   以 top:0 定位的头像才是「距窗口顶约 12px」的真·左上角。右组（纵向按钮列）
+   继续居中，不受影响。 */
+.chat-header-left {
+  align-self: flex-start;
+}
 /* 右侧是**纵向按钮列**：设置（齿轮）→ 外观（调色板）→ refine chip（有值时）。
    三者在同一 DOM 父子下自然下延，chip 因此不再需要 absolute 到 header 外
    （原先 top:50px/right:16px/z-index:20 与 header 内的浮层互抢层级）。 */
@@ -248,7 +256,7 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 24px 64px 180px;
+  padding: 24px 64px 200px;
   min-width: 0;
   margin: 0 auto;
   width: 100%;
@@ -1818,17 +1826,47 @@
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
 }
 
-/* ── Lightbox 放大预览 ── */
+/* ── Lightbox 放大预览 ──
+   2026-10-19 修复：portal 到 body（根层）。此前渲染在 .chat-panel 内，
+   被 .chat-area（z-index:1 层叠上下文）整体压在 TitleBar 之下——窗口控制按钮
+   浮在遮罩上被误当预览关闭钮（会真关掉应用）。根层后 z-index 由本层真实生效。
+   层级语义：10001 = 高于一切（error.css 顶层 10000 也让位于本预览；
+   ref-lightbox 3100 同理，本层是图片放大最深态）。 */
 .msg-lightbox-overlay {
   position: fixed;
   inset: 0;
-  z-index: 9999;
+  z-index: 10001;
   background: rgba(0, 0, 0, 0.85);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   animation: msgLightboxFadeIn 0.2s ease;
+}
+
+/* 显式关闭钮：右上角固定，不随图片居中布局滚动 */
+.msg-lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.msg-lightbox-close:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+.msg-lightbox-close svg {
+  width: 18px;
+  height: 18px;
 }
 
 .msg-lightbox-image {
@@ -2233,21 +2271,318 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* ── .message-actions 内嵌 ──
-   元数据条是只读信息，并入动作行只为共享同一行排版，**不共享按钮的交互语义**：
-   - 左侧留 10px 与图标按钮拉开，避免紧贴
-   - gap 与 .message-actions 同值（4px），三个 chip 与图标按钮保持同一节奏
-   - 不设 hover / active，不做任何点击反馈——它不是按钮 */
-.turn-meta-bar--actions {
+/* ── 消息底部行：执行数据 + 动作按钮同排 ──
+   2026-10-24 大王定：复制/点评/执行回溯放在 `.turn-meta-bar--actions` 之后，
+   同行显示。元数据条常驻（不随 hover、执行中实时可见），按钮组执行完成才出现；
+   气泡窄时允许整行换行，不让 chip 被动作按钮挤出可见区。 */
+.message-footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: 4px;
+}
+.message-footer-row > .turn-meta-bar--actions,
+.message-footer-row > .message-actions {
   margin-top: 0;
-  margin-left: 10px;
+}
+
+/* ── .message-actions 内嵌 ──
+   元数据条与按钮组已收进 `.message-footer-row`（2026-10-24：按钮组跟在
+   执行数据之后同行显示）。此处仅保留行内排版参数：左侧不缩进。 */
+.turn-meta-bar--actions {
+  margin-left: 0;
   gap: var(--space-1);
   align-items: center;
 }
 
-/* 字号与行高对齐动作行（12px / 1.5），仅压缩水平内边距与透明度让位给图标按钮 */
+/* 执行中状态指示（2026-10-25 大王定 v3「突触回路」）：两枚神经元由一条微光
+   线相连，脉冲在两者间往返——到达即端点闪爆 + 小涟漪，反向再发，1.5s 一拍。
+   语义与 agent 执行回路同构（输入→思考→输出→反馈），读「在推进」。
+   契约延续：不做旋转（旋转=加载等待，长任务会被读成卡住）。
+   方形 SVG 块无边框无背景；仅 duration slot 且 isLive 时由 TurnMetaBar 渲染。 */
+.turn-meta-thinking {
+  flex-shrink: 0;
+  margin-right: 3px;
+  color: var(--spark-dim);
+  overflow: visible;
+}
+.turn-meta-thinking-axis {
+  opacity: 0.22;
+}
+.turn-meta-thinking-node-l,
+.turn-meta-thinking-node-r {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.turn-meta-thinking-node-l {
+  animation: turn-meta-node-l 1.5s cubic-bezier(0.45, 0, 0.2, 1) infinite;
+}
+.turn-meta-thinking-node-r {
+  animation: turn-meta-node-r 1.5s cubic-bezier(0.45, 0, 0.2, 1) infinite;
+}
+.turn-meta-thinking-pulse,
+.turn-meta-thinking-tail {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.turn-meta-thinking-pulse {
+  animation: turn-meta-pulse 1.5s cubic-bezier(0.34, 0.62, 0.28, 1) infinite;
+}
+/* 彗尾 = 同一套拍子 + 0.05s 相位滞后（正延迟=落在脉冲身后），幅度更小更哑 */
+.turn-meta-thinking-tail {
+  animation: turn-meta-tail 1.5s cubic-bezier(0.34, 0.62, 0.28, 1) infinite;
+  animation-delay: 0.05s;
+}
+.turn-meta-thinking-ring-l,
+.turn-meta-thinking-ring-r {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.turn-meta-thinking-ring-l {
+  animation: turn-meta-ring-l 1.5s cubic-bezier(0.25, 0.6, 0.3, 1) infinite;
+}
+.turn-meta-thinking-ring-r {
+  animation: turn-meta-ring-r 1.5s cubic-bezier(0.25, 0.6, 0.3, 1) infinite;
+}
+
+/* 1.5s 突触回路拍子（脉冲行程 2.2→7.8 = 5.6px，全程 translate 驱动、零旋转）：
+   0-20%   左→右行进（彗尾以 0.05s 相位落其后）；
+   20-26%  抵达右元被吸收（缩点隐没）；26-31% 驻留蓄势；
+   33-52%  右→左行进；52-58% 抵达左元被吸收；
+   65-100% 于左元处重新蓄能（渐显长大），下一拍整装出发。
+   端点在被抵达的邻段闪爆（node-r ~26% / node-l ~60%），涟漪同步迸出大于端点、
+   渐扩渐隐（上限 scale 1.35 → 半径 ~2.6，画布内基本不溢界）。 */
+@keyframes turn-meta-pulse {
+  0% {
+    transform: translateX(0) scale(0.95);
+    opacity: 1;
+  }
+  20% {
+    transform: translateX(5.6px) scale(0.95);
+    opacity: 1;
+  }
+  26% {
+    transform: translateX(5.6px) scale(0.35);
+    opacity: 0;
+  }
+  31% {
+    transform: translateX(5.6px) scale(0.35);
+    opacity: 0;
+  }
+  33% {
+    transform: translateX(5.6px) scale(0.6);
+    opacity: 0.9;
+  }
+  52% {
+    transform: translateX(0) scale(0.95);
+    opacity: 1;
+  }
+  58% {
+    transform: translateX(0) scale(0.35);
+    opacity: 0;
+  }
+  65% {
+    transform: translateX(0) scale(0.5);
+    opacity: 0.5;
+  }
+  84% {
+    transform: translateX(0) scale(0.7);
+    opacity: 0.7;
+  }
+  94% {
+    transform: translateX(0) scale(0.85);
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateX(0) scale(0.95);
+    opacity: 1;
+  }
+}
+@keyframes turn-meta-tail {
+  0% {
+    transform: translateX(0) scale(0.6);
+    opacity: 0.55;
+  }
+  20% {
+    transform: translateX(5.6px) scale(0.6);
+    opacity: 0.55;
+  }
+  26% {
+    transform: translateX(5.6px) scale(0.22);
+    opacity: 0;
+  }
+  31% {
+    transform: translateX(5.6px) scale(0.22);
+    opacity: 0;
+  }
+  33% {
+    transform: translateX(5.6px) scale(0.4);
+    opacity: 0.5;
+  }
+  52% {
+    transform: translateX(0) scale(0.6);
+    opacity: 0.55;
+  }
+  58% {
+    transform: translateX(0) scale(0.22);
+    opacity: 0;
+  }
+  65% {
+    transform: translateX(0) scale(0.32);
+    opacity: 0.25;
+  }
+  84% {
+    transform: translateX(0) scale(0.45);
+    opacity: 0.4;
+  }
+  94% {
+    transform: translateX(0) scale(0.5);
+    opacity: 0.5;
+  }
+  100% {
+    transform: translateX(0) scale(0.6);
+    opacity: 0.55;
+  }
+}
+@keyframes turn-meta-node-l {
+  0%,
+  48% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  56% {
+    transform: scale(1.1);
+    opacity: 1;
+  }
+  58% {
+    transform: scale(1.5);
+    opacity: 1;
+  }
+  68% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+  80%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes turn-meta-node-r {
+  0%,
+  20% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  24% {
+    transform: scale(1.05);
+    opacity: 1;
+  }
+  26% {
+    transform: scale(1.5);
+    opacity: 1;
+  }
+  36% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+  48%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes turn-meta-ring-r {
+  0%,
+  24% {
+    transform: scale(0.45);
+    opacity: 0;
+  }
+  30% {
+    transform: scale(0.7);
+    opacity: 0.42;
+  }
+  44% {
+    transform: scale(1.3);
+    opacity: 0.1;
+  }
+  56%,
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+@keyframes turn-meta-ring-l {
+  0%,
+  56% {
+    transform: scale(0.45);
+    opacity: 0;
+  }
+  62% {
+    transform: scale(0.7);
+    opacity: 0.42;
+  }
+  76% {
+    transform: scale(1.3);
+    opacity: 0.1;
+  }
+  88%,
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-meta-thinking-pulse,
+  .turn-meta-thinking-tail,
+  .turn-meta-thinking-ring-l,
+  .turn-meta-thinking-ring-r,
+  .turn-meta-thinking-node-l,
+  .turn-meta-thinking-node-r {
+    animation: none;
+  }
+}
+
+/* 执行态提示 chip（大王 2026-10-22 定）：单条工具执行**超过 60s** 才显示，工具结束
+   （成功或失败）立即消失；文案按命令类型单项显示（Testing / Building / Checking /
+   Running）；变色用流光渐变实现（background-clip:text + 渐变动画扫过）——**字不拆**
+   （逐字 span 拆字被判定太丑，撤）；渐变色值走主题变量，暗亮主题天然兼容。
+
+   ⚠ 选择器必须压过下方的 `.turn-meta-bar--actions .turn-meta-chip`
+   （0,2,0 会覆盖 0,1,0 的 background/color，曾导致流光完全不可见），
+   故用同权重 + 追加类，并显式给 -webkit-text-fill-color。 */
+.turn-meta-bar--actions .turn-meta-chip.turn-meta-chip--patience,
+.turn-meta-chip--patience {
+  /* inline-block：若保持 inline-flex，文本会成为匿名 flex item，
+     background-clip:text 在部分 Chromium 版本下不裁剪匿名项 → 文字透明不可见 */
+  display: inline-block;
+  background: linear-gradient(
+    90deg,
+    var(--spark-dim) 0%,
+    var(--fg-1, var(--spark-fg, currentColor)) 50%,
+    var(--spark-dim) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: turn-meta-sheen 2.4s linear infinite;
+}
+@keyframes turn-meta-sheen {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+/* 字号与行高对齐动作行（12px / 1.5）；左侧不留 padding，左侧距离交给
+   执行中的 SVG 图标自身宽度（2026-10-24 大王定）。 */
 .turn-meta-bar--actions .turn-meta-chip {
-  padding: 1px 6px;
+  padding: 1px 6px 1px 0;
   background: transparent;
   color: var(--spark-dim);
   font-size: 12px;

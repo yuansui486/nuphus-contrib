@@ -37,7 +37,10 @@
   width: fit-content;
 }
 .bgt-entry {
-  position: static;
+  /* static → relative：为执行光影（.task-track-shimmer 派生）提供定位上下文；
+     overflow hidden 把 200% 宽的光影梯度裁在胶囊圆角内，不外溢。 */
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -56,6 +59,51 @@
 .bgt-entry:hover {
   background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
   color: var(--spark-primary);
+}
+
+/* ── 入口胶囊的「仍在执行」光影 ──
+ * 超时转后台（system shell >300s 自动后台化）的任务让胶囊长期驻留，
+ * 静态外观容易被误读成「卡死残留」。光影复用 .task-track-shimmer 基类
+ * （task-bubble.css，随主包静态加载），只覆写两处成形参数：
+ *   · 圆角 6px → 999px（贴合胶囊）；
+ *   · 去内描边（胶囊自带 1px 边框，叠内描边会双重线）。 */
+.bgt-entry .task-track-shimmer {
+  border-radius: 999px;
+  border: none;
+}
+
+/* ── 入口 hover 小 tips（与 .agent-tooltip 同族的浮层配方）──
+ * 光影只说「在动」，tips 把语义说全：N 个任务在后台执行、不是卡死、
+ * 点哪里看列表。磨砂底沿用入口同款 --panel-bg 派生（本文件刻意不用
+ * --glass-bg——其 α 写死、面板不透明度滑块管不到它）。 */
+.bgt-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  padding: 6px 11px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 88%, transparent);
+  backdrop-filter: blur(8px) saturate(1.2);
+  -webkit-backdrop-filter: blur(8px) saturate(1.2);
+  border: var(--border-divider);
+  box-shadow: var(--shadow-elevated);
+  color: var(--spark-secondary);
+  font-size: var(--fz-xs);
+  white-space: nowrap;
+  /* 展开方向向左（right:0 贴胶囊右缘），不与桌面右上角工具条重叠；
+     pointer-events:none 防止一旦误入 tips 触发 hover 抖闪 */
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition:
+    opacity var(--dur-fast, 0.14s) var(--ease-out, ease-out),
+    transform var(--dur-fast, 0.14s) var(--ease-out, ease-out);
+  z-index: 60;
+}
+.bgt-entry:hover .bgt-tip,
+.bgt-entry:focus-visible .bgt-tip {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 /* ═══════════════════════════════════════
@@ -129,6 +177,15 @@
   color: var(--spark-primary);
   white-space: nowrap;
 }
+/* 标题旁小字说明：超时转后台的任务多为验证/构建/测试类长命令，
+   说明文字与标题同中线、保持单行不换行。 */
+.bgt-hint {
+  flex: 0 0 auto;
+  font-size: var(--fz-xs);
+  line-height: 16px;
+  color: var(--spark-dim);
+  white-space: nowrap;
+}
 .bgt-close-btn {
   display: flex;
   align-items: center;
@@ -174,16 +231,48 @@
   flex: 1 1 auto;
   min-width: 0;
 }
-/* 命令文本：后端已截断，这里只做排版截断 + 完整文本走 title */
-.bgt-cmd {
-  font-size: var(--fz-xs);
+/* 主行「在干什么」：调用方标题优先，其次是命令摘要 —— 普通用户先看这一行 */
+.bgt-headline {
+  font-size: var(--fz-sm, 13px);
   color: var(--spark-primary);
-  font-family: var(--font-mono, monospace);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   margin-bottom: 3px;
 }
+/* 状态词：运行中 / 保留在后台（语义色沿用既有 token） */
+.bgt-state {
+  white-space: nowrap;
+}
+.bgt-state--foreground,
+.bgt-state--retained {
+  color: var(--spark-secondary);
+}
+/* 次要一行（小字）：命令原文 / 输出路径 / PID —— 全量信息在 hover 里，
+   普通用户扫前两行即可（2026-10-26 信息降噪） */
+.bgt-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  font-size: var(--fz-xs);
+  color: var(--spark-dim);
+  opacity: 0.75;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bgt-sub-cmd {
+  font-family: var(--font-mono, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 剩余上限：与「已运行」同层的动态值 */
+.bgt-remaining {
+  white-space: nowrap;
+}
+/* 命令文本：后端已截断，这里只做排版截断 + 完整文本走 title */
 .bgt-meta {
   display: flex;
   align-items: center;
@@ -199,23 +288,6 @@
   display: inline-flex;
   align-items: center;
   gap: 3px;
-}
-/* 保留徽标：语义色走既有 token，不新造颜色 */
-.bgt-badge {
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--spark-secondary);
-  white-space: nowrap;
-}
-.bgt-output {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 3px;
-  font-size: var(--fz-xs);
-  color: var(--spark-dim);
-  min-width: 0;
 }
 .bgt-output-path {
   /* 刻意**不**用 `direction: rtl` 那套「把路径尾部留在视野内」的取巧写法：

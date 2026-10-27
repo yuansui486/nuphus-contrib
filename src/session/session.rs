@@ -11,6 +11,40 @@ use serde::{Deserialize, Serialize};
 pub const REFINE_SYSTEM_PREFIX: &str =
     "[当前 session 对话内容已触发提炼，以下是提炼的内容，非当前指令]";
 
+/// 进程内提示词前缀快照（session 切换时复用，避免重建 L0+L2+L1）。
+///
+/// **只活在内存，永不落盘**——这是本结构的核心约束，不是实现细节：
+/// - L1 里含每运行随机生成的门铃令牌（`handoff::HandoffState::token`）和
+///   `chrono::Local` 当天日期。若随 `Session` 序列化进 SQLite，重启后恢复
+///   旧会话会把死令牌/旧日期当成有效系统提示，外部 Agent 上报一律 403。
+/// - 升级安装包必然重启进程 → 快照天然失效，提示词按新版本重建，不存在
+///   「旧版本宪法滞留」的静默偏差。
+///
+/// 因此快照不需要 revision / created_at 之类的版本或时效判据：进程边界
+/// 就是唯一且完备的失效条件。失效口径 = 「重启即重算」，与项目「重启走
+/// 最新数据、不做缓存保障」一致。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptSnapshot {
+    pub system_prompt: String,
+    #[serde(default)]
+    pub tools: Vec<crate::api::ToolDefinition>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    /// Custom 模式激活卡片 id；其它模式 None。防同工具集的两张卡串 L2。
+    #[serde(default)]
+    pub custom_agent_id: Option<String>,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub vision_model: Option<String>,
+    #[serde(default)]
+    pub tenets_section: String,
+}
+
 /// 会话
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -45,6 +79,11 @@ pub struct Session {
     /// 用作 memory entry 的 turn_id，用于因果链追踪。
     #[serde(default)]
     pub turn_count: u32,
+    /// 进程内提示词前缀快照（session 切换复用）。**永不落盘**：
+    /// `skip` 使其不进任何 serde 序列化路径（SQLite 镜像 / session_backup /
+    /// retry_session / 手机端回执），进程重启即自然丢弃，按最新数据重建。
+    #[serde(skip)]
+    pub prompt_snapshot: Option<PromptSnapshot>,
 }
 
 impl Session {
@@ -62,6 +101,7 @@ impl Session {
             api_input_tokens: 0,
             api_output_tokens: 0,
             turn_count: 0,
+            prompt_snapshot: None,
         }
     }
 
@@ -91,6 +131,7 @@ impl Session {
             api_input_tokens: 0,
             api_output_tokens: 0,
             turn_count: parent_depth + 1,
+            prompt_snapshot: None,
         }
     }
 
@@ -141,6 +182,7 @@ impl Session {
             api_input_tokens: 0,
             api_output_tokens: 0,
             turn_count: 0,
+            prompt_snapshot: None,
         }
     }
 
@@ -230,6 +272,25 @@ impl Session {
     pub fn clear(&mut self) {
         self.messages.clear();
         self.refined = false;
+        self.prompt_snapshot = None;
+    }
+
+    pub fn prompt_snapshot(&self) -> Option<&PromptSnapshot> {
+        self.prompt_snapshot.as_ref()
+    }
+
+    pub fn set_prompt_snapshot(&mut self, snapshot: PromptSnapshot) {
+        self.prompt_snapshot = Some(snapshot);
+    }
+
+    pub fn clear_prompt_snapshot(&mut self) {
+        self.prompt_snapshot = None;
+    }
+
+    pub fn set_prompt_snapshot_tenets(&mut self, tenets_section: String) {
+        if let Some(snapshot) = self.prompt_snapshot.as_mut() {
+            snapshot.tenets_section = tenets_section;
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -276,6 +337,56 @@ impl Session {
         self.refined = false;
     }
 
+    /// 回滚到指定消息数——in-loop refine 失败时移除刚注入的提示词消息
+    /// （先调用后 commit：摘要没拿到就不能在 session 里留下提炼指令残留，
+    /// 否则下一轮 LLM 会看到一条无人响应的「开始提炼」指令）。
+    pub fn truncate_messages(&mut self, len: usize) {
+        if self.messages.len() > len {
+            self.messages.truncate(len);
+        }
+    }
+
+    /// 应急截断（TooLong 兜底）：上下文已被 API 判超限且不可重试时的最后自救。
+    ///
+    /// 策略：**最后一条纯 User 消息**（不含 ToolResult）及其之后的完整工具链
+    /// 保留，此前所有非 System 消息整体丢弃——删除边界只落在纯 User 消息上，
+    /// 绝不撕断 assistant tool_use / user tool_result 对（孤儿块会被 API 拒绝）。
+    /// System（含 refine 摘要与安全警告）一律保留。
+    ///
+    /// 这是粗粒度截断（可能多删）：TooLong 场景的目标是保命重试，不是精细压缩；
+    /// 精细压缩由 85% 硬止损（in-loop refine）负责。返回删除的消息数；
+    /// 0 = 无处可删（除 System 前缀外已无历史），调用方应如实报错。
+    pub fn emergency_truncate_for_overflow(&mut self) -> usize {
+        // 最后一条纯 User 消息的下标（从后往前找）
+        let keep_from = self.messages.iter().enumerate().rev().find_map(|(i, m)| {
+            (m.role == MessageRole::User
+                && !m
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. })))
+            .then_some(i)
+        });
+        let Some(keep_from) = keep_from else {
+            return 0;
+        };
+        let before = self.messages.len();
+        let kept: Vec<Message> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| m.role == MessageRole::System || *i >= keep_from)
+            .map(|(_, m)| m.clone())
+            .collect();
+        let removed = before.saturating_sub(kept.len());
+        if removed > 0 {
+            self.messages = kept;
+            // 会话内容已变，官方读数作废（下一请求会重建）
+            self.api_input_tokens = 0;
+            self.api_output_tokens = 0;
+        }
+        removed
+    }
+
     /// 方案 1: 提炼后原始对话存入 memory，用提炼内容替换当前会话历史
     /// 保留 session ID、depth 不变，清空 messages，插入引导消息
     pub fn replace_with_distill(&mut self, distill_content: &str) {
@@ -298,14 +409,44 @@ impl Session {
         });
     }
 
-    /// 累积提炼：保留已有的提炼 System 消息，清空其余消息，追加新摘要
-    /// 用于同一 session 多次 refine —— 先前摘要不动，前缀缓存不失效
+    /// 末条 assistant 消息的文本——refine 接力的取数口（模型产出摘要后
+    /// 循环自然收敛，末条 assistant 即摘要正文）。无 assistant 消息返回 None。
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+            .map(|m| m.text_content())
+    }
+
+    /// 末条消息是否为「无工具调用的 assistant 纯文本回复」——refine 接力的
+    /// 收敛闸门：模型遵守提炼提示词（产出摘要、不调工具）才允许整体替换
+    /// 会话；否则（提示词未被遵守、循环走到耗尽/中断）不替换，历史不丢。
+    pub fn last_assistant_is_plain_text(&self) -> bool {
+        match self.messages.last() {
+            Some(m) if m.role == MessageRole::Assistant => !m
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+            _ => false,
+        }
+    }
+
+    /// 再次提炼：清空全部对话消息，仅保留非 refine 的 System 消息（安全警告等），
+    /// 移除过往 refine 摘要（内容已由 save_refine_entry 归档至记忆系统），写入新摘要。
+    ///
+    /// 历史事故（2026-10-25 定位）：a7828be3（10-21）为修「多次 refine 摘要累加」把
+    /// retain 条件从「只留 System」改成「只删旧摘要 System」——摘要累加修掉了，却把
+    /// v0.1.0 起「对话消息全清」的压缩能力搭进去，refine 从此不压缩、上下文照样爆
+    /// （随 v1.0.0/v1.1.0 发版给全部用户）。本实现同时满足两者：对话全清（压缩）
+    /// + 旧摘要不累加 + 安全警告 System 保留。
     pub fn accumulate_distill(&mut self, distill_content: &str) {
         self.refined = true;
         // 同 replace_with_distill：不清零则旧峰值残留，下一轮 force refine 必复发
         self.api_input_tokens = 0;
         self.api_output_tokens = 0;
-        self.messages.retain(|m| m.role == MessageRole::System);
+        self.messages
+            .retain(|m| m.role == MessageRole::System && !Session::is_refine_system_message(m));
         self.messages.push(Message {
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
@@ -315,6 +456,14 @@ impl Session {
             internal: true,
             timestamp: Some(crate::session::types::now_ms()),
         });
+    }
+
+    /// 判断消息是否为 refine 摘要 System 消息（content 以 REFINE_SYSTEM_PREFIX 开头）
+    pub(crate) fn is_refine_system_message(m: &Message) -> bool {
+        m.role == MessageRole::System
+            && m.content.iter().any(|b| {
+                matches!(b, ContentBlock::Text { text, .. } if text.starts_with(REFINE_SYSTEM_PREFIX))
+            })
     }
 
     /// 移除并返回最后一条 User 消息（用于 refine 失败后清理残留 prompt）
@@ -376,6 +525,7 @@ impl Session {
             api_input_tokens: 0,
             api_output_tokens: 0,
             turn_count: 0,
+            prompt_snapshot: None,
         }
     }
 }
@@ -383,5 +533,61 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 核心不变量：提示词快照绝不进序列化产物。
+    /// 一旦回归，重启恢复会把旧进程的门铃令牌/日期当成有效系统提示。
+    #[test]
+    fn prompt_snapshot_never_serialized() {
+        let mut session = Session::new();
+        session.set_prompt_snapshot(PromptSnapshot {
+            system_prompt: "sys".to_string(),
+            tools: Vec::new(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            mode: "leader".to_string(),
+            project_path: None,
+            custom_agent_id: None,
+            supports_vision: false,
+            vision_model: None,
+            tenets_section: String::new(),
+        });
+        assert!(session.prompt_snapshot().is_some());
+
+        let value = serde_json::to_value(&session).unwrap();
+        assert!(
+            value.get("prompt_snapshot").is_none(),
+            "prompt_snapshot 必须被 serde(skip) 排除，否则会落盘"
+        );
+
+        // 往返后快照必然丢失 —— 这就是「重启即重算」的实现方式
+        let restored: Session = serde_json::from_value(value).unwrap();
+        assert!(restored.prompt_snapshot().is_none());
+    }
+
+    #[test]
+    fn clear_resets_prompt_snapshot() {
+        let mut session = Session::new();
+        session.set_prompt_snapshot(PromptSnapshot {
+            system_prompt: "sys".to_string(),
+            tools: Vec::new(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            mode: "leader".to_string(),
+            project_path: None,
+            custom_agent_id: None,
+            supports_vision: false,
+            vision_model: None,
+            tenets_section: String::new(),
+        });
+        session.set_prompt_snapshot_tenets("tenets".to_string());
+        assert_eq!(session.prompt_snapshot().unwrap().tenets_section, "tenets");
+        session.clear();
+        assert!(session.prompt_snapshot().is_none());
     }
 }

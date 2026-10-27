@@ -33,7 +33,7 @@ impl ToolRegistry {
     pub(crate) fn register_workflow_validate(&mut self) {
         self.register(ToolDef {
             name: "workflow_validate".to_string(),
-            description: "对工作流做静态编译检查（步骤合法性/工具名/必填参数/变量引用/call 环检测），返回 JSON 报告。设计完成后先验证再执行。".to_string(),
+            description: "静态校验工作流（步骤合法性 / 工具名 / 必填参数 / 变量引用 / call 环），返回 JSON 报告。设计完成后先 validate 再 run。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -52,7 +52,7 @@ impl ToolRegistry {
     pub(crate) fn register_workflow_run(&mut self) {
         self.register(ToolDef {
             name: "workflow_run".to_string(),
-            description: "按 ID 执行已保存的工作流。可选传入 inputs 参数化复用同一工作流。断点续连：若上次运行失败或暂停，重复调用同一 id 会自动跳过已完成步骤，从失败步骤继续执行。失败时返回 {\"failed\":true,\"error\":\"...\",\"completed_steps\":[\"step_id\",...]}，解决阻塞后调用 workflow_run 传同一 id 即可续跑（不要新建/复制工作流重跑）。".to_string(),
+            description: "按 id 运行已保存工作流，inputs 注入变量池（可参数化复用同一工作流）。失败返回 failed/error/completed_steps；同一 id 复跑会自动跳过已完成步骤续跑——解决阻塞后重跑同一 id，不要新建或复制工作流。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -220,16 +220,28 @@ impl ToolRegistry {
                         if force { cmd.arg("/F"); }
                         let output = cmd.output()
                             .map_err(|e| format!("taskkill failed: {}", e))?;
-                        let msg = String::from_utf8_lossy(&output.stdout);
-                        Ok(ToolResult::success(format!("Killed PID {}: {}", pid, msg.trim())))
+                        if output.status.success() {
+                            let msg = String::from_utf8_lossy(&output.stdout);
+                            Ok(ToolResult::success(format!("Killed PID {}: {}", pid, msg.trim())))
+                        } else {
+                            // 修复前不检查退出码：taskkill ERROR（进程不存在/拒绝访问）
+                            // 混在 stdout 里也回成功文本，调用方收到假成功
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            Ok(ToolResult::failure(format!("taskkill failed for PID {}: {}", pid, err.trim())))
+                        }
                     } else if let Some(name) = name {
                         let mut cmd = std::process::Command::new("taskkill");
                         cmd.arg("/IM").arg(name);
                         if force { cmd.arg("/F"); }
                         let output = cmd.output()
                             .map_err(|e| format!("taskkill failed: {}", e))?;
-                        let msg = String::from_utf8_lossy(&output.stdout);
-                        Ok(ToolResult::success(format!("Killed process '{}': {}", name, msg.trim())))
+                        if output.status.success() {
+                            let msg = String::from_utf8_lossy(&output.stdout);
+                            Ok(ToolResult::success(format!("Killed process '{}': {}", name, msg.trim())))
+                        } else {
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            Ok(ToolResult::failure(format!("taskkill failed for '{}': {}", name, err.trim())))
+                        }
                     } else {
                         Ok(ToolResult::failure("Either pid or name must be provided"))
                     }
@@ -241,15 +253,26 @@ impl ToolRegistry {
                         let mut cmd = std::process::Command::new("kill");
                         if force { cmd.arg("-9"); }
                         cmd.arg(pid.to_string());
-                        let _output = cmd.output()
+                        let output = cmd.output()
                             .map_err(|e| format!("kill failed: {}", e))?;
-                        Ok(ToolResult::success(format!("Killed PID {}", pid)))
+                        if output.status.success() {
+                            Ok(ToolResult::success(format!("Killed PID {}", pid)))
+                        } else {
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            Ok(ToolResult::failure(format!("kill failed for PID {}: {}", pid, err.trim())))
+                        }
                     } else if let Some(name) = name {
-                        let _output = std::process::Command::new("pkill")
+                        let output = std::process::Command::new("pkill")
                             .args(if force { vec!["-9", name] } else { vec![name] })
                             .output()
                             .map_err(|e| format!("pkill failed: {}", e))?;
-                        Ok(ToolResult::success(format!("Killed process '{}'", name)))
+                        if output.status.success() {
+                            Ok(ToolResult::success(format!("Killed process '{}'", name)))
+                        } else {
+                            // pkill 无匹配进程时退出码 1——如实报失败，杜绝假成功
+                            let err = String::from_utf8_lossy(&output.stderr);
+                            Ok(ToolResult::failure(format!("pkill found no process '{}' or failed: {}", name, err.trim())))
+                        }
                     } else {
                         Ok(ToolResult::failure("Either pid or name must be provided"))
                     }

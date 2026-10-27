@@ -397,16 +397,9 @@ impl super::SubTaskRunner {
                     from_task: self.is_task,
                 });
 
-                // System tool HUD hint
-                let system_hint = match call.tool.as_str() {
-                    "system_shell" => Some("执行系统命令"),
-                    "system_sleep" => Some("等待中"),
-                    "system_info" => Some("获取系统信息"),
-                    "system_env_get" => Some("读取环境变量"),
-                    "process_list" => Some("查看进程"),
-                    "process_kill" => Some("终止进程"),
-                    _ => None,
-                };
+                // System tool HUD hint —— 文案走仲裁侧同一张表（单一事实源；
+                // 此前的本地副本与 hud_arbiter::system_hint 并列存在，是漂移源）
+                let system_hint = crate::hud_arbiter::system_hint(call.tool.as_str());
                 if let Some(hint) = system_hint {
                     self.emit(NuphusEvent::HudUpdate {
                         text: hint.to_string(),
@@ -670,7 +663,24 @@ impl super::SubTaskRunner {
                 let mut cache = crate::cache::global_cache().lock().await;
                 let result = match cache.get(&call.tool, &call.params) {
                     Some(r) => r.clone(),
-                    None => continue,
+                    None => {
+                        // 边界：该 call 的 Start 早已发出，但缓存条目在标记命中之后又
+                        // 消失（并发失效）。补一条 stub End 保证配对 —— 否则 HUD 仲裁
+                        // 活跃集泄漏，之后每次 ToolCallEnd 都会把显示切回它的 running，
+                        // 而 running 相位没有 auto-hide（HUD 计时永不退表）。
+                        self.emit(NuphusEvent::ToolCallEnd {
+                            call_id: call.id.clone(),
+                            tool_name: call.tool.clone(),
+                            success: false,
+                            duration_ms: 0,
+                            output_preview: String::new(),
+                            output_full_size: 0,
+                            is_truncated: false,
+                            error: Some("cache entry vanished before replay".to_string()),
+                            from_task: self.is_task,
+                        });
+                        continue;
+                    }
                 };
                 drop(cache);
                 let output_str = result.output.as_deref().unwrap_or("");
@@ -730,26 +740,49 @@ impl super::SubTaskRunner {
                 );
             }
 
-            // Context water level monitor (no distillation, just reminder)
+            // Context water level monitor (no distillation, reminder only)
+            // ── Exec 设计决策（大王 2026-10-25 定权）──
+            // Exec **不引入 refine 机制**：子任务会话无沉淀价值，且提炼预算
+            // （一次 LLM 调用）对小窗口任务是纯浪费。软约束就够——越线仅注入
+            // 收敛劝导，产出回复交 Leader，由 Leader 决定后续（拆分/重试/在
+            // 主会话 refine）。口径与 Leader 同源（RefineTier 分档）；85% 是
+            // Exec 专属硬劝导线，Leader 侧无此线（force 线即分档内 75/80/50–80），
+            // 动作只有劝导，没有压缩。
             let usage = self.session.estimate_token_usage();
-            let ratio = usage as f64 / self.config.context_window as f64;
-            if ratio > 0.70 {
-                tracing::warn!(
-                    "[EXEC CONTEXT] High context usage: {}/{} ({:.1}%). \
-                    Consider breaking task into smaller subtasks.",
-                    usage,
-                    self.config.context_window,
-                    ratio * 100.0
-                );
-                self.reminders.enqueue(
-                    format!(
-                        "当前上下文使用量已达 {:.0}% ({} tokens)。如后续步骤继续失败，请精简输出或要求 Leader 拆分任务。",
-                        ratio * 100.0, usage
-                    ),
-                    3,
-                    ReminderPriority::High,
-                    ReminderCategory::DeviationCorrect,
-                );
+            let cw_exec = self.config.context_window;
+            if cw_exec > 0 && usage > 0 {
+                let tier = crate::agent::distill::RefineTier::for_window(cw_exec);
+                let ratio = usage as f64 / cw_exec as f64;
+                // 85% 硬止损：最强劝导（仍不 refine、不截断执行）
+                if ratio >= 0.85 && self.max_warning_injected < 4 {
+                    self.max_warning_injected = 4;
+                    tracing::warn!(
+                        "[EXEC CONTEXT] usage {}/{} ({:.1}%) — hard-stop advisory (no refine by design)",
+                        usage, cw_exec, ratio * 100.0
+                    );
+                    self.reminders.enqueue(
+                        format!(
+                            "上下文使用量已达 {:.0}% ({} tokens)。请立即停止非关键探索，基于已获得的信息尽快产出结论回复 Leader——后续由 Leader 决策（拆分任务或重试）。",
+                            ratio * 100.0, usage
+                        ),
+                        3,
+                        ReminderPriority::Critical,
+                        ReminderCategory::DeviationCorrect,
+                    );
+                } else if let Some(pr) = tier.prompt_ratio() {
+                    if ratio >= pr && self.max_warning_injected < 2 {
+                        self.max_warning_injected = 2;
+                        self.reminders.enqueue(
+                            format!(
+                                "当前上下文使用量已达 {:.0}% ({} tokens)。请规划收敛：优先完成核心目标，尽快输出结论回复 Leader。",
+                                ratio * 100.0, usage
+                            ),
+                            3,
+                            ReminderPriority::High,
+                            ReminderCategory::DeviationCorrect,
+                        );
+                    }
+                }
             }
 
             let iter_duration = iter_timer.elapsed().as_millis();
@@ -844,8 +877,8 @@ impl super::SubTaskRunner {
                     // thinking (is_thinking=true) before content
                     // (is_thinking=false) so the frontend order is stable.
                     // 返回值（是否产出可见 text）暂不使用：子任务的过程 text 由
-                    // TimelineEntry 按事件展示，不参与跨迭代边界分隔（见
-                    // `emit_text_break` 与 react_loop 的 stream_text_seen）。
+                    // TimelineEntry 按事件展示，不参与跨迭代边界分隔（共享实现
+                    // 见 agent::common::TextBoundary，leader / WorkAgent 已接入）。
                     let _ = crate::agent::common::route_stream_text_delta(
                         text,
                         &think_state,

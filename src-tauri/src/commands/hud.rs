@@ -40,6 +40,8 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
         .inner_size(HUD_WIDTH, HUD_HEIGHT)
         .decorations(false)
         .transparent(true)
+        // Tauri v2 起窗口阴影默认开启，与透明背景冲突（tauri#8133），必须在建窗时关闭
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
@@ -51,6 +53,9 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
             tracing::info!("[HUD] Window created (hidden)");
             // Position bottom-right after creation
             if let Some(window) = app.get_webview_window(HUD_LABEL) {
+                // WebView2 的 DefaultBackgroundColor 默认白色（官方只接受 alpha=0/255）——
+                // 它是网页内容底下那层底，不刷成透明，「窗口透明」就只是错觉
+                let _ = window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
                 observe_user_drag(&window);
                 position_bottom_right(&window);
             }
@@ -62,7 +67,13 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
 }
 
 /// Show HUD with given text and phase
-pub fn show<R: tauri::Runtime>(app: &AppHandle<R>, text: &str, phase: &str) {
+///
+/// `seq`：全局事件序号（TauriEventEmitter 发射时分配）。0 = 无序号的直调
+/// 旁路（main.rs 快捷键、llm.rs 绑定告警、hud_update 命令），前端恒生效。
+/// 非 0 时前端按 seq 单调消费，小于等于已见 seq 的事件直接丢弃——这是
+/// 并行工具生命周期事件乱序（迟到 running 覆盖终态 done、计时器无法
+/// 退出）的根治点。
+pub fn show<R: tauri::Runtime>(app: &AppHandle<R>, text: &str, phase: &str, seq: u64) {
     // Get / recreate window if needed
     let window = match app.get_webview_window(HUD_LABEL) {
         Some(w) => w,
@@ -103,7 +114,7 @@ pub fn show<R: tauri::Runtime>(app: &AppHandle<R>, text: &str, phase: &str) {
     // Emit update event to the frontend
     let _ = window.emit(
         "hud-update",
-        serde_json::json!({ "text": text, "phase": phase }),
+        serde_json::json!({ "text": text, "phase": phase, "seq": seq }),
     );
 
     // Show if not already visible
@@ -407,7 +418,7 @@ mod tests {
 /// Tauri command: update HUD from frontend or agent
 #[tauri::command(async)]
 pub fn hud_update(app: AppHandle, text: String, phase: String) {
-    show(&app, &text, &phase);
+    show(&app, &text, &phase, 0);
 }
 
 /// Tauri command: hide HUD

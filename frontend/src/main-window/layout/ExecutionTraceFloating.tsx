@@ -800,7 +800,7 @@ export function ExecutionTraceFloating({
     const top = el.scrollTop
     const prev = foldLastTopRef.current
     // 位置**每帧**都记（哪怕是程序滚动造成的）：方向判定必须拿真实相邻两帧作比较，
-    // 否则第一次用户上滚会因"没有前��帧"而永远无法武装（2026-10-09 实测事故）。
+    // 否则第一次用户上滚会因"没有前一帧"而永远无法武装（2026-10-09 实测事故）。
     foldLastTopRef.current = top
     // 武装只认「用户帧」：进场自动下拉 / 贴底回滚 / 锚点补偿都是程序滚动。
     if (onScroll() && prev != null && top < prev - FOLD_SCROLL_DELTA_EPS_PX) {
@@ -920,7 +920,9 @@ export function ExecutionTraceFloating({
   // 数值唯一来源 resolveTurnDuration：
   //   执行中 → Date.now() - turnMeta.startedAtMs（后端绝对起点，刷新后经轮询通道补回）
   //   已结束 → turnMeta.durationMs（后端权威总耗时）
-  // 这里只做 100ms 重渲染让数字走秒，**不持有任何时间值、不起跑、不兜底**。
+  // 节奏（2026-10-19 大王定调）：**执行追踪必须极高及时性**——100ms 保持原速，
+  // 不随 ChatPanel/ChatInputBar 的 1000ms 降档（面板是执行过程的实时仪表，
+  // 工具调用进出/状态翻转全靠这里的高频重渲染呈现）。不持有时间值、不起跑、不兜底。
   const [, forceTick] = useState(0)
   useEffect(() => {
     if (!isProcessing) return
@@ -1525,7 +1527,10 @@ export function ExecutionTraceFloating({
         {/* ── Footer Actions ── */}
         <div className="execution-trace-footer">
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {!hasRated && onRate && (
+            {/* 点评/重新生成仅执行完成后可用：实时模式执行中（isProcessing 且无
+                traceOverride 历史覆盖）隐藏——执行没完点评无意义；历史 trace 与
+                已完成轮次照常（大王 2026-10-22 定）。 */}
+            {!hasRated && onRate && !(isProcessing && !traceOverride) && (
               <>
                 <button className="exec-footer-btn primary" onClick={() => setShowRating(true)}>
                   <IconStar size={14} />

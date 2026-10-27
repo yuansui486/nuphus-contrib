@@ -270,9 +270,13 @@
 }
 .compact-btn--primary:hover:not(:disabled) {
   background: var(--accent-hover);
+  /* 显式钉住反色字：.compact-btn:hover (0,2,0) 会用 --spark-primary 抢字色，
+     简白主题下变成灰黑字落在黑底上（大王报障）。(0,3,0) 在此压回 on-accent。 */
+  color: var(--on-accent);
 }
 .compact-btn--primary:active:not(:disabled) {
   background: var(--accent);
+  color: var(--on-accent);
 }
 .compact-btn.danger-btn {
   color: var(--error);

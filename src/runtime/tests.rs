@@ -11,6 +11,7 @@ use crate::session::Session;
 use crate::tools::registry::{ToolDef, ToolRegistry};
 use crate::ToolResult;
 use async_trait::async_trait;
+use serial_test::serial;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -64,6 +65,77 @@ impl ApiClient for MockApiClient {
 
     fn provider_kind(&self) -> ProviderKind {
         self.provider_kind
+    }
+
+    fn provider_name(&self) -> &str {
+        ""
+    }
+}
+
+/// 固定返回非重试 LLM 错误的 mock——验证首刷语义：
+/// 首个 LLM 请求即失败（400 非重试），react_loop 立即返回，LLM 从未成功过。
+struct FailingApiClient;
+
+#[async_trait]
+impl ApiClient for FailingApiClient {
+    async fn stream(&self, _request: MessageRequest) -> crate::Result<Vec<AssistantEvent>> {
+        Err(crate::NuphusError::LLM(crate::LLMError::ApiError {
+            status: 400,
+            body: "injected non-retryable failure".to_string(),
+        }))
+    }
+
+    fn model_name(&self) -> &str {
+        "mock-model"
+    }
+
+    fn provider_kind(&self) -> ProviderKind {
+        ProviderKind::MiniMax
+    }
+
+    fn provider_name(&self) -> &str {
+        ""
+    }
+}
+
+/// 每轮都发起一次 mock_echo 工具调用（参数含轮次序号——避开防死循环同参拦截），
+/// 把 react 循环推进到 10+ 轮，验证轮中快照的「10 迭代」触发时机。
+struct ToolCallingApiClient {
+    calls: Mutex<usize>,
+}
+
+impl Default for ToolCallingApiClient {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ApiClient for ToolCallingApiClient {
+    async fn stream(&self, _request: MessageRequest) -> crate::Result<Vec<AssistantEvent>> {
+        let n = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        Ok(vec![
+            AssistantEvent::ToolUse {
+                id: format!("snapshot-test-call-{n}"),
+                name: "mock_echo".to_string(),
+                input: format!(r#"{{"text": "iteration-{n}"}}"#),
+            },
+            AssistantEvent::MessageStop,
+        ])
+    }
+
+    fn model_name(&self) -> &str {
+        "mock-model"
+    }
+
+    fn provider_kind(&self) -> ProviderKind {
+        ProviderKind::MiniMax
     }
 
     fn provider_name(&self) -> &str {
@@ -538,4 +610,103 @@ fn test_runtime_config_custom_max_iterations() {
         .expect("build should succeed");
 
     assert_eq!(runtime.config().max_iterations, 42);
+}
+
+/// 首刷语义：用户消息 push 之后、第一次 LLM 请求之前，快照已含该消息。
+///
+/// mock 首个请求即返回非重试错误（400）——LLM 从未成功过，快照依然落盘 →
+/// 证明落盘先于首次 LLM 请求、且不依赖请求成功。
+#[test]
+#[serial]
+fn react_loop_first_flush_persists_user_message_before_first_llm_call() {
+    let mut runtime = RuntimeBuilder::new()
+        .llm(Arc::new(FailingApiClient))
+        .tools(make_mock_tool_registry())
+        .config(RuntimeConfig {
+            agent_config: crate::agent::AgentConfig {
+                enable_memory: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build()
+        .expect("build should succeed");
+    let session_id = runtime.session().id.clone();
+
+    let output =
+        tokio_test::block_on(runtime.run("轮中快照首刷验证输入", &None, &AtomicBool::new(false)))
+            .expect("非重试 LLM 错误应正常返回而非传播");
+    assert!(!output.success, "首个请求即失败应标记为未成功");
+
+    let (mode, json) = crate::store::session::get_snapshot(&session_id)
+        .unwrap()
+        .expect("首刷应已落盘（用户消息 push 之后、首次 LLM 请求之前）");
+    assert_eq!(mode, "leader");
+    let restored: Session = serde_json::from_str(&json).expect("快照 JSON 应可反序列化");
+    assert!(
+        restored
+            .messages()
+            .iter()
+            .any(|m| m.text_content().contains("轮中快照首刷验证输入")),
+        "首刷快照应已含用户消息"
+    );
+
+    crate::store::session::delete_session(&session_id).unwrap();
+}
+
+/// 轮中增量快照的 10 迭代触发：max_iterations=12 的工具循环跑完后，
+/// 落盘快照应停在「第 10 轮开头」——含 iteration-1..10 的工具调用，
+/// 不含 iteration-11/12（执行中崩溃最多丢失当前迭代的增量）。
+#[test]
+#[serial]
+fn react_loop_in_loop_snapshot_captures_mid_loop_state() {
+    let mut runtime = RuntimeBuilder::new()
+        .llm(Arc::new(ToolCallingApiClient::default()))
+        .tools(make_mock_tool_registry())
+        .config(RuntimeConfig {
+            agent_config: crate::agent::AgentConfig {
+                max_iterations: 12,
+                enable_memory: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build()
+        .expect("build should succeed");
+    let session_id = runtime.session().id.clone();
+
+    let output =
+        tokio_test::block_on(runtime.run("轮中快照多轮触发验证", &None, &AtomicBool::new(false)))
+            .expect("工具循环应正常跑完 max_iterations");
+    assert!(!output.success, "达到最大迭代次数应标记为未成功完成");
+
+    let (mode, json) = crate::store::session::get_snapshot(&session_id)
+        .unwrap()
+        .expect("轮中快照应已落盘");
+    assert_eq!(mode, "leader");
+    assert!(json.contains("iteration-10"), "快照应含第 10 轮的工具调用");
+    assert!(
+        !json.contains("iteration-11"),
+        "快照不应含第 11 轮——崩溃最多丢失当前迭代的增量"
+    );
+
+    let restored: Session = serde_json::from_str(&json).expect("快照 JSON 应可反序列化");
+    assert_eq!(restored.id, session_id);
+    assert!(
+        restored
+            .messages()
+            .iter()
+            .any(|m| m.text_content().contains("轮中快照多轮触发验证")),
+        "快照应含用户消息"
+    );
+
+    // 终态（内存）领先快照恰好 2 个迭代——验证「增量」语义而非全量覆盖
+    let final_json = serde_json::to_string(&runtime.session()).unwrap();
+    assert!(final_json.contains("iteration-12"), "终态应含第 12 轮");
+    assert!(
+        restored.len() < runtime.session().len(),
+        "快照应落后于终态（崩溃最多丢当前迭代的增量）"
+    );
+
+    crate::store::session::delete_session(&session_id).unwrap();
 }

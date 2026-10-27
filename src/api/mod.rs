@@ -32,6 +32,7 @@ pub enum ProviderKind {
     #[serde(rename = "opencode-go")]
     OpenCodeGo,
     Xai,
+    StepFun,
 }
 
 impl ProviderKind {
@@ -52,6 +53,7 @@ impl ProviderKind {
             "local" => Some(Self::Local),
             "opencode-go" => Some(Self::OpenCodeGo),
             "xai" => Some(Self::Xai),
+            "stepfun" => Some(Self::StepFun),
             _ => None,
         }
     }
@@ -72,6 +74,7 @@ impl ProviderKind {
             Self::Local => "local",
             Self::OpenCodeGo => "opencode-go",
             Self::Xai => "xai",
+            Self::StepFun => "stepfun",
         }
     }
 }

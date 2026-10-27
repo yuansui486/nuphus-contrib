@@ -149,7 +149,11 @@ impl ToolRegistry {
                 let mut zero_result_diagnostic: Option<String> = None;
                 #[allow(clippy::unnecessary_unwrap)]
                 let entries: Vec<String> = if semantic && query_ref.is_some() {
-                    let mut results = memory::search_entries_semantic(query_ref.unwrap(), fetch_limit, kind, all_projects)
+                    // session_id 精查不受项目过滤限制（与下方 filtered 路径对齐：
+                    // store 层 `!all_projects && session_id.is_none()` 才启用项目过滤）。
+                    // 修复前 semantic 路径把 all_projects 原样下传，跨项目 sid 精查被静默滤空。
+                    let effective_all = all_projects || session_id.is_some();
+                    let mut results = memory::search_entries_semantic(query_ref.unwrap(), fetch_limit, kind, effective_all)
                         .map_err(|e| format!("semantic search failed: {}", e))?;
                     if let Some(sid) = session_id { results.retain(|(e,_)| e.session_id == sid); }
                     if let Some(gt) = goal_type { results.retain(|(e,_)| e.goal_type.as_deref() == Some(gt)); }
@@ -304,7 +308,8 @@ impl ToolRegistry {
 
     /// Leader 主动记忆更新工具 —— 只允许 Leader 写入，ExecAgent 不可访问
     ///
-    /// 写入 ~/.nuphus/memory.md（用户数据目录，见 utils::nuphus_data_dir）。
+    /// 写入项目记忆日志 `.nuphus/memory/{tag}.md`（用户数据目录，见
+    /// utils::active_memory_md_path；早期文档写的 ~/.nuphus/memory.md 已过时）。
     /// 这不是随手笔记，而是重点阶段/文件/操作的索引指南，
     /// 会被注入到 Leader 每轮 prompt 中用于快速决策。
     /// 自动截断到 2000 字符，保留尾部最新内容。
@@ -384,11 +389,11 @@ impl ToolRegistry {
     pub(crate) fn register_workflow_memory_update(&mut self) {
         self.register(ToolDef {
             name: "workflow_memory_update".to_string(),
-            description: "Append a dated summary entry to the workflow working memory (.nuphus/workflow-memory.md), injected into new Workflow Agent sessions. Write a SEARCHABLE digest: phase progress, key findings, parameter experiments, blocking items — not full details; deep history stays in SQLite, reachable via memory_search / memory_session_context using the session id shown in each signature line. Session id is auto-appended by the system — do not repeat it. Write INCREMENTAL changes only (new phase, new decision, resolved blocker) — do not restate unchanged items. Max 2000 chars per entry. Suggested structure: ##Phase / ##File / ##Blocker / ##Decision.".to_string(),
+            description: "向 workflow-memory.md 追加一条摘要，新建 Workflow 会话时自动注入最新尾部。写可检索的摘要（阶段进展 / 关键发现 / 参数实验 / 阻塞与决策），不写全量细节；只写本轮增量，不复述未变内容；单条 ≤2000 字符（超出取尾部）。session id 由系统自动追加，不要重复；署名行里的 session id 可用于回查。需要更细的历史时用 memory_search / memory_session_context 查 SQLite。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "记忆内容（建议结构化格式：## phase / ## files / ## blockers / ## decisions）"},
+                    "content": {"type": "string", "description": "记忆内容（建议 ## phase / ## files / ## blockers / ## decisions）"},
                 },
                 "required": ["content"]
             }),
@@ -443,11 +448,11 @@ impl ToolRegistry {
     pub(crate) fn register_session_context(&mut self) {
         self.register(ToolDef {
             name: "memory_session_context".to_string(),
-            description: "查看会话因果链。session_id：该会话最近 N 条；session_id+turn_id：该轮全部条目（Leader 意图与对话、Exec/Workflow 任务轨迹的紧凑步骤：工具 + 参数摘要 + 结果摘要 + 成败）。".to_string(),
+description: "查看会话因果链。session_id：该会话最近 N 条；session_id+turn_id：该轮全部条目（Leader 意图与对话、Exec/Workflow 任务轨迹的紧凑步骤：工具 + 参数摘要 + 结果摘要 + 成败）。session_id 亦可直接传 distill 记录的 entry id（形如 refine-{session_id}-{ts}，L1 提炼索引给出的就是它）。".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "会话 ID（从 memory_search 结果中获取的完整 session_id）"},
+                    "session_id": {"type": "string", "description": "会话 ID（memory_search 结果的完整 session_id，或 L1 提炼索引里的 ID：session id / entry id 均可）"},
                     "turn_id": {"type": "string", "description": "可选。精确到某轮次，查看该轮次的所有条目（Leader 意图、Exec 结果、StateChecker 模式等）"},
                     "limit": {"type": "integer", "default": 20, "description": "不加 turn_id 时最多返回多少条"}
                 },

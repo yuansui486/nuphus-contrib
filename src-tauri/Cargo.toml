@@ -1,6 +1,6 @@
 [package]
 name = "nuphus-desktop"
-version = "0.2.30"
+version = "1.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/mrpulor-gh/nuphus"
@@ -114,6 +114,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2.11.0"
 tauri-plugin-process = "2.3.1"
+# 单实例守卫：第二实例（命名互斥 / D-Bus）唤醒已运行实例后立即退出。
+# 必须作为**第一个** plugin 注册——插件按注册顺序执行，第二实例必须在其余 setup 之前被裁掉
+# （否则会先建 splash/主窗、抢热键、抢 18771 门铃）。见 main.rs 注册处。
+tauri-plugin-single-instance = "2"
 
 # Windows API（emitter.rs 置前不抢焦点：SetWindowPos + SWP_NOACTIVATE）
 # 用 windows-sys 而非 windows crate——tauri 内部依赖 windows-sys，

@@ -53,6 +53,31 @@ describe('buildTurnAnchors', () => {
     expect(anchors).toEqual([{ turn: 1, messageId: 'u1', prompt: '问', response: '答' }])
   })
 
+  it('refine 是分界线：refine 前的 turn 不进 rail（多轮 refine 不无限膨胀）', () => {
+    const anchors = buildTurnAnchors([
+      msg('u0', 'user', '旧问'),
+      msg('a0', 'assistant', '旧答'),
+      msg('r1', 'refine', '提炼1'),
+      msg('u1', 'user', '问'),
+      msg('a1', 'assistant', '答'),
+    ])
+    // refine 前的 u0 被过滤，只保留 refine 后的 u1（turn 从 1 重新计）
+    expect(anchors).toEqual([{ turn: 1, messageId: 'u1', prompt: '问', response: '答' }])
+  })
+
+  it('多轮 refine：只保留最后一个 refine 之后的 turn', () => {
+    const anchors = buildTurnAnchors([
+      msg('u0', 'user', '旧问0'),
+      msg('r1', 'refine', '提炼1'),
+      msg('u1', 'user', '旧问1'),
+      msg('r2', 'refine', '提炼2'),
+      msg('u2', 'user', '新问'),
+      msg('a2', 'assistant', '新答'),
+    ])
+    // 只保留最后一个 refine（r2）之后的 u2
+    expect(anchors).toEqual([{ turn: 1, messageId: 'u2', prompt: '新问', response: '新答' }])
+  })
+
   it('开头的 assistant 不造空轮', () => {
     const anchors = buildTurnAnchors([msg('a0', 'assistant', '欢迎语')])
     expect(anchors).toEqual([])

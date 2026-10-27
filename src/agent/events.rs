@@ -389,35 +389,6 @@ pub struct StepOutput {
 /// Risk level — re-exported from api::types for backward compatibility
 pub use crate::api::types::RiskLevel;
 
-impl NuphusEvent {
-    /// 主界面（webview）失联期间仍然必须放行的事件。
-    ///
-    /// 判定口径：HUD 是**另一个 Tauri 窗口**（主 webview 死了它可能还活着），
-    /// 以及「任务生命周期边界 / 错误 / 需要用户交互」的事件——这些漏一个，
-    /// 用户回来看到的就是错乱的状态。高频道进度事件（文本增量、工具输出行、
-    /// 任务快照等）在失联期间全部丢弃：它们对已死的界面毫无价值，却正是
-    /// 「往死 webview 里狂发 JS」错误洪水（线上 46 条/秒）的来源。
-    pub fn is_essential_when_ui_dead(&self) -> bool {
-        matches!(
-            self,
-            Self::HudUpdate { .. }
-                | Self::ExecutionCompleted { .. }
-                | Self::ExecutionError { .. }
-                | Self::LeaderDone { .. }
-                | Self::Error { .. }
-                | Self::Warning { .. }
-                | Self::UserInputRequest { .. }
-                | Self::SecurityCheck { .. }
-                | Self::TaskRuns { .. }
-                | Self::SessionChanged { .. }
-                | Self::SessionInfo { .. }
-                | Self::MessageAccepted { .. }
-                | Self::DirectResponse { .. }
-                | Self::NewChatBroadcast
-        )
-    }
-}
-
 // ── EventEmitter trait ──
 
 /// Event emitter trait.
@@ -444,70 +415,6 @@ mod tests {
         assert_eq!(parsed.goal, "读取 Cargo.toml");
         assert_eq!(parsed.tools, vec!["Read"]);
         assert_eq!(parsed.success_criteria, "获取项目依赖列表");
-    }
-
-    /// UI 失联期间的事件分级：边界/错误/交互/HUD 必须放行，进度流必须丢弃。
-    /// （丢错一个边界事件 → 用户回来看到状态错乱；放错一个进度事件 →
-    ///  就是往死 webview 里继续撞，错误洪水由此而来。）
-    #[test]
-    fn essential_vs_noise_when_ui_dead() {
-        assert!(
-            NuphusEvent::ExecutionCompleted {
-                step_index: 0,
-                output: StepOutput {
-                    step_index: 0,
-                    result_message: String::new(),
-                    artifacts: vec![],
-                    tool_calls_count: 0,
-                },
-                total_duration_ms: 0,
-                total_calls: 0,
-                meta: None,
-            }
-            .is_essential_when_ui_dead(),
-            "执行完成是生命周期边界，必须放行"
-        );
-        assert!(
-            NuphusEvent::Warning {
-                code: "ui_reconnected".into(),
-                message: String::new(),
-                attempt: None,
-                max_attempts: None,
-            }
-            .is_essential_when_ui_dead(),
-            "Warning（含恢复通知）必须放行"
-        );
-        assert!(
-            NuphusEvent::HudUpdate {
-                text: "任务执行中".into(),
-                phase: "running".into(),
-                step_kind: None,
-            }
-            .is_essential_when_ui_dead(),
-            "HUD 是独立窗口，主 webview 死后可能仍可见"
-        );
-        assert!(
-            NuphusEvent::TaskRuns { runs: vec![] }.is_essential_when_ui_dead(),
-            "TaskRuns 是快照语义，恢复态依赖它重建任务面板"
-        );
-        assert!(
-            !NuphusEvent::LlmTextDelta {
-                text: "你".into(),
-                is_thinking: false,
-                from_task: false,
-            }
-            .is_essential_when_ui_dead(),
-            "文本增量是纯进度流，失联期间必须丢弃"
-        );
-        assert!(
-            !NuphusEvent::ToolOutputLine {
-                call_id: "c1".into(),
-                line: "stdout line".into(),
-                is_stderr: false,
-            }
-            .is_essential_when_ui_dead(),
-            "工具输出行是最高频的洪水来源，必须丢弃"
-        );
     }
 
     #[test]

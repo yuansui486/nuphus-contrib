@@ -1355,7 +1355,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for CollapseFi
 
 /// 周期性上报折叠摘要：把「限流期间被折叠了多少条」汇总输出，避免限流
 /// 本身变成信息黑洞。**只由 init_logging 在 tokio 运行时内调用一次。**
-async fn collapse_summary_loop(counter: std::sync::Arc<CollapseCounter>) {
+async fn collapse_summary_loop(counter: std::sync::Arc<CollapseCounter>, sink: &'static str) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let folded = counter.take_folded();
@@ -1364,6 +1364,7 @@ async fn collapse_summary_loop(counter: std::sync::Arc<CollapseCounter>) {
         }
         let total: u64 = folded.iter().map(|(_, n)| n).sum();
         tracing::warn!(
+            sink,
             window_s = LOG_COLLAPSE_WINDOW.as_secs(),
             sources = folded.len(),
             folded = total,
@@ -1388,8 +1389,10 @@ pub fn init_logging() {
         .with_ansi(false);
 
     // 同源高频错误限流（webview 假死时的 eval 错误洪水即此形态）。
-    let collapse_counter = std::sync::Arc::new(CollapseCounter::new());
-    let collapse_filter = CollapseFilter::new(collapse_counter.clone());
+    let file_collapse_counter = std::sync::Arc::new(CollapseCounter::new());
+    let stderr_collapse_counter = std::sync::Arc::new(CollapseCounter::new());
+    let file_collapse_filter = CollapseFilter::new(file_collapse_counter.clone());
+    let stderr_collapse_filter = CollapseFilter::new(stderr_collapse_counter.clone());
 
     Registry::default()
         .with(
@@ -1397,14 +1400,15 @@ pub fn init_logging() {
                 .add_directive(tracing::Level::INFO.into())
                 .add_directive("chromiumoxide=WARN".parse().unwrap()),
         )
-        .with(file_layer.with_filter(collapse_filter.clone()))
-        .with(stderr_layer.with_filter(collapse_filter))
+        .with(file_layer.with_filter(file_collapse_filter))
+        .with(stderr_layer.with_filter(stderr_collapse_filter))
         .init();
 
     // 折叠摘要：有 tokio 运行时才起（init_logging 在 setup 内调用，正常具备；
     // 无运行时的测试环境跳过，不影响日志限流本身）。
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(collapse_summary_loop(collapse_counter));
+        handle.spawn(collapse_summary_loop(file_collapse_counter, "file"));
+        handle.spawn(collapse_summary_loop(stderr_collapse_counter, "stderr"));
     }
 }
 // ── 项目标签记忆日志（memory/{tag}.md）──
@@ -1957,6 +1961,68 @@ mod log_rotation_tests {
         assert!(backup.join("keep.txt").exists(), "既有历史内容必须保留");
         assert_eq!(std::fs::metadata(&log).unwrap().len(), 4096);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dual_sink_logging_tests {
+    use super::{CollapseCounter, CollapseFilter};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn separate_collapse_counters_feed_file_and_stderr() {
+        let file_buf = Buffer::default();
+        let stderr_buf = Buffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file_buf.clone())
+                    .with_filter(CollapseFilter::new(Arc::new(CollapseCounter::new()))),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(stderr_buf.clone())
+                    .with_filter(CollapseFilter::new(Arc::new(CollapseCounter::new()))),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("dual sink probe");
+        });
+
+        assert!(
+            !file_buf.0.lock().unwrap().is_empty(),
+            "文件 sink 必须收到窗口内首条日志（共用计数器会被外层 stderr 抢先消费）"
+        );
+        assert!(
+            !stderr_buf.0.lock().unwrap().is_empty(),
+            "stderr sink 必须收到窗口内首条日志"
+        );
     }
 }
 

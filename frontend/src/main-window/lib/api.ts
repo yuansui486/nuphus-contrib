@@ -46,6 +46,8 @@ export function getTenets() {
     items: Array<{
       id: string
       content: string
+      /** null/空 = 通用原则；非空 = 仅归属该项目目录 */
+      project_path: string | null
       priority: string
       enforce: string
       active: boolean
@@ -58,8 +60,12 @@ export function deleteTenet(id: string) {
   return invoke<boolean>('delete_tenet', { id })
 }
 
-export function addTenet(content: string, priority?: string) {
-  return invoke<void>('add_tenet', { content, priority })
+export function addTenet(content: string, priority?: string, projectPath?: string) {
+  return invoke<void>('add_tenet', { content, priority, projectPath })
+}
+
+export function updateTenet(id: string, content: string, priority?: string) {
+  return invoke<boolean>('update_tenet', { id, content, priority })
 }
 
 // ── 新知识库 API ──
@@ -2376,9 +2382,13 @@ export function openExternal(url: string) {
  *
  * 已有窗口则提到前台，没有则启动一个。返回窗口当前页URL，供调用方回显落点。
  * 只置前、**不导航**；要打开某个网址用 {@link browserOpenUrl}（新开标签）。
+ *
+ * @param defaultUrl 可选默认页：仅当窗口当前停在空白页（about:blank，冷启动或
+ * 空闲孤儿页）时由后端**就地导航**过去——不新开标签、不堆积标签。窗口已有真实
+ * 页面时忽略此参数（唤出语义不改动用户浏览现场）。后端会用外链白名单二次校验。
  */
-export function browserShowWindow() {
-  return invoke<string>('browser_show_window')
+export function browserShowWindow(defaultUrl?: string) {
+  return invoke<string>('browser_show_window', { defaultUrl: defaultUrl ?? null })
 }
 
 /** {@link browserOpenUrl} 的返回（字段名与后端 serde 逐字对应，见 cdp_window.rs 的测试） */

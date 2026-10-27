@@ -3,7 +3,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { getVersion } from '@tauri-apps/api/app'
 import { check } from '@tauri-apps/plugin-updater'
 import { getChangelog } from '../lib/api'
-import { UpdatePage } from './UpdatePage'
+import { UpdatePage as UpdatePageView } from './UpdatePage'
+import { useAppUpdate } from '../hooks/useAppUpdate'
+
+/** 手动页测试共用真实更新控制器，只替换 Tauri 边界。 */
+function UpdatePage() {
+  return <UpdatePageView updater={useAppUpdate(false)} />
+}
 
 // Tauri 侧依赖全部桩掉：本测试只验证「版本与更新」页面的渲染与 CHANGELOG 段落切分，
 // 不触达真实 updater / IPC（jsdom 里没有 Tauri 运行时）。
@@ -65,6 +71,19 @@ describe('UpdatePage 本版更新内容', () => {
     // 相邻版本的内容不进入本版区块
     expect(screen.queryByText('开发中的改动。')).toBeNull()
     expect(screen.queryByText('上一轮的旧改动。')).toBeNull()
+  })
+
+  it('check 必须携带超时参数（端点降级的前置条件：无超时 = 首端点停滞即永久挂死）', async () => {
+    arrange('0.2.16', CHANGELOG)
+    render(<UpdatePage />)
+
+    fireEvent.click(screen.getByRole('button', { name: /检查更新/ }))
+    await waitFor(() => expect(mockedCheck).toHaveBeenCalled())
+    expect(mockedCheck).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: expect.any(Number) }),
+    )
+    const arg = mockedCheck.mock.calls[0][0]
+    expect(arg?.timeout).toBeGreaterThanOrEqual(1000)
   })
 
   it('渲染行内代码、强调和链接，保留代码字符与可复制的路径', async () => {

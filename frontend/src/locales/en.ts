@@ -117,13 +117,19 @@ const en: Record<string, string> = {
   'interrupt.retained':
     '{0} background task(s) still running (open the bottom-right capsule to view or end them)',
 
-  'backgroundTasks.entryTitle': 'Background tasks',
   'backgroundTasks.entryLabel': 'Background tasks ({0} still running)',
+  'backgroundTasks.entryTip': 'Running · not stuck — full delivery after verification',
   'backgroundTasks.title': 'Background tasks',
+  'backgroundTasks.hint': 'verify/build/test can take a while — still running..',
   'backgroundTasks.close': 'Close',
   'backgroundTasks.loading': 'Loading…',
   'backgroundTasks.empty': 'No background tasks are still running',
   'backgroundTasks.badgeRetained': 'Retained',
+  'backgroundTasks.stateRunning': 'Running',
+  'backgroundTasks.stateRetained': 'Kept in background',
+  'backgroundTasks.elapsed': 'running for {0}',
+  'backgroundTasks.remaining': 'about {0} left',
+  'backgroundTasks.expiring': 'near the lifetime cap — the system will end it',
   'backgroundTasks.startedAt': 'since {0}',
   'backgroundTasks.kill': 'End',
   'backgroundTasks.killFailed': 'Failed to end background task',
@@ -155,7 +161,7 @@ const en: Record<string, string> = {
   'preview.exitAnnotateMode': 'Exit annotation mode',
 
   // ── In-app browser (own window: 44px shell controller + remote content page) ──
-  'browser.toggle': 'In-app browser',
+  'browser.toggle': 'Browser',
   'browser.toggleTitle': 'Open / raise a browser window',
   'browser.starting': 'Starting browser…',
   'browser.addressPlaceholder': 'Enter a URL and press Enter, e.g. https://example.com',
@@ -382,6 +388,7 @@ const en: Record<string, string> = {
   'sessionRail.newChatBrowse': 'Browse local folder…',
   'sessionRail.newChatSwitchFail': 'Project switch failed ...chat not created',
   'sessionRail.newChatBrowseFail': 'Could not open the folder picker',
+  'sessionRail.editProjectTenets': 'Edit project tenets',
   // ── Session rail: "Projects" row menu (tidy / sort / restore hidden) + 📁+ ──
   'sessionRail.projectsMenu': 'Project menu',
   'sessionRail.newProjectFolder': 'New project folder',
@@ -545,6 +552,16 @@ const en: Record<string, string> = {
   'update.latest': 'You are up to date',
   'update.available': 'New version v{0} is available',
   'update.downloadInstall': 'Download and install',
+  'update.installRestart': 'Install and restart',
+  'update.downloadReady': 'The update is downloaded. Click “Install and restart” to continue.',
+  'update.waitForIdle':
+    'Wait for tasks and saving to finish before installing to avoid interrupting your work.',
+  'update.stateUnavailable':
+    'Unable to verify task status. Installation is paused; click install again later.',
+  'update.noticeHint': 'Nuphus will restart after installation. You can update later.',
+  'update.noticeFailed': 'The update did not complete. View details to retry.',
+  'update.viewDetails': 'View details',
+  'update.later': 'Later',
   'update.downloading': 'Downloading update ({0})',
   'update.failed': '{0}',
   'update.retry': 'Retry',
@@ -557,6 +574,8 @@ const en: Record<string, string> = {
   'update.errPermission':
     'No write permission, so the install could not finish. Check the install directory permissions and retry.',
   'update.errUnknown': 'The update did not finish. Please send us the error below.',
+  'update.stallHint':
+    'Download is slow or stalled. A common cause: your proxy routes the update server abroad (servers are in China). Try adding nuphus.com and gitee.com as DIRECT rules in your proxy app, or install manually from the Gitee mirror on the download page.',
   'update.changesTitle': 'Changes in this version',
   'update.changesEmpty': 'No changelog entries for this version',
   'update.changesUnavailable': 'Changelog unavailable',
@@ -1134,6 +1153,8 @@ const en: Record<string, string> = {
   'models.hotModelsTitle': 'Popular models',
   'models.baseUrlLabel': 'Endpoint URL',
   'models.baseUrlHelp': 'Endpoint URL of the relay or gateway, usually ending with /v1',
+  'models.stepfunChannelApi': 'API Key (pay as you go)',
+  'models.stepfunChannelPlan': 'Step Plan (subscription)',
   'models.headerSectionLabel': 'Custom Headers',
   'models.headerSectionHelp': 'Some relays require extra request headers; leave empty to send none',
   'models.headerNamePlaceholder': 'Header name, e.g. X-Gateway',
@@ -1589,6 +1610,7 @@ const en: Record<string, string> = {
   'themes.customDefaultName': 'My Theme',
   'themes.customDiscard': 'Discard changes',
   'themes.customDiscardDone': 'Unsaved changes discarded',
+  'themes.resetItem': 'Restore default',
   'themes.myThemeActivate': 'Click to use this theme',
   'themes.myThemeDelete': 'Delete this theme',
   'themes.customSwitchConfirm': 'You have unsaved changes that will be lost on switch. Continue?',
@@ -1776,10 +1798,19 @@ const en: Record<string, string> = {
 
   'sessionDivider.refined': 'Session refined',
   'sessionDivider.messages': '{0} messages',
+  'refineCollapse.archived': '{n} archived',
+  'refineCollapse.expand': 'Expand history',
+  'refineCollapse.collapse': 'Collapse history',
 
   'taskBubble.idle': 'Idle',
   'taskBubble.failed': ' → {0} failed',
   'taskBubble.interrupted': ' → {0} unsettled',
+
+  // Exec indicator at the chat area's top-left corner (round avatar + state;
+  // clicking it opens the execution trace panel)
+  'execIndicator.running': 'Exec subtask running',
+  'execIndicator.completed': 'Exec subtask completed',
+  'execIndicator.openTrace': 'View execution trace',
 
   // Task detail modal (opened by clicking any row in the panel) — all four states,
   // interrupted kept separate from failed
@@ -2110,6 +2141,22 @@ const en: Record<string, string> = {
   'memory.tenet.content': 'Content *',
   'memory.tenet.placeholder': 'e.g., Always ask before modifying user configuration files',
   'memory.tenet.priority': 'Priority',
+  'memory.tenet.generalTitle': 'General Tenets',
+  'memory.tenet.projectTitle': 'Project Tenets',
+  'memory.tenet.projectTitleWithName': 'Project Tenets · {0}',
+  'memory.tenet.projectGuide':
+    'Applies only to "{0}". Switching projects automatically uses that project\'s tenets. Changes take effect on your next message.',
+  'memory.tenet.projectEmpty': 'No tenets for this project yet.',
+  'memory.tenet.addProject': 'Add project tenet',
+  'memory.tenet.allTitle': 'Tenets',
+  'memory.tenet.allGuide':
+    'General tenets apply to every project; project tenets apply only to their own project. Changes take effect on your next message.',
+  'memory.tenet.scope': 'Scope',
+  'memory.tenet.edit': 'Edit tenet',
+  'memory.tenet.priority.critical': 'Core',
+  'memory.tenet.priority.high': 'Important',
+  'memory.tenet.priority.medium': 'General',
+  'memory.tenet.priority.low': 'Reminder',
   'memory.noTenets':
     'No tenets yet. Nuphus learns principles from conversations, or you can add them through the approval flow.',
   'memory.noPatterns': 'No reusable experience yet (sources: user reviews / system distills).',
@@ -2275,7 +2322,8 @@ const en: Record<string, string> = {
   'help.action': 'Action',
   'help.shortcut.send': 'Send message',
   'help.shortcut.newline': 'New line',
-  'help.shortcut.palette': 'Open command palette; in Workflow mode, open workflows',
+  'help.shortcut.palette': 'Open the command palette',
+  'help.shortcut.workflowList': 'Open the workflow list',
   'help.shortcut.focusInput': 'Focus the input box',
   'help.shortcut.newChat': 'New session (archives the current chat)',
   'help.shortcut.workflowPanel':

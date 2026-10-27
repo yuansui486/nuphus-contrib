@@ -18,9 +18,10 @@
  */
 import { act, fireEvent, render, screen, waitFor, type RenderResult } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { invoke } from '@tauri-apps/api/core'
 import { AppearancePanel } from './AppearancePanel'
 import { ThemeProvider } from '../../hooks/useTheme'
-import { markOpacityIntent, OPACITY_COLOR_KEYS } from '../../hooks/customTheme'
+import { OPACITY_COLOR_KEYS } from '../../hooks/customTheme'
 import { __setThumbEncoder } from '../../ui/assetUrl'
 
 // 轻提示通道：jsdom 无 Tauri IPC，桩掉（HUD/island 分流不在本测试范围）
@@ -230,6 +231,91 @@ describe('AppearancePanel 外观浮窗', () => {
     // 回预设态 → 重新应用 LS_SKIN（解析出可渲染 URL，而不是清空、也不是主题那张）
     expect(skinBroadcasts).toHaveLength(1)
     expect(skinBroadcasts[0]).toMatch(/^blob:/)
+  })
+
+  /* ── 背景图必须跟着主题走：切到系统主题后，那张自定义主题的背景图不得留着 ──
+     复现路径：激活带皮肤图的自定义主题 → 点系统主题卡 → 背景应回到预设态
+     （LS_SKIN；本仓该键已无写入点，故为"无背景"），而不是继续显示上一张图。 */
+  it('激活带皮肤图的自定义主题后点系统主题卡：背景图被清掉（不留上一张）', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: {}, skin: 'C:/img/theme.png' },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+    skinBroadcasts = []
+
+    await act(async () => {
+      fireEvent.click(presetCards(view)[2])
+    })
+
+    // 背景必须重新应用（预设态的值），而不是"什么都不做"留下上一张图
+    expect(skinBroadcasts.length).toBeGreaterThan(0)
+    // 预设态的 LS_SKIN 为空 → 广播清除（null）
+    expect(skinBroadcasts[skinBroadcasts.length - 1]).toBeNull()
+  })
+
+  it('预设态之间切系统主题：背景也按预设态重新应用（不留上一张图）', async () => {
+    const view = await renderPanel()
+    skinBroadcasts = []
+
+    await act(async () => {
+      fireEvent.click(presetCards(view)[1])
+    })
+
+    expect(skinBroadcasts.length).toBeGreaterThan(0)
+    expect(skinBroadcasts[skinBroadcasts.length - 1]).toBeNull()
+  })
+
+  /* ── 竞态：背景图解析是异步的，慢的解析会盖掉后来的清除 ──
+     真实时序：点「我的主题」卡激活带图主题（触发图片解析，耗时）→ 用户在解析
+     完成前点系统主题卡（触发清除）→ 先前的解析随后才完成 → 若无守卫，
+     后到的"图片"广播盖掉已生效的"清除" → 背景图留在系统主题上。 */
+  it('激活主题的图片解析慢于切主题：后到的图片广播不得盖掉已生效的清除', async () => {
+    let releaseImage: (() => void) | null = null
+    const imageGate = new Promise<void>(resolve => {
+      releaseImage = resolve
+    })
+    const invokeMock = vi.mocked(invoke)
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'read_image_base64') {
+        await imageGate
+        return { base64: 'QUJD', mime: 'image/png' }
+      }
+      return undefined as never
+    })
+
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: {}, skin: 'C:/img/theme.png' },
+      ]),
+    )
+    const view = await renderPanel()
+    skinBroadcasts = []
+
+    // ① 点「我的主题」卡激活（触发 activateCustom → applySkinBg(图片路径) → 慢解析）
+    await act(async () => {
+      fireEvent.click(themeCards(view)[0].querySelector('.apnp-theme-face') as HTMLElement)
+    })
+    // ② 解析未完成时点系统主题卡（触发清除）
+    await act(async () => {
+      fireEvent.click(presetCards(view)[2])
+    })
+    const afterClear = skinBroadcasts.length
+    expect(skinBroadcasts[afterClear - 1]).toBeNull()
+
+    // ③ 慢的解析此刻才完成 → 后到的图片广播必须被丢弃
+    await act(async () => {
+      releaseImage?.()
+      await imageGate
+    })
+
+    // 广播数不再增加（过期的图片结果被守卫丢弃），最后一次仍是"清除"
+    expect(skinBroadcasts.length).toBe(afterClear)
+    expect(skinBroadcasts[skinBroadcasts.length - 1]).toBeNull()
   })
 
   it('「我的主题」空态只显示「＋ 新建」卡（无空列表提示句）', async () => {
@@ -705,7 +791,7 @@ describe('AppearancePanel 外观浮窗', () => {
  * 恒返回空串，ThemeProvider 写 data-theme 在 jsdom 里不带任何解析结果。
  * 这里按 data-theme 仿真浏览器对 :root / [data-theme] 的解析（内联样式优先，
  * 与真实层级一致）。核心色取 tokens.css 真实值；面板 / 弹窗 / 皮肤的 α 刻意
- * 取三主题互异的值 —— 真实 CSS 里三主题 α 相同（modal .8 / panel .9 / skin .35），
+ * 取三主题互异的值 —— 真实 CSS 里三主题 α 相同（modal .8 / panel .9 / skin 0），
  * 若照抄，「滑块读数停在上一套主题」这类冻结回归将完全测不出来。
  */
 const THEME_TOKENS: Record<string, Record<string, string>> = {
@@ -720,7 +806,7 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
     '--input-bg': '#12141e',
     '--panel-bg': 'rgba(14, 14, 22, 0.9)',
     '--modal-bg': 'rgba(14, 14, 22, 0.8)',
-    '--skin-bg-opacity': '0.35',
+    '--skin-bg-opacity': '0',
   },
   light: {
     '--accent': '#111111',
@@ -733,7 +819,7 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
     '--input-bg': '#12141e',
     '--panel-bg': 'rgba(251, 251, 252, 0.85)',
     '--modal-bg': 'rgba(251, 251, 252, 0.75)',
-    '--skin-bg-opacity': '0.4',
+    '--skin-bg-opacity': '0',
   },
   fresh: {
     '--accent': '#0b7a52',
@@ -746,7 +832,7 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
     '--input-bg': '#ffffff',
     '--panel-bg': 'rgba(255, 255, 255, 0.97)',
     '--modal-bg': 'rgba(255, 255, 255, 0.95)',
-    '--skin-bg-opacity': '0.35',
+    '--skin-bg-opacity': '0',
   },
 }
 
@@ -754,15 +840,15 @@ const THEME_TOKENS: Record<string, Record<string, string>> = {
 const EXPECTED: Record<string, { colors: string[]; sliders: number[] }> = {
   dark: {
     colors: ['#3b82f6', '#0a0a10', '#12121a', '#f5f5fa', '#d0d0dd'],
-    sliders: [100, 100, 90, 80, 35],
+    sliders: [100, 100, 90, 80, 0],
   },
   light: {
     colors: ['#111111', '#ffffff', '#f7f7f8', '#1a1a1a', '#444444'],
-    sliders: [100, 100, 85, 75, 40],
+    sliders: [100, 100, 85, 75, 0],
   },
   fresh: {
     colors: ['#0b7a52', '#edf5f0', '#ffffff', '#12251b', '#37503f'],
-    sliders: [100, 100, 97, 95, 35],
+    sliders: [100, 100, 97, 95, 0],
   },
 }
 
@@ -859,7 +945,7 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
     expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe('')
 
-    // 再切清新仍跟随（持久 dirty 意图 ≠ 覆盖可跨主题残留）
+    // 再切清新仍跟随（系统预设态不携带任何自定义覆盖）
     await switchPreset(view, 2)
     expect(opacitySliderValues(view)).toEqual(EXPECTED.fresh.sliders)
   })
@@ -884,7 +970,7 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
     expect(opacitySliderValues(view)).toEqual(EXPECTED.light.sliders)
   })
 
-  it('dirty 通道跨基底重派走预览通道：激活另一基底的已存主题时按新基底色重派生', async () => {
+  it('切换自定义主题：按目标主题自己的不透明度恢复，不被源主题滑块覆盖', async () => {
     localStorage.setItem(
       'nuphus_custom_themes',
       JSON.stringify([
@@ -892,33 +978,348 @@ describe('系统主题切换：自定义区实时跟随当前基底', () => {
           id: 'ct-src',
           name: '源',
           base: 'dark',
-          overrides: { '--msg-user-bg': 'rgba(21, 34, 56, 0.6)' },
+          overrides: {
+            '--msg-user-bg': 'rgba(21, 34, 56, 0.6)',
+            '--msg-assistant-bg': 'rgba(18, 20, 30, 0.6)',
+          },
         },
-        { id: 'ct-dst', name: '目标', base: 'light', overrides: { '--surface-0': '#ffffff' } },
+        {
+          id: 'ct-dst',
+          name: '目标',
+          base: 'light',
+          overrides: {
+            '--surface-0': '#ffffff',
+            '--msg-user-bg': 'rgba(240, 240, 242, 0.4)',
+            '--msg-assistant-bg': 'rgba(255, 255, 255, 0.4)',
+          },
+        },
       ]),
     )
     localStorage.setItem('nuphus_custom_active', 'ct-src')
-    // 用户拖过气泡通道（持久 dirty 意图，customTheme.readOpacityIntent）
-    markOpacityIntent('bubbles')
     const view = await renderPanel()
 
     // 源主题激活态：滑块读自身覆盖（60%）
     expect(opacitySliderValues(view)[0]).toBe(60)
 
-    // 激活另一基底的已存主题（dark → light）：dirty 通道按新基底颜色重派，
-    // 产物走预览通道（「放弃修改」随之出现），而不是覆写基底显示值
+    // 激活另一基底的已存主题（dark → light）：必须原样恢复目标主题保存的 40%，
+    // 不得用源主题的 60% 重派覆盖（这正是旧 dirty 重派机制的缺陷）
     await act(async () => {
       fireEvent.click(themeCards(view)[0].querySelector('.apnp-theme-face') as HTMLElement)
     })
 
-    expect(screen.getByRole('button', { name: '放弃修改' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
+    expect(opacitySliderValues(view)[0]).toBe(40)
     expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe(
-      'rgba(240, 240, 242, 0.6)',
+      'rgba(240, 240, 242, 0.4)',
     )
     expect(document.documentElement.style.getPropertyValue('--msg-assistant-bg')).toBe(
-      'rgba(255, 255, 255, 0.6)',
+      'rgba(255, 255, 255, 0.4)',
     )
     // 颜色区：生效覆盖优先（ct-dst 的 surface-0），其余回落 light 基底（非 #000000）
     expect(colorTokenValues(view)).toEqual(EXPECTED.light.colors)
+  })
+
+  it('每个自定义主题各自保存不透明度：改完保存后切走再切回仍保留', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '甲', base: 'dark', overrides: {} },
+        { id: 'ct-b', name: '乙', base: 'light', overrides: {} },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+    const cardByName = (name: string) =>
+      themeCards(view).find(c => c.querySelector('.apnp-theme-name')?.textContent === name)!
+
+    // 在甲上把气泡拖到 35% 并保存
+    fireEvent.change(view.container.querySelectorAll('.opacity-range')[0], {
+      target: { value: '35' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+
+    const savedA = storedThemes().find(t => t.id === 'ct-a')
+    expect(savedA?.overrides['--msg-user-bg']).toBe('rgba(21, 34, 56, 0.35)')
+
+    // 切到乙（无覆盖 → 回落 light 基底默认 100%）
+    await act(async () => {
+      fireEvent.click(cardByName('乙').querySelector('.apnp-theme-face') as HTMLElement)
+    })
+    expect(opacitySliderValues(view)[0]).toBe(100)
+
+    // 切回甲 → 恢复甲保存的 35%
+    await act(async () => {
+      fireEvent.click(cardByName('甲').querySelector('.apnp-theme-face') as HTMLElement)
+    })
+    expect(opacitySliderValues(view)[0]).toBe(35)
+    expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe(
+      'rgba(21, 34, 56, 0.35)',
+    )
+  })
+})
+
+/* ═══════════════════════════════════════════════════════════════
+   行内「恢复默认」小钮（5 个不透明度行 + 5 个颜色行各一个）
+
+   契约（main 现行草稿语义，逐条钉住）：
+   ① 只回退**未保存草稿**（previewOverrides）里的对应覆盖键；
+   ② **绝不触碰、不回写用户已保存的自定义主题数据** —— 恢复路径不调
+      saveCustom、不写 localStorage（用 Storage.setItem spy 钉死）；
+   ③ 恢复目标 = 当前生效基线：已激活的自定义主题里有该键 → 回到它的值；
+      基线里没有 → 删键（回落主题基底默认）；
+   ④ 草稿被清空 → clearCustomPreview()（空草稿若留着会遮蔽已保存主题的值）；
+   ⑤ 没有可恢复内容时按钮 disabled，且**常驻渲染**（不做条件渲染）。
+
+   无障碍名 = 「恢复默认 · <行标签>」，故 10 个小钮彼此可区分。
+   ═══════════════════════════════════════════════════════════════ */
+describe('行内「恢复默认」：只回退未保存草稿，不碰已保存主题', () => {
+  /** 10 个「恢复默认」小钮（顺序：5 个不透明度行 → 5 个颜色行） */
+  const resetButtons = (r: RenderResult): HTMLButtonElement[] =>
+    Array.from(r.container.querySelectorAll<HTMLButtonElement>('.apnp-reset-btn'))
+
+  /** 按行标签取小钮（无障碍名 = 「恢复默认 · <行标签>」） */
+  const resetBtn = (rowLabel: string): HTMLButtonElement =>
+    screen.getByRole('button', { name: `恢复默认 · ${rowLabel}` }) as HTMLButtonElement
+
+  beforeEach(() => {
+    localStorage.clear()
+    // ThemeProvider 的覆盖应用是全局的：清掉上个用例残留的内联 token 与 data-theme
+    document.documentElement.style.cssText = ''
+    document.documentElement.removeAttribute('data-theme')
+    stubThemeComputedStyle()
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('不透明度滑块步进为 1%（细粒度微调）', async () => {
+    const view = await renderPanel()
+
+    const sliders = Array.from(view.container.querySelectorAll('.opacity-range'))
+    expect(sliders).toHaveLength(5)
+    for (const slider of sliders) {
+      expect(slider).toHaveAttribute('step', '1')
+    }
+  })
+
+  it('无草稿时 10 个「恢复默认」小钮全部 disabled（常驻渲染，不是条件按钮）', async () => {
+    const view = await renderPanel()
+
+    const buttons = resetButtons(view)
+    expect(buttons).toHaveLength(10)
+    for (const button of buttons) {
+      expect(button).toBeDisabled()
+    }
+  })
+
+  it('改气泡不透明度后点「恢复默认」：两个气泡键一起回基线，草稿清空', async () => {
+    const view = await renderPanel()
+
+    // 拖气泡滑块 → 草稿写入两个气泡键（dark 基底色派生）
+    fireEvent.change(view.container.querySelectorAll('.opacity-range')[0], {
+      target: { value: '60' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe(
+      'rgba(21, 34, 56, 0.6)',
+    )
+    expect(document.documentElement.style.getPropertyValue('--msg-assistant-bg')).toBe(
+      'rgba(18, 20, 30, 0.6)',
+    )
+    expect(resetBtn('消息气泡')).toBeEnabled()
+
+    fireEvent.click(resetBtn('消息气泡'))
+
+    // 草稿清空 → 覆盖被撤掉（空草稿若仍留着会遮蔽已保存主题的值）
+    expect(document.documentElement.style.getPropertyValue('--msg-user-bg')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--msg-assistant-bg')).toBe('')
+    expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
+    // 无可恢复内容 → 小钮回到 disabled
+    expect(resetBtn('消息气泡')).toBeDisabled()
+  })
+
+  it('颜色行「恢复默认」：该 token 键回基线（草稿删键），其余行不受影响', async () => {
+    const view = await renderPanel()
+
+    // 改「窗口底色」→ 草稿出现该键
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[1], {
+      target: { value: '#123456' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('#123456')
+    expect(resetBtn('窗口底色（全局背景的基础色）')).toBeEnabled()
+
+    fireEvent.click(resetBtn('窗口底色（全局背景的基础色）'))
+
+    // 删键 → 回落主题基底默认
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('')
+    expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
+    expect(resetBtn('窗口底色（全局背景的基础色）')).toBeDisabled()
+  })
+
+  it('编辑已激活自定义主题时，「恢复默认」回落到该主题已保存的值（而非主题基底）', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: { '--surface-0': '#0d1b2a' } },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+
+    // 改「窗口底色」→ 草稿覆盖了该主题已保存的值
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[1], {
+      target: { value: '#123456' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('#123456')
+
+    fireEvent.click(resetBtn('窗口底色（全局背景的基础色）'))
+
+    // 回到该主题**已保存**的值（不是主题基底值）
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('#0d1b2a')
+    // 已保存主题数据原封不动
+    expect(storedThemes()[0].overrides['--surface-0']).toBe('#0d1b2a')
+  })
+
+  it('恢复默认只动草稿：已保存主题数据与 localStorage 均未被改写（saveCustom 未被调用）', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: { '--surface-0': '#0d1b2a' } },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+    const storedBefore = localStorage.getItem('nuphus_custom_themes')
+
+    // 写入 spy：恢复路径若碰了 saveCustom / persistCustomStore，这里必被记到
+    const spy = vi.spyOn(Storage.prototype, 'setItem')
+
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[1], {
+      target: { value: '#123456' },
+    })
+    fireEvent.click(resetBtn('窗口底色（全局背景的基础色）'))
+
+    // 已保存主题数据逐字未变
+    expect(localStorage.getItem('nuphus_custom_themes')).toBe(storedBefore)
+    expect(storedThemes()[0].overrides).toEqual({ '--surface-0': '#0d1b2a' })
+    // 恢复路径没有一次 localStorage 写入（不落盘、不新增持久化键）
+    expect(spy.mock.calls.filter(c => c[0] === 'nuphus_custom_themes')).toHaveLength(0)
+    expect(spy.mock.calls.filter(c => c[0] === 'nuphus_custom_active')).toHaveLength(0)
+
+    spy.mockRestore()
+  })
+
+  it('恢复强调色：主键与 4 个派生键同组回退（派生键不留在旧强调色上）', async () => {
+    const view = await renderPanel()
+
+    // 改强调色 → 主键 + 派生键一起进草稿
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[0], {
+      target: { value: '#ff0000' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe('#ff0000')
+    expect(document.documentElement.style.getPropertyValue('--accent-rgb')).toBe('255, 0, 0')
+
+    fireEvent.click(resetBtn('强调色（按钮·链接·选中态）'))
+
+    // 主键与派生键一起撤回（回落主题基底，不留半套派生值）
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--accent-rgb')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--accent-hover')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--accent-dim')).toBe('')
+    expect(document.documentElement.style.getPropertyValue('--accent-glow')).toBe('')
+  })
+
+  it('各不透明度通道只回退自己的键（不牵连别行）', async () => {
+    const view = await renderPanel()
+
+    // 只拖输入框 → 草稿里只有 --input-bg
+    fireEvent.change(view.container.querySelectorAll('.opacity-range')[1], {
+      target: { value: '70' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--input-bg')).toBe(
+      'rgba(18, 20, 30, 0.7)',
+    )
+    expect(resetBtn('输入框')).toBeEnabled()
+    expect(resetBtn('消息气泡')).toBeDisabled()
+    expect(resetBtn('控制面板')).toBeDisabled()
+    expect(resetBtn('弹窗')).toBeDisabled()
+    expect(resetBtn('背景图')).toBeDisabled()
+
+    fireEvent.click(resetBtn('输入框'))
+
+    expect(document.documentElement.style.getPropertyValue('--input-bg')).toBe('')
+  })
+
+  it('基线只有强调色主键（导入的主题）时，恢复后派生键按主键重新派生（保持同源）', async () => {
+    // 外部导入的主题 JSON 可能只带主键，没有 4 个派生键
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-b', name: '橄榄', base: 'dark', overrides: { '--accent': '#0d1b2a' } },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-b')
+    const view = await renderPanel()
+
+    // 改强调色 → 主键 + 派生键一起进草稿
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[0], {
+      target: { value: '#ff0000' },
+    })
+    expect(document.documentElement.style.getPropertyValue('--accent-rgb')).toBe('255, 0, 0')
+
+    fireEvent.click(resetBtn('强调色（按钮·链接·选中态）'))
+
+    // 回到基线主键；派生键**按基线主键重新派生**，不留在旧强调色上（不同源 = 脱钩）
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe('#0d1b2a')
+    expect(document.documentElement.style.getPropertyValue('--accent-rgb')).toBe('13, 27, 42')
+  })
+
+  it('恢复默认后草稿与基线等值 → 清空草稿（不留「假未保存」态）', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: { '--surface-0': '#0d1b2a' } },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+
+    // 改「窗口底色」→ 草稿覆盖该主题已保存的值
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[1], {
+      target: { value: '#123456' },
+    })
+    expect(screen.getByRole('button', { name: '放弃修改' })).toBeInTheDocument()
+
+    fireEvent.click(resetBtn('窗口底色（全局背景的基础色）'))
+
+    // 回到已保存值，且草稿被清掉：等值草稿 = 假未保存，「放弃修改」不再出现
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('#0d1b2a')
+    expect(screen.queryByRole('button', { name: '放弃修改' })).toBeNull()
+    expect(resetBtn('窗口底色（全局背景的基础色）')).toBeDisabled()
+  })
+
+  it('恢复默认后仍有其它真实差异 → 草稿保留（只清等值部分，不误伤真草稿）', async () => {
+    localStorage.setItem(
+      'nuphus_custom_themes',
+      JSON.stringify([
+        { id: 'ct-a', name: '海蓝', base: 'dark', overrides: { '--surface-0': '#0d1b2a' } },
+      ]),
+    )
+    localStorage.setItem('nuphus_custom_active', 'ct-a')
+    const view = await renderPanel()
+
+    // 两处真实修改：窗口底色 + 强调色
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[1], {
+      target: { value: '#123456' },
+    })
+    fireEvent.change(view.container.querySelectorAll('.color-token-picker')[0], {
+      target: { value: '#ff0000' },
+    })
+
+    // 只恢复窗口底色 → 强调色仍是真实差异，草稿必须保留
+    fireEvent.click(resetBtn('窗口底色（全局背景的基础色）'))
+
+    expect(document.documentElement.style.getPropertyValue('--surface-0')).toBe('#0d1b2a')
+    expect(document.documentElement.style.getPropertyValue('--accent')).toBe('#ff0000')
+    expect(screen.getByRole('button', { name: '放弃修改' })).toBeInTheDocument()
   })
 })

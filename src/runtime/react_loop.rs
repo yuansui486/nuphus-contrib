@@ -3,6 +3,7 @@
 //! ReactAgent::run()'s ~630 line loop body is inlined here;
 //! Runtime truly owns the execution loop, ReactAgent degrades to a pure state container.
 
+use super::tool_lifecycle::ToolEndGuard;
 use crate::agent::events::NuphusEvent;
 use crate::agent::prompt;
 use crate::agent::reminders::{ReminderCategory, ReminderPriority};
@@ -12,6 +13,47 @@ use crate::{session::ContentBlock, ExecutionStep, StepStatus};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// ══════════════════════════════════════════════════════════════════════════
+// 轮中增量快照持久化
+// ══════════════════════════════════════════════════════════════════════════
+//
+// 事故背景（0.3.1「执行中崩溃 + 吞两个对话」）：会话消息体只在进程内存，落盘
+// 仅任务完成后 flush_active_mirror——执行中崩溃（panic / webview 崩 / OOM /
+// 强杀）= 内存态全丢、DB 零痕迹。本机制在 ReAct 循环内周期性把当前会话完整
+// 快照写入 sessions.snapshot 列，崩溃最多丢失「当前迭代」的增量而非整个对话。
+//
+// 死锁安全：执行期间 agent 被 take() 出 runtime ctx（process.rs），runtime 锁
+// 只在任务开始/完成短暂持有——循环内 flush 只拿 DB 连接，不获取任何 state 锁。
+
+// 工具调用生命周期守卫（ToolEndGuard）：实现见 runtime/tool_lifecycle.rs，
+// 与 workflow_agent 共用。早退路径的 Start/End 配对由它的 Drop 兜底。
+
+/// 轮中快照落盘判定（纯函数）：迭代数达 10 的倍数，或距上次落盘 ≥ 30 秒。
+///
+/// 与 IO 分离便于单测——测试不需要真跑满 30 秒。
+/// iteration 0 亦命中倍数条件：恰好为「进入循环前的首刷失败」提供即时重试。
+fn should_flush(iteration: usize, elapsed: Duration) -> bool {
+    iteration % 10 == 0 || elapsed >= Duration::from_secs(30)
+}
+
+/// best-effort 落盘核心：序列化失败与写盘失败同一语义——只 warn，绝不 panic/中断。
+///
+/// 与 Shelf::write_mirror（src-tauri/src/commands/process/shelf.rs）同构，但
+/// **不做 prune**：快照保留策略只由完成路径 flush_active_mirror 做。
+/// 泛型序列化入口使「序列化失败路径不 panic」可用强制失败的 Serialize 替身
+/// 直接单测——Session 全为纯数据（String/整数/布尔），正常输入永不触发失败。
+fn write_snapshot_best_effort<T: serde::Serialize>(id: &str, mode: &str, value: &T) {
+    match serde_json::to_string(value) {
+        Ok(json) => {
+            if let Err(e) = crate::store::session::upsert_snapshot(id, mode, &json) {
+                tracing::warn!("[Snapshot] 写快照失败 id={id}: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("[Snapshot] 序列化快照失败 id={id}: {e}"),
+    }
+}
 
 impl super::Runtime {
     pub(super) async fn react_loop(
@@ -142,6 +184,16 @@ impl super::Runtime {
                 steps: vec![],
                 retry_session: None,
             });
+        }
+
+        // ── 提示词前缀：先校验/还原会话快照，再注入原则变更 ──
+        // 顺序有含义：prepare 会丢弃失效快照，inject 若先跑就会基于作废快照误发更新。
+        // 两者都必须在 push_user 之前 —— 原则更新须排在用户提问之前入 session，
+        // 否则同一轮出现「提问 → 原则更新」的倒序（连续两条 user 消息）。
+        self.agent
+            .prepare_session_prompt_snapshot(self.config.mode.as_str());
+        if !resume {
+            self.agent.inject_tenet_update();
         }
 
         // 2. Add user input to session（resume 时跳过：断点已在 session 中，直接续跑）
@@ -310,23 +362,47 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
         // Prevents infinite follow-up loops; resets each run() call.
         let mut reasoning_followup_done = false;
 
+        // TooLong 应急截断是否已用（每轮一次）：上下文被 API 判超限且不可重试时，
+        // 返回失败前尝试一次「丢弃最老工具链」的自救重发；只救一次，防死循环。
+        let mut too_long_emergency_done = false;
+
         // ── 跨迭代 text 边界分隔（issue #66 后续）──
-        // 前端把 llm_text_delta 做纯字符串拼接（useEvents.ts：m.content + event.text
-        // 与 last.text + event.text），自身不插任何分隔——它无法知道一轮 LLM 调用
-        // 在哪里结束。一轮任务通常横跨多个 react 迭代（每次工具调用后又是一轮 LLM），
-        // 于是上一轮末句与下一轮首句直接相邻：MarkdownContent 收到的是整块无 \n 的
-        // 文本，走单行分支不产 span.md-line，多步过程性文字塌成连续文字流。
-        // 这里在每轮「首个内容 text」之前补一个换行；本轮无 text 则不补，纯工具轮
-        // 不会留下孤立空行。修在 Rust 侧而非前端，一次覆盖气泡 / timeline / mobile。
-        let stream_text_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 共享实现见 agent::common::TextBoundary：一轮任务内跟踪「是否已有迭代
+        // 产出过可见 text」，在下一迭代首个 TextDelta 前补一个换行，避免前端
+        // 纯字符串拼接把过程性 text 塌成连续文字流。所有 runtime 共用，禁止复制。
+        let text_boundary = crate::agent::common::TextBoundary::new();
+
+        // 上下文预算：执行中防溢出（两级，2026-10-25 定权）。
+        // - prompt 线（Medium 50% / Large 30%）：软预警一次，提示模型规划收敛；
+        // - force 线（Small 75% / Medium 80% / Large 可调默认 50%）：软劝导一次，
+        //   给模型自己收敛的机会——收敛后轮次自然结束，turn-end 正常 refine
+        //   兜底，**不接力**；
+        // - 85%（绝对硬线）：唯一保命线与**唯一接力点**——小上下文长任务单
+        //   turn 内（上限 1000 迭代）可能一次暴涨顶爆 API；85% 保留 15% 余量
+        //   给「提炼请求 + 摘要输出」，越线当场提炼、压缩后从摘要就地续跑。
+        //   此线不依赖模型自觉（模型不遵守 force 劝导时它是唯一兜底）。
+        let mut ctx_warned = false;
+        let mut ctx_force_warned = false;
+        let mut ctx_hard_stop_done = false;
+
+        // ── 轮中增量快照：进入循环前首刷一次 ──
+        // 此刻 session 已含用户消息（上方 push_user），首次 LLM 请求尚未发出。
+        // resume 场景 session 末尾即断点（见 resume() 文档），同样先落盘再进循环。
+        // best-effort：失败只 warn 不中断（见 write_snapshot_best_effort）。
+        self.flush_session_snapshot();
+        let mut last_flush = Instant::now();
 
         for iteration in 0..self.agent.config.max_iterations {
-            // 本轮是否需要补分隔 = 此前是否已有迭代产出过内容 text。
-            // 用独立 Arc 而非复用 stream_text_seen：发出即清零，保证同轮后续
-            // chunk 不会被反复插入换行。
-            let break_before_text = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                stream_text_seen.load(std::sync::atomic::Ordering::SeqCst),
-            ));
+            // ── 轮中增量快照：迭代数达 10 的倍数，或距上次落盘 ≥ 30 秒 ──
+            // 执行中崩溃最多丢失当前迭代的增量而非整个对话。iteration 0 亦命中
+            // 倍数条件——为上方首刷失败提供即时重试；UPSERT 幂等，无副作用。
+            if should_flush(iteration, last_flush.elapsed()) {
+                self.flush_session_snapshot();
+                last_flush = Instant::now();
+            }
+
+            // 本迭代的边界句柄：此前已有可见 text 时，首个 TextDelta 前补换行。
+            let iteration_break = text_boundary.begin_iteration();
             if iteration > 0 && iteration % 5 == 0 {
                 let progress = crate::agent::common::render_ascii_progress(
                     iteration,
@@ -464,7 +540,84 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                     .push_user_internal(crate::handoff::format_doorbell_section(&handoff_events));
             }
 
+            // ── 上下文预算：执行中防溢出（两级，2026-10-25 定权）──
+            // 1) prompt 线（Medium 50% / Large 30%）：软预警一次；
+            // 2) force 线（分档 75/80/50，与 turn-end maybe_refine_session
+            //    同源）：软劝导一次——模型自己收敛，收敛后本轮自然结束，
+            //    turn-end 正常 refine 兜底，不接力；
+            // 3) 85% 绝对硬线：唯一保命线与唯一接力点——无视模型状态当场
+            //    提炼（refine_in_loop：禁工具提炼 → accumulate 压缩 → 从摘要
+            //    就地续跑）。模型不遵守 force 劝导继续暴涨时，此线是最后兜底；
+            //    85% 留出的 15% 余量正是提炼请求 + 摘要输出的安全空间。
+            // 注入走 push_user_internal，不动系统提示前缀，不影响缓存命中。
+            {
+                let cw = crate::agent::goal_types::get_context_window_for(
+                    &self.agent.config.model,
+                    Some(&self.agent.config.provider),
+                );
+                // 官方 usage 缺失时回落字符估算（2026-10-25 审计修正：此前只读
+                // api_input_tokens，不回 usage 的 provider 会让本块整段失效）。
+                // estimate 取 max(官方读数, 字符估算) 的保守值；中文密集时字符
+                // 估算仍可能偏低——85% 硬线是这类失真的最后一道确定性拦截。
+                let tokens = self.agent.session.estimate_token_usage();
+                if cw > 0 && tokens > 0 {
+                    let tier = crate::agent::distill::RefineTier::for_window(cw);
+                    let force_ratio = tier.force_ratio(self.config.large_force_refine_threshold);
+                    let ratio = tokens as f64 / cw as f64;
+
+                    if ratio >= 0.85 && !ctx_hard_stop_done {
+                        // 85% 硬止损：当场提炼 + 压缩 + 就地续跑（唯一接力点）。
+                        // 独立于 force 线——force 线已被模型无视时（或单次暴涨
+                        // 直接从线下越到 85%+），此处是最后一个不依赖模型自觉
+                        // 的动作点。ctx_hard_stop_done 保证本轮只硬切一次。
+                        ctx_hard_stop_done = true;
+                        ctx_force_warned = true;
+                        tracing::warn!(
+                            "[REFINE] 85% hard stop: {}/{} tokens ({:.1}%) — in-loop refine",
+                            tokens,
+                            cw,
+                            ratio * 100.0
+                        );
+                        if !self.refine_in_loop(cancel_flag).await {
+                            // 提炼失败/达上限：降级硬劝导（一次性）——turn-end
+                            // 正常 refine 兜底，不 break（收敛与否交模型）。
+                            self.agent.session.push_user_internal(format!(
+                                "⚠️ 上下文用量已达 {:.0}%（约 {}/{} tokens），自动提炼未生效。\
+                                 请立即停止发起新的工具调用，基于当前已获得的信息输出最终回复，结束任务。",
+                                ratio * 100.0,
+                                tokens,
+                                cw
+                            ));
+                        }
+                    } else if ratio >= force_ratio && !ctx_force_warned {
+                        // force 线软劝导：给模型自己收敛的机会（不接力——收敛后
+                        // 本轮结束，turn-end 正常 refine 处理）。
+                        ctx_force_warned = true;
+                        self.agent.session.push_user_internal(format!(
+                            "[系统] 上下文用量已达 {:.0}%（约 {}/{} tokens），接近该模型的容量上限。\
+                             请规划收敛：优先完成核心目标，非关键探索可省略，尽快输出结论。",
+                            ratio * 100.0,
+                            tokens,
+                            cw
+                        ));
+                    } else if let Some(pr) = tier.prompt_ratio() {
+                        if ratio >= pr && !ctx_warned {
+                            ctx_warned = true;
+                            self.agent.session.push_user_internal(format!(
+                                "[系统] 上下文用量已达 {:.0}%（约 {}/{} tokens）。请规划收敛：优先完成核心目标，非关键探索可省略，尽快输出结论。",
+                                ratio * 100.0,
+                                tokens,
+                                cw
+                            ));
+                        }
+                    }
+                }
+            }
+
             let request = self.agent.build_request(&merged_system);
+
+            self.agent
+                .capture_session_prompt_snapshot(self.config.mode.as_str());
 
             self.agent.emit_pre_llm_diag(iteration, &request.messages);
 
@@ -501,8 +654,7 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                 let collected_clone = collected.clone();
                 let think_state = in_think.clone();
                 let first_token_clone = first_token_at.clone();
-                let break_before_text_clone = break_before_text.clone();
-                let stream_text_seen_clone = stream_text_seen.clone();
+                let iteration_break_clone = iteration_break.clone();
                 let emitter = Box::new(move |event: crate::api::AssistantEvent| {
                     // 首 token 时间戳：首个内容/推理 chunk 到达即记录（dsh turn-metrics
                     // 的 firstTokenTime 等价物）。TTFT = 该戳 - gen_attempt_start。
@@ -517,12 +669,8 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         }
                     }
                     if let crate::api::AssistantEvent::TextDelta(text) = &event {
-                        // 迭代边界分隔：本内容 chunk 若是本轮首个可见 text 且此前已有
-                        // 迭代产出过 text，先补一个换行（swap 保证同轮只补一次）
-                        if break_before_text_clone.swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
-                            crate::agent::common::emit_text_break(exec_emitter.as_deref(), false);
-                        }
+                        // 迭代边界分隔（共享实现）：本迭代首个 TextDelta 前补换行
+                        iteration_break_clone.before_delta(exec_emitter.as_deref(), false);
                         // Single routing entry: process_text_delta (think split +
                         // tool-XML strip with the provider tag set), then emit
                         // thinking (is_thinking=true) before content
@@ -535,7 +683,7 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                             exec_emitter.as_deref(),
                         ) {
                             // 本轮确实产出了可见 text → 下一轮需要补分隔
-                            stream_text_seen_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                            iteration_break_clone.mark_emitted();
                         }
                     }
                     if let crate::api::AssistantEvent::Reasoning(text) = &event {
@@ -641,6 +789,30 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                             // （issue #92）。原始错误体始终保留 —— 关键词永远追不齐
                             // 服务商的措辞，漏匹配时用户/维护者仍能看懂真实原因。
                             let kind = crate::agent::common::classify_llm_error(&err_str);
+                            // TooLong 兜底（2026-10-25）：上下文已被 API 判超限且
+                            // 不可重试——返回失败之前做一次应急截断自救：丢弃最老
+                            // 工具链（保留最后一条纯 User 及其后完整链 + 全部
+                            // System），截断成功则重发；仍失败才如实报错。
+                            // 这是 85% 硬止损估算失真窗口（如中文密集会话字符
+                            // 估算偏低、单轮直越上限）的最后一道网。
+                            if kind == crate::agent::common::LlmErrorKind::TooLong
+                                && !too_long_emergency_done
+                            {
+                                too_long_emergency_done = true;
+                                let removed = self.agent.session.emergency_truncate_for_overflow();
+                                if removed > 0 {
+                                    self.agent.session.strip_incomplete_tools();
+                                    tracing::warn!(
+                                        "[REFINE] TooLong emergency truncate: removed {} msgs, retrying",
+                                        removed
+                                    );
+                                    self.agent.emit_exec(&format!(
+                                        "// CONTEXT OVERFLOW: emergency truncate ({} msgs dropped), retrying",
+                                        removed
+                                    ));
+                                    continue;
+                                }
+                            }
                             return Ok(crate::AgentOutput {
                                 message: format!(
                                     "LLM请求失败：{}\n该错误不可重试。{}",
@@ -883,7 +1055,25 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
             consecutive_empty = 0;
 
             // Extract tool calls
-            let tool_calls = crate::agent::common::extract_tool_calls(&assistant_blocks);
+            // 提炼轮（tools_suppressed）代码级禁工具第二道保险：请求已不带 tools，
+            // 但少数 provider 的 XML content tag 仍可能产出 tool_use 块——此处
+            // 直接剔除，不执行、不落库，只留文本作为摘要。提炼轮继续调工具会
+            // 让 85% 硬止损的保命动作本身膨胀上下文（19e52dee 仅靠提示词约束）。
+            let (assistant_blocks, tool_calls) = if self.agent.tools_suppressed {
+                let text_only: Vec<ContentBlock> = assistant_blocks
+                    .into_iter()
+                    .filter(|b| {
+                        !matches!(
+                            b,
+                            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                        )
+                    })
+                    .collect();
+                (text_only, Vec::new())
+            } else {
+                let calls = crate::agent::common::extract_tool_calls(&assistant_blocks);
+                (assistant_blocks, calls)
+            };
 
             // Text and reasoning already emitted in real-time during streaming
             // (TextDelta via process_text_delta, Reasoning via direct forward).
@@ -1161,6 +1351,14 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         from_task: false,
                     });
                 }
+                // Start 之后立刻挂守卫：本 call 的任何早退（含下方 continue 与
+                // `?` 传播）都由 Drop 补一条 stub End，HUD 活跃集不泄漏。
+                let mut end_guard = ToolEndGuard::arm(
+                    self.agent.exec_emitter.as_ref(),
+                    &call.id,
+                    &call.tool,
+                    tool_start,
+                );
 
                 // Tool name validation: intercept non-existent tool names early to prevent system prompt corruption
                 if !self.agent.tools.has_tool(&call.tool) {
@@ -1172,6 +1370,22 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         ),
                         false,
                     );
+                    // HUD 仲裁按 ToolCallStart/End 配对注册/注销——此处 continue
+                    // 缺 End 会让条目泄漏、活跃集永远非空。补一条 stub End。
+                    if let Some(ref emitter) = self.agent.exec_emitter {
+                        emitter.emit(NuphusEvent::ToolCallEnd {
+                            call_id: call.id.clone(),
+                            tool_name: call.tool.clone(),
+                            success: false,
+                            duration_ms: 0,
+                            output_preview: format!("unknown tool {}", call.tool),
+                            output_full_size: 0,
+                            is_truncated: false,
+                            error: Some(format!("unknown tool {}", call.tool)),
+                            from_task: false,
+                        });
+                    }
+                    end_guard.disarm(); // 上面已发真实 End，勿再补
                     continue;
                 }
 
@@ -1485,6 +1699,7 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
                         from_task: false,
                     });
                 }
+                end_guard.disarm(); // 正常路径：真实 End 已发
 
                 let step = ExecutionStep {
                     tool: call.tool.clone(),
@@ -1692,7 +1907,102 @@ l1_buf.push(prompt::env_info_section(&self.agent.config.model, Some(self.agent.c
             retry_session: None,
         })
     }
+
+    /// 轮中增量快照落盘（best-effort）：把当前会话完整快照写入 `sessions.snapshot` 列。
+    ///
+    /// 进入循环前首刷一次（session 已含用户消息、首次 LLM 请求之前），循环内
+    /// 每 10 迭代或距上次落盘 ≥ 30s 再刷。执行期间 agent 已被 take() 出 runtime
+    /// ctx（process.rs），锁只在任务开始/完成短暂持有：本方法只拿 DB 连接，
+    /// 不获取任何 state 锁，无死锁面。写失败只 warn 不中断，绝不 prune。
+    fn flush_session_snapshot(&self) {
+        write_snapshot_best_effort(
+            &self.agent.session.id,
+            self.config.mode.as_str(),
+            &self.agent.session,
+        );
+    }
 }
 
 // detect_frustration removed — replaced by LLM thinking-based emotion detection.
 // Trigger: src/agent/prompt.rs (build_l2_leader) instructs LLM to read plugin/knowledge/nuphus-self/emotion_guide.md when needed.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// 轮中快照触发条件（纯函数）：10 的倍数必刷、超 30s 必刷、都不满足不刷。
+    #[test]
+    fn should_flush_boundaries() {
+        // 迭代数达 10 的倍数：无论距上次落盘多久都刷
+        assert!(should_flush(10, Duration::ZERO));
+        assert!(should_flush(20, Duration::from_secs(1)));
+        assert!(should_flush(30, Duration::from_secs(0)));
+        // iteration 0 亦命中倍数条件——为「进入循环前的首刷失败」提供即时重试
+        assert!(should_flush(0, Duration::ZERO));
+        // 不足 10 轮但距上次落盘 ≥ 30s（临界含 30s）：刷
+        assert!(should_flush(5, Duration::from_secs(30)));
+        assert!(should_flush(9, Duration::from_secs(31)));
+        // 不足 10 轮且未超时：不刷
+        assert!(!should_flush(1, Duration::ZERO));
+        assert!(!should_flush(5, Duration::from_secs(29)));
+        assert!(!should_flush(9, Duration::from_secs(29)));
+    }
+
+    /// 序列化失败路径：只 warn 不 panic（best-effort 语义）。
+    /// Session 全为纯数据永不触发 serde 失败，用强制失败的 Serialize 替身覆盖该分支。
+    #[test]
+    fn write_snapshot_best_effort_serialize_failure_does_not_panic() {
+        /// 序列化必然失败的测试替身——直接返回 Err 覆盖 warn 分支。
+        struct Unserializable;
+
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::Error as _;
+                Err(S::Error::custom("injected serialization failure"))
+            }
+        }
+
+        // serde 失败路径：只 warn 记录，不 panic、不触碰 DB
+        write_snapshot_best_effort("injected-serialize-failure", "leader", &Unserializable);
+        // 到达此处即未 panic
+    }
+
+    /// 落盘契约：upsert_snapshot 写入后 get_snapshot 读回且内容一致
+    /// （轮中 flush 依赖的存储链路：序列化 → UPSERT → 读回 → 反序列化）。
+    #[test]
+    #[serial]
+    fn snapshot_round_trip_upsert_get_consistent() {
+        let mut session = crate::session::Session::new();
+        session.push_user("轮中快照往返一致性测试".to_string());
+        session.advance_turn();
+        let id = session.id.clone();
+
+        write_snapshot_best_effort(&id, "leader", &session);
+
+        let (mode, json) = crate::store::session::get_snapshot(&id)
+            .unwrap()
+            .expect("快照应可读回");
+        assert_eq!(mode, "leader");
+        let restored: crate::session::Session =
+            serde_json::from_str(&json).expect("快照 JSON 应可反序列化");
+        assert_eq!(restored.id, id, "读回会话 id 应一致");
+        assert_eq!(restored.len(), session.len(), "读回消息数应一致");
+        assert!(
+            restored
+                .messages()
+                .iter()
+                .any(|m| m.text_content().contains("轮中快照往返一致性测试")),
+            "读回内容应含用户消息"
+        );
+        // 恢复链可见性：列表路径应能列出该快照（shelf 预热 / 恢复依赖）
+        let listed: Vec<String> = crate::store::session::list_snapshots(100)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        assert!(listed.contains(&id), "快照应出现在 list_snapshots");
+
+        crate::store::session::delete_session(&id).unwrap();
+    }
+}

@@ -8,8 +8,13 @@ import {
   useEffect,
   type ReactNode,
 } from 'react'
-import { newCustomThemeId, parseCustomThemeJSON, type CustomTheme } from './customTheme'
-import { applySkinBg } from '../ui/skinBg'
+import {
+  newCustomThemeId,
+  parseCustomThemeJSON,
+  SKIN_OPACITY_KEY,
+  type CustomTheme,
+} from './customTheme'
+import { applySkinBg, readSkinBg } from '../ui/skinBg'
 
 export type ThemeId = 'dark' | 'light' | 'fresh'
 
@@ -130,6 +135,22 @@ export function skinRestoreSource(customTheme: CustomTheme | null, presetSkin: s
   return customTheme ? (customTheme.skin ?? '') : presetSkin
 }
 
+/**
+ * #117：`--skin-bg-opacity` 的默认值改为 0 之后，「没显式设置过」= 不显示。
+ *
+ * 但有背景图、用户又从未拖过该滑块时，必须给一个可见初值，否则「选了图看不见效果」
+ * （原先 0.35 承担的就是这个语义，现在收窄成：只对有图且无覆盖的情形注入）。
+ * 只在**有图**时注入；系统预设态没有 customTheme，走不到这里 —— 于是历史遗留的
+ * LS_SKIN 残留路径不会被凭空点亮成 35%（#117 的主诉）。
+ */
+function withSkinOpacityDefault(
+  overrides: Record<string, string>,
+  hasSkin: boolean,
+): Record<string, string> {
+  if (!hasSkin || overrides[SKIN_OPACITY_KEY] !== undefined) return overrides
+  return { ...overrides, [SKIN_OPACITY_KEY]: '0.35' }
+}
+
 export function ThemeProvider({
   children,
   defaultTheme = 'dark',
@@ -179,9 +200,9 @@ export function ThemeProvider({
     const html = document.documentElement
     html.setAttribute('data-theme', theme)
     if (previewOverrides !== null) {
-      applyOverrides(previewOverrides)
+      applyOverrides(withSkinOpacityDefault(previewOverrides, !!customTheme?.skin))
     } else if (customTheme) {
-      applyOverrides(customTheme.overrides)
+      applyOverrides(withSkinOpacityDefault(customTheme.overrides, !!customTheme.skin))
     } else {
       applyOverrides({})
     }
@@ -236,6 +257,9 @@ export function ThemeProvider({
       persistCustomStore(prev.themes, null)
       return { themes: prev.themes, activeId: null }
     })
+    // 停用自定义 = 回系统预设态 → 背景同步回 LS_SKIN（与外观浮窗点系统主题卡
+    // 同一口径）。早先这里不碰背景，HUD 快捷切主题后背景图会留在原主题上。
+    void applySkinBg(readSkinBg())
   }, [persistCustomStore])
 
   // 实时预览：切换基底 + 临时覆盖（不持久化，用于「保存前」的编辑态）

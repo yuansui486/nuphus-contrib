@@ -249,11 +249,13 @@ export function ChatInputBar({
   // 唯一来源 resolveTurnDuration：有 durationMs = 已结束（后端权威）；
   // 否则有 startedAtMs = 进行中（Date.now() - startedAtMs）。
   // 刷新后起点由 useSession 的轮询通道从 get_execution_state 补回，**无需任何兜底**。
-  // 执行中每 100ms 重渲染一次让数字走秒——tick 只触发渲染、不持有时间值。
+  // 节奏（2026-10-19 大王定调）：1000ms 顶层 tick（原 100ms 太密；1s 是走秒的
+  // 可见下限，与 ChatPanel 同拍）。耗时数字自身的细粒度更新由 TurnMetaBar
+  // 组件内 200ms 自tick 承担。
   const [, forceTick] = useState(0)
   useEffect(() => {
     if (!isProcessing) return
-    const timer = window.setInterval(() => forceTick(n => n + 1), 100)
+    const timer = window.setInterval(() => forceTick(n => n + 1), 1000)
     return () => window.clearInterval(timer)
   }, [isProcessing])
   const ctxDurationMs = resolveTurnDuration(turnMeta)
@@ -1155,8 +1157,10 @@ export function ChatInputBar({
                 <span className="input-bar-ctx-value" style={{ color: ctxColor }}>
                   {/* used 用状态色（红/黄/绿）暗示进度；sep + cap 中性不抢戏 */}
                   {ctxUsed > 0 ? fmt(ctxUsed) : '--'}
-                  {ctxLimit > 0 && <span className="input-bar-ctx-sep">/</span>}
-                  {ctxLimit > 0 && <span className="input-bar-ctx-cap">{fmt(ctxLimit)}</span>}
+                  {/* 分母未知也给占位（`302k / --`）：只留分子会被读成「没有总量」。
+                        与 ctx 弹窗里的 capacity 行同口径（2026-10-26 大王实测）。 */}
+                  <span className="input-bar-ctx-sep">/</span>
+                  <span className="input-bar-ctx-cap">{ctxLimit > 0 ? fmt(ctxLimit) : '--'}</span>
                 </span>
                 {/* 解码速度/首 token 延迟不占常驻位：明细在下方 ctx 弹窗（ttft / speed 两行） */}
                 {ctxHover && (

@@ -117,4 +117,37 @@ describe('后台任务面板样式契约（不透明度体系 + 无新 token）'
     const title = ruleBody('.bgt-title')
     expect(title).toMatch(/line-height:\s*16px/)
   })
+
+  it('执行光影与小字说明：超时转后台的任务「不是卡死」（大王钦定）', () => {
+    // 2026-10-21 要求：system shell >300s 转后台的保留任务常驻可见，
+    // 静态胶囊会被误读成卡死。入口挂 .task-track-shimmer 光影（复用
+    // task-bubble.css 的梯度与动画基类），胶囊侧只覆写圆角与描边；
+    // 光影裁切依赖 relative + overflow: hidden（不含 z-index，锚点契约不破）。
+    const entry = ruleBody('.bgt-entry')
+    expect(entry).toMatch(/position:\s*relative/)
+    expect(entry).toMatch(/overflow:\s*hidden/)
+    expect(entry).not.toMatch(/z-index/)
+    expect(panelCss).toContain('.bgt-entry .task-track-shimmer')
+    expect(panelCss).toContain('border-radius: 999px')
+
+    // 标题旁小字说明：同中线（line-height 16px）、单行
+    const hint = ruleBody('.bgt-hint')
+    expect(hint).toMatch(/font-size:\s*var\(--fz-xs\)/)
+    expect(hint).toMatch(/line-height:\s*16px/)
+    expect(hint).toMatch(/white-space:\s*nowrap/)
+    expect(ruleBody('.bgt-header')).not.toBe('')
+  })
+
+  it('入口 hover 小 tips：磨砂浮层 + hover/focus 双通道呼出（非 arrows Pound 原生 title）', () => {
+    // 与 .agent-tooltip 同族的呼出配方：绝对定位在胶囊上方、默认 opacity 0、
+    // hover / focus-visible 翻到 1；磨砂底走 --panel-bg 派生（不退 --glass-bg）。
+    const tip = ruleBody('.bgt-tip')
+    expect(tip).toMatch(/position:\s*absolute/)
+    expect(tip).toMatch(/bottom:\s*calc\(100%\s*\+\s*8px\)/)
+    expect(tip).toMatch(/opacity:\s*0/)
+    expect(tip).toMatch(/pointer-events:\s*none/)
+    expect(tip).toMatch(/background:\s*color-mix\(in srgb, var\(--panel-bg\)/)
+    expect(panelCss).toMatch(/\.bgt-entry:hover \.bgt-tip/)
+    expect(panelCss).toMatch(/\.bgt-entry:focus-visible \.bgt-tip/)
+  })
 })

@@ -20,7 +20,7 @@
 //! Errors are wrapped into NuphusError::Tool by the caller (client::ocr).
 
 use crate::api::MessageRequest;
-use crate::config::{self, resolve_vision_provider, resolve_vision_strategy, VisionStrategy};
+use crate::config::{self, resolve_vision_strategy, VisionStrategy};
 
 fn resolve_vision_model<'a>(
     registry: &'a config::ModelRegistry,
@@ -73,25 +73,23 @@ pub async fn vision_ocr(image_path: &str, prompt: Option<&str>) -> Result<String
 ///
 /// 协议解析（Chat Completions / Anthropic Messages）由对应 Provider 的传输层负责。
 pub async fn vision_ocr_data_url(data_url: &str, prompt: Option<&str>) -> Result<String, String> {
-    let vision_model_id = resolve_vision_model_id()?;
-
-    // 2. 加载 registry 解析模型配置
+    // 2. 加载 registry 解析模型配置（先读盘，策略判定复用同一份注册表）
     let registry = config::load_registry().map_err(|e| format!("加载模型配置失败: {e}"))?;
 
-    // 3. Resolve model alias to find provider config
-    let vision_provider = resolve_vision_provider();
+    // 3. 视觉目标 = (model, provider) 成对解析。provider 必须与 model 一同带出，
+    //    否则同名模型跨段时下游会按段序盲选到错的 provider（详见 resolve_vision_target）。
+    let strategy = resolve_vision_strategy();
+    let (vision_model_id, vision_provider) = resolve_vision_target(&registry, &strategy)?;
     let (provider_config, model_entry) =
         resolve_vision_model(&registry, &vision_model_id, vision_provider.as_deref())?;
 
     // 错误文案上下文：实际模型 + provider 段名 + 跟随态标注。未显式配置视觉模型时
     // （strategy == Main）实际调用的是 Leader 主模型，错误文案必须讲清这一点，
-    // 否则用户会去错误的配置项里排查。resolve_vision_model_id 内部已按同一策略
-    // 解析过模型 id，这里重复调 resolve_vision_strategy 只为取跟随态布尔值
-    // （load_registry 为轻量读盘，与本函数既有的多次读取同一口径）。
+    // 否则用户会去错误的配置项里排查。
     let error_ctx = VisionErrorContext {
         model: model_entry.id.clone(),
         provider: provider_config.name.clone(),
-        follow_leader: matches!(resolve_vision_strategy(), VisionStrategy::Main),
+        follow_leader: matches!(strategy, VisionStrategy::Main),
     };
 
     // 4. 该模型段的传输层（协议族由 Provider 自身声明；鉴权头 / 端点 / 重试 /
@@ -450,19 +448,57 @@ fn split_transport_error(err: &crate::NuphusError) -> (Option<u16>, String) {
     }
 }
 
-/// 使用统一判定获取视觉模型 ID（desktop_vision 工具与描述注入共用）
-fn resolve_vision_model_id() -> Result<String, String> {
-    match resolve_vision_strategy() {
+/// 解析视觉调用目标：(模型 id, provider 段名)。
+///
+/// **Main 分支必须带出 provider**：`resolve_main_binding()` 的权威产物是
+/// (provider, model) 成对值。只回传模型 id 会让下游 `find_model` 走
+/// legacy 段序盲选——同名模型跨段时（本项目 `deepseek-v4.1-flash` 同时在
+/// `opencode-go` / `custom-41flash` / `custom-41flash-alt` 三段发布），
+/// 视觉请求会被路由到段序第一段，用该段的 Key 鉴权后必然 401。
+///
+/// 这曾是「跟随 Leader 却报了别家 provider 鉴权失败」的真实缺陷：错误文案
+/// 把用户引向错误配置项。provider 与 model 必须成对传递，不接受单值。
+fn resolve_vision_target(
+    registry: &config::ModelRegistry,
+    strategy: &VisionStrategy,
+) -> Result<(String, Option<String>), String> {
+    match strategy {
         VisionStrategy::Main => {
-            let registry = config::load_registry().map_err(|e| format!("加载模型配置失败: {e}"))?;
-            Ok(registry.model.clone())
+            let (provider, model) = registry.resolve_main_binding().map_err(|e| {
+                format!(
+                    "图像理解不可用：无法确定 Leader 主模型绑定（{e}）。\n\
+                     请在设置 → 模型 中重新选择主模型（会同时写入 provider 与 model）。"
+                )
+            })?;
+            Ok((model, Some(provider)))
         }
-        VisionStrategy::Capability(m) => Ok(m),
+        VisionStrategy::Capability(m) => {
+            // 显式绑定：provider 存在就用精确绑定；旧配置无 provider 字段时
+            // 走兼容解析，但同名多段必须报歧义而不是静默盲选。
+            let bound = registry.capabilities.vision_provider.clone();
+            if !bound.is_empty() {
+                return Ok((m.clone(), Some(bound)));
+            }
+            let candidates = registry.find_model_candidates(m);
+            match candidates.len() {
+                0 => Err(format!("未找到视觉模型: {m}")),
+                1 => Ok((m.clone(), Some(candidates[0].0.name.clone()))),
+                n => Err(format!(
+                    "视觉模型 {m} 在 {n} 个 provider 段中都存在（{}），无法确定该用哪一个。\n\
+                     请在设置 → 模型 → 图像音频模型 中重新选择一次，以写入 provider 绑定。",
+                    candidates
+                        .iter()
+                        .map(|(p, _)| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        }
         // 不可用时给**真实的、可执行**的说明：讲清原因（Leader 不支持视觉）+ 两条出路。
         // 这段文本会随工具结果进入 Leader 上下文——是「当前能力确实不可用」的事实告知，
         // 不是静默降级：Leader 看到后应如实告诉用户，而不是假装看到了图像内容。
         VisionStrategy::None => {
-            let leader = config::load_registry().map(|r| r.model).unwrap_or_default();
+            let leader = registry.model.clone();
             let leader_part = if leader.is_empty() {
                 "当前 Leader 模型不支持视觉输入".to_string()
             } else {
@@ -733,6 +769,127 @@ id = "shared-model"
         let registry = duplicate_model_registry();
         let (provider, _) = resolve_vision_model(&registry, "shared-model", None).unwrap();
         assert_eq!(provider.name, "first");
+    }
+
+    /// 回归：Main 策略必须把 Leader 的 provider 绑定一并带出。
+    ///
+    /// 原缺陷：`resolve_vision_model_id` 在 Main 分支只返回模型 id，下游拿到
+    /// `provider = None` → `find_model` 按段序盲选。当同名模型同时发布在多个段时
+    /// （真实配置里 `deepseek-v4.1-flash` 出现在 opencode-go / custom-41flash /
+    /// custom-41flash-alt 三段），视觉请求会用第一段的 Key 鉴权 → 401，且错误文案
+    /// 把用户指向了根本没在用的 provider。
+    #[test]
+    fn main_strategy_carries_leader_provider_binding() {
+        let mut registry = duplicate_model_registry();
+        registry.model = "shared-model".to_string();
+        registry.leader_provider = Some("selected".to_string());
+
+        let strategy = VisionStrategy::Main;
+        let (model, provider) = resolve_vision_target(&registry, &strategy).unwrap();
+
+        assert_eq!(model, "shared-model");
+        assert_eq!(
+            provider.as_deref(),
+            Some("selected"),
+            "Main 必须带出 Leader 的 provider 绑定，否则下游按段序盲选到 'first'"
+        );
+    }
+
+    /// 回归：显式视觉绑定有 provider 时精确路由，不受段序影响。
+    #[test]
+    fn capability_strategy_uses_explicit_provider() {
+        let mut registry = duplicate_model_registry();
+        registry.capabilities.vision = "shared-model".to_string();
+        registry.capabilities.vision_provider = "selected".to_string();
+
+        let strategy = VisionStrategy::Capability("shared-model".to_string());
+        let (model, provider) = resolve_vision_target(&registry, &strategy).unwrap();
+
+        assert_eq!(model, "shared-model");
+        assert_eq!(provider.as_deref(), Some("selected"));
+    }
+
+    /// 回归：旧配置没有 vision_provider 且同名跨段 → 报歧义，不静默盲选。
+    #[test]
+    fn capability_strategy_without_provider_reports_ambiguity() {
+        let mut registry = duplicate_model_registry();
+        registry.capabilities.vision = "shared-model".to_string();
+        // vision_provider 保持空（旧配置形态）
+
+        let strategy = VisionStrategy::Capability("shared-model".to_string());
+        let err = resolve_vision_target(&registry, &strategy).unwrap_err();
+
+        assert!(
+            err.contains("shared-model") && err.contains("first") && err.contains("selected"),
+            "歧义必须列出候选段名，实际: {err}"
+        );
+    }
+
+    /// 唯一候选时仍走兼容路径（旧配置无 provider 也能用）。
+    #[test]
+    fn capability_strategy_without_provider_resolves_single_candidate() {
+        let mut registry = duplicate_model_registry();
+        // 把 second 段的同名模型删掉，只留 first
+        registry.providers[1].models.clear();
+        registry.capabilities.vision = "shared-model".to_string();
+
+        let strategy = VisionStrategy::Capability("shared-model".to_string());
+        let (_, provider) = resolve_vision_target(&registry, &strategy).unwrap();
+
+        assert_eq!(provider.as_deref(), Some("first"));
+    }
+
+    /// 端到端（真实 providers.toml）：跟随 Leader 时必须路由到 Leader 绑定的段，
+    /// 而不是同名模型的段序首段。
+    ///
+    /// 这是本次 401 的实际现场：本机 `deepseek-v4.1-flash` 同时发布在
+    /// opencode-go / custom-41flash / custom-41flash-alt，Leader 绑定的是
+    /// custom-41flash-alt，但旧实现回落到段序首段 opencode-go 的 Key。
+    /// 无配置文件的环境（CI）跳过，不伪造通过。
+    #[test]
+    fn real_config_follows_leader_provider_not_first_segment() {
+        let Ok(registry) = config::load_registry() else {
+            eprintln!("skip: 本机无 providers.toml");
+            return;
+        };
+        let Ok((bound_provider, bound_model)) = registry.resolve_main_binding() else {
+            eprintln!("skip: 无 Leader 绑定");
+            return;
+        };
+        if !matches!(resolve_vision_strategy(), VisionStrategy::Main) {
+            eprintln!("skip: 已显式配置视觉模型，非 Main 策略");
+            return;
+        }
+
+        let (model, provider) = resolve_vision_target(&registry, &VisionStrategy::Main).unwrap();
+
+        assert_eq!(model, bound_model);
+        assert_eq!(
+            provider.as_deref(),
+            Some(bound_provider.as_str()),
+            "跟随 Leader 必须用 Leader 绑定的 provider 段"
+        );
+
+        // 该模型若在同名多段发布，证明「盲选首段」确实会选错
+        let segments: Vec<&str> = registry
+            .find_model_candidates(&bound_model)
+            .iter()
+            .map(|(p, _)| p.name.as_str())
+            .collect();
+        if segments.len() > 1 {
+            assert!(
+                segments.contains(&bound_provider.as_str()),
+                "绑定段必须是同名候选之一"
+            );
+            // 修复的核心价值：当绑定段不是段序首段时，旧实现必然选错。
+            // 此处显式记录该场景已覆盖，防止将来有人把断言改成恒真。
+            if segments[0] != bound_provider.as_str() {
+                eprintln!(
+                    "覆盖到真实缺陷场景：同名候选段序首段={}，Leader 绑定={}",
+                    segments[0], bound_provider
+                );
+            }
+        }
     }
 
     #[test]

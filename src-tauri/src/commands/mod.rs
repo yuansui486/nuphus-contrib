@@ -29,7 +29,6 @@ pub mod skill;
 pub mod tenet;
 pub mod toolbar;
 pub mod tools;
-pub mod ui_link;
 pub mod user_assets;
 pub mod user_input;
 pub mod workflow;

@@ -13,6 +13,8 @@
  *    系统主题（3 大卡）→ 我的主题（卡片网格）→ 界面不透明度 →
  *    颜色微调 → 紧凑保存行。管理型低频动作（导入 / 导出 / 停用）收进「⋯ 更多」
  *    小菜单——不进主视线，也不单独占一页；
+ *    （行内的「恢复默认」小钮 —— 5 个不透明度行 + 5 个颜色行各一个 ——
+ *      **常驻渲染**，没有可恢复内容时 disabled，不是条件按钮）
  * ③ 「我的主题」即管理台：换背景（卡面 hover 的「上传」钮）/ 行内改名 / 删除 /
  *    ＋ 新建全在卡片上完成 —— 浮窗内**没有**独立的皮肤背景栏，背景只归主题。
  *    「保存 → 原地看到它（新卡即进入行内改名）」是本浮窗的用户感知闭环。
@@ -36,6 +38,7 @@ import {
   IconMoreHorizontal,
   IconPalette,
   IconPlus,
+  IconRotateCcw,
   IconSave,
   IconUpload,
   IconX,
@@ -43,22 +46,19 @@ import {
 import { useTheme } from '../../hooks/useTheme'
 import type { ThemeId } from '../../hooks/useTheme'
 import {
+  ACCENT_DERIVED_KEYS,
   CORE_TOKEN_KEYS,
-  OPACITY_COLOR_KEYS,
   SKIN_OPACITY_KEY,
+  accentOverrideGroup,
   applyCoreColor,
-  markOpacityIntent,
   newCustomThemeId,
   normalizeHexInput,
   parseColorAlpha,
   parseColorValue,
   parseCustomThemeJSON,
-  readOpacityIntent,
-  stripOpacityColorKeys,
   toRgba,
   type CoreTokenKey,
   type CustomTheme,
-  type OpacityChannel,
 } from '../../hooks/customTheme'
 import { Button } from '../../ui/Button'
 import { FormRow } from '../../ui/PageLayout'
@@ -91,6 +91,32 @@ const TOKEN_LABELS: Record<CoreTokenKey, string> = {
 /* 无覆盖时的稳定空对象（避免每次渲染生成新引用触发 effect） */
 const EMPTY_OVERRIDES: Record<string, string> = {}
 
+/* ── 行内「恢复默认」的覆盖键分组 ──
+   语义严格限定为 **未保存草稿**（previewOverrides）：只回退草稿里对应的覆盖键，
+   绝不触碰、不回写用户已保存的自定义主题数据（不调 saveCustom / 不写 localStorage）。
+
+   气泡是两个键（用户气泡 / 助手气泡），**视为一组**一起回退 ——
+   只回退一个会让两边气泡透明度劈叉。 */
+const OPACITY_RESET_KEYS: Record<
+  'bubbles' | 'input' | 'panel' | 'modal' | 'skin',
+  readonly string[]
+> = {
+  bubbles: ['--msg-user-bg', '--msg-assistant-bg'],
+  input: ['--input-bg'],
+  panel: ['--panel-bg'],
+  modal: ['--modal-bg'],
+  skin: [SKIN_OPACITY_KEY],
+}
+
+/** 颜色行 → 覆盖键组（普通 token 单键；强调色带 4 个派生键）。
+ *
+ * 强调色必须与派生键同组：applyCoreColor 随主键一起写草稿，只回退主键会把
+ * 派生键留在上一版强调色的取值上（主键与派生键脱钩）。清单取自 customTheme，
+ * 不另建镜像常量 —— 清单漂移会让恢复只回退一半。 */
+function colorResetKeys(key: CoreTokenKey): readonly string[] {
+  return key === '--accent' ? ['--accent', ...ACCENT_DERIVED_KEYS] : [key]
+}
+
 type ToastFn = (message: string, type?: 'info' | 'success' | 'warning' | 'error') => void
 
 /**
@@ -100,17 +126,56 @@ type ToastFn = (message: string, type?: 'info' | 'success' | 'warning' | 'error'
  */
 const showToast: ToastFn = (message, type = 'info') => showAppFeedback(message, type)
 
+/* ── 行内「恢复默认」小钮（每个不透明度行 / 每个颜色行各一个）──
+   **常驻渲染**：没有可恢复的内容时 disabled，而不是不渲染 ——
+   面板形态约束里「放弃修改」是唯一的条件按钮，行内小钮不做条件渲染。
+
+   语义只到「未保存草稿」一层：回退 previewOverrides 里的覆盖键，
+   已保存的自定义主题数据一概不碰。 */
+function ResetItemButton({
+  label,
+  canReset,
+  onReset,
+}: {
+  /** 行标签（气泡名 / 颜色名），进无障碍名以便 10 个小钮彼此可区分 */
+  label: string
+  /** 草稿里该行有值且与基线不同 → 可恢复；否则 disabled */
+  canReset: boolean
+  onReset: () => void
+}) {
+  const { t } = useLanguage()
+  const title = `${t('themes.resetItem')} · ${label}`
+  return (
+    <button
+      type="button"
+      className="apnp-reset-btn"
+      aria-label={title}
+      title={title}
+      disabled={!canReset}
+      onClick={onReset}
+    >
+      <IconRotateCcw size={12} />
+    </button>
+  )
+}
+
 /* ── 核心色 token 行：color picker + 可手改 hex ── */
 function ColorTokenRow({
   tokenKey,
   label,
   value,
   onCommit,
+  onReset,
+  canReset,
 }: {
   tokenKey: CoreTokenKey
   label: string
   value: string
   onCommit: (key: CoreTokenKey, hex: string) => void
+  /** 行内「恢复默认」：把该行的草稿覆盖回退到基线（不碰已保存数据） */
+  onReset: () => void
+  /** 草稿里该行有值且与基线不同 → 可恢复；否则小钮 disabled */
+  canReset: boolean
 }) {
   const [text, setText] = useState(value)
 
@@ -129,27 +194,30 @@ function ColorTokenRow({
     <FormRow
       label={<span className="color-token-label">{label}</span>}
       control={
-        <span className="color-token-control">
-          <input
-            type="color"
-            className="color-token-picker"
-            value={value}
-            onChange={e => onCommit(tokenKey, e.target.value)}
-            aria-label={label}
-          />
-          <input
-            type="text"
-            className="color-token-hex"
-            value={text}
-            onChange={e => setText(e.target.value)}
-            onBlur={commitText}
-            onKeyDown={e => {
-              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-            }}
-            spellCheck={false}
-            aria-label={`${label} hex`}
-          />
-        </span>
+        <>
+          <span className="color-token-control">
+            <input
+              type="color"
+              className="color-token-picker"
+              value={value}
+              onChange={e => onCommit(tokenKey, e.target.value)}
+              aria-label={label}
+            />
+            <input
+              type="text"
+              className="color-token-hex"
+              value={text}
+              onChange={e => setText(e.target.value)}
+              onBlur={commitText}
+              onKeyDown={e => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+              }}
+              spellCheck={false}
+              aria-label={`${label} hex`}
+            />
+          </span>
+          <ResetItemButton label={label} canReset={canReset} onReset={onReset} />
+        </>
       }
     />
   )
@@ -266,7 +334,7 @@ function readSkinOpacityPercent(): number {
   const cs = getComputedStyle(document.documentElement)
   const raw = cs.getPropertyValue(SKIN_OPACITY_KEY).trim()
   const n = raw ? parseFloat(raw) : Number.NaN
-  return Number.isFinite(n) ? Math.round(n * 100) : 35
+  return Number.isFinite(n) ? Math.round(n * 100) : 0
 }
 
 /**
@@ -327,13 +395,6 @@ function readOpacityAlphas(overrides: Record<string, string>, skinDefault: numbe
   }
 }
 
-/** 两个覆盖集合是否等价（键集合相同且逐键同值；键序无关） */
-function sameOverrides(a: Record<string, string>, b: Record<string, string>): boolean {
-  const keys = Object.keys(a)
-  if (keys.length !== Object.keys(b).length) return false
-  return keys.every(k => a[k] === b[k])
-}
-
 /* ── 不透明度滑块行：range + 百分比数值 ──
    `label` 直接就是**被调整的对象名**（消息气泡 / 输入框 / 控制面板 / 弹窗 /
    背景图），不再挂「影响对象」小注：label 与 note 早先互为同义反复
@@ -342,30 +403,39 @@ function OpacitySliderRow({
   label,
   value,
   onChange,
+  onReset,
+  canReset,
   min = 20,
 }: {
   label: string
   value: number
   onChange: (percent: number) => void
+  /** 行内「恢复默认」：把该通道的草稿覆盖回退到基线（不碰已保存数据） */
+  onReset: () => void
+  /** 草稿里该通道有值且与基线不同 → 可恢复；否则小钮 disabled */
+  canReset: boolean
   min?: number
 }) {
   return (
     <FormRow
       label={label}
       control={
-        <span className="opacity-control">
-          <input
-            type="range"
-            className="opacity-range"
-            min={min}
-            max={100}
-            step={5}
-            value={value}
-            onChange={e => onChange(Number(e.target.value))}
-            aria-label={label}
-          />
-          <span className="opacity-value">{value}%</span>
-        </span>
+        <>
+          <span className="opacity-control">
+            <input
+              type="range"
+              className="opacity-range"
+              min={min}
+              max={100}
+              step={1}
+              value={value}
+              onChange={e => onChange(Number(e.target.value))}
+              aria-label={label}
+            />
+            <span className="opacity-value">{value}%</span>
+          </span>
+          <ResetItemButton label={label} canReset={canReset} onReset={onReset} />
+        </>
       }
     />
   )
@@ -421,7 +491,7 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
     bubbles: 100,
     input: 100,
     panel: 80,
-    skin: 35,
+    skin: 0,
     modal: 80,
   })
 
@@ -474,81 +544,11 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
     overrides,
   })
 
-  // 基底切换后的第二阶段：新基底颜色已写入 DOM（旧派生色已被上一步剥离），
-  // 此时按当前 α 重新派生 rgba 覆盖。用 ref 记住已处理过的基底，避免拖动等渲染重复执行。
-  //
-  // dirty 语义：只有用户**显式拖过**的滑块通道才在基底切换后重派覆盖。
-  // 若不做这层约束，切换内置主题卡片就会因「旧基底滑块读数 ≠ 新基底默认 α」
-  // 误写 --modal-bg 覆盖 → 预览态/落盘被标记为「用户自定义」且刷新后回不来纯主题。
-  //
-  // dirty 的**来源必须是持久的**（localStorage，见 customTheme.readOpacityIntent）：
-  // 本浮窗虽已保活（开合不卸载），但「重开页面 / 重启」仍会让组件 ref 归零；
-  // 若以 ref 为准，用户「拖滑块 → 刷新 → 切主题」这条路径会让 dirty 判为 false，
-  // 于是 --input-bg 等派生色被 strip 后不再重派 → 回落基底实色，
-  // 用户设定的透明度被静默丢弃（滑块读数仍显示旧值）。这是输入框/气泡不跟透明度
-  // 变化的确定性根因。
-  //
-  // ── 状态职责（2026-09-28 语义正名，改前先读）──
-  // baseDefaults 是 **effect A 独占**的「当前基底 token 计算值」：A 与 B 同在
-  // theme 变化这一批执行、后写胜出，B 昔日直接 setBaseDefaults(next) 会把 A 刚
-  // 写入的正确基底值覆写成「剥皮后的覆盖集合」，表现为切主题后颜色区整片
-  // 褪成 #000000、滑块读数停在上一套。B 的产物是「基底切换后重派的派生覆盖」，
-  // 出口只有一个 —— 预览通道 applyCustomPreview(buildPreview(theme, next))。
-  const lastDerivedBaseRef = useRef(theme)
-  const dirtyOpacityRef = useRef<Record<OpacityChannel, boolean>>(readOpacityIntent())
-  useEffect(() => {
-    if (lastDerivedBaseRef.current === theme) return
-    lastDerivedBaseRef.current = theme
-    // 纯净预设态（无自定义激活、无预览草稿）没有可迁移的覆盖：基底值的刷新
-    // 完全归 effect A。此处一个字节的状态都不写 —— 否则点系统预设卡回不到
-    // 纯净态（铁律②），持久 dirty 意图也会把旧覆盖借尸还魂。
-    if (previewOverrides === null && customTheme === null) return
-    const dirty = dirtyOpacityRef.current
-    const { bubbles, input, panel, modal } = opacityAlphas
-    const cs = getComputedStyle(document.documentElement)
-    const colors: Record<string, { r: number; g: number; b: number } | null> = {}
-    for (const key of OPACITY_COLOR_KEYS) {
-      colors[key] = parseColorValue(cs.getPropertyValue(key).trim())
-    }
-    const user = colors['--msg-user-bg']
-    const assistant = colors['--msg-assistant-bg']
-    const inputColor = colors['--input-bg']
-    const panelColor = colors['--panel-bg']
-    const modalColor = colors['--modal-bg']
-    const next = stripOpacityColorKeys(activeOverrides)
-    if (dirty.bubbles && bubbles < 100 && user && assistant) {
-      next['--msg-user-bg'] = toRgba(user, bubbles / 100)
-      next['--msg-assistant-bg'] = toRgba(assistant, bubbles / 100)
-    }
-    if (dirty.input && input < 100 && inputColor) {
-      next['--input-bg'] = toRgba(inputColor, input / 100)
-    }
-    // 面板与弹窗同族：基底即半透明玻璃，仅当滑块值 ≠ 新基底默认 α 时才写覆盖
-    // （100% 写 α=1 实色，否则回落基底仍是玻璃）
-    if (dirty.panel && panelColor) {
-      const computedPct = Math.round(
-        (parseColorAlpha(cs.getPropertyValue('--panel-bg').trim()) ?? 0.8) * 100,
-      )
-      if (panel !== computedPct) {
-        next['--panel-bg'] = toRgba(panelColor, panel / 100)
-      }
-    }
-    if (dirty.modal && modalColor) {
-      const computedPct = Math.round(
-        (parseColorAlpha(cs.getPropertyValue('--modal-bg').trim()) ?? 0.8) * 100,
-      )
-      if (modal !== computedPct) {
-        next['--modal-bg'] = toRgba(modalColor, modal / 100)
-      }
-    }
-    // 出口语义正名（铁律①）：重派产物走预览通道。与当前生效覆盖一致（没有
-    // 需要重派的东西）时不动预览 —— 空预览会经 ThemeProvider 把已生效的
-    // 覆盖整体清掉。baseDefaults 由 effect A 独占，本 effect 不得写它。
-    if (!sameOverrides(next, activeOverrides)) {
-      applyCustomPreview(buildPreview(theme, next))
-    }
-  }, [theme, opacityAlphas, activeOverrides, customTheme])
-
+  // 不透明度属于**每个自定义主题自己的数据**（以 rgba / 数值覆盖的形式存于 overrides，
+  // 由主题 JSON 一起保存 / 导出 / 导入）。激活主题只应用该主题的 overrides，
+  // 绝不能用「上一个主题的滑块读数」重新派生覆盖 —— 那会把目标主题已保存的
+  // 不透明度改写成源主题的值（基底不同时必现，同基底时偶发，取决于 dirty 通道）。
+  // 早先的 dirty-intent 全局重派机制正是这一缺陷的来源，已整体移除。
   const handleColorCommit = (key: CoreTokenKey, hex: string) => {
     const next = applyCoreColor(activeOverrides, key, hex)
     const nextTheme = buildPreview(theme, next)
@@ -558,18 +558,8 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
   /* ── 不透明度滑块 ── */
   // 取当前生效色（computed style，兼容 hex/rgb/rgba）→ 转 rgba(color, α) 写入覆盖通道。
   // 拖动时读到的 rgb 即基底色（α 不改变 rgb 分量），后续拖动可继续以此派生。
-  //
-  // 每个 handler 都调 markOpacityIntent：把「用户拖过这个通道」落成持久声明。
-  // 只写组件内 ref 是不够的 —— 刷新/重启后 ref 归零，切主题时该通道的覆盖会被
-  // strip 掉且不再重派（详见 dirtyOpacityRef 处注释）。mark 写 ref 供本次会话立即生效，
-  // 写 localStorage 供重开 / 重启后仍然生效。
-  const markDirty = (channel: OpacityChannel) => {
-    dirtyOpacityRef.current[channel] = true
-    markOpacityIntent(channel)
-  }
-
+  // 覆盖随「保存」落到当前自定义主题；切换主题时按目标主题的覆盖原样恢复。
   const handleBubbleOpacity = (percent: number) => {
-    markDirty('bubbles')
     setOpacityAlphas(prev => ({ ...prev, bubbles: percent }))
     const cs = getComputedStyle(document.documentElement)
     const user = parseColorValue(cs.getPropertyValue('--msg-user-bg').trim())
@@ -587,7 +577,6 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
   }
 
   const handleInputOpacity = (percent: number) => {
-    markDirty('input')
     setOpacityAlphas(prev => ({ ...prev, input: percent }))
     const cs = getComputedStyle(document.documentElement)
     const inputColor = parseColorValue(cs.getPropertyValue('--input-bg').trim())
@@ -601,7 +590,6 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
   // 设置中心面板：语义上属弹窗族（--panel-bg），与弹窗同规则 ——
   // 基底即半透明玻璃，100% 需写 α=1 实色覆盖（不能 delete 回落基底，否则仍是玻璃）
   const handlePanelOpacity = (percent: number) => {
-    markDirty('panel')
     setOpacityAlphas(prev => ({ ...prev, panel: percent }))
     const cs = getComputedStyle(document.documentElement)
     const panelColor = parseColorValue(cs.getPropertyValue('--panel-bg').trim())
@@ -612,7 +600,6 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
   }
 
   const handleModalOpacity = (percent: number) => {
-    markDirty('modal')
     setOpacityAlphas(prev => ({ ...prev, modal: percent }))
     const cs = getComputedStyle(document.documentElement)
     const modalColor = parseColorValue(cs.getPropertyValue('--modal-bg').trim())
@@ -625,12 +612,63 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
 
   // 皮肤背景图为数值直写（非 rgba 派生），0% 即隐藏背景图
   const handleSkinOpacity = (percent: number) => {
-    markDirty('skin')
     setOpacityAlphas(prev => ({ ...prev, skin: percent }))
     const next = { ...activeOverrides }
     next[SKIN_OPACITY_KEY] = String(percent / 100)
     const nextTheme = buildPreview(theme, next)
     applyCustomPreview(nextTheme)
+  }
+
+  /* ── 行内「恢复默认」（每个不透明度行 / 每个颜色行各一个小钮）──
+     语义严格限定为 **main 现行草稿语义**：只删「未保存草稿」里的对应覆盖键，
+     **绝不触碰、不回写用户已保存的自定义主题数据** ——
+     不调 saveCustom、不写 localStorage、不新增任何持久化键。
+
+     恢复目标 = **当前生效基线**：已激活的自定义主题里有该键 → 回到它的值；
+     基线里没有该键 → 从草稿里删掉该键（回落主题基底默认）。 */
+  const baselineOverrides = customTheme?.overrides ?? EMPTY_OVERRIDES
+
+  /** 该组键在草稿里「有值且与基线不同」才有可恢复的东西（否则小钮 disabled） */
+  const canResetKeys = (keys: readonly string[]): boolean => {
+    if (previewOverrides === null) return false
+    return keys.some(key => {
+      const draftValue: string | undefined = previewOverrides[key]
+      return draftValue !== undefined && draftValue !== baselineOverrides[key]
+    })
+  }
+
+  /**
+   * 把该组键恢复到基线：**只改草稿**（previewOverrides），已保存主题一概不碰。
+   * 草稿与基线等值（含被清空）→ clearCustomPreview()：空草稿若仍留在
+   * previewOverrides 上会遮蔽已保存主题的覆盖
+   * （activeOverrides = previewOverrides ?? customTheme…），用户会看不到自己
+   * 保存过的值；等值草稿留着则让「放弃修改」亮着却没有任何真实未保存差异
+   * （假未保存态）——两者都清。
+   */
+  const resetKeysToBaseline = (keys: readonly string[]) => {
+    const next: Record<string, string> = { ...(previewOverrides ?? {}) }
+    if (keys.includes('--accent')) {
+      // 强调色**成组**回退：主键与 4 个派生键必须同源 —— 只回退主键会让派生键留在
+      // 旧强调色的取值上（底色回蓝、悬停/辉光还是红的）
+      for (const key of keys) delete next[key]
+      const baselineAccent = baselineOverrides['--accent']
+      // 基线可能**只有主键**（导入的主题 JSON）→ 按主键重新派生，保持同源
+      if (baselineAccent !== undefined) Object.assign(next, accentOverrideGroup(baselineAccent))
+    } else {
+      for (const key of keys) {
+        const baseline: string | undefined = baselineOverrides[key]
+        if (baseline !== undefined) next[key] = baseline
+        else delete next[key]
+      }
+    }
+    // 只剩与基线等值的键 = 没有真实未保存差异 → 清草稿（空草稿同样在此收敛）：
+    // 等值草稿留着会让「放弃修改」亮着，构成假未保存态
+    const hasRealDiff = Object.keys(next).some(key => next[key] !== baselineOverrides[key])
+    if (!hasRealDiff) {
+      clearCustomPreview()
+      return
+    }
+    applyCustomPreview(buildPreview(theme, next))
   }
 
   // 预览草稿 = 未保存修改（编辑一律先预览不落盘；保存按钮才持久化——
@@ -925,11 +963,13 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
                   // 专属，不得跨系统主题残留。useTheme.setTheme 本就清草稿预览，
                   // 此处显式再清一次是把契约钉在本调用点，不依赖上游实现的自觉。
                   clearCustomPreview()
-                  // 若此前挂着自定义主题，背景同步回 LS_SKIN（主题皮肤快照只归
-                  // 该主题，边界见 useTheme.tsx 顶部注释）
-                  const fromCustom = customTheme !== null
+                  // 背景同步回预设态（LS_SKIN）：**无条件**执行，不看此前是否挂着
+                  // 自定义主题 —— 背景图是上一状态留下的，不回退就会一直挂着
+                  // （主题皮肤快照只归该主题，边界见 useTheme.tsx 顶部注释）。
+                  // 早先这里有 `if (fromCustom)` 守卫，导致预设态之间切主题时
+                  // 背景纹丝不动 —— 上一张图继续显示在新的系统主题上。
                   setTheme(th.id)
-                  if (fromCustom) void applySkinBg(readSkinBg())
+                  void applySkinBg(readSkinBg())
                 }}
                 title={`${t(`theme.${th.id}`)} — ${t(`theme.${th.id}Desc`)}`}
               >
@@ -1058,27 +1098,37 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
             label={t('themes.opacityBubbles')}
             value={opacityAlphas.bubbles}
             onChange={handleBubbleOpacity}
+            canReset={canResetKeys(OPACITY_RESET_KEYS.bubbles)}
+            onReset={() => resetKeysToBaseline(OPACITY_RESET_KEYS.bubbles)}
           />
           <OpacitySliderRow
             label={t('themes.opacityInput')}
             value={opacityAlphas.input}
             onChange={handleInputOpacity}
+            canReset={canResetKeys(OPACITY_RESET_KEYS.input)}
+            onReset={() => resetKeysToBaseline(OPACITY_RESET_KEYS.input)}
           />
           <OpacitySliderRow
             label={t('themes.opacityPanel')}
             value={opacityAlphas.panel}
             onChange={handlePanelOpacity}
+            canReset={canResetKeys(OPACITY_RESET_KEYS.panel)}
+            onReset={() => resetKeysToBaseline(OPACITY_RESET_KEYS.panel)}
           />
           <OpacitySliderRow
             label={t('themes.opacityModal')}
             value={opacityAlphas.modal}
             onChange={handleModalOpacity}
+            canReset={canResetKeys(OPACITY_RESET_KEYS.modal)}
+            onReset={() => resetKeysToBaseline(OPACITY_RESET_KEYS.modal)}
           />
           <OpacitySliderRow
             label={t('themes.opacitySkin')}
             value={opacityAlphas.skin}
             min={0}
             onChange={handleSkinOpacity}
+            canReset={canResetKeys(OPACITY_RESET_KEYS.skin)}
+            onReset={() => resetKeysToBaseline(OPACITY_RESET_KEYS.skin)}
           />
         </section>
 
@@ -1092,6 +1142,8 @@ export function AppearancePanel({ open, onClose, toggleRef }: AppearancePanelPro
               label={t(TOKEN_LABELS[key])}
               value={effectiveValue(key)}
               onCommit={handleColorCommit}
+              canReset={canResetKeys(colorResetKeys(key))}
+              onReset={() => resetKeysToBaseline(colorResetKeys(key))}
             />
           ))}
         </section>

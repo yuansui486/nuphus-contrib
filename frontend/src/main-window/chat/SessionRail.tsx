@@ -17,6 +17,7 @@ import {
   IconPin,
   IconPinOff,
   IconPlus,
+  IconShield,
   IconTrash2,
   IconX,
 } from '../../ui/Icons'
@@ -24,6 +25,7 @@ import { playUiSound } from '../../ui/sound'
 import { CompactModal } from '../layout/CompactModal'
 import { NewChatModal, type NewChatProjectOption } from './NewChatModal'
 import { CreateProjectModal } from './CreateProjectModal'
+import { ProjectTenetsDialog } from '../dialogs/ProjectTenetsDialog'
 import { useLanguage } from '../../locales'
 import {
   listShelfSessions,
@@ -44,6 +46,7 @@ import {
   DEFAULT_GROUP_LIMIT,
   DEFAULT_SESSION_SORT_PREFS,
   buildSessionGroups,
+  dirDisplayName,
   normalizeGroupLimit,
   normalizePathKey,
   normalizePinnedSessions,
@@ -591,6 +594,8 @@ export default function SessionRail({
   const [newChatOpen, setNewChatOpen] = useState(false)
   /** 「创建项目」弹窗开合（入口 = 「项目」行右端 📁+；不再进项目中心） */
   const [createProjectOpen, setCreateProjectOpen] = useState(false)
+  /** 项目原则弹窗目标（入口 = 组头盾牌按钮；null = 关闭） */
+  const [tenetProject, setTenetProject] = useState<{ name: string; path: string } | null>(null)
   /** 抽屉开合态：默认收起（只露色块），点击色块才伸出 */
   const [open, setOpen] = useState(false)
   /** 组头折叠态（key → true=收起整组）：默认全部展开，运行时状态不持久化 */
@@ -1652,6 +1657,23 @@ export default function SessionRail({
                         )}
                       </button>
                       <span className="sr-group-actions">
+                        {/* 项目原则：进入组头即可维护该文件夹作用域的原则 */}
+                        {group.path && (
+                          <button
+                            type="button"
+                            className="sr-edit-btn"
+                            onClick={() =>
+                              setTenetProject({
+                                name: group.name || dirDisplayName(group.path as string),
+                                path: group.path as string,
+                              })
+                            }
+                            title={t('sessionRail.editProjectTenets')}
+                            aria-label={t('sessionRail.editProjectTenets')}
+                          >
+                            <IconShield size={12} />
+                          </button>
+                        )}
                         {/* 组内新建对话：先切该文件夹再新建（无路径的「未分组」组不提供） */}
                         {group.path && onNewChat && onSwitchProjectDir && (
                           <button
@@ -1794,6 +1816,9 @@ export default function SessionRail({
         onPickDir={handlePickProjectDir}
         onSubmit={handleCreateProject}
       />
+
+      {/* 项目原则弹窗（组头盾牌入口）：独立于创建流程，直接维护该文件夹的原则 */}
+      <ProjectTenetsDialog project={tenetProject} onClose={() => setTenetProject(null)} />
     </>
   )
 }

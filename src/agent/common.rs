@@ -8,7 +8,8 @@ use crate::agent::events::{EventEmitter, NuphusEvent};
 use crate::api::AssistantEvent;
 use crate::session::ContentBlock;
 use crate::ToolCall;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Return result of process_events
 pub struct ProcessEventsResult {
@@ -256,6 +257,56 @@ pub fn emit_text_break(emitter: Option<&dyn EventEmitter>, from_task: bool) {
     }
 }
 
+/// 跨迭代 text 边界状态：一轮用户任务内共享，**唯一实现**。
+///
+/// 前端对 `llm_text_delta` 只做纯字符串拼接（`useEvents.ts` / mobile store），
+/// 自身无法得知 LLM 迭代边界；边界只能由后端补。此前只有 leader（react_loop）
+/// 做了这件事，WorkAgent 路径因此把多次迭代的过程 text 粘成一段——这里把
+/// leader 的既有语义收口成共享组件，所有 runtime 共用，禁止各自复制：
+///   - 每轮迭代开始调用 [`TextBoundary::begin_iteration`] 取得一次性句柄；
+///   - 流回调在首个 `TextDelta` 前调用 [`IterationBreak::before_delta`]；
+///   - 路由函数返回「确实产出可见 text」时调用 [`IterationBreak::mark_emitted`]。
+#[derive(Clone, Default)]
+pub struct TextBoundary {
+    seen: Arc<AtomicBool>,
+}
+
+/// 单次 LLM 迭代的边界句柄（由 [`TextBoundary::begin_iteration`] 产出）。
+#[derive(Clone)]
+pub struct IterationBreak {
+    pending: Arc<AtomicBool>,
+    seen: Arc<AtomicBool>,
+}
+
+impl TextBoundary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 开始新一次 LLM 迭代：若此前已有迭代产出过可见 text，则本轮首个
+    /// TextDelta 前需要补一个换行。
+    pub fn begin_iteration(&self) -> IterationBreak {
+        IterationBreak {
+            pending: Arc::new(AtomicBool::new(self.seen.load(Ordering::SeqCst))),
+            seen: self.seen.clone(),
+        }
+    }
+}
+
+impl IterationBreak {
+    /// 本迭代首个 TextDelta 调用：需要时补一个换行（swap 保证同轮只补一次）。
+    pub fn before_delta(&self, emitter: Option<&dyn EventEmitter>, from_task: bool) {
+        if self.pending.swap(false, Ordering::SeqCst) {
+            emit_text_break(emitter, from_task);
+        }
+    }
+
+    /// 本迭代确实产出了可见 text：下一迭代开始前需要补分隔。
+    pub fn mark_emitted(&self) {
+        self.seen.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Route one streaming `TextDelta` through the shared text cleaner and forward
 /// the split results as frontend events.
 ///
@@ -447,6 +498,13 @@ pub fn is_retryable_llm_error(err: &str) -> bool {
 pub enum LlmErrorKind {
     /// 鉴权失败：Key 无效 / 过期 / 无权限。
     Auth,
+    /// 账号未完成服务商实名认证（账号侧合规门禁，Key 本身有效）。
+    ///
+    /// 与 [`Self::Auth`] 必须分开：StepFun 对未实名账号返回 **403
+    /// `"type":"real_name_required"`**，而 403 在关键词表里会被 Auth 抢走，
+    /// 把用户引去检查一把根本没问题的密钥（实测踩坑）。判别依据是错误体里的
+    /// 业务类型而非状态码——401 指密钥无效，403+实名语义指账号门禁。
+    RealName,
     /// 余额 / 配额不足。
     Balance,
     /// 内容被服务商安全审核拦截（风控）。
@@ -469,6 +527,10 @@ impl LlmErrorKind {
         match self {
             LlmErrorKind::Auth => {
                 "API Key 无效或无权限，请到设置 → 模型服务商检查该服务商的密钥后重试"
+            }
+            LlmErrorKind::RealName => {
+                "该账号尚未完成服务商的实名认证，Key 本身有效。\
+                 请到对应服务商控制台完成实名认证后重试"
             }
             LlmErrorKind::Balance => "账户余额或配额不足，请到对应服务商控制台查询后重试",
             LlmErrorKind::ContentPolicy => {
@@ -517,6 +579,22 @@ pub fn classify_llm_error(err: &str) -> LlmErrorKind {
     for pat in &content_policy {
         if e.contains(pat) {
             return LlmErrorKind::ContentPolicy;
+        }
+    }
+
+    // --- 实名认证门禁（账号侧合规）--- 必须排在 Auth 之前：
+    // StepFun 未实名账号返回 403 + `"type":"real_name_required"`，错误体里同时
+    // 含 `403`，若落到 Auth 会把用户引去检查一把本来就有效的密钥。
+    let real_name = [
+        "real_name_required",
+        "real-name",
+        "identity verification",
+        "complete identity verification",
+        "实名",
+    ];
+    for pat in &real_name {
+        if e.contains(pat) {
+            return LlmErrorKind::RealName;
         }
     }
 
@@ -748,6 +826,34 @@ mod tests {
         );
     }
 
+    /// 回归：StepFun 未实名账号返回 403 + `real_name_required`。
+    ///
+    /// 该错误体里同时含 `403`，若实名判据排在 Auth 之后会被抢走，用户被误导去
+    /// 检查一把有效的密钥（实测原缺陷）。钉住两点：类别必须是 RealName，且
+    /// 重试语义不受影响（403 仍不可重试）。
+    #[test]
+    fn real_name_required_wins_over_403_auth() {
+        let err = "LLM error: API error 403: {\"error\":{\"message\":\"Identity \
+                   verification is required to call this API. Complete identity \
+                   verification at account.stepfun.com, then retry your \
+                   request.\",\"type\":\"real_name_required\"}}";
+        assert_eq!(
+            classify_llm_error(err),
+            LlmErrorKind::RealName,
+            "403 + real_name_required 必须归 RealName，不能被 Auth 抢走"
+        );
+        assert!(
+            !is_retryable_llm_error(err),
+            "实名门禁不可重试（重试语义不得因新增类别而改变）"
+        );
+
+        // 纯净 403（无实名语义）仍归 Auth —— 不能为了修这一条把所有 403 都改写。
+        assert_eq!(
+            classify_llm_error("API error 403: forbidden"),
+            LlmErrorKind::Auth
+        );
+    }
+
     #[test]
     fn classifies_model_and_too_long() {
         assert_eq!(
@@ -771,6 +877,7 @@ mod tests {
         );
         for kind in [
             LlmErrorKind::Auth,
+            LlmErrorKind::RealName,
             LlmErrorKind::Balance,
             LlmErrorKind::ContentPolicy,
             LlmErrorKind::Model,

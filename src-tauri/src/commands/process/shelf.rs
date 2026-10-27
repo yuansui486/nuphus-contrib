@@ -1391,8 +1391,8 @@ pub(crate) fn switch_session_inner_mode(
         let mut shelf = state.shelf.lock().map_err(|e| e.to_string())?;
         shelf.take(&id)
     };
-    let (entry, target_session) = match taken {
-        Some(pair) => pair,
+    let (entry, target_session, from_shelf) = match taken {
+        Some(pair) => (pair.0, pair.1, true),
         None => match read_mirror(&id) {
             Some((mode, session)) => {
                 if mode != target_kind {
@@ -1403,20 +1403,31 @@ pub(crate) fn switch_session_inner_mode(
                     .lock()
                     .ok()
                     .and_then(|s| s.titles.get(&session.id).cloned());
-                (
-                    build_entry(
-                        session.id.clone(),
-                        &mode,
-                        &session,
-                        title.as_deref(),
-                        session_project_tag_of(&session.id),
-                    ),
-                    session,
-                )
+                let entry = build_entry(
+                    session.id.clone(),
+                    &mode,
+                    &session,
+                    title.as_deref(),
+                    session_project_tag_of(&session.id),
+                );
+                (entry, session, false)
             }
             None => return Err("not_found".to_string()),
         },
     };
+    // 快照存活判定：`PromptSnapshot` 带 `#[serde(skip)]`，**任何序列化跳板都会
+    // 静默丢掉它**。内存展示台是纯 clone（快照存活），磁盘镜像 / session_backup
+    // 走 JSON 往返（快照必失）。此前两条来源都不打日志，于是「切回未命中前缀
+    // 缓存」只能看到 rebuilt 而分不清根因——这一行把来源与快照存活一起钉住。
+    tracing::info!(
+        "[Shelf] 目标会话来源={}，携带提示词快照={}",
+        if from_shelf {
+            "内存展示台"
+        } else {
+            "磁盘镜像"
+        },
+        target_session.prompt_snapshot().is_some()
+    );
     let target_enhanced_mode = if target_kind == "workflow" {
         state
             .workflow_enhanced_modes
@@ -1477,6 +1488,15 @@ pub(crate) fn switch_session_inner_mode(
         return Ok(());
     };
     *slot = target_session;
+    // 切到目标会话：只丢运行时构建缓存，**保留目标会话自带的快照**——
+    // 下轮 prepare_session_prompt_snapshot 命中即可复用其系统提示前缀。
+    if target_kind == "workflow" {
+        if let Some(agent) = ctx.workflow_agent.as_mut() {
+            agent.drop_prompt_prefix_cache();
+        }
+    } else if let Some(runtime) = ctx.leader_agent.as_mut() {
+        runtime.drop_prompt_prefix_cache();
+    }
     state
         .workflow_enhanced_mode
         .store(target_enhanced_mode, std::sync::atomic::Ordering::SeqCst);

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { IconFolder, IconFolderPlus } from '../../ui/Icons'
 import { useLanguage } from '../../locales'
 import { CompactModal } from '../layout/CompactModal'
+import { ProjectTenetsPanel } from '../dialogs/ProjectTenetsPanel'
 import './new-chat-modal.css'
 
 /** 会话标题长度上限：比后端 rename_session_cmd 的 60 字上限留出余量，弹窗内直接截断（不报错） */
@@ -194,6 +195,8 @@ export function NewChatModal({
             </button>
           </div>
         </div>
+        {/* 项目原则编辑入口：选中归属项目后直接维护该项目的作用域原则 */}
+        {selected && <ProjectTenetsPanel project={selected} />}
       </div>
     </CompactModal>
   )

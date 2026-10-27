@@ -1,0 +1,62 @@
+/* ═══════════════════════════════════════════
+   refine-collapse-bar.css — Refine 折叠条（小巧占位）
+
+   设计约束（大王 10-21）：小巧精简、提示/按钮性质，**非通栏**。
+   宽度自适应内容、居中显示，不铺满整行；点击展开/折叠 refine 前历史消息。
+
+   Token 约定: tokens.css 语义层
+   ═══════════════════════════════════════════ */
+
+/* 外层行：居中，让小巧条不贴边 */
+.refine-collapse-bar-row {
+  display: flex;
+  justify-content: center;
+  margin: 10px 0;
+}
+
+/* 小巧折叠条：宽度自适应内容，非全宽 */
+.refine-collapse-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: var(--fz-xs);
+  line-height: 1.4;
+  color: var(--fg-3);
+  background: var(--bg-2);
+  border: 1px solid var(--border-secondary);
+  border-radius: 999px;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+  max-width: 80%;
+}
+
+.refine-collapse-bar:hover {
+  color: var(--fg-2);
+  border-color: var(--border-primary);
+  background: var(--bg-3);
+}
+
+.refine-collapse-bar:active {
+  transform: scale(0.98);
+}
+
+.refine-collapse-bar-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.refine-collapse-bar-chevron {
+  opacity: 0.5;
+  flex-shrink: 0;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.refine-collapse-bar-chevron.expanded {
+  transform: rotate(180deg);
+}
