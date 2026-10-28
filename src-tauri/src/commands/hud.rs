@@ -40,8 +40,6 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
         .inner_size(HUD_WIDTH, HUD_HEIGHT)
         .decorations(false)
         .transparent(true)
-        // Tauri v2 起窗口阴影默认开启，与透明背景冲突（tauri#8133），必须在建窗时关闭
-        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
@@ -53,9 +51,6 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
             tracing::info!("[HUD] Window created (hidden)");
             // Position bottom-right after creation
             if let Some(window) = app.get_webview_window(HUD_LABEL) {
-                // WebView2 的 DefaultBackgroundColor 默认白色（官方只接受 alpha=0/255）——
-                // 它是网页内容底下那层底，不刷成透明，「窗口透明」就只是错觉
-                let _ = window.set_background_color(Some(tauri::webview::Color(0, 0, 0, 0)));
                 observe_user_drag(&window);
                 position_bottom_right(&window);
             }
@@ -74,6 +69,19 @@ pub fn create<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// 并行工具生命周期事件乱序（迟到 running 覆盖终态 done、计时器无法
 /// 退出）的根治点。
 pub fn show<R: tauri::Runtime>(app: &AppHandle<R>, text: &str, phase: &str, seq: u64) {
+    // HUD 显示开关（通用设置，默认开 = 历史行为）：关闭时隐藏已显示窗口并早退。
+    // 判断放在函数最前 → 覆盖全部调用路径（emitter 事件链 / main.rs 热键直调 /
+    // hud_update 命令）；读数即读即用（UserPreferences::load，不做进程内缓存，
+    // 与其余偏好命令同一模式）。
+    if !nuphus::config::UserPreferences::load().hud_enabled {
+        if let Some(w) = app.get_webview_window(HUD_LABEL) {
+            if w.is_visible().unwrap_or(false) {
+                hide(app);
+            }
+        }
+        return;
+    }
+
     // Get / recreate window if needed
     let window = match app.get_webview_window(HUD_LABEL) {
         Some(w) => w,

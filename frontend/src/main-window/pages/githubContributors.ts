@@ -158,6 +158,46 @@ export interface GithubRound {
 /** 轮次倒序（最新在前），轮内按贡献时间先后 */
 export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
   {
+    version: '1.1.3',
+    date: '2026-10-28',
+    contributors: [
+      {
+        user: 'mrpulor-gh',
+        contributions: [
+          {
+            pr: null,
+            commit: 'd453f4bd',
+            summary:
+              '通用设置页与键盘体验：语言/字号/关闭行为/HUD 与置前开关集中一处；快捷键弹窗支持全局热键捕获重绑（冲突检测 + 运行时重注册）',
+          },
+          {
+            pr: null,
+            commit: '6aee73b7',
+            summary:
+              '上下文窗口显示修复：启动装载按「提供商 + 模型 id」双字段绑定解析（同名模型跨段不再被段序盲选，分母恢复显示）',
+          },
+          {
+            pr: null,
+            commit: 'fc0a5c0a',
+            summary:
+              '更新内容预览：更新提示条新增「更新内容」入口，安装前查看该版本改动明细（发布流程同步写入更新元数据）',
+          },
+          {
+            pr: null,
+            commit: 'c02c2749',
+            summary:
+              '官网入口：设置中心「官网与 GitHub」更名并加链接；标题栏弹层新增「官网」（首位）与「当前版本（v…）」显示',
+          },
+          {
+            pr: null,
+            commit: 'cd628c73',
+            summary: '自动提炼上限 2 → 10：长任务后段不再出现「超线却只剩劝导」',
+          },
+        ],
+      },
+    ],
+  },
+  {
     version: '1.1.2',
     date: '2026-10-26',
     contributors: [
@@ -167,22 +207,26 @@ export const CONTRIBUTOR_ROUNDS: GithubRound[] = [
           {
             pr: null,
             commit: '9d692ce9',
-            summary: 'Exec 执行指示器：聊天区左上角常驻头像，执行中边缘弧环绕、点击直达执行追踪面板、60 秒无新派发向左退场',
+            summary:
+              'Exec 执行指示器：聊天区左上角常驻头像，执行中边缘弧环绕、点击直达执行追踪面板、60 秒无新派发向左退场',
           },
           {
             pr: null,
             commit: 'e74c39c1',
-            summary: 'HUD 叠加窗口真透明（建窗关闭窗口阴影 + WebView2 底色置全透明，圆角与透明首次真正生效）',
+            summary:
+              'HUD 叠加窗口真透明（建窗关闭窗口阴影 + WebView2 底色置全透明，圆角与透明首次真正生效）',
           },
           {
             pr: null,
             commit: '7f9e975f',
-            summary: 'HUD 交互与显示修复（告警措辞改安抚、忍耐态保持动作标题可见、仲裁显示不被 shell 标题覆盖）',
+            summary:
+              'HUD 交互与显示修复（告警措辞改安抚、忍耐态保持动作标题可见、仲裁显示不被 shell 标题覆盖）',
           },
           {
             pr: null,
             commit: '325dce84',
-            summary: '系统预设主题下背景图不透明度默认 0（#117：残留路径不再凭空点亮，选了图仍可见）',
+            summary:
+              '系统预设主题下背景图不透明度默认 0（#117：残留路径不再凭空点亮，选了图仍可见）',
           },
         ],
       },

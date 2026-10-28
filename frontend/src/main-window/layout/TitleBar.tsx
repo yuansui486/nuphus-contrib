@@ -1,5 +1,6 @@
 import { useState, useEffect, type ReactNode } from 'react'
 import { getCurrentWindow, type Window } from '@tauri-apps/api/window'
+import { getVersion } from '@tauri-apps/api/app'
 import { NuphusAvatar, type NuphusAvatarState } from '../../ui/NuphusAvatar'
 import { IconButton } from '../../ui/Button'
 import { IconMinus, IconSquare, IconX, IconMenu, IconPlus } from '../../ui/Icons'
@@ -24,6 +25,7 @@ export function TitleBar({
   const [menuOpen, setMenuOpen] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [win, setWin] = useState<Window | null>(null)
+  const [version, setVersion] = useState('')
   useEffect(() => {
     // 浏览器调试环境无 Tauri 运行时，跳过窗口 API，避免整棵组件树崩溃
     const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -34,6 +36,16 @@ export function TitleBar({
         setWin(null)
       }
     }
+  }, [])
+
+  // 品牌弹层「当前版本（vX.Y.Z）」：挂载时读取一次；非 Tauri 或读取失败时
+  // 回退原文案（版本（检查更新）），不显示空括号。
+  useEffect(() => {
+    const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+    if (!isTauri) return
+    void getVersion()
+      .then(setVersion)
+      .catch(() => {})
   }, [])
 
   const minimize = () => win?.minimize()
@@ -79,6 +91,14 @@ export function TitleBar({
             <div className="title-bar-about-menu">
               <a
                 className="title-bar-about-item"
+                href="https://www.nuphus.com"
+                target="_blank"
+                rel="noreferrer"
+              >
+                {t('titleBar.website')}
+              </a>
+              <a
+                className="title-bar-about-item"
                 href="https://github.com/mrpulor-gh/nuphus"
                 target="_blank"
                 rel="noreferrer"
@@ -94,7 +114,7 @@ export function TitleBar({
                   onOpenUpdate?.()
                 }}
               >
-                {t('titleBar.checkUpdate')}
+                {version ? t('titleBar.currentVersion', version) : t('titleBar.checkUpdate')}
               </button>
             </div>
           )}
