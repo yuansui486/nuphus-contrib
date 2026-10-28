@@ -281,6 +281,9 @@
   .wb-canvas .workflow-workbench-actions-group {
     flex-wrap: wrap;
   }
+  .wb-canvas .wfc-more {
+    margin-left: auto;
+  }
 }
 .wb-conflict {
   padding: 12px 16px;
