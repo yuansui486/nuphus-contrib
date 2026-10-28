@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import {
   IconFolderOpen as FolderOpen,
   IconMoon as Moon,
@@ -9,6 +9,7 @@ import {
 import type { Project } from './api'
 
 interface Props {
+  accountSettings?: ReactNode
   ui: (zh: string, en: string) => string
   projects: Project[]
   projectId: string
@@ -92,6 +93,12 @@ export function WorkbenchSettings(props: Props) {
             <span>{ui('切换主题', 'Toggle theme')}</span>
           </button>
         </div>
+        {props.accountSettings && (
+          <section aria-label={ui('账号与授权', 'Account and authorization')}>
+            <h3>{ui('账号与授权', 'Account and authorization')}</h3>
+            {props.accountSettings}
+          </section>
+        )}
         {props.mode && (
           <section>
             <h3>{ui('当前工作流', 'Current workflow')}</h3>

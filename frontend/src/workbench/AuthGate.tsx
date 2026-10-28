@@ -121,36 +121,39 @@ export default function AuthGate() {
 
   if (status?.authorized && projects?.length === 0) {
     return (
-      <div className="lq-authorized">
-        <div className="lq-account" role="status">
-          <span>
-            {status.subject?.tenant_name} ·{' '}
-            {status.subject?.display_name || status.subject?.username}
-          </span>
-          <span>
-            {status.state === 'offline' ? '离线授权' : '已授权'}
-            {status.offline_until
-              ? ` · 有效至 ${new Date(status.offline_until).toLocaleString('zh-CN')}`
-              : ''}
-          </span>
-          <button disabled={busy} onClick={() => void action('verify')}>
-            联网验证
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => {
-              if (window.confirm('退出将停止当前任务和定时执行。确认退出？')) void action('logout')
-            }}
-          >
-            退出登录
-          </button>
-          {error && <span role="alert">{error}</span>}
-        </div>
-        <WorkbenchApp
-          key={`${status.subject?.tenant_id}:${status.epoch}`}
-          storageScope={status.subject?.tenant_id}
-        />
-      </div>
+      <WorkbenchApp
+        key={`${status.subject?.tenant_id}:${status.epoch}`}
+        storageScope={status.subject?.tenant_id}
+        accountSettings={
+          <div className="lq-account">
+            <span>
+              {status.subject?.tenant_name} ·{' '}
+              {status.subject?.display_name || status.subject?.username}
+            </span>
+            <span role="status">
+              {status.state === 'offline' ? '离线授权' : '已授权'}
+              {status.offline_until
+                ? ` · 有效至 ${new Date(status.offline_until).toLocaleString('zh-CN')}`
+                : ''}
+            </span>
+            <div className="wb-actions">
+              <button disabled={busy} onClick={() => void action('verify')}>
+                联网验证
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => {
+                  if (window.confirm('退出将停止当前任务和定时执行。确认退出？'))
+                    void action('logout')
+                }}
+              >
+                退出登录
+              </button>
+            </div>
+            {error && <span role="alert">{error}</span>}
+          </div>
+        }
+      />
     )
   }
   return (

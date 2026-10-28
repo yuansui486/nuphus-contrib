@@ -120,34 +120,21 @@
   display: block;
   overflow-wrap: anywhere;
 }
-.lq-authorized {
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-}
-.lq-authorized > .wb-app {
-  flex: 1;
-  min-height: 0;
-  height: auto;
-}
 .lq-account {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  padding: 7px 14px;
-  font-size: 11px;
-  background: var(--bg-secondary, #f6f6f7);
+  flex-direction: column;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
   color: var(--text-primary, #152c4b);
-  border-bottom: 1px solid var(--border-primary, #dce3eb);
 }
-.lq-account button {
-  background: transparent;
-  color: inherit;
-  padding: 3px 7px;
-  border: 1px solid var(--border-primary, #dce3eb);
-  border-radius: 5px;
-  cursor: pointer;
+.lq-account [role='status'] {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.lq-account [role='alert'] {
+  color: var(--error);
 }
 @media (max-height: 680px) {
   .lq-login-main {

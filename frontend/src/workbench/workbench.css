@@ -246,6 +246,7 @@
   min-width: 0;
 }
 .wb-canvas {
+  container-type: inline-size;
   position: relative;
   flex: 1;
   min-width: 0;
@@ -255,6 +256,34 @@
 .wb-canvas > .wfc-page {
   position: absolute;
   inset: 0;
+}
+/* The embedded canvas shares the viewport with the assistant. Measure its
+   available width instead of using the full window's breakpoint. */
+@container (max-width: 1000px) {
+  .wb-canvas .wfc-toolbar {
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+  .wb-canvas .wfc-toolbar-row--primary {
+    display: flex;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+  .wb-canvas .wfc-toolbar > .wfc-toolbar-row:not(.wfc-toolbar-row--primary) {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+  .wb-canvas .wfc-toolbar .wfc-title,
+  .wb-canvas .wfc-toolbar .wfc-title-input {
+    min-width: 0;
+    max-width: min(60cqw, 360px);
+  }
+  .wb-canvas .workflow-workbench-actions-group {
+    flex-wrap: wrap;
+  }
+  .wb-canvas .wfc-more {
+    margin-left: auto;
+  }
 }
 .wb-conflict {
   padding: 12px 16px;

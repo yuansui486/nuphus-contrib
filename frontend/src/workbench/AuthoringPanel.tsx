@@ -572,8 +572,8 @@ export function AuthoringPanel({
         </div>
         <small className="wb-authoring-hint">
           {ui(
-            '生成后可在画布检查，不会自动运行。',
-            'Review the canvas before running. Generation does not run it.',
+            '助手可编辑和试运行工作流，进度与结果会显示在对话中。',
+            'The assistant can edit and test workflows. Follow progress and results in the conversation.',
           )}
         </small>
       </footer>
