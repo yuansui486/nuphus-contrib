@@ -100,6 +100,8 @@ jobs:
           cargo test -p nuphus --lib tools::registry::tests:: --features workbench
       - run: cargo check -p nuphus-desktop --features workbench
       - run: cargo test -p nuphus-desktop --features workbench --bin nuphus workbench
+      - name: Desktop command thread contracts
+        run: cargo test -p nuphus-desktop --features workbench --bin nuphus command_conventions
       - name: Handoff migration and edition isolation
         run: cargo test -p nuphus-desktop --features workbench --bin nuphus commands::config::handoff::tests
       - run: cargo check -p nuphus-desktop

@@ -313,7 +313,7 @@ pub async fn workbench_clients(app: AppHandle, action: String, args: Value) -> R
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn workbench_view_state(
     app: AppHandle,
     project_id: String,
