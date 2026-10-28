@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, expect, it, vi } from 'vitest'
 import AuthGate, { type AuthStatus } from './AuthGate'
+import { useState, type ReactNode } from 'react'
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   handler: null as null | ((event: { payload: AuthStatus }) => void),
@@ -14,7 +15,22 @@ vi.mock('@tauri-apps/api/event', () => ({
 }))
 vi.mock('../main-window/layout/TitleBar', () => ({ TitleBar: () => <div>灵雀标题栏</div> }))
 vi.mock('./WorkbenchApp', () => ({
-  default: ({ storageScope }: { storageScope: string }) => <div>业务工作台 {storageScope}</div>,
+  default: ({
+    storageScope,
+    accountSettings,
+  }: {
+    storageScope: string
+    accountSettings: ReactNode
+  }) => {
+    const [open, setOpen] = useState(false)
+    return (
+      <>
+        <div>业务工作台 {storageScope}</div>
+        <button onClick={() => setOpen(!open)}>设置</button>
+        {open && accountSettings}
+      </>
+    )
+  },
 }))
 const signedOut: AuthStatus = {
   state: 'signed_out',
@@ -107,10 +123,36 @@ it('keeps offline business available but unmounts immediately on revoked authori
   )
   render(<AuthGate />)
   expect(await screen.findByText('业务工作台 t1')).toBeVisible()
+  expect(screen.queryByText(/离线授权 · 有效至/)).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '设置' }))
   expect(screen.getByText(/离线授权 · 有效至/)).toBeVisible()
   act(() => mocks.handler?.({ payload: { ...signedOut, message: '设备登录已失效' } }))
   expect(screen.queryByText(/业务工作台/)).not.toBeInTheDocument()
   expect(screen.getByText('设备登录已失效')).toBeVisible()
+})
+it('keeps verification and logout functional inside account settings', async () => {
+  mocks.invoke.mockImplementation((_command, args) =>
+    Promise.resolve(
+      args?.action === 'unclaimed' ? [] : args?.action === 'logout' ? signedOut : online,
+    ),
+  )
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+  render(<AuthGate />)
+  await screen.findByText('业务工作台 t1')
+  expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '设置' }))
+  expect(screen.getByText('测试企业 · test')).toBeVisible()
+  fireEvent.click(screen.getByRole('button', { name: '联网验证' }))
+  await waitFor(() =>
+    expect(mocks.invoke).toHaveBeenCalledWith('lingque_auth', { action: 'verify' }),
+  )
+  await waitFor(() => expect(screen.getByRole('button', { name: '退出登录' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+  await waitFor(() =>
+    expect(mocks.invoke).toHaveBeenCalledWith('lingque_auth', { action: 'logout' }),
+  )
+  expect(screen.queryByText(/业务工作台/)).not.toBeInTheDocument()
+  confirm.mockRestore()
 })
 it('requires validation rather than showing a password form for an expired cached session', async () => {
   mocks.invoke.mockImplementation(() =>

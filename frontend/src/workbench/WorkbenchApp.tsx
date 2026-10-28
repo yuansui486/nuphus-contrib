@@ -1,4 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { TitleBar } from '../main-window/layout/TitleBar'
@@ -39,7 +48,13 @@ const ModelsPage = lazy(() =>
 const terminal = (status: string) =>
   ['completed', 'failed', 'cancelled', 'interrupted', 'skipped'].includes(status)
 
-export default function WorkbenchApp({ storageScope }: { storageScope?: string } = {}) {
+export default function WorkbenchApp({
+  storageScope,
+  accountSettings,
+}: {
+  storageScope?: string
+  accountSettings?: ReactNode
+} = {}) {
   const projectStorageKey = storageScope
     ? `workbench:${storageScope}:last-project`
     : 'workbench:last-project'
@@ -424,6 +439,7 @@ export default function WorkbenchApp({ storageScope }: { storageScope?: string }
       {settingsOpen && (
         <WorkbenchSettings
           ui={ui}
+          accountSettings={accountSettings}
           projects={projects}
           projectId={projectId}
           mode={page === 'workflows' ? active?.authoring_mode : undefined}

@@ -74,6 +74,20 @@ beforeEach(() => {
   })
 })
 describe('workflow-first Workbench shell', () => {
+  it('shows account controls only inside settings', async () => {
+    render(
+      <LangProvider>
+        <WorkbenchApp accountSettings={<button>Sign out</button>} />
+      </LangProvider>,
+    )
+    await screen.findByRole('button', { name: /Flow one/ })
+    expect(screen.queryByRole('button', { name: 'Sign out' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const account = screen.getByRole('region', { name: 'Account and authorization' })
+    expect(account).toContainElement(screen.getByRole('button', { name: 'Sign out' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
+    expect(screen.queryByRole('button', { name: 'Sign out' })).not.toBeInTheDocument()
+  })
   it('does not reopen a slow create after the user navigates to runs', async () => {
     let finish!: (value: Draft) => void
     const response = new Promise<Draft>(resolve => {
