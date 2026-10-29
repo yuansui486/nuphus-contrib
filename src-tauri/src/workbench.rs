@@ -100,7 +100,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
         }))
         .map_err(native_error)?;
         let auth = authority.clone();
-        store.with_tenant_guard(Arc::new(move || {
+        store.with_authorization_guard(Arc::new(move || {
             let identity = auth.require()?;
             if nuphus_workbench::service::REQUEST_EPOCH
                 .try_with(|expected| expected.as_ref().is_some_and(|e| e != &identity.epoch))
@@ -111,7 +111,7 @@ pub fn install(app: &AppHandle) -> Result<()> {
                     "登录身份已变化，旧请求已停止。",
                 ));
             }
-            Ok(identity.subject.tenant_id)
+            Ok(())
         }))
     };
     let service = Arc::new(Service::new(
@@ -267,10 +267,11 @@ pub async fn workbench_clients(app: AppHandle, action: String, args: Value) -> R
                 let executable = nuphus_workbench::local::bridge_path()?;
                 local["available"] = json!(executable.is_file());
                 local["executable"] = json!(executable);
-                local["config"] = json!({"mcpServers":{"nuphus-workbench":{"command":executable,"args":["serve"]}}});
+                local["config"] =
+                    json!({"mcpServers":{"lingque":{"command":executable,"args":["serve"]}}});
                 // A deliberately isolated development profile stays isolated when copied.
                 if std::env::var_os("NUPHUS_WORKBENCH_DATA_DIR").is_some() {
-                    local["config"]["mcpServers"]["nuphus-workbench"]["env"] =
+                    local["config"]["mcpServers"]["lingque"]["env"] =
                         json!({"NUPHUS_WORKBENCH_DATA_DIR":store.root()});
                 }
                 local

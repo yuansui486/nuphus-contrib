@@ -8,7 +8,7 @@ host supplies the upstream compiler and executor through `service::Host`.
 
 Implemented: project registration, revision-checked IR editing, independent layout
 revisions, immutable published versions, run identity and idempotency, durable
-cursor events, tenant-scoped local HTTP/MCP and a stdio bridge. Legacy scoped tokens remain compatible.
+cursor events, local HTTP/MCP and a stdio bridge. Legacy scoped tokens remain compatible.
 Lingque product authorization is provided by the desktop host; see [LINGQUE_AUTH.md](../../LINGQUE_AUTH.md).
 
 The edition now includes a workflow-first UI, internal-generation integration,
@@ -22,8 +22,11 @@ The Workbench application/tray hosts `http://127.0.0.1:47731` (override port usi
 `NUPHUS_WORKBENCH_PORT`). It does not start an independent privileged daemon.
 Bind failures are exposed to the UI rather than silently choosing another service.
 The desktop edition accepts native loopback callers without enrollment or a token,
-after desktop product login, with access to the current tenant's projects and capabilities. The Connections page displays status
+after desktop product login, with access to shared local projects regardless of the logged-in account. The Connections page displays status
 and addresses, not a client/permission management form. No internal model is required.
+The MCP server name (stdio and HTTP) and the recommended `mcpServers` key are
+`lingque`. Rename older configuration entries and reconnect; executable paths
+remain compatible.
 Only 127.0.0.1 is bound; browser Origin/Fetch-Metadata and non-local Host headers
 are rejected. This trusts local programs: it is not an OS sandbox or a project ACL.
 Do not expose the endpoint on a public socket or through an unauthenticated tunnel.
@@ -61,8 +64,11 @@ arbitrary network binding and access from web-page origins are not enabled.
 ## Workflow lifecycle
 
 1. `project.list` → select a permitted project (or explicitly register one).
-2. `canvas.create` → obtain workflow ID and content revision. External clients
-   default to `external` authoring; the local UI defaults to `internal`.
+2. Reuse the task's known `workflow_id`, or inspect `workflow.list` to locate it.
+   Ask the user to select ambiguous matches; names alone never imply identity.
+   Only a new logical workflow needs `canvas.create` / `workflow.import` with a
+   persistent globally unique `request_id`. Keep the returned workflow ID across
+   tests. External clients default to `external`; the UI defaults to `internal`.
 3. `canvas.update` → apply a batch with the exact last-read revision. Nested
    steps use upstream IR (`seq`, `if.then/else`, `loop.do`, `wait/auto`); visual
    edges are derived from this IR, not separately executable edges.
@@ -76,6 +82,34 @@ arbitrary network binding and access from web-page origins are not enabled.
    `run.respond` binds a response to a particular pending wait request; it cannot
    approve a later loop iteration. Use `run.cancel` to request cancellation.
 
+For iterative testing, read/update the same canvas and call `workflow.debug`
+(`node` / `through`); its optional `steps` / `input_specs` test unsaved definitions
+without publishing them. A single native tool test can use `automation.observe`
+or `automation.execute` without any draft. Do not create/import again to retry a test.
+
+### Creation retries
+
+`canvas.create` and `workflow.import` accept an optional nonblank string
+`request_id`. Persist it before sending and reuse identical arguments after a
+timeout, reconnect or host restart. The response retains the draft's top-level
+fields and adds `created`: `true` for a new draft, `false` for a retry returning
+the original draft's **current** revision, without overwriting subsequent edits.
+Creation/import and the retry record commit atomically.
+
+Keys are scoped to project and caller identity, not login account or MCP session.
+All tokenless local external clients share one identity, so use globally unique
+keys (e.g. UUIDs). Reusing a key with a different operation, trimmed name,
+effective authoring mode or import document returns `idempotency_conflict`.
+Document object-key order and rewritten `id` / `run_history` are ignored.
+If the draft was deleted, a retry returns `not_found` with its original
+`workflow_id`; it never recreates it. Without a key, legacy creation behavior is
+unchanged. A new key deliberately creates another draft, even with the same name.
+
+Creation keys and execution keys have separate lifecycles: keep the creation key
+for the logical workflow; use a new run/debug key for each intentional execution,
+and reuse an execution key only for an uncertain retry. Instructions cannot stop
+a client that deliberately creates workflows with fresh keys on every test.
+
 A connection ending does not cancel execution. Retry a start with the **same**
 `request_id` and identical arguments after an uncertain response; changed arguments
 with that ID are rejected. A new ID intentionally creates a new execution and may
@@ -85,7 +119,7 @@ them automatically. Failed runs remain queryable.
 Content conflicts return `revision_conflict` and never overwrite another editor.
 Layout has its own revision. Deleting a draft preserves versions and run evidence.
 Local callers have `read`, `edit`, `run`, `respond`, `automation`, `projects` for all
-projects belonging to the authorized tenant, including projects registered later. There is no per-node permission wizard.
+shared local projects, including projects registered later. There is no per-node permission wizard.
 Native OS permissions and existing execution coordination remain in force.
 Anonymous calls share a local-external identity, so use globally unique request IDs.
 

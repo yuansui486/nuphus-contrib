@@ -11,7 +11,7 @@ const local = {
   executable: 'E:\\应用 Space\\nuphus-workbench-mcp.exe',
   config: {
     mcpServers: {
-      'nuphus-workbench': { command: 'E:\\应用 Space\\nuphus-workbench-mcp.exe', args: ['serve'] },
+      lingque: { command: 'E:\\应用 Space\\nuphus-workbench-mcp.exe', args: ['serve'] },
     },
   },
 }

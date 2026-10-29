@@ -58,7 +58,8 @@ const draft = (project: string, mode: 'internal' | 'external' = 'internal'): Dra
   updated_at: 0,
 })
 beforeEach(() => {
-  localStorage.removeItem('workbench:last-project')
+  localStorage.clear()
+  vi.spyOn(window, 'confirm').mockReturnValue(false)
   mocks.leave.mockReset().mockResolvedValue(true)
   localStorage.setItem('nuphus_language', 'en')
   mocks.invoke.mockReset()
@@ -74,13 +75,152 @@ beforeEach(() => {
   })
 })
 describe('workflow-first Workbench shell', () => {
+  it('cancels deletion without sending a request or opening the canvas', async () => {
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete workflow: Flow one' }))
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('Flow one'))
+    expect(
+      mocks.invoke.mock.calls.filter(([, args]) => args?.operation === 'workflow.delete'),
+    ).toHaveLength(0)
+    expect(screen.getByRole('button', { name: /^Flow one/ })).toBeInTheDocument()
+    expect(screen.queryByText('Canvas editor')).not.toBeInTheDocument()
+  })
+  it('deletes the selected revision once and refreshes the list while keeping history', async () => {
+    vi.mocked(window.confirm).mockReturnValue(true)
+    let finish!: (value: unknown) => void
+    let removed = false
+    const response = new Promise(resolve => {
+      finish = resolve
+    })
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) => {
+      if (payload?.operation === 'workflow.delete') {
+        await response
+        removed = true
+        return { deleted: true }
+      }
+      if (payload?.operation === 'workflow.list' && removed) return []
+      return fallback(command, payload)
+    })
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    const button = await screen.findByRole('button', { name: 'Delete workflow: Flow one' })
+    fireEvent.click(button)
+    fireEvent.click(button)
+    expect(button).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Flow one/ })).toBeDisabled()
+    expect(
+      mocks.invoke.mock.calls.filter(([, args]) => args?.operation === 'workflow.delete'),
+    ).toHaveLength(1)
+    expect(mocks.invoke).toHaveBeenCalledWith('workbench_call', {
+      operation: 'workflow.delete',
+      args: { project_id: 'one', workflow_id: 'flow-one', revision: 1 },
+    })
+    await act(async () => {
+      finish({})
+      await response
+    })
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /^Flow one/ })).not.toBeInTheDocument(),
+    )
+    expect(screen.getByRole('status')).toHaveTextContent('versions and run history retained')
+  })
+  it('refreshes a stale deletion conflict without automatically retrying or removing the card', async () => {
+    vi.mocked(window.confirm).mockReturnValue(true)
+    let conflicted = false
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) => {
+      if (payload?.operation === 'workflow.delete') {
+        conflicted = true
+        throw { code: 'revision_conflict', message: 'Reload the changed draft' }
+      }
+      if (payload?.operation === 'workflow.list' && conflicted)
+        return [{ ...draft('one'), revision: 2 }]
+      return fallback(command, payload)
+    })
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete workflow: Flow one' }))
+    await screen.findByText(/revision_conflict/)
+    expect(screen.getByRole('button', { name: /^Flow one/ })).toHaveTextContent('Revision 2')
+    expect(screen.getByRole('button', { name: 'Delete workflow: Flow one' })).toBeEnabled()
+    expect(
+      mocks.invoke.mock.calls.filter(([, args]) => args?.operation === 'workflow.delete'),
+    ).toHaveLength(1)
+  })
+  it('keeps the newly selected project intact when an old project deletion finishes', async () => {
+    vi.mocked(window.confirm).mockReturnValue(true)
+    let finish!: (value: unknown) => void
+    const response = new Promise(resolve => {
+      finish = resolve
+    })
+    const fallback = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, payload) =>
+      payload?.operation === 'workflow.delete' ? response : fallback(command, payload),
+    )
+    render(
+      <LangProvider>
+        <WorkbenchApp />
+      </LangProvider>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete workflow: Flow one' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Current project' }), {
+      target: { value: 'two' },
+    })
+    await screen.findByRole('button', { name: /^Flow two/ })
+    await act(async () => {
+      finish({ deleted: true })
+      await response
+    })
+    expect(screen.getByRole('button', { name: /^Flow two/ })).toBeInTheDocument()
+    expect(screen.queryByText(/Workflow deleted/)).not.toBeInTheDocument()
+  })
+  it.each([
+    ['two', 'one', 'one', 'two'],
+    ['missing', 'two', 'one', 'two'],
+    ['missing', 'missing', 'two', 'two'],
+    ['missing', 'missing', 'missing', 'one'],
+  ])(
+    'restores a shared project with legacy fallback (%s, %s, %s)',
+    async (shared, current, historical, expected) => {
+      localStorage.setItem('workbench:last-project', shared)
+      localStorage.setItem('workbench:current:last-project', current)
+      localStorage.setItem('workbench:historical:last-project', historical)
+      const view = render(
+        <LangProvider>
+          <WorkbenchApp storageScope="current" />
+        </LangProvider>,
+      )
+      await screen.findByRole('button', { name: new RegExp(`^Flow ${expected}`) })
+      await waitFor(() => expect(localStorage.getItem('workbench:last-project')).toBe(expected))
+      expect(localStorage.getItem('workbench:historical:last-project')).toBe(historical)
+      view.unmount()
+      render(
+        <LangProvider>
+          <WorkbenchApp storageScope="another-account" />
+        </LangProvider>,
+      )
+      await screen.findByRole('button', { name: new RegExp(`^Flow ${expected}`) })
+    },
+  )
   it('shows account controls only inside settings', async () => {
     render(
       <LangProvider>
         <WorkbenchApp accountSettings={<button>Sign out</button>} />
       </LangProvider>,
     )
-    await screen.findByRole('button', { name: /Flow one/ })
+    await screen.findByRole('button', { name: /^Flow one/ })
     expect(screen.queryByRole('button', { name: 'Sign out' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
     const account = screen.getByRole('region', { name: 'Account and authorization' })
@@ -102,7 +242,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    await screen.findByRole('button', { name: /Flow one/ })
+    await screen.findByRole('button', { name: /^Flow one/ })
     fireEvent.click(screen.getByRole('button', { name: 'New canvas' }))
     fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
     await waitFor(() =>
@@ -131,7 +271,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Enable AI assistant' }))
     await waitFor(() =>
       expect(mocks.invoke.mock.calls.some(([, args]) => args?.operation === 'canvas.update')).toBe(
@@ -154,7 +294,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    await screen.findByRole('button', { name: /Flow two/ })
+    await screen.findByRole('button', { name: /^Flow two/ })
     expect(screen.queryByRole('combobox', { name: 'Current project' })).not.toBeInTheDocument()
     const settings = screen.getByRole('button', { name: 'Settings' })
     settings.focus()
@@ -172,7 +312,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    await screen.findByRole('button', { name: /Flow one/ })
+    await screen.findByRole('button', { name: /^Flow one/ })
     expect(screen.getByText(/previous project is unavailable/)).toBeInTheDocument()
     expect(localStorage.getItem('workbench:last-project')).toBe('one')
   })
@@ -182,7 +322,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     const field = screen.getByRole('textbox', { name: 'Assistant draft' })
     fireEvent.change(field, { target: { value: 'Keep this request' } })
     fireEvent.click(screen.getByRole('button', { name: 'AI assistant' }))
@@ -200,7 +340,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Start generation' }))
     fireEvent.click(screen.getByRole('button', { name: 'AI assistant' }))
     expect(screen.getByRole('status', { name: 'Generating' })).toBeInTheDocument()
@@ -220,7 +360,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Runs' }))
     await waitFor(() => expect(mocks.leave).toHaveBeenCalled())
     expect(screen.getByText('Canvas editor')).toBeInTheDocument()
@@ -240,7 +380,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    await screen.findByRole('button', { name: /Flow one/ })
+    await screen.findByRole('button', { name: /^Flow one/ })
     expect(screen.queryByRole('button', { name: /English|中文/ })).not.toBeInTheDocument()
     const create = screen.getByRole('button', { name: 'New canvas' })
     fireEvent.click(create)
@@ -312,7 +452,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     expect(screen.getByText('Canvas editor')).toBeInTheDocument()
     expect(screen.getByText('Internal composer')).toBeInTheDocument()
   })
@@ -328,7 +468,7 @@ describe('workflow-first Workbench shell', () => {
         <WorkbenchApp />
       </LangProvider>,
     )
-    fireEvent.click(await screen.findByRole('button', { name: /Flow one/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Flow one/ }))
     expect(screen.getByText('Canvas editor')).toBeInTheDocument()
     expect(screen.queryByText('Internal composer')).not.toBeInTheDocument()
     expect(mocks.invoke.mock.calls.some(([command]) => command === 'workbench_generate')).toBe(
@@ -358,12 +498,12 @@ describe('workflow-first Workbench shell', () => {
     fireEvent.change(screen.getByRole('combobox', { name: 'Current project' }), {
       target: { value: 'two' },
     })
-    await screen.findByRole('button', { name: /Flow two/ })
+    await screen.findByRole('button', { name: /^Flow two/ })
     await act(async () => {
       completeOld([draft('one')])
       await oldRequest
     })
-    expect(screen.getByRole('button', { name: /Flow two/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Flow one/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Flow two/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Flow one/ })).not.toBeInTheDocument()
   })
 })

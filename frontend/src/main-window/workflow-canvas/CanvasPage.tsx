@@ -91,7 +91,8 @@ import { ContainerNode } from './nodes/ContainerNode'
 import { LaneFrame } from './nodes/LaneFrame'
 import { SequenceEdge, EDGE_INSERT_EVENT } from './edges/SequenceEdge'
 import { DataEdge } from './edges/DataEdge'
-import { Inspector, loadToolsOnce } from './Inspector'
+import { Inspector } from './Inspector'
+import { useToolRegistry } from './toolRegistry'
 import { ToolPalette, TOOL_DRAG_MIME } from './ToolPalette'
 import { skeletonFromSchema } from './toolSkeleton'
 import { ProblemsPanel } from './ProblemsPanel'
@@ -1621,16 +1622,7 @@ function CanvasInner({
   )
 
   // 工具注册表（与 Inspector/ToolPalette 共享模块级缓存）：拖拽 drop 时按名查 schema 预填骨架
-  const [wfToolsList, setWfToolsList] = useState<ToolSchema[] | null>(null)
-  useEffect(() => {
-    let alive = true
-    void loadToolsOnce().then(t => {
-      if (alive) setWfToolsList(t)
-    })
-    return () => {
-      alive = false
-    }
-  }, [])
+  const wfToolsList = useToolRegistry()
 
   /** 意图表单提交（2026-09-05 方案A，取代旧的录制一键交给 WorkflowAgent）：
    *  纯文本模板注入 workflow 输入框（带阶段/子步骤意图 + workflow id + 目录 + 名称），

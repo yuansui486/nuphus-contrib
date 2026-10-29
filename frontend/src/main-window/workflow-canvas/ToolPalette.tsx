@@ -10,10 +10,10 @@
  * - 只读（运行中/旧格式）时整体禁用，不产生任何编辑
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Monitor, Globe, FolderOpen, Terminal, Sparkles, Puzzle } from 'lucide-react'
 import type { ToolSchema } from '../../core/types'
-import { loadToolsOnce } from './Inspector'
+import { loadToolsOnce, useToolRegistry } from './toolRegistry'
 
 /** 拖拽 MIME 类型（CanvasPage onDragOver/onDrop 据此识别工具拖入） */
 export const TOOL_DRAG_MIME = 'application/x-nuphus-tool'
@@ -124,19 +124,8 @@ interface ToolPaletteProps {
 }
 
 export function ToolPalette({ disabled, onAdd }: ToolPaletteProps) {
-  // 与 Inspector 共享模块级缓存（loadToolsOnce 单例），不重复请求
-  const [tools, setTools] = useState<ToolSchema[] | null | undefined>(undefined)
+  const tools = useToolRegistry()
   const [openGroup, setOpenGroup] = useState<string | null>(null)
-
-  useEffect(() => {
-    let alive = true
-    void loadToolsOnce().then(t => {
-      if (alive) setTools(t)
-    })
-    return () => {
-      alive = false
-    }
-  }, [])
 
   // 按 group 聚类；group 缺省（旧缓存/异常）或未知键一律归 misc
   const groups = useMemo(() => {
@@ -150,7 +139,19 @@ export function ToolPalette({ disabled, onAdd }: ToolPaletteProps) {
     return GROUP_ORDER.filter(k => map.has(k)).map(k => ({ key: k, tools: map.get(k)! }))
   }, [tools])
 
-  if (groups.length === 0) return null
+  if (groups.length === 0)
+    return (
+      <div className="wfc-palette wfc-palette-status" role="status">
+        <span>
+          {tools === undefined ? '正在加载工具…' : tools === null ? '工具加载失败' : '暂无可用工具'}
+        </span>
+        {tools === null && (
+          <button type="button" onClick={() => void loadToolsOnce()}>
+            重试加载
+          </button>
+        )}
+      </div>
+    )
 
   return (
     <div

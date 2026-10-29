@@ -33,21 +33,11 @@ export default function AuthGate() {
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [projects, setProjects] = useState<Array<{
-    project_id: string
-    name: string
-    directory: string
-  }> | null>(null)
   const busyRef = useRef(false)
-  const epoch = useRef<string | null>(null)
   const mounted = useRef(true)
   const apply = useCallback((next: AuthStatus) => {
     if (!mounted.current) return
     setStatus(next)
-    if (!next.authorized || next.epoch !== epoch.current) {
-      epoch.current = next.authorized ? next.epoch : null
-      setProjects(null)
-    }
   }, [])
   useEffect(() => {
     mounted.current = true
@@ -61,46 +51,22 @@ export default function AuthGate() {
       void listener.then(stop => stop())
     }
   }, [apply])
-  useEffect(() => {
-    if (!status?.authorized) return
-    let alive = true
-    void auth<NonNullable<typeof projects>>('unclaimed')
-      .then(items => {
-        if (alive) setProjects(items)
-      })
-      .catch(e => {
-        if (alive) setError(message(e))
-      })
-    return () => {
-      alive = false
-    }
-  }, [status?.authorized, status?.epoch])
-
-  const action = async (kind: 'login' | 'verify' | 'logout' | 'claim' | 'status') => {
+  const action = async (kind: 'login' | 'verify' | 'logout' | 'status') => {
     if (busyRef.current) return
     busyRef.current = true
     setBusy(true)
     setError('')
     try {
-      if (kind === 'claim') {
-        await auth('claim', {
-          expectedEpoch: status?.epoch,
-          projectIds: projects?.map(p => p.project_id),
-        })
-        setProjects(await auth('unclaimed'))
-      } else {
-        if (kind === 'logout') {
-          setStatus(null)
-          setProjects(null)
-          setPassword('')
-        }
-        apply(
-          await auth<AuthStatus>(
-            kind,
-            kind === 'login' ? { tenantCode: tenant, username, password } : {},
-          ),
-        )
+      if (kind === 'logout') {
+        setStatus(null)
+        setPassword('')
       }
+      apply(
+        await auth<AuthStatus>(
+          kind,
+          kind === 'login' ? { tenantCode: tenant, username, password } : {},
+        ),
+      )
     } catch (e) {
       setError(message(e))
       try {
@@ -119,10 +85,10 @@ export default function AuthGate() {
     void action('login')
   }
 
-  if (status?.authorized && projects?.length === 0) {
+  if (status?.authorized) {
     return (
       <WorkbenchApp
-        key={`${status.subject?.tenant_id}:${status.epoch}`}
+        key={status.epoch}
         storageScope={status.subject?.tenant_id}
         accountSettings={
           <div className="lq-account">
@@ -169,37 +135,7 @@ export default function AuthGate() {
             </div>
           </div>
           <p className="lq-subtitle">连接你的工作流，让任务有序执行。</p>
-          {status?.authorized ? (
-            <>
-              <h2>确认旧项目归属</h2>
-              <p>
-                将以下旧项目归入「{status.subject?.tenant_name}
-                」。同租户账号共享，其他租户不可通过灵雀访问。模型配置仍作为本机公共设置保留。
-              </p>
-              {projects === null ? (
-                <p>正在读取待确认项目…</p>
-              ) : (
-                <ul className="lq-projects">
-                  {projects.map(p => (
-                    <li key={p.project_id}>
-                      <strong>{p.name}</strong>
-                      <small>{p.directory}</small>
-                    </li>
-                  ))}
-                </ul>
-              )}
-              <button disabled={busy || projects === null} onClick={() => void action('claim')}>
-                确认归属并进入
-              </button>
-              <button
-                className="lq-secondary"
-                disabled={busy}
-                onClick={() => void action('logout')}
-              >
-                退出，换个账号
-              </button>
-            </>
-          ) : status?.subject ? (
+          {status?.subject ? (
             <>
               <p role="status">{status.message}</p>
               <button disabled={busy} onClick={() => void action('verify')}>

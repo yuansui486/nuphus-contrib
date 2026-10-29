@@ -25,6 +25,7 @@ import {
   IconPlus as Plus,
   IconSettings as Settings,
   IconSparkles as Sparkles,
+  IconX as X,
 } from '../ui/Icons'
 import {
   call,
@@ -55,9 +56,8 @@ export default function WorkbenchApp({
   storageScope?: string
   accountSettings?: ReactNode
 } = {}) {
-  const projectStorageKey = storageScope
-    ? `workbench:${storageScope}:last-project`
-    : 'workbench:last-project'
+  // The old tenant key is read only for migration; all accounts write one shared key.
+  const projectStorageKey = 'workbench:last-project'
   const { lang } = useLanguage()
   const ui = useCallback((zh: string, en: string) => (lang === 'zh' ? zh : en), [lang])
   const { toggleTheme } = useTheme()
@@ -72,6 +72,7 @@ export default function WorkbenchApp({
   const [notice, setNotice] = useState('')
   const [search, setSearch] = useState('')
   const [creating, setCreating] = useState(false)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
   const [page, setPage] = useState<'workflows' | 'clients' | 'models' | 'runs'>('workflows')
   const [endpoint, setEndpoint] = useState<Endpoint | null>(null)
   const [conflict, setConflict] = useState(false)
@@ -80,6 +81,7 @@ export default function WorkbenchApp({
   const [assistantOpen, setAssistantOpen] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const creatingRef = useRef(false)
+  const deletingRef = useRef(false)
   const dirty = useRef(false)
   const activeRef = useRef(active)
   activeRef.current = active
@@ -112,7 +114,16 @@ export default function WorkbenchApp({
         setProjects(items)
         let previous: string | null = null
         try {
-          previous = localStorage.getItem(projectStorageKey)
+          const keys = [projectStorageKey]
+          if (storageScope) keys.push(`workbench:${storageScope}:last-project`)
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i)
+            if (key && /^workbench:.+:last-project$/.test(key) && !keys.includes(key))
+              keys.push(key)
+          }
+          const saved = keys.map(key => localStorage.getItem(key)).filter(Boolean)
+          previous =
+            saved.find(id => items.some(item => item.project_id === id)) ?? saved[0] ?? null
         } catch {
           /* Storage is optional. */
         }
@@ -131,7 +142,7 @@ export default function WorkbenchApp({
     return () => {
       alive = false
     }
-  }, [fail, ui, projectStorageKey])
+  }, [fail, ui, projectStorageKey, storageScope])
 
   const refresh = useCallback(async () => {
     if (!projectId) return
@@ -312,6 +323,48 @@ export default function WorkbenchApp({
     setProjectId(project.project_id)
     setActive(null)
   }
+  const deleteDraft = async (draft: Draft) => {
+    if (deletingRef.current) return
+    if (
+      !window.confirm(
+        ui(
+          `确认删除工作流“${draft.document.name}”？画布和定时配置将被删除，历史版本和运行记录会保留，正在执行的任务不会停止。`,
+          `Delete workflow “${draft.document.name}”? Its canvas and schedule will be removed. Published versions and run history will be kept; active runs will continue.`,
+        ),
+      )
+    )
+      return
+    deletingRef.current = true
+    setDeletingId(draft.workflow_id)
+    try {
+      await call('workflow.delete', {
+        project_id: draft.project_id,
+        workflow_id: draft.workflow_id,
+        revision: draft.revision,
+      })
+      if (projectRef.current !== draft.project_id) return
+      // Invalidate older polls so they cannot put the deleted card back.
+      ++refreshSequence.current
+      setDrafts(items => items.filter(item => item.workflow_id !== draft.workflow_id))
+      setSchedules(items => items.filter(item => item.workflow_id !== draft.workflow_id))
+      setNotice(
+        ui(
+          '工作流已删除，历史版本和运行记录已保留。',
+          'Workflow deleted; versions and run history retained.',
+        ),
+      )
+      await refresh()
+    } catch (error) {
+      if (projectRef.current === draft.project_id) {
+        // A stale revision must be reviewed rather than silently retried.
+        await refresh().catch(() => {})
+        fail(error)
+      }
+    } finally {
+      deletingRef.current = false
+      setDeletingId(null)
+    }
+  }
   const loadEndpoint = useCallback(async () => {
     setEndpoint(await clients<Endpoint>('status'))
   }, [])
@@ -483,37 +536,33 @@ export default function WorkbenchApp({
             <header>
               <div>
                 <h1>{ui('工作流', 'Workflows')}</h1>
-                <p>
-                  {ui(
-                    '把重复的工作，变成可重复使用的流程。',
-                    'Turn repetitive work into reusable workflows.',
-                  )}
-                </p>
                 {selectedProject && selectedProject.project_id !== projects[0]?.project_id && (
                   <small className="wb-location" title={selectedProject.directory}>
                     {ui('项目', 'Project')} · {selectedProject.name}
                   </small>
                 )}
               </div>
-              <button
-                className="wb-primary"
-                disabled={!projectId || creating}
-                onClick={() => void create()}
-                title={ui(
-                  '新建空白工作流并直接在画布中编排',
-                  'Create a blank workflow and open the canvas',
-                )}
-              >
-                <Plus size={16} />
-                {creating ? ui('创建中…', 'Creating…') : ui('画布新建', 'New canvas')}
-              </button>
+              <div className="wb-dashboard-actions">
+                <input
+                  aria-label={ui('搜索工作流', 'Search workflows')}
+                  placeholder={ui('搜索工作流…', 'Search workflows…')}
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                />
+                <button
+                  className="wb-primary"
+                  disabled={!projectId || creating}
+                  onClick={() => void create()}
+                  title={ui(
+                    '新建空白工作流并直接在画布中编排',
+                    'Create a blank workflow and open the canvas',
+                  )}
+                >
+                  <Plus size={16} />
+                  {creating ? ui('创建中…', 'Creating…') : ui('画布新建', 'New canvas')}
+                </button>
+              </div>
             </header>
-            <input
-              aria-label={ui('搜索工作流', 'Search workflows')}
-              placeholder={ui('搜索工作流…', 'Search workflows…')}
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-            />
             {!drafts.length && (
               <div className="wb-empty">
                 <h2>{ui('从一个工作流开始', 'Start with a workflow')}</h2>
@@ -533,6 +582,7 @@ export default function WorkbenchApp({
                     <button
                       className="wb-card"
                       key={draft.workflow_id}
+                      disabled={deletingId === draft.workflow_id}
                       onClick={() => openDraft(draft)}
                     >
                       <h2>{draft.document.name}</h2>
@@ -562,6 +612,23 @@ export default function WorkbenchApp({
                         void refresh().catch(fail)
                       }}
                     />
+                    <button
+                      className="wb-delete-workflow"
+                      aria-label={ui(
+                        `删除工作流：${draft.document.name}`,
+                        `Delete workflow: ${draft.document.name}`,
+                      )}
+                      title={
+                        deletingId === draft.workflow_id
+                          ? ui('删除中…', 'Deleting…')
+                          : ui('删除工作流', 'Delete workflow')
+                      }
+                      aria-busy={deletingId === draft.workflow_id}
+                      disabled={deletingId !== null}
+                      onClick={() => void deleteDraft(draft)}
+                    >
+                      <X size={18} aria-hidden="true" />
+                    </button>
                   </div>
                 ))}
             </div>

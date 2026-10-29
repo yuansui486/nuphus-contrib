@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Nuphus Workbench",
+  "productName": "灵雀 Lingque",
   "mainBinaryName": "nuphus-workbench",
   "identifier": "io.github.yuansui486.nuphusworkbench",
   "version": "0.1.0",

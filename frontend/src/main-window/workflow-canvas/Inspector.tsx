@@ -9,7 +9,8 @@ import { createContext, useContext, useEffect, useId, useRef, useState } from 'r
 import { createPortal } from 'react-dom'
 import { IconX } from '../../ui/Icons'
 import type { WorkflowStep, Condition, VarRef, ToolSchema } from '../../core/types'
-import { wfTools, listModels, type ModelInfo } from '../lib/api'
+import { listModels, type ModelInfo } from '../lib/api'
+import { loadToolsOnce, useToolRegistry } from './toolRegistry'
 import { stepKind } from './projection'
 import { ToolParameterForm } from './ToolParameterForm'
 import {
@@ -52,29 +53,6 @@ interface InspectorProps {
   onPatch: (patch: Partial<WorkflowStep>) => void | Promise<boolean>
   onPatchAction: (action: WorkflowStep['do']) => void | Promise<boolean>
   onClose: () => void
-}
-
-// ── 工具注册表：进入画布加载一次并缓存；失败 → null（静默回退纯文本模式） ──
-let toolsCache: ToolSchema[] | null | undefined
-let toolsInflight: Promise<ToolSchema[] | null> | null = null
-
-/** 加载 wf_tools（模块级单例缓存；ToolPalette 复用，避免二次请求） */
-export function loadToolsOnce(): Promise<ToolSchema[] | null> {
-  if (toolsCache != null) return Promise.resolve(toolsCache)
-  if (!toolsInflight) {
-    toolsInflight = wfTools()
-      .then(t => {
-        toolsCache = t ?? []
-        return toolsCache
-      })
-      .catch(() => {
-        return null
-      })
-      .finally(() => {
-        toolsInflight = null
-      })
-  }
-  return toolsInflight
 }
 
 // ── 模型注册表：同 tools 缓存策略；失败/为空 → chat 表单隐藏模型下拉（不报错） ──
@@ -778,18 +756,8 @@ export function Inspector({
       /* private browsing */
     }
   }
-  // 工具注册表（模块级缓存，加载一次；失败 → null 回退纯文本）
-  const [tools, setTools] = useState<ToolSchema[] | null | undefined>(toolsCache)
+  const tools = useToolRegistry()
   const [toolChanged, setToolChanged] = useState(false)
-  useEffect(() => {
-    let alive = true
-    void loadToolsOnce().then(t => {
-      if (alive) setTools(t)
-    })
-    return () => {
-      alive = false
-    }
-  }, [])
   // 模型注册表（同 tools 缓存策略；失败/为空 → chat 分支隐藏模型下拉，不报错）
   const [models, setModels] = useState<ModelInfo[] | null | undefined>(modelsCache)
   useEffect(() => {
@@ -1045,8 +1013,7 @@ export function Inspector({
                   <button
                     type="button"
                     onClick={() => {
-                      setTools(undefined)
-                      void loadToolsOnce().then(setTools)
+                      void loadToolsOnce()
                     }}
                   >
                     {editorText('重试加载', t)}

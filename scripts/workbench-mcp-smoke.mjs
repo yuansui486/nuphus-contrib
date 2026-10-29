@@ -1,11 +1,12 @@
 // Native acceptance through the installed stdio executable, never through UI clicks.
 // Isolated profile + installation path; no keys, model calls or business files.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, copyFile, readdir } from "node:fs/promises";
+import { spawn, execFileSync } from "node:child_process";
+import { constants } from "node:fs";
+import { access, mkdtemp, mkdir, copyFile, readdir } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createInterface } from "node:readline";
-import { resolve, join, dirname } from "node:path";
+import { resolve, join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 const repo = fileURLToPath(new URL("..", import.meta.url));
 const parent = process.env.WORKBENCH_TEST_ROOT;
@@ -25,7 +26,6 @@ const bridgeSource = resolve(
   process.env.WORKBENCH_TEST_MCP ||
     join(dirname(hostSource), "nuphus-workbench-mcp" + suffix),
 );
-// Packaged macOS apps must stay in their bundle for frameworks/resources lookup.
 let bridge = bridgeSource;
 if (process.platform === "win32") {
   for (const source of [
@@ -44,6 +44,34 @@ if (process.platform === "win32") {
     await copyFile(source, target);
   }
   bridge = join(installation, "nuphus-workbench-mcp.exe");
+} else if (process.platform === "darwin") {
+  // Move the entire signed bundle: copying just its executables loses resources
+  // and doesn't exercise installation paths containing spaces and Unicode.
+  const bundle = resolve(dirname(hostSource), "../..");
+  if (
+    basename(bundle).endsWith(".app") &&
+    dirname(hostSource) === join(bundle, "Contents", "MacOS")
+  ) {
+    assert.equal(
+      dirname(bridgeSource),
+      dirname(hostSource),
+      "The bundled MCP executable must be beside the host",
+    );
+    const installedBundle = join(installation, "灵雀 工作台.app");
+    execFileSync("/usr/bin/ditto", [bundle, installedBundle]);
+    execFileSync("/usr/bin/codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      installedBundle,
+    ]);
+    bridge = join(installedBundle, "Contents", "MacOS", basename(bridgeSource));
+    await access(
+      join(installedBundle, "Contents", "MacOS", basename(hostSource)),
+      constants.X_OK,
+    );
+  }
+  await access(bridge, constants.X_OK);
 }
 const occupied = createServer((socket) => socket.end());
 await new Promise((resolve, reject) => {
@@ -123,11 +151,12 @@ function client() {
   return {
     rpc,
     async init() {
-      await rpc("initialize", {
+      const initialized = await rpc("initialize", {
         protocolVersion: "2025-06-18",
         capabilities: {},
         clientInfo: { name: "workbench-acceptance", version: "1" },
       });
+      assert.equal(initialized.serverInfo.name, "lingque");
       child.stdin.write(
         JSON.stringify({
           jsonrpc: "2.0",
@@ -135,7 +164,14 @@ function client() {
         }) + "\n",
       );
       const tools = await rpc("tools/list");
-      assert.ok(tools.tools.some((t) => t.name === "workflow_run"));
+      for (const name of ["workflow_run", "workflow_delete", "canvas_create"]) {
+        assert.ok(
+          tools.tools.some((t) => t.name === name),
+          `Missing ${name}`,
+        );
+      }
+      const deletion = tools.tools.find((t) => t.name === "workflow_delete");
+      assert.ok(deletion.inputSchema.required.includes("revision"));
     },
     async call(name, args = {}) {
       const result = await rpc("tools/call", {
@@ -184,6 +220,7 @@ try {
       JSON.stringify({
         stage: "PASS",
         checks: [
+          "lingque MCP identity and workflow deletion discovery",
           "automatic tray startup",
           "concurrent host reuse",
           "HTTP port conflict independence",

@@ -10,6 +10,9 @@ use std::sync::{
     Arc,
 };
 
+#[path = "creation_tests.rs"]
+mod creation_tests;
+
 #[derive(Default)]
 struct FakeHost {
     starts: AtomicUsize,

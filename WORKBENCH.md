@@ -4,8 +4,8 @@
 上游是 `mrpulor-gh/nuphus/main`。保留上游原版入口、编译器、画布和执行器，
 不维护另一套执行语义，不要求外部 Agent 复用内置 Agent。
 
-本次命名不迁移安装标识、数据目录或 MCP 命令。界面展示「灵雀 Lingque」，安装包产品名仍保留 `Nuphus Workbench`，
-避免丢失用户配置或使已有 MCP 连接失效。采用 B「逐流」标志；唯一 SVG 源为
+MCP 对外服务名和推荐配置键为 `lingque`，保留现有可执行文件名、安装标识和数据目录。应用和安装包统一展示「灵雀 Lingque」，
+以避免旧名称造成混淆，同时不影响已有 MCP 连接。采用 B「逐流」标志；唯一 SVG 源为
 `frontend/public/lingque.svg`，运行 `node scripts/prepare-lingque-icons.mjs` 可重建专用桌面图标。
 原版图标不变；工作台构建通过轻量适配器替换启动页品牌，继续复用原版进度与下载逻辑。
 
@@ -69,13 +69,17 @@ npx tauri build --config src-tauri/tauri.workbench.conf.json --features workbenc
 cargo build --release -p nuphus-workbench --features gateway --bin nuphus-workbench-mcp
 ```
 
-产品名 `Nuphus Workbench`，应用标识 `io.github.yuansui486.nuphusworkbench`。
+产品名 `灵雀 Lingque`，应用标识 `io.github.yuansui486.nuphusworkbench`。
 发行程序名为 `nuphus-workbench`（Windows 带 `.exe`），安装器不会将原版 `nuphus.exe`
 当作工作台进程。Cargo 目标仍保留上游名称，由 Tauri 打包时重命名，减少核心合并冲突。
 配置、数据库、浏览器用户目录、模型缓存与原版隔离，不自动复制原版模型密钥。
 默认服务数据根目录为系统用户数据目录下 `nuphus-workbench`；
 `NUPHUS_WORKBENCH_DATA_DIR` 仅覆盖工作台注册表/默认项目，不重定向所有模型配置。
 每个项目的数据放在 `<项目>/.nuphus-workbench`。项目 ID 随项目数据库保存。
+灵雀登录仅做鉴权：同一 OS 用户、同一数据根的所有账号（包括不同租户）共享本机项目、
+历史运行、定时任务及模型设置。历史租户目录和 v3 元数据保留，项目直接可见，无需确认归属。
+仅空注册表创建公共 `workspace`；不搬移项目，不合并原版或不同 OS 用户的数据。
+授权后不另设原生命令功能黑名单；画布工具列表加载失败会提示重试，恢复后同步更新工具栏与参数面板。
 服务端口默认 47731，可用 `NUPHUS_WORKBENCH_PORT` 设置；开发前端独立使用 5176。
 `--background` 隐藏主窗口、保持托盘服务。不启动原版门铃、官方中继与移动端服务。
 物理桌面自动化锁仍共享，防止两个版本同时抢占真实鼠标键盘。
@@ -111,10 +115,14 @@ IPC、HTTP、MCP 和应用内画布调用同一个服务层。
 配置示例（以页面生成的实际安装路径为准）：
 
 ```json
-{"mcpServers":{"nuphus-workbench":{"command":"C:\\完整安装路径\\nuphus-workbench-mcp.exe","args":["serve"]}}}
+{"mcpServers":{"lingque":{"command":"C:\\完整安装路径\\nuphus-workbench-mcp.exe","args":["serve"]}}}
 ```
 
-macOS 程序位于 `Nuphus Workbench.app/Contents/MacOS/nuphus-workbench-mcp`，移动 App 后需重新复制路径。
+macOS 程序位于 `灵雀 Lingque.app/Contents/MacOS/nuphus-workbench-mcp`，移动 App 后需重新复制路径。
+先把整个 App 放入「应用程序」并登录，再复制「外部接入」页面的配置；`command` 使用包内程序的绝对路径，
+含空格时直接作为 JSON 字符串填写，无需再套 shell 引号，也不要只复制 MCP 程序离开 App。
+旧配置请将 `mcpServers` 下的 `nuphus-workbench` 键改为 `lingque` 并重新连接。
+协议初始化的 `serverInfo.name` 也统一为 `lingque`；原有程序路径仍可使用。
 同一路径更新不需要修改配置；更新期间请暂停 Agent 的 MCP，完成后重新连接。
 Windows 安装器协调关闭当前安装的 MCP 程序，并在升级期间阻止自动启动主程序；
 文件无法释放时停止安装并提示重试，不跳过文件。取消安装后不会留下永久启动禁用标记。
@@ -126,12 +134,22 @@ HTTP 服务失败不会关闭 IPC。本机 IPC 以用户和数据目录区分实
 脚本隔离数据，验证端口占用、双客户端冷启动、未登录拦截和重启重连；授权后的画布和运行验收使用 `scripts/lingque-auth-smoke.mjs`，
 不读取模型密钥、不调用模型、不操作业务文件。可用 `WORKBENCH_TEST_EXE` 和 `WORKBENCH_TEST_MCP`
 指定已安装或打包后的程序。
+macOS CI 还会构建 ARM64 App，将整个签名包复制到含中文和空格的路径，检查主程序与 MCP 的执行权限，
+并通过实际 stdio 连接验证 `lingque` 名称、删除工具、双客户端冷启动、端口冲突和断线重连；发布包重复执行同一验收。
 Windows 可用 `./scripts/workbench-mcp-focus.ps1 -TestRoot <临时目录>` 包装同一验收，额外检查自动启动不抢前台焦点。
 
-主要调用链：`project.list → canvas.create/get/update → workflow.validate →
-workflow.save → workflow.run → run.get/events/steps`。
-输入放在 `workflow.run.inputs`。每次有意启动使用新的 `request_id`，
-网络错误后的重试复用原 ID 和参数，避免重复发送消息或写文件。
+主要调用链：`project.list → 复用 workflow_id（必要时 workflow.list 查找）→
+canvas.get/update → workflow.debug → run.get/events/steps`。
+只有新任务确实需要独立工作流时才调用 `canvas.create` 或 `workflow.import`，
+传入并保存唯一的创建 `request_id` 和返回的 `workflow_id`，后续反复编辑、测试均复用该工作流。
+不按同名自动合并或覆盖；候选不明确时请用户选择。
+创建请求超时、重连或重启后的重试沿用原 ID 和参数，返回 `created: false` 及原工作流的最新修订。
+参数变化报冲突；已删除的工作流不会因旧请求而复活。旧客户端不传创建 ID 时保持原行为。
+完整运行仍使用 `workflow.validate → workflow.save → workflow.run`，输入放在 `workflow.run.inputs`。
+每次有意运行或调试使用新的运行 `request_id`，网络错误后的重试复用原运行 ID 和参数，
+避免重复发送消息或写文件。单工具测试可直接调用 `automation.observe/execute`，无需新建草稿。
+工作流列表的每张卡片提供“删除工作流”，确认后删除画布及定时配置，保留历史版本和运行记录，
+不取消正在执行的任务。MCP 可调用 `workflow_delete`，传入最后读取的 `revision`，冲突时先重新读取。
 工具定义、调试、人工确认、并发及安全边界见
 [公共接口说明](crates/nuphus-workbench/README.md)。
 可运行 [HTTP 示例](examples/workbench-client.mjs)，仅创建并运行等待节点。
@@ -168,7 +186,8 @@ workflow.save → workflow.run → run.get/events/steps`。
 5. 普通版/工作台验证通过且产品分支仍等于测试前基线时，才快进到**同一个已测试提交**。
    冲突、失败或产品分支变化均不自动覆盖。无 force push、无自动选择冲突一侧。
 6. 安装包独立手动触发 dispatcher 的 `build`，固定产品 SHA、先跑 CI，
-   输出 Windows x64 安装器、macOS ARM64 DMG 和 stdio 桥接器。构建产物保留 14 天。
+   从 `edition/lingque` checkout 源码，输出灵雀品牌的 Windows x64 安装器、macOS ARM64 DMG 和 stdio 桥接器；
+   GitHub Artifact 名以 `lingque-` 开头，构建产物保留 14 天。`main` 仅承载 GitHub 默认分支所需的调度入口。
 
 源码每小时同步不等于每小时发布安装包。自动更新渠道禁用，绝不拉取原版更新覆盖工作台。
 正式自动升级需另行配置该产品独立的签名密钥、版本号和发布地址。

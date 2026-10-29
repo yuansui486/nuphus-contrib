@@ -93,6 +93,7 @@
 .wb-dashboard > header {
   display: flex;
   gap: 20px;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 22px;
@@ -117,11 +118,23 @@
   border-color: var(--accent);
   white-space: nowrap;
 }
-.wb-dashboard > input {
-  box-sizing: border-box;
-  width: min(100%, 420px);
+.wb-dashboard-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 1 440px;
   min-width: 0;
-  padding: 10px 12px;
+  max-width: 100%;
+}
+.wb-dashboard-actions > button {
+  flex-shrink: 0;
+}
+.wb-dashboard-actions > input {
+  box-sizing: border-box;
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 12px;
   border: 1px solid var(--border-primary);
   border-radius: 8px;
   background: var(--bg-secondary);
@@ -144,6 +157,7 @@
   border-color: var(--accent);
 }
 .wb-card-group {
+  position: relative;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -151,6 +165,34 @@
 .wb-card-group > .wb-card {
   width: 100%;
   flex: 1;
+  padding-right: 44px;
+}
+.wb-dashboard .wb-card-group > .wb-delete-workflow {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--error);
+  opacity: 0;
+  pointer-events: none;
+}
+.wb-dashboard .wb-card-group:hover > .wb-delete-workflow,
+.wb-dashboard .wb-card-group:focus-within > .wb-delete-workflow {
+  opacity: 1;
+  pointer-events: auto;
+}
+.wb-dashboard .wb-delete-workflow:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+@media (hover: none) {
+  .wb-dashboard .wb-card-group > .wb-delete-workflow {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 .wb-schedule-control {
   padding: 8px 0;

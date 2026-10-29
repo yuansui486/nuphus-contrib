@@ -278,25 +278,12 @@ pub fn start(app: AppHandle, authority: Arc<Authority>) {
 }
 
 fn ensure_default(app: &AppHandle) -> Result<()> {
-    use sha2::{Digest, Sha256};
     let Some(state) = app.try_state::<WorkbenchState>() else {
         return Ok(());
     };
-    let identity = state.authority.require()?;
-    if state.service.store.projects()?.is_empty()
-        && state.service.store.unclaimed_projects()?.is_empty()
-    {
-        let key = format!(
-            "{:x}",
-            Sha256::digest(identity.subject.tenant_id.as_bytes())
-        );
-        let directory = state
-            .service
-            .store
-            .root()
-            .join("tenants")
-            .join(key)
-            .join("workspace");
+    state.authority.require()?;
+    if state.service.store.projects()?.is_empty() {
+        let directory = state.service.store.root().join("workspace");
         std::fs::create_dir_all(&directory)?;
         state
             .service
@@ -341,24 +328,23 @@ pub async fn lingque_auth(
     tenant_code: Option<String>,
     username: Option<String>,
     password: Option<String>,
-    expected_epoch: Option<String>,
-    project_ids: Option<Vec<String>>,
 ) -> Result<Value> {
     let state = app
         .try_state::<WorkbenchState>()
         .ok_or_else(|| ApiError::new("edition_unavailable", "请启动灵雀版本"))?;
     let auth = &state.authority;
     match action.as_str() {
-        "status" => Ok(serde_json::to_value(auth.status())?),
-        "login" => Ok(serde_json::to_value(
+        "status" => authorized_status(&app, auth.status()),
+        "login" => authorized_status(
+            &app,
             auth.login(
                 tenant_code.as_deref().unwrap_or(""),
                 username.as_deref().unwrap_or(""),
                 password.as_deref().unwrap_or(""),
             )
             .await?,
-        )?),
-        "verify" => Ok(serde_json::to_value(auth.heartbeat(true).await?)?),
+        ),
+        "verify" => authorized_status(&app, auth.heartbeat(true).await?),
         "logout" => {
             // logout clears local state before its first await.
             let logout = auth.logout();
@@ -377,19 +363,21 @@ pub async fn lingque_auth(
             )?)
         }
         "claim" => {
-            let expected = expected_epoch
-                .ok_or_else(|| ApiError::new("invalid_params", "请重新读取待确认项目。"))?;
-            auth.require_epoch(&expected)?;
-            for project in project_ids
-                .ok_or_else(|| ApiError::new("invalid_params", "请选择已确认归属的项目。"))?
-            {
-                auth.require_epoch(&expected)?;
-                state.service.store.claim_project(&project)?;
-            }
+            auth.require()?;
             Ok(json!({"claimed":true}))
         }
         _ => Err(ApiError::new("unknown_operation", "未知登录操作")),
     }
+}
+
+fn authorized_status(
+    app: &AppHandle,
+    status: nuphus_workbench::product_auth::Status,
+) -> Result<Value> {
+    if status.authorized {
+        ensure_default(app)?;
+    }
+    Ok(serde_json::to_value(status)?)
 }
 
 pub fn public_command(command: &str) -> bool {
@@ -408,25 +396,17 @@ pub fn public_command(command: &str) -> bool {
 }
 
 pub fn guard_command(command: &str) -> std::result::Result<(), String> {
+    authorize_command(command, nuphus::profile::require_product)
+}
+
+fn authorize_command(
+    command: &str,
+    authorize: impl FnOnce() -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
     if public_command(command) {
         return Ok(());
     }
-    nuphus::profile::require_product()?;
-    // Workbench uses versioned tenant storage, never the legacy unscoped workflow/chat store.
-    if (command.starts_with("wf_")
-        && !matches!(command, "wf_get_step_schema" | "wf_get_tool_schema"))
-        || matches!(
-            command,
-            "send_message_cmd"
-                | "handoff_ensure"
-                | "agent_init"
-                | "mobile_server_start"
-                | "mobile_server_ensure"
-        )
-    {
-        return Err("灵雀请通过工作台项目接口使用该能力。".into());
-    }
-    Ok(())
+    authorize()
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
@@ -469,5 +449,35 @@ mod tests {
             assert!(!public_command(command));
         }
         assert!(public_command("lingque_auth"));
+    }
+
+    #[test]
+    fn business_commands_require_login_without_an_additional_feature_blacklist() {
+        for command in [
+            "wf_tools",
+            "wf_gate_status",
+            "wf_propose_scoped_edit",
+            "wf_list",
+            "wf_run",
+            "workbench_call",
+            "workbench_generate",
+            "execute_tool",
+            "send_message_cmd",
+            "handoff_ensure",
+            "agent_init",
+            "mobile_server_start",
+            "get_current_config",
+        ] {
+            assert_eq!(
+                authorize_command(command, || Err("login required".into())),
+                Err("login required".into())
+            );
+            assert!(authorize_command(command, || Ok(())).is_ok(), "{command}");
+            assert!(authorize_command(command, || Err("session changed".into())).is_err());
+        }
+        assert!(authorize_command("lingque_auth", || panic!(
+            "public command must remain available"
+        ))
+        .is_ok());
     }
 }

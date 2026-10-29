@@ -242,7 +242,7 @@ pub async fn workbench_generate(
         None,
         binding.1,
         "用户".into(),
-        "Nuphus Workbench".into(),
+        "灵雀 Lingque".into(),
         *native.tool_permissions_ref.lock().map_err(native_error)?,
         0.5,
     );

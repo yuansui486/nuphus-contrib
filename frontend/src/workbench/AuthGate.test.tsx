@@ -95,27 +95,24 @@ it('submits once without changing password and clears it after failure', async (
   expect(await screen.findByText('该租户尚未开通灵雀')).toBeVisible()
   expect(screen.getByLabelText('密码')).toHaveValue('')
 })
-it('requires explicit legacy project ownership confirmation', async () => {
-  let claimed = false
+it('opens shared local data immediately without claiming legacy projects', async () => {
   mocks.invoke.mockImplementation((_command, args) => {
     if (args?.action === 'status') return Promise.resolve(online)
-    if (args?.action === 'claim') claimed = true
-    if (args?.action === 'unclaimed')
-      return Promise.resolve(
-        claimed ? [] : [{ project_id: 'p1', name: '原工作流', directory: 'E:/test' }],
-      )
+    if (args?.action === 'unclaimed') throw new Error('ownership must not be queried')
     return Promise.resolve({})
   })
   render(<AuthGate />)
-  expect(await screen.findByText('原工作流')).toBeVisible()
-  expect(screen.queryByText(/业务工作台/)).not.toBeInTheDocument()
-  fireEvent.click(screen.getByRole('button', { name: '确认归属并进入' }))
   expect(await screen.findByText('业务工作台 t1')).toBeVisible()
-  expect(mocks.invoke).toHaveBeenCalledWith('lingque_auth', {
-    action: 'claim',
-    expectedEpoch: 'e1',
-    projectIds: ['p1'],
-  })
+  expect(screen.queryByText('确认旧项目归属')).not.toBeInTheDocument()
+  expect(
+    mocks.invoke.mock.calls.some(([, args]) => ['claim', 'unclaimed'].includes(args?.action)),
+  ).toBe(false)
+  act(() =>
+    mocks.handler?.({
+      payload: { ...online, epoch: 'e2', subject: { ...online.subject!, tenant_id: 't2' } },
+    }),
+  )
+  expect(await screen.findByText('业务工作台 t2')).toBeVisible()
 })
 it('keeps offline business available but unmounts immediately on revoked authorization', async () => {
   mocks.invoke.mockImplementation((_command, args) =>

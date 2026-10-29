@@ -19,9 +19,9 @@ use axum::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-        ReadResourceResponse, ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -309,7 +309,21 @@ impl<H: Host> Mcp<H> {
 
 pub fn server_info() -> ServerConfig {
     ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
-        .with_instructions("Nuphus Workbench: native project/workflow service, not an Agent proxy. Read a canvas revision before editing. Publish then run with a unique request_id; reuse that ID for retries. Use run_events cursors to follow durable progress. Closing the client does not cancel a run.")
+        .with_server_info(Implementation::new("lingque", env!("CARGO_PKG_VERSION")).with_title("灵雀 Lingque"))
+        .with_instructions(concat!(
+            "Lingque: native project/workflow service, not an Agent proxy. ",
+            "Keep and reuse the task's workflow_id across edits and tests. If unknown, inspect workflow_list; ",
+            "ask the user to select ambiguous matches, never merge by name. ",
+            "Use canvas_create or workflow_import only for a new logical workflow, supplying a globally unique request_id ",
+            "that you persist with the returned workflow_id. Reuse identical creation arguments and request_id after timeout, reconnect or restart; ",
+            "never create/import a replacement to retry a test. ",
+            "Read the current canvas revision before canvas_update. For iterative node/through tests use workflow_debug ",
+            "on the same workflow_id; steps/input_specs can override unsaved test definitions without changing the canvas. ",
+            "For a single native tool test use automation_observe/automation_execute without creating a draft. ",
+            "For a full run publish with workflow_save, then workflow_run. Use a new run/debug request_id for each intentional execution; ",
+            "reuse the same ID and arguments only for uncertain retries. Tests perform real actions. ",
+            "Use run_events cursors and run_steps to follow durable progress. Closing the client does not cancel a run."
+        ))
 }
 
 pub fn tool_list(principal: Option<&Principal>) -> ListToolsResult {

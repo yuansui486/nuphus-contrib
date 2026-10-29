@@ -247,26 +247,30 @@ impl<H: Host> Service<H> {
                     } else {
                         AuthoringMode::External
                     });
-                let draft = self.store.create(project, string(&args, "name")?, mode)?;
-                if let Some(mut document) = imported_document {
-                    document["id"] = json!(draft.workflow_id);
-                    document["run_history"] = json!([]);
-                    match self.store.update(
-                        project,
-                        &draft.workflow_id,
-                        draft.revision,
-                        &[Edit::ReplaceDocument { document }],
-                    ) {
-                        Ok(imported) => encode(imported),
-                        Err(error) => {
-                            self.store
-                                .delete(project, &draft.workflow_id, draft.revision)?;
-                            Err(error)
-                        }
-                    }
-                } else {
-                    encode(draft)
-                }
+                let request = args
+                    .get("request_id")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|key| !key.trim().is_empty())
+                            .ok_or_else(|| {
+                                ApiError::new(
+                                    "invalid_params",
+                                    "request_id must be a nonblank string",
+                                )
+                            })
+                    })
+                    .transpose()?;
+                let (draft, created) = self.store.create_requested(
+                    project,
+                    string(&args, "name")?,
+                    mode,
+                    imported_document,
+                    request.map(|key| (principal.id(), key)),
+                )?;
+                let mut result = encode(draft)?;
+                result["created"] = json!(created);
+                Ok(result)
             }
             "canvas.get" | "workflow.get" => {
                 encode(self.store.draft(project, string(&args, "workflow_id")?)?)

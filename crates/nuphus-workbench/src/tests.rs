@@ -5,55 +5,179 @@ use crate::{
 use serde_json::json;
 
 #[test]
-fn tenant_ownership_is_explicit_persistent_and_cannot_be_reregistered() {
+fn authorized_accounts_share_legacy_projects_without_rewriting_ownership() {
     let root = tempfile::tempdir().unwrap();
     let store = WorkbenchStore::open(root.path().join("registry")).unwrap();
     let project = store.register_project(root.path(), "Legacy").unwrap();
     let old = store
         .create(&project.project_id, "Preserved", AuthoringMode::External)
         .unwrap();
-    let a = store
-        .clone()
-        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-a".into())));
-    assert!(a.projects().unwrap().is_empty());
-    assert!(a.draft(&project.project_id, &old.workflow_id).is_err());
-    assert_eq!(a.unclaimed_projects().unwrap().len(), 1);
-    a.claim_project(&project.project_id).unwrap();
-    a.claim_project(&project.project_id).unwrap();
-    assert_eq!(
-        a.draft(&project.project_id, &old.workflow_id)
-            .unwrap()
-            .document,
-        old.document
-    );
-    let b = store
-        .clone()
-        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-b".into())));
-    assert!(b.projects().unwrap().is_empty());
-    assert!(b.claim_project(&project.project_id).is_err());
-    assert!(b.register_project(root.path(), "Steal").is_err());
-    assert!(b.events(&project.project_id, None, 0, 20).is_err());
-    let same = WorkbenchStore::open(root.path().join("another-registry"))
-        .unwrap()
-        .with_tenant_guard(std::sync::Arc::new(|| Ok("tenant-a".into())));
-    assert_eq!(
-        same.register_project(root.path(), "Same tenant")
-            .unwrap()
-            .project_id,
-        project.project_id
-    );
     let db =
         rusqlite::Connection::open(root.path().join(".nuphus-workbench/workbench.sqlite")).unwrap();
-    assert_eq!(
-        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+    db.execute(
+        "INSERT INTO metadata(key,value) VALUES('tenant_id','tenant-a')",
+        [],
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", 3).unwrap();
+    let second_dir = root.path().join("tenants/old-tenant-b/workspace");
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let second = store.register_project(&second_dir, "Old tenant B").unwrap();
+    let version = store
+        .publish_validated(&project.project_id, &old.workflow_id, old.revision)
+        .unwrap();
+    let (run, _) = store
+        .register_run(
+            &project.project_id,
+            "local",
+            "history",
+            "fingerprint",
+            &version,
+            json!({}),
+            json!({}),
+        )
+        .unwrap();
+    let binding = json!({"workflow_id":old.workflow_id,"config":{"kind":"interval","interval_minutes":1,"timezone":"UTC"},"generation":"legacy","anchor_at":0,"next_at":60000,"sealed_inputs":"sealed"});
+    db.execute(
+        "INSERT INTO schedules(workflow_id,body) VALUES(?1,?2)",
+        rusqlite::params![old.workflow_id, binding.to_string()],
+    )
+    .unwrap();
+    store
+        .save_authoring_session(
+            &project.project_id,
+            &old.workflow_id,
+            &json!({"messages":["history"]}),
+        )
+        .unwrap();
+    drop(store);
+
+    // Each login, including a different tenant after restart, uses the same registry.
+    for _account in ["tenant-a/user-1", "tenant-a/user-2", "tenant-b/user-1"] {
+        let account = WorkbenchStore::open(root.path().join("registry"))
+            .unwrap()
+            .with_authorization_guard(std::sync::Arc::new(|| Ok(())));
+        assert_eq!(account.projects().unwrap().len(), 2);
+        assert_eq!(account.project(&second.project_id).unwrap(), second);
+        assert_eq!(
+            account.register_project(root.path(), "Same data").unwrap(),
+            project
+        );
+        assert_eq!(
+            account
+                .draft(&project.project_id, &old.workflow_id)
+                .unwrap()
+                .document,
+            old.document
+        );
+        assert_eq!(
+            account
+                .versions(&project.project_id, &old.workflow_id)
+                .unwrap()[0]
+                .version_id,
+            version.version_id
+        );
+        assert_eq!(
+            account
+                .authoring_session(&project.project_id, &old.workflow_id)
+                .unwrap(),
+            Some(json!({"messages":["history"]}))
+        );
+        assert!(!account
+            .events(&project.project_id, None, 0, 20)
+            .unwrap()
+            .is_empty());
+        assert!(account.unclaimed_projects().unwrap().is_empty());
+        assert_eq!(
+            account.runs(&project.project_id).unwrap()[0].run_id,
+            run.run_id
+        );
+        assert_eq!(
+            account.schedules(&project.project_id).unwrap()[0].generation,
+            "legacy"
+        );
+        assert!(account.runs(&second.project_id).unwrap().is_empty());
+        assert!(account.schedules(&second.project_id).unwrap().is_empty());
+        assert!(account.draft(&second.project_id, &old.workflow_id).is_err());
+        account.claim_project(&project.project_id).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM metadata WHERE key='tenant_id'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
             .unwrap(),
-        3
-    );
-    let unavailable = store.with_tenant_guard(std::sync::Arc::new(|| {
-        Err(ApiError::new("product_auth_required", "login"))
+            "tenant-a"
+        );
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            account
+                .project_db(&second.project_id)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            2
+        );
+    }
+}
+
+#[test]
+fn logout_blocks_shared_data_but_preserves_pinned_run_evidence() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (_root, store, project, draft) = fixture();
+    let authorized = Arc::new(AtomicBool::new(true));
+    let current = authorized.clone();
+    let store = store.with_authorization_guard(Arc::new(move || {
+        if current.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(ApiError::new("product_auth_required", "login"))
+        }
     }));
-    assert!(unavailable.projects().is_err());
-    assert!(unavailable.project(&project.project_id).is_err());
+    let version = store
+        .publish_validated(&project.project_id, &draft.workflow_id, draft.revision)
+        .unwrap();
+    let (run, _) = store
+        .register_run(
+            &project.project_id,
+            "local",
+            "logout",
+            "fingerprint",
+            &version,
+            json!({}),
+            json!({}),
+        )
+        .unwrap();
+    let pinned = store.pinned().unwrap();
+    authorized.store(false, Ordering::SeqCst);
+    assert!(store.projects().is_err());
+    assert!(store.project(&project.project_id).is_err());
+    assert!(store
+        .draft(&project.project_id, &draft.workflow_id)
+        .is_err());
+    assert!(store
+        .register_project(std::path::Path::new(&project.directory), "Denied")
+        .is_err());
+    assert!(store.claim_project(&project.project_id).is_err());
+    assert!(store.unclaimed_projects().is_err());
+    assert!(store.pinned().is_err());
+    assert!(store.runs(&project.project_id).is_err());
+    assert!(store.schedules(&project.project_id).is_err());
+    pinned
+        .transition(&project.project_id, &run.run_id, RunStatus::Cancelled, None)
+        .unwrap();
+    authorized.store(true, Ordering::SeqCst);
+    assert_eq!(
+        store.run(&project.project_id, &run.run_id).unwrap().status,
+        RunStatus::Cancelled
+    );
 }
 
 fn fixture() -> (tempfile::TempDir, WorkbenchStore, Project, Draft) {

@@ -1,5 +1,7 @@
 // Node 22+. Start Workbench, then run this example; no client setup required.
-// Creates a workflow containing only a short wait; no desktop/filesystem effects.
+// Reuses one wait-only demo per project; no desktop/filesystem effects.
+// NUPHUS_WORKBENCH_WORKFLOW selects an existing wait-only workflow instead.
+// Set NUPHUS_WORKBENCH_CREATE_REQUEST_ID to a new UUID for a separate demo.
 import { randomUUID } from "node:crypto";
 const base = process.env.NUPHUS_WORKBENCH_URL || "http://127.0.0.1:47731";
 const token = process.env.NUPHUS_WORKBENCH_TOKEN;
@@ -22,27 +24,43 @@ const project_id =
   process.env.NUPHUS_WORKBENCH_PROJECT || projects[0]?.project_id;
 if (!project_id)
   throw new Error("No permitted project; register one in Workbench");
-const draft = await call("canvas.create", {
-  project_id,
-  name: "External client smoke test",
-});
+const workflow_id = process.env.NUPHUS_WORKBENCH_WORKFLOW;
+const steps = [{ id: "wait", name: "Wait briefly", do: { sleep: 0.05 } }];
+// Preserve this key and the arguments across uncertain retries/restarts.
+// The fixed, example-specific default intentionally reuses the project's demo.
+const draft = workflow_id
+  ? await call("canvas.get", { project_id, workflow_id })
+  : await call("workflow.import", {
+      project_id,
+      name: "External client smoke test",
+      request_id:
+        process.env.NUPHUS_WORKBENCH_CREATE_REQUEST_ID ||
+        "example:workbench-client:wait:v1",
+      document: {
+        name: "External client smoke test",
+        status: "Draft",
+        steps,
+        doc: null,
+        schedule: null,
+        inputs: [],
+        dry_run: false,
+      },
+    });
 const scope = { project_id, workflow_id: draft.workflow_id };
-const edited = await call("canvas.update", {
-  ...scope,
-  revision: draft.revision,
-  operations: [
-    {
-      op: "add_step",
-      lane: "main",
-      parent_id: null,
-      index: 0,
-      step: { id: "wait", name: "Wait briefly", do: { sleep: 0.05 } },
-    },
-  ],
-});
+console.log("Workflow (reuse this ID):", draft.workflow_id);
+// Never overwrite an existing canvas or execute an edited demo's real actions.
+const existingSteps = draft.document.steps;
+if (
+  existingSteps?.length !== 1 ||
+  existingSteps[0].do?.sleep !== 0.05 ||
+  Object.keys(existingSteps[0].do).length !== 1
+)
+  throw new Error(
+    "The selected workflow is no longer the wait-only demo; use a new creation request ID for a separate demo",
+  );
 const version = await call("workflow.save", {
   ...scope,
-  revision: edited.draft.revision,
+  revision: draft.revision,
 });
 // Preserve this object if a transport failure makes the response uncertain.
 const request = {

@@ -20,10 +20,10 @@ Function ${PREFIX}WorkbenchStopMcp
     ${IfNot} ${Errors}
       Goto wb_abort
     ${EndIf}
-    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Please pause Nuphus Workbench MCP in your Agent, then retry. The MCP executable is still in use or cannot be accessed. No application data will be removed." IDRETRY wb_retry
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Please pause Lingque MCP in your Agent, then retry. The MCP executable is still in use or cannot be accessed. No application data will be removed." IDRETRY wb_retry
   wb_abort:
     SetErrorLevel 10
-    Abort "Cannot release Workbench MCP executable."
+    Abort "Cannot release Lingque MCP executable."
   wb_done:
 FunctionEnd
 !macroend

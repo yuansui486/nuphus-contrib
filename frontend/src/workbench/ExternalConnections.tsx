@@ -85,8 +85,8 @@ export function ExternalConnections({ endpoint }: { endpoint: Endpoint | null })
           </div>
           <p>
             {ui(
-              '同一路径升级后无需重新配置。移动安装位置后，请重新复制配置；更新期间请暂停 MCP 连接，更新完成后重新连接。',
-              'No configuration change is needed when upgrading in place. Copy the configuration again if you move the installation. Pause MCP during updates and reconnect afterward.',
+              'MCP 名称为 lingque。旧配置请将 mcpServers 中的名称改为 lingque，或重新复制配置。移动安装位置后也需重新复制；更新完成后请重新连接。',
+              'The MCP name is lingque. Rename the old mcpServers entry to lingque or copy this configuration again. Also copy it after moving the installation, and reconnect after updates.',
             )}
           </p>
         </div>
@@ -133,8 +133,8 @@ export function ExternalConnections({ endpoint }: { endpoint: Endpoint | null })
       </details>
       <p>
         {ui(
-          '本机 Agent 复用当前登录，可使用当前租户的项目、画布、工作流、定时任务和自动化能力，不需要配置内置模型。断开 MCP 不会停止运行，但退出登录或授权失效会停止任务。切换账号后请重新连接 MCP。仅向可信的本机程序提供此配置。',
-          'Local Agents use the current login and its tenant’s projects, canvases, workflows, schedules and automation without an internal model. Disconnecting MCP does not stop runs; logout or invalid authorization does. Reconnect MCP after switching accounts. Share this configuration only with trusted local applications.',
+          '本机 Agent 复用当前登录，可使用本机共享的项目、画布、工作流、定时任务和自动化能力，不需要配置内置模型。断开 MCP 不会停止运行，但退出登录或授权失效会停止任务。切换账号后请重新连接 MCP。仅向可信的本机程序提供此配置。',
+          'Local Agents use the current login to access shared local projects, canvases, workflows, schedules and automation without an internal model. Disconnecting MCP does not stop runs; logout or invalid authorization does. Reconnect MCP after switching accounts. Share this configuration only with trusted local applications.',
         )}
       </p>
     </section>

@@ -31,7 +31,7 @@ jobs:
           echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci --no-audit --no-fund
@@ -68,7 +68,7 @@ jobs:
           echo "Validated source revision: $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -111,3 +111,16 @@ jobs:
           cargo test -p nuphus --lib desktop_automation:: --features workbench
           cargo test -p nuphus --lib tools::semantic_desktop:: --features workbench
           cargo test -p desktop-api --lib
+      - name: macOS bundled MCP acceptance
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm ci --no-audit --no-fund --prefix frontend
+          npx tauri build --debug --config src-tauri/tauri.workbench.conf.json --features workbench --bundles app
+          app='target/debug/bundle/macos/灵雀 Lingque.app'
+          codesign --force --deep --sign - "$app"
+          lipo "$app/Contents/MacOS/nuphus-workbench" -verify_arch arm64
+          lipo "$app/Contents/MacOS/nuphus-workbench-mcp" -verify_arch arm64
+          WORKBENCH_TEST_EXPECT_AUTH_REQUIRED=1 WORKBENCH_TEST_ROOT="$(mktemp -d)" WORKBENCH_TEST_EXE="$app/Contents/MacOS/nuphus-workbench" WORKBENCH_TEST_MCP="$app/Contents/MacOS/nuphus-workbench-mcp" node scripts/workbench-mcp-smoke.mjs

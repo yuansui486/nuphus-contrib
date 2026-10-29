@@ -1,6 +1,6 @@
 // Shared by local development and release packaging. Generated binaries are ignored.
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -42,4 +42,6 @@ const destination = resolve(
 );
 mkdirSync(dirname(destination), { recursive: true });
 copyFileSync(output, destination);
+// A reused sidecar file must remain executable when bundled on macOS/Linux.
+if (process.platform !== "win32") chmodSync(destination, 0o755);
 console.log(`Prepared MCP executable: ${destination}`);

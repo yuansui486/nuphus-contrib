@@ -28,6 +28,9 @@ pub fn operations() -> Vec<Operation> {
                 "source" => json!({}),
                 "mode" => json!({"type":"string","enum":["node","through"]}),
                 "authoring_mode" => json!({"type":"string","enum":["internal","external"]}),
+                "request_id" if name == "canvas.create" || name == "workflow.import" => {
+                    json!({"type":"string","minLength":1,"description":"Persist a globally unique ID for this logical creation; reuse it with identical arguments after timeout, reconnect or restart. Do not generate a new ID for a retry. Optional for legacy clients."})
+                }
                 "operations" => json!({"type":"array","minItems":1}),
                 _ => json!({"type":"string","minLength":1}),
             };
@@ -67,10 +70,10 @@ pub fn operations() -> Vec<Operation> {
     );
     add(
         "canvas.create",
-        "Create a draft. External clients default to external authoring (no internal chat panel).",
+        "Create once per new logical workflow, not once per test. Prefer the task's existing workflow_id; otherwise inspect workflow.list before creating. Supply a persistent unique request_id for safe retries. Returns created=false and the current draft on replay. External authoring is the default for external clients.",
         "edit",
         &["project_id", "name"],
-        &["authoring_mode"],
+        &["authoring_mode", "request_id"],
     );
     add("canvas.get", "Read native Workflow IR, content revision, layout and authoring mode. Edges are derived from nested IR, not a separate graph.", "read", &["project_id","workflow_id"], &[]);
     add("canvas.update", "Atomically edit the native IR using the exact last-read revision. A conflict never overwrites another editor. Move indexes are evaluated after removal; loop children are do.loop.do.", "edit", &["project_id","workflow_id","revision","operations"], &[]);
@@ -97,7 +100,7 @@ pub fn operations() -> Vec<Operation> {
     );
     add(
         "workflow.list",
-        "List project workflow drafts.",
+        "List project drafts to find the workflow for the current task before creating another. Reuse a known workflow_id; ambiguous names require user selection, never automatic merging or overwriting.",
         "read",
         &["project_id"],
         &[],
@@ -163,10 +166,10 @@ pub fn operations() -> Vec<Operation> {
     );
     add(
         "workflow.import",
-        "Import native Workflow IR as a new draft with a new ID. Does not execute it.",
+        "Import once as a new draft; supply a persistent unique request_id for safe retries. To revise or test an existing workflow, use canvas.update (including replace_document) and workflow.debug instead of importing again. Does not execute it.",
         "edit",
         &["project_id", "name", "document"],
-        &["authoring_mode"],
+        &["authoring_mode", "request_id"],
     );
     add(
         "workflow.export",
@@ -213,7 +216,7 @@ pub fn operations() -> Vec<Operation> {
     add("automation.observe", "Run an explicitly requested read-only native observation as a durable one-step run. Query run.steps for full structured output. No screenshot or private app content is sent to a model automatically.", "automation", &["project_id","request_id","tool","parameters"], &[]);
     add("workflow.tools", "Discover native tool-step schemas from the same registry as the canvas selector. Includes file, network and automation tools; does not execute them.", "read", &["project_id"], &["tool_filter"]);
     add("workflow.schema", "Read the upstream authoritative step JSON Schema. The document has id, name, status, steps, inputs, doc and schedule; never invent node shapes.", "read", &["project_id"], &[]);
-    add("workflow.debug", "Test one node or run through the selected node with explicit test variables and data provenance. This performs real actions and can repeat side effects in the selected scope. Debug definitions are frozen and never published over the canvas. Use run.pause/resume/cancel and run.steps to control and inspect.", "run", &["project_id","workflow_id","revision","request_id","selected_step_id","mode"], &["steps","input_specs","variables","runtime_inputs","use_retry_policy","source"]);
+    add("workflow.debug", "Repeat tests on the same workflow_id; this never creates a canvas draft. Test one node or run through the selected node; optional steps/input_specs are unsaved overrides, never published over the canvas. Real actions can repeat side effects. Use a new request_id for an intentional new test; reuse the same ID and arguments for an uncertain retry. Inspect with run.steps; control with run.pause/resume/cancel.", "run", &["project_id","workflow_id","revision","request_id","selected_step_id","mode"], &["steps","input_specs","variables","runtime_inputs","use_retry_policy","source"]);
     add("automation.execute", "Execute one existing native desktop/browser tool locally using the same executor and automation gate. Returns run_id; repeat the same request_id only to retry an uncertain reply. Discover schemas with automation.capabilities first. No internal Agent is invoked.", "automation", &["project_id","request_id","tool","parameters"], &[]);
     result
 }

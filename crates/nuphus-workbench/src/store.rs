@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub struct WorkbenchStore {
     root: PathBuf,
-    tenant: Option<std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>>,
+    authorization: Option<std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -124,7 +124,10 @@ impl WorkbenchStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        let store = Self { root, tenant: None };
+        let store = Self {
+            root,
+            authorization: None,
+        };
         let conn = store.registry()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects(
@@ -141,96 +144,39 @@ impl WorkbenchStore {
         &self.root
     }
 
-    /// Production hosts supply a verified identity provider; never an API argument.
-    pub fn with_tenant_guard(
+    /// Authorization gates access to shared local data, never project ownership.
+    pub fn with_authorization_guard(
         mut self,
-        guard: std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>,
+        guard: std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>,
     ) -> Self {
-        self.tenant = Some(guard);
+        self.authorization = Some(guard);
         self
     }
 
-    /// Retain the originating tenant for internal terminal evidence writes after logout.
+    /// Allow an already authorized run to persist terminal evidence after logout.
     pub fn pinned(&self) -> Result<Self> {
         let mut store = self.clone();
-        if let Some(guard) = &self.tenant {
-            let tenant = guard()?;
-            store.tenant = Some(std::sync::Arc::new(move || Ok(tenant.clone())));
+        if let Some(guard) = &self.authorization {
+            guard()?;
+            store.authorization = None;
         }
         Ok(store)
     }
 
-    fn owner(directory: &Path) -> Result<Option<String>> {
-        let conn = connect(&directory.join(".nuphus-workbench/workbench.sqlite"))?;
-        Ok(conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='tenant_id'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
-
-    fn check_owner(&self, directory: &Path) -> Result<()> {
-        if let Some(guard) = &self.tenant {
-            let tenant = guard()?;
-            if Self::owner(directory)?.as_deref() != Some(&tenant) {
-                return Err(ApiError::new(
-                    "tenant_access_denied",
-                    "此项目不属于当前租户，或尚未确认归属。",
-                ));
-            }
+    fn authorize(&self) -> Result<()> {
+        if let Some(guard) = &self.authorization {
+            guard()?;
         }
         Ok(())
     }
 
     pub fn unclaimed_projects(&self) -> Result<Vec<Project>> {
-        if let Some(guard) = &self.tenant {
-            guard()?;
-        }
-        let mut raw = self.clone();
-        raw.tenant = None;
-        raw.projects()?
-            .into_iter()
-            .filter_map(|p| match Self::owner(Path::new(&p.directory)) {
-                Ok(None) => Some(Ok(p)),
-                Ok(Some(_)) => None,
-                Err(_) => None,
-            })
-            .collect()
+        self.authorize()?;
+        Ok(vec![])
     }
 
-    pub fn claim_project(&self, project_id: &str) -> Result<()> {
-        let tenant = self
-            .tenant
-            .as_ref()
-            .ok_or_else(|| ApiError::new("unauthorized", "Tenant identity required"))?(
-        )?;
-        let mut raw = self.clone();
-        raw.tenant = None;
-        let project = raw.project(project_id)?;
-        let mut conn = raw.project_db(&project.project_id)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner: Option<String> = tx
-            .query_row(
-                "SELECT value FROM metadata WHERE key='tenant_id'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if owner.as_ref().is_some_and(|old| old != &tenant) {
-            return Err(ApiError::new(
-                "tenant_access_denied",
-                "项目已属于其他租户。",
-            ));
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO metadata(key,value) VALUES('tenant_id',?1)",
-            [&tenant],
-        )?;
-        tx.execute_batch("PRAGMA user_version=3;")?;
-        tx.commit()?;
-        Ok(())
+    pub fn claim_project(&self, _project_id: &str) -> Result<()> {
+        self.authorize()
     }
 
     pub(crate) fn registry(&self) -> Result<Connection> {
@@ -238,7 +184,7 @@ impl WorkbenchStore {
     }
 
     pub fn register_project(&self, directory: &Path, name: &str) -> Result<Project> {
-        let tenant = self.tenant.as_ref().map(|guard| guard()).transpose()?;
+        self.authorize()?;
         if !directory.is_absolute() || !directory.is_dir() {
             return Err(ApiError::new(
                 "invalid_project",
@@ -249,12 +195,6 @@ impl WorkbenchStore {
             return Err(ApiError::new("invalid_project", "Project name is required"));
         }
         let directory = directory.canonicalize()?.to_string_lossy().to_string();
-        let existing_project = Path::new(&directory)
-            .join(".nuphus-workbench/workbench.sqlite")
-            .exists();
-        if existing_project && tenant.is_some() {
-            self.check_owner(Path::new(&directory))?;
-        }
         let conn = self.registry()?;
         let previous: Option<String> = conn
             .query_row(
@@ -264,12 +204,6 @@ impl WorkbenchStore {
             )
             .optional()?;
         let id = project_identity(Path::new(&directory), previous.as_deref())?;
-        if let Some(tenant) = tenant.filter(|_| !existing_project) {
-            connect(&Path::new(&directory).join(".nuphus-workbench/workbench.sqlite"))?.execute(
-                "INSERT INTO metadata(key,value) VALUES('tenant_id',?1)",
-                [&tenant],
-            )?;
-        }
         if previous.as_ref().is_some_and(|old| old != &id) {
             return Err(ApiError::new(
                 "project_identity_changed",
@@ -302,9 +236,7 @@ impl WorkbenchStore {
     }
 
     pub fn projects(&self) -> Result<Vec<Project>> {
-        if let Some(guard) = &self.tenant {
-            guard()?;
-        }
+        self.authorize()?;
         let conn = self.registry()?;
         let mut stmt = conn
             .prepare("SELECT project_id,name,directory FROM projects ORDER BY name,project_id")?;
@@ -317,17 +249,11 @@ impl WorkbenchStore {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if self.tenant.is_some() {
-            Ok(items
-                .into_iter()
-                .filter(|p| self.check_owner(Path::new(&p.directory)).is_ok())
-                .collect())
-        } else {
-            Ok(items)
-        }
+        Ok(items)
     }
 
     pub fn project(&self, project_id: &str) -> Result<Project> {
+        self.authorize()?;
         let project = self
             .registry()?
             .query_row(
@@ -343,7 +269,6 @@ impl WorkbenchStore {
             )
             .optional()?
             .ok_or_else(|| missing("Project"))?;
-        self.check_owner(Path::new(&project.directory))?;
         Ok(project)
     }
 
@@ -372,6 +297,9 @@ impl WorkbenchStore {
             run_id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, client_id TEXT NOT NULL,
             request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, body TEXT NOT NULL,
             UNIQUE(client_id,request_id));
+            CREATE TABLE IF NOT EXISTS creation_requests(
+            client_id TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+            workflow_id TEXT NOT NULL, PRIMARY KEY(client_id,request_id));
             CREATE TABLE IF NOT EXISTS events(
             cursor INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
             workflow_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -394,11 +322,68 @@ impl WorkbenchStore {
     }
 
     pub fn create(&self, project: &str, name: &str, mode: AuthoringMode) -> Result<Draft> {
+        self.create_requested(project, name, mode, None, None)
+            .map(|(draft, _)| draft)
+    }
+
+    /// Keep the draft, import and optional retry record in one transaction.
+    /// Retry records deliberately outlive draft deletion (no resurrection).
+    pub(crate) fn create_requested(
+        &self,
+        project: &str,
+        name: &str,
+        mode: AuthoringMode,
+        document: Option<Value>,
+        request: Option<(&str, &str)>,
+    ) -> Result<(Draft, bool)> {
         if name.trim().is_empty() {
             return Err(ApiError::new("invalid_params", "Workflow name is required"));
         }
+        let request = request
+            .map(|(client, key)| {
+                if key.trim().is_empty() {
+                    return Err(ApiError::new("invalid_params", "request_id must not be blank"));
+                }
+                let mut normalized = document.clone();
+                if let Some(Value::Object(fields)) = normalized.as_mut() {
+                    fields.remove("id");
+                    fields.remove("run_history");
+                }
+                Ok((client, key, fingerprint(&json!({
+                    "operation": if document.is_some() { "workflow.import" } else { "canvas.create" },
+                    "name": name.trim(), "authoring_mode": mode, "document": normalized,
+                }))))
+            })
+            .transpose()?;
+        let mut conn = self.project_db(project)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((client, key, hash)) = &request {
+            let previous: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT fingerprint,workflow_id FROM creation_requests WHERE client_id=?1 AND request_id=?2",
+                    params![client, key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((previous_hash, workflow)) = previous {
+                if previous_hash != *hash {
+                    return Err(ApiError::new(
+                        "idempotency_conflict",
+                        "This creation request_id was already used with different arguments",
+                    ));
+                }
+                let draft = load_draft(&tx, &workflow).map_err(|error| {
+                    if error.code == "not_found" {
+                        error.details(json!({"workflow_id":workflow}))
+                    } else {
+                        error
+                    }
+                })?;
+                return Ok((draft, false));
+            }
+        }
         let id = uuid::Uuid::new_v4().to_string();
-        let draft = Draft {
+        let mut draft = Draft {
             project_id: project.into(),
             workflow_id: id.clone(),
             revision: 1,
@@ -409,8 +394,22 @@ impl WorkbenchStore {
             layout_revision: 0,
             updated_at: now(),
         };
-        let mut conn = self.project_db(project)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let imported = document.is_some();
+        if let Some(mut document) = document {
+            if !document.is_object() {
+                return Err(ApiError::new(
+                    "invalid_params",
+                    "document must be an object",
+                ));
+            }
+            document["id"] = json!(id);
+            document["run_history"] = json!([]);
+            edit::apply(&mut draft, &edit::Edit::ReplaceDocument { document })?;
+            // Import never arms a schedule; only the explicit schedule API does.
+            draft.document["schedule"] = Value::Null;
+            edit::check_document(&draft.document, &id)?;
+            draft.revision = 2;
+        }
         tx.execute(
             "INSERT INTO drafts(workflow_id,revision,body) VALUES(?1,?2,?3)",
             params![id, draft.revision, serde_json::to_string(&draft)?],
@@ -423,8 +422,24 @@ impl WorkbenchStore {
             "canvas.created",
             &json!({"revision":1}),
         )?;
+        if imported {
+            event(
+                &tx,
+                project,
+                &id,
+                None,
+                "canvas.changed",
+                &json!({"revision":2}),
+            )?;
+        }
+        if let Some((client, key, hash)) = request {
+            tx.execute(
+                "INSERT INTO creation_requests(client_id,request_id,fingerprint,workflow_id) VALUES(?1,?2,?3,?4)",
+                params![client, key, hash, id],
+            )?;
+        }
         tx.commit()?;
-        Ok(draft)
+        Ok((draft, true))
     }
 
     pub fn authoring_session(&self, project: &str, workflow: &str) -> Result<Option<Value>> {
