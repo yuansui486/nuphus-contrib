@@ -451,6 +451,13 @@ export function useEvents(h: EventHandlers) {
           // 用户中断：不播错误音效、mood 回到 idle（中断不是失败）；
           // 其余 LLM 错误：立即播放错误音效（低沉三音下行）——用户不盯屏也能感知失败
           if (!isInterrupted) playUiSound('error')
+          // 输入框连接状态复位：health 机此前只认后端 `error` 事件，
+          // execution_error（不可重试失败 / 重试用尽等出口）被漏接 → 状态永久
+          // 停在「连接中」且无任何原因（2026-10-28 用户侧「connecting 一直转、
+          // 什么提示都没有」）。非中断失败一律转「已断开」并把原因记入时间线。
+          if (!isInterrupted) {
+            setHealth('offline', event.error || '模型请求未能完成', 'disconnect', 'failed')
+          }
           const s = h.refs.streamingMsgId.current
           if (s) {
             h.setMessages(prev =>
@@ -1416,13 +1423,13 @@ export function useEvents(h: EventHandlers) {
   }, [h.setUserInputRequest])
 
   // ── Refine timeout guard: 事件彻底丢失时的兜底复位 ──
-  // 95s > 后端 90s 硬超时：正常慢提炼不被误掐；旧版只复位 isProcessing 不复位
+  // 185s > 后端 Leader 180s 硬超时：正常慢提炼不被误掐；旧版只复位 isProcessing 不复位
   // refining/refineState（弹窗仍卡 spinner）+ 70s 会误杀后端还在跑的提炼。
   useEffect(() => {
     const interval = setInterval(() => {
       if (refineActiveRef.current && refineStartTimeRef.current > 0) {
         const elapsed = Date.now() - refineStartTimeRef.current
-        if (elapsed > 95000) {
+        if (elapsed > 185000) {
           console.warn('[REFINE] Timeout guard triggered, resetting refine state')
           resetRefineUI()
         }
